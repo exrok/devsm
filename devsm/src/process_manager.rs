@@ -1,3 +1,4 @@
+use crate::rpc::{DecodeResult, DecodingState, RpcMessageKind};
 use crate::workspace::{self, ExitCause, JobIndex, JobStatus, Workspace, WorkspaceState};
 use crate::{
     config::{Command, TaskConfigRc},
@@ -6,13 +7,12 @@ use crate::{
     log_storage::{LogGroup, LogWriter},
 };
 use anyhow::{Context, bail};
-use devsm_rpc::{DecodeResult, DecodingState, RpcMessageKind};
 use extui::Style;
+use hashbrown::HashMap;
 use jsony_value::ValueMap;
 use mio::{Events, Interest, Poll, Token, Waker, unix::SourceFd};
 use slab::Slab;
 use std::io::Write;
-use hashbrown::HashMap;
 use std::{
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
@@ -382,7 +382,7 @@ impl ProcessManager {
             let mut ws = workspace.handle.state.write().unwrap();
             ws.update_job_status(job_index, JobStatus::Running { process_index });
         }
-        self.broadcast_job_status(workspace_index, job_index, devsm_rpc::JobStatusKind::Running);
+        self.broadcast_job_status(workspace_index, job_index, crate::rpc::JobStatusKind::Running);
         Ok(())
     }
 }
@@ -760,9 +760,9 @@ impl ProcessManager {
                     let exit_code =
                         if libc::WIFEXITED(status as i32) { libc::WEXITSTATUS(status as i32) as u32 } else { u32::MAX };
                     let rpc_cause = match cause {
-                        ExitCause::Unknown => devsm_rpc::ExitCause::Unknown,
-                        ExitCause::Killed => devsm_rpc::ExitCause::Killed,
-                        ExitCause::Restarted => devsm_rpc::ExitCause::Restarted,
+                        ExitCause::Unknown => crate::rpc::ExitCause::Unknown,
+                        ExitCause::Killed => crate::rpc::ExitCause::Killed,
+                        ExitCause::Restarted => crate::rpc::ExitCause::Restarted,
                     };
                     if let Some(workspace) = self.workspaces.get(ws_idx as usize) {
                         let mut ws = workspace.handle.state.write().unwrap();
@@ -1016,11 +1016,11 @@ impl ProcessManager {
         };
         let client_index = self.clients.insert(client_entry);
 
-        let mut encoder = devsm_rpc::Encoder::new();
+        let mut encoder = crate::rpc::Encoder::new();
         encoder.encode_response(
-            devsm_rpc::RpcMessageKind::OpenWorkspaceAck,
+            crate::rpc::RpcMessageKind::OpenWorkspaceAck,
             0,
-            &devsm_rpc::OpenWorkspaceResponse { success: true, error: None },
+            &crate::rpc::OpenWorkspaceResponse { success: true, error: None },
         );
         let client = &mut self.clients[client_index];
         let _ = client.socket.write_all(encoder.output());
@@ -1056,7 +1056,7 @@ impl ProcessManager {
             }
         }
 
-        let mut encoder = devsm_rpc::Encoder::new();
+        let mut encoder = crate::rpc::Encoder::new();
 
         loop {
             match state.decode(&buffer) {
@@ -1104,15 +1104,15 @@ impl ProcessManager {
         kind: RpcMessageKind,
         correlation: u16,
         payload: &[u8],
-        encoder: &mut devsm_rpc::Encoder,
+        encoder: &mut crate::rpc::Encoder,
     ) {
         match kind {
             RpcMessageKind::Subscribe => {
-                let Ok(filter) = jsony::from_binary::<devsm_rpc::SubscriptionFilter>(payload) else {
+                let Ok(filter) = jsony::from_binary::<crate::rpc::SubscriptionFilter>(payload) else {
                     encoder.encode_response(
                         RpcMessageKind::ErrorResponse,
                         correlation,
-                        &devsm_rpc::ErrorResponsePayload { code: 1, message: "Invalid subscription filter".into() },
+                        &crate::rpc::ErrorResponsePayload { code: 1, message: "Invalid subscription filter".into() },
                     );
                     return;
                 };
@@ -1123,15 +1123,15 @@ impl ProcessManager {
                 encoder.encode_response(
                     RpcMessageKind::SubscribeAck,
                     correlation,
-                    &devsm_rpc::SubscribeAck { success: true },
+                    &crate::rpc::SubscribeAck { success: true },
                 );
             }
             RpcMessageKind::RunTask => {
-                let Ok(req) = jsony::from_binary::<devsm_rpc::RunTaskRequest>(payload) else {
+                let Ok(req) = jsony::from_binary::<crate::rpc::RunTaskRequest>(payload) else {
                     encoder.encode_response(
                         RpcMessageKind::ErrorResponse,
                         correlation,
-                        &devsm_rpc::ErrorResponsePayload { code: 2, message: "Invalid run task request".into() },
+                        &crate::rpc::ErrorResponsePayload { code: 2, message: "Invalid run task request".into() },
                     );
                     return;
                 };
@@ -1143,7 +1143,7 @@ impl ProcessManager {
                     encoder.encode_response(
                         RpcMessageKind::RunTaskAck,
                         correlation,
-                        &devsm_rpc::RunTaskResponse {
+                        &crate::rpc::RunTaskResponse {
                             success: false,
                             job_index: None,
                             error: Some(format!("Task '{}' not found", req.task_name).into()),
@@ -1162,7 +1162,7 @@ impl ProcessManager {
                 encoder.encode_response(
                     RpcMessageKind::RunTaskAck,
                     correlation,
-                    &devsm_rpc::RunTaskResponse { success: true, job_index, error: None },
+                    &crate::rpc::RunTaskResponse { success: true, job_index, error: None },
                 );
             }
             RpcMessageKind::Terminate => {
@@ -1172,7 +1172,7 @@ impl ProcessManager {
                 encoder.encode_response(
                     RpcMessageKind::OpenWorkspaceAck,
                     correlation,
-                    &devsm_rpc::OpenWorkspaceResponse { success: true, error: None },
+                    &crate::rpc::OpenWorkspaceResponse { success: true, error: None },
                 );
             }
             _ => {
@@ -1427,10 +1427,10 @@ impl ProcessManager {
         &mut self,
         ws_index: WorkspaceIndex,
         job_index: JobIndex,
-        status: devsm_rpc::JobStatusKind,
+        status: crate::rpc::JobStatusKind,
     ) {
-        let event = devsm_rpc::JobStatusEvent { job_index: job_index.as_u32(), status };
-        let mut encoder = devsm_rpc::Encoder::new();
+        let event = crate::rpc::JobStatusEvent { job_index: job_index.as_u32(), status };
+        let mut encoder = crate::rpc::Encoder::new();
         encoder.encode_push(RpcMessageKind::JobStatus, &event);
         let output = encoder.output();
 
@@ -1451,10 +1451,10 @@ impl ProcessManager {
         ws_index: WorkspaceIndex,
         job_index: JobIndex,
         exit_code: i32,
-        cause: devsm_rpc::ExitCause,
+        cause: crate::rpc::ExitCause,
     ) {
-        let event = devsm_rpc::JobExitedEvent { job_index: job_index.as_u32(), exit_code, cause };
-        let mut encoder = devsm_rpc::Encoder::new();
+        let event = crate::rpc::JobExitedEvent { job_index: job_index.as_u32(), exit_code, cause };
+        let mut encoder = crate::rpc::Encoder::new();
         encoder.encode_push(RpcMessageKind::JobExited, &event);
         let output = encoder.output();
 

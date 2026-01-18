@@ -1,59 +1,8 @@
+#![allow(dead_code, reason = "it is used but only from testing harness")]
 //! Bidirectional RPC protocol for devsm client-daemon communication.
 //!
-//! This module provides a zero-copy, sans-IO protocol implementation with proper
-//! message framing, request/response correlation, and subscription support.
-//!
-//! # Wire Format
-//!
-//! Each message consists of a 12-byte header followed by an optional payload:
-//!
-//! ```text
-//! +0  magic:       u32  - Protocol magic (0xDE75_0001)
-//! +4  kind:        u16  - Message type discriminant
-//! +6  correlation: u16  - Request/response pairing (0 = subscription push)
-//! +8  len:         u32  - Payload length in bytes
-//! ```
-//!
-//! Payloads are encoded using jsony Binary format.
-//!
-//! # Examples
-//!
-//! Zero-copy decoding with external buffer:
-//!
-//! ```ignore
-//! let mut state = DecodingState::default();
-//! let mut buffer = Vec::new();
-//!
-//! // Read into buffer capacity
-//! buffer.reserve(1024);
-//! let n = socket.read(&mut buffer.spare_capacity_mut())?;
-//! unsafe { buffer.set_len(buffer.len() + n); }
-//!
-//! // Decode messages (zero-copy payloads)
-//! loop {
-//!     match state.decode(&buffer) {
-//!         DecodeResult::Message { kind, correlation, payload } => {
-//!             handle_message(kind, correlation, payload);
-//!         }
-//!         DecodeResult::MissingData { .. } => break,
-//!         DecodeResult::Empty => {
-//!             buffer.clear();
-//!             break;
-//!         }
-//!         DecodeResult::Error(e) => return Err(e),
-//!     }
-//! }
-//! state.compact(&mut buffer, 4096);
-//! ```
-//!
-//! Encoding a message:
-//!
-//! ```ignore
-//! let mut encoder = Encoder::new();
-//! encoder.encode_push(RpcMessageKind::JobStatus, &event);
-//! socket.write_all(encoder.output())?;
-//! encoder.clear();
-//! ```
+//! Currently this is just a module, but in the future may be extracted into owns crate.
+//! I just don't want to worry about publish one.
 
 use jsony::Jsony;
 

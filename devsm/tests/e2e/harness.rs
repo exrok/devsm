@@ -8,7 +8,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use devsm_rpc::{
+use crate::rpc::{
     ClientProtocol, DecodeResult, ExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind,
     encode_attach_rpc,
 };

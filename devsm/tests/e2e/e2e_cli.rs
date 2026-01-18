@@ -6,7 +6,7 @@ use std::fs;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use devsm_rpc::{ExitCause, JobStatusKind};
+use crate::rpc::{ExitCause, JobStatusKind};
 use harness::{RpcEvent, RpcSubscriber, TestHarness, cargo_bin_path};
 
 #[test]

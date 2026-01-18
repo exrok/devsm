@@ -44,12 +44,11 @@ dependencies = [
  "anyhow",
  "bumpalo",
  "codespan-reporting",
- "devsm-rpc",
  "extui",
  "foldhash",
  "hashbrown",
  "jsony",
- "jsony_value 0.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "jsony_value",
  "kvlog",
  "libc",
  "memchr",
@@ -60,15 +59,6 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "vt100",
-]
-
-[[package]]
-name = "devsm-rpc"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "jsony",
- "jsony_value 0.0.1",
 ]
 
 [[package]]
@@ -138,14 +128,6 @@ name = "jsony_macros"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c18667b5fc4ed9586b42797ecfeb32f8d235ff7aec32e12f79797e3b79c316f4"
-
-[[package]]
-name = "jsony_value"
-version = "0.0.1"
-dependencies = [
- "foldhash",
- "jsony",
-]
 
 [[package]]
 name = "jsony_value"

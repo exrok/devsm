@@ -12,11 +12,11 @@ use std::{
     sync::Arc,
 };
 
+use crate::rpc::{Encoder, RpcMessageKind};
 use crate::{
     process_manager::ClientChannel,
     workspace::{BaseTask, JobStatus, TestJob, TestJobStatus, TestRun, Workspace},
 };
-use devsm_rpc::{Encoder, RpcMessageKind};
 
 fn send_termination(encoder: &mut Encoder, socket: &mut Option<UnixStream>) {
     let Some(socket) = socket.as_mut() else { return };

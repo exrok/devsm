@@ -9,7 +9,7 @@ use anyhow::bail;
 use sendfd::SendWithFd;
 
 use crate::daemon::{WorkspaceCommand, socket_path};
-use devsm_rpc::{
+use crate::rpc::{
     ClientProtocol, DecodeResult, JobExitedEvent, JobStatusEvent, JobStatusKind, ResizeNotification, RpcMessageKind,
 };
 
@@ -22,6 +22,7 @@ mod line_width;
 mod log_fowarder_ui;
 mod log_storage;
 mod process_manager;
+mod rpc;
 mod scroll_view;
 mod searcher;
 mod test_summary_ui;

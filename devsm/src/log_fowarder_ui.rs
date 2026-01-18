@@ -13,12 +13,12 @@ use std::{
     sync::Arc,
 };
 
+use crate::rpc::{Encoder, ExitCause as RpcExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind};
 use crate::{
     log_storage::{LogFilter, LogGroup, LogId},
     process_manager::ClientChannel,
     workspace::{ExitCause, JobIndex, JobStatus, Workspace},
 };
-use devsm_rpc::{Encoder, ExitCause as RpcExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {

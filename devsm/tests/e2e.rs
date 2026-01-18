@@ -6,3 +6,5 @@ mod e2e_cli;
 mod e2e_tui;
 #[path = "e2e/harness.rs"]
 mod harness;
+#[path = "../../devsm/src/rpc.rs"]
+mod rpc;
