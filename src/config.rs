@@ -93,10 +93,16 @@ impl TaskConfigRc {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Command<'a> {
+    Cmd(&'a [&'a str]),
+    Sh(&'a str),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TaskConfig<'a> {
     pub kind: TaskKind,
     pub pwd: &'a str,
-    pub cmd: &'a [&'a str],
+    pub command: Command<'a>,
     pub profiles: &'a [&'a str],
     pub envvar: &'a [(&'a str, &'a str)],
     pub before: &'a [Alias<'a>],
@@ -208,11 +214,17 @@ pub struct WorkspaceConfig<'a> {
 }
 
 #[derive(Debug)]
+enum CommandExpr<'a> {
+    Cmd(StringListExpr<'a>),
+    Sh(StringExpr<'a>),
+}
+
+#[derive(Debug)]
 pub struct TaskConfigExpr<'a> {
     pub kind: TaskKind,
     info: &'a str,
     pwd: StringExpr<'a>,
-    cmd: StringListExpr<'a>,
+    command: CommandExpr<'a>,
     pub profiles: &'a [&'a str],
     envvar: &'a [(&'a str, StringExpr<'a>)],
     before: AliasListExpr<'a>,
@@ -224,7 +236,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         kind: TaskKind::Action,
         info: "Default Expression for Cargo Innvocations",
         pwd: StringExpr::Var("pwd"),
-        cmd: StringListExpr::List(&[StringListExpr::Literal("cargo"), StringListExpr::Var("args")]),
+        command: CommandExpr::Cmd(StringListExpr::List(&[StringListExpr::Literal("cargo"), StringListExpr::Var("args")])),
         profiles: &["default"],
         envvar: &[],
         before: AliasListExpr::List(&[]),
@@ -249,7 +261,7 @@ impl TaskConfigExpr<'static> {
             TaskConfig {
                 kind: TaskKind::Action,
                 pwd: "",
-                cmd: &[],
+                command: Command::Cmd(&[]),
                 before: &[],
                 before_once: &[],
                 profiles: &[],
@@ -269,13 +281,23 @@ impl TaskConfigExpr<'static> {
     }
 }
 
+impl<'a> BumpEval<'a> for CommandExpr<'static> {
+    type Object = Command<'a>;
+    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<Command<'a>, EvalError> {
+        Ok(match self {
+            CommandExpr::Cmd(cmd_expr) => Command::Cmd(cmd_expr.bump_eval(env, bump)?),
+            CommandExpr::Sh(sh_expr) => Command::Sh(sh_expr.bump_eval(env, bump)?),
+        })
+    }
+}
+
 impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
     type Object = TaskConfig<'a>;
     fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<TaskConfig<'a>, EvalError> {
         Ok(TaskConfig {
             kind: self.kind,
             pwd: self.pwd.bump_eval(env, bump)?,
-            cmd: self.cmd.bump_eval(env, bump)?,
+            command: self.command.bump_eval(env, bump)?,
             before: self.before.bump_eval(env, bump)?,
             before_once: self.before_once.bump_eval(env, bump)?,
             profiles: self.profiles,
@@ -420,6 +442,7 @@ impl<'a> BumpJsonDecode<'a> for TaskConfigExpr<'a> {
     ) -> Result<Self, &'static jsony::json::DecodeError> {
         let mut pwd = StringExpr::Literal("./");
         let mut cmd: Option<StringListExpr> = None;
+        let mut sh: Option<StringExpr> = None;
         let mut profiles: &[&str] = &[];
         let mut envvar: &[(&str, StringExpr)] = &[];
         let mut before = AliasListExpr::List(&[]);
@@ -433,6 +456,7 @@ impl<'a> BumpJsonDecode<'a> for TaskConfigExpr<'a> {
                 "info" => info = take_string(parser, bump)?,
                 "kind" | "type" => kind = TaskKind::decode_json(parser)?,
                 "cmd" => cmd = Some(StringListExpr::decode(parser, bump)?),
+                "sh" => sh = Some(StringExpr::decode(parser, bump)?),
                 "profiles" => profiles = <&[&str]>::decode(parser, bump)?,
                 "before" => before = AliasListExpr::decode(parser, bump)?,
                 "before_once" => before_once = AliasListExpr::decode(parser, bump)?,
@@ -457,18 +481,26 @@ impl<'a> BumpJsonDecode<'a> for TaskConfigExpr<'a> {
             next_key = parser.object_step()?;
         }
 
+        // Validate that exactly one of cmd or sh is specified
+        let command = match (cmd, sh) {
+            (Some(cmd), None) => CommandExpr::Cmd(cmd),
+            (None, Some(sh)) => CommandExpr::Sh(sh),
+            (Some(_), Some(_)) => {
+                return Err(&DecodeError { message: "Fields `cmd` and `sh` are mutually exclusive in TaskConfig" });
+            }
+            (None, None) => {
+                return Err(&DecodeError { message: "Either `cmd` or `sh` field is required in TaskConfig" });
+            }
+        };
+
         Ok(TaskConfigExpr {
             info,
             kind,
             pwd,
+            command,
             envvar,
             before,
             before_once,
-            cmd: if let Some(cmd) = cmd {
-                cmd
-            } else {
-                return Err(&DecodeError { message: "`cmd` field is required in TaskConfig" });
-            },
             profiles,
         })
     }

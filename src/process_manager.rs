@@ -1,6 +1,6 @@
 use crate::workspace::{self, ExitCause, JobIndex, JobStatus, Workspace, WorkspaceState};
 use crate::{
-    config::TaskConfigRc,
+    config::{Command, TaskConfigRc},
     daemon::WorkspaceCommand,
     line_width::{Segment, apply_raw_display_mode_vt_to_style},
     log_storage::{JobLogCorrelation, LogWriter},
@@ -278,9 +278,7 @@ impl ProcessManager {
     ) -> anyhow::Result<()> {
         let index = self.processes.vacant_key();
         let tc = task.config();
-        let [cmd, args @ ..] = tc.cmd else { panic!("Expected atleast one command") };
         let workspace = &self.workspaces[workspace_index as usize];
-        let mut command = std::process::Command::new(cmd);
         let path = {
             let ws = &mut *workspace.handle.state.write().unwrap();
             ws.change_number = ws.change_number.wrapping_add(1);
@@ -295,7 +293,21 @@ impl ProcessManager {
             }
             ws.config.current.base_path.join(tc.pwd)
         };
-        command.args(args).env("CARGO_TERM_COLOR", "always").current_dir(path).envs(tc.envvar.iter().copied());
+
+        let (mut command, sh_script) = match &tc.command {
+            Command::Sh(script) => (std::process::Command::new("/bin/sh"), Some(*script)),
+            Command::Cmd(cmd_args) => {
+                if cmd_args.is_empty() {
+                    bail!("Command must not be empty");
+                }
+                let [cmd, args @ ..] = *cmd_args else { panic!("Expected atleast one command") };
+                let mut cmd = std::process::Command::new(cmd);
+                cmd.args(args);
+                (cmd, None)
+            }
+        };
+
+        command.env("CARGO_TERM_COLOR", "always").current_dir(path).envs(tc.envvar.iter().copied());
         unsafe {
             command.pre_exec(|| {
                 // Create process group to allow nested cleanup
@@ -308,10 +320,21 @@ impl ProcessManager {
                 Ok(())
             });
         }
-        command.stdin(Stdio::null());
+
+        // If using sh, pipe the script to stdin, otherwise use null stdin
+        let stdin = if sh_script.is_some() { Stdio::piped() } else { Stdio::null() };
+        command.stdin(stdin);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         let mut child = command.spawn().context("Failed to spawn process")?;
+
+        // If using sh, write the script to stdin and close it
+        if let (Some(mut stdin), Some(script)) = (child.stdin.take(), sh_script) {
+            use std::io::Write;
+            let _ = stdin.write_all(script.as_bytes());
+            let _ = stdin.flush();
+            drop(stdin);
+        }
         self.wait_thread.thread().unpark();
         if let Some(stdout) = &mut child.stdout {
             unsafe {

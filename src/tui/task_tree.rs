@@ -1,7 +1,7 @@
 use vtui::{Color, DoubleBuffer, HAlign, Rect};
 
 use crate::{
-    config::TaskKind,
+    config::{Command, TaskKind},
     tui::constrain_scroll_offset,
     workspace::{BaseTaskIndex, JobIndex, JobStatus, WorkspaceState},
 };
@@ -310,7 +310,18 @@ impl TaskTreeState {
                 break;
             }
             let job = &ws[ji];
-            let command = job.task.config().cmd.join(" ");
+            let command = match &job.task.config().command {
+                Command::Cmd(args) => args.join(" "),
+                Command::Sh(script) => {
+                    // Show "sh: " followed by a prefix of the script
+                    let prefix = if script.len() > 50 {
+                        format!("{}...", &script[..50])
+                    } else {
+                        script.to_string()
+                    };
+                    format!("sh: {}", prefix)
+                }
+            };
             let status = StatusKind::of(&job.process_status, bt.config.kind);
             line.take_left(6)
                 .with(if Some(ji) == sel.job {
