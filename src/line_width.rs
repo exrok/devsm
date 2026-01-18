@@ -24,23 +24,6 @@ struct SegmentIterator<'a> {
 
 // given the string after the [b']
 
-fn numericalize_unchecked(text: &str) -> [u8; 8] {
-    let mut buf = [0u8; 8];
-    let mut num = 0;
-    let mut i = 0;
-    for &ch in text.as_bytes() {
-        if ch == b';' {
-            buf[i & 0b111] = num;
-            num = 0;
-            i += 1;
-            continue;
-        }
-        num = num.wrapping_mul(10).wrapping_add(ch.wrapping_sub(b'0'));
-    }
-    buf[i & 0b111] = num;
-    buf
-}
-
 fn numericalize_unchecked_iter(text: &str) -> impl Iterator<Item = u8> {
     let mut bytes = text.as_bytes().iter();
     std::iter::from_fn(move || {
@@ -101,35 +84,6 @@ impl<'a> Segment<'a> {
     }
 }
 
-/// Computes the terminal display width of a string, ignoring ANSI SGR color codes.
-///
-/// This function is optimized for performance by:
-/// 1. Treating pure ASCII segments separately, where width is simply the byte length.
-/// 2. Skipping over ANSI SGR escape codes (`\x1b[...m`) without processing their contents.
-/// 3. Using `unicode_width` only for segments that contain non-ASCII characters.
-///
-/// # Assumptions
-/// The function assumes the input `text` contains no control characters (`\t`, `\n`, etc.)
-/// and that the only VT escape codes present are SGR display mode codes (`\x1b[...m`).
-pub fn width_ignoring_vt_ansi_color(text: &str) -> usize {
-    let mut width = 0;
-    // SAFETY for from_utf8_unchecked: The SegmentIterator is carefully designed to only split
-    // on ASCII boundaries (`m`, `\x1b`, or the transition between ASCII/non-ASCII chars).
-    // Since the original `&str` is valid UTF-8, any split on an ASCII boundary will
-    // also result in valid UTF-8 slices.
-    for segment in Segment::iterator(text) {
-        match segment {
-            // For pure ASCII, width is equivalent to byte length. This is a fast path.
-            Segment::Ascii(s) => width += s.len(),
-            // For segments with unicode, we use the unicode-width crate.
-            Segment::Utf8(s) => width += s.width(),
-            // ANSI escape codes have zero display width.
-            Segment::AnsiEscapes(_) => continue,
-        }
-    }
-    width
-}
-
 /// Strips ANSI escape codes from text and appends lowercase content to buffer.
 ///
 /// Used for building search indices where case-insensitive matching is needed
@@ -159,20 +113,6 @@ pub struct MatchHighlight {
     pub start: u32,
     /// Length of match in stripped text bytes.
     pub len: u32,
-}
-
-impl MatchHighlight {
-    /// Returns true if the given stripped position is within the highlight range.
-    pub fn contains(&self, stripped_pos: usize) -> bool {
-        self.len > 0
-            && stripped_pos >= self.start as usize
-            && stripped_pos < (self.start + self.len) as usize
-    }
-
-    /// Returns true if the given stripped range overlaps with the highlight range.
-    pub fn overlaps(&self, start: usize, end: usize) -> bool {
-        self.len > 0 && start < (self.start + self.len) as usize && end > self.start as usize
-    }
 }
 
 pub fn apply_raw_display_mode_vt_to_style(style: &mut Style, escape: &str) {
@@ -392,5 +332,34 @@ mod tests {
         let text = "日本語abc";
         let segments: Vec<_> = Segment::iterator(text).collect();
         assert_eq!(segments, vec![Segment::Utf8("日本語"), Segment::Ascii("abc"),]);
+    }
+
+    /// Computes the terminal display width of a string, ignoring ANSI SGR color codes.
+    ///
+    /// This function is optimized for performance by:
+    /// 1. Treating pure ASCII segments separately, where width is simply the byte length.
+    /// 2. Skipping over ANSI SGR escape codes (`\x1b[...m`) without processing their contents.
+    /// 3. Using `unicode_width` only for segments that contain non-ASCII characters.
+    ///
+    /// # Assumptions
+    /// The function assumes the input `text` contains no control characters (`\t`, `\n`, etc.)
+    /// and that the only VT escape codes present are SGR display mode codes (`\x1b[...m`).
+    fn width_ignoring_vt_ansi_color(text: &str) -> usize {
+        let mut width = 0;
+        // SAFETY for from_utf8_unchecked: The SegmentIterator is carefully designed to only split
+        // on ASCII boundaries (`m`, `\x1b`, or the transition between ASCII/non-ASCII chars).
+        // Since the original `&str` is valid UTF-8, any split on an ASCII boundary will
+        // also result in valid UTF-8 slices.
+        for segment in Segment::iterator(text) {
+            match segment {
+                // For pure ASCII, width is equivalent to byte length. This is a fast path.
+                Segment::Ascii(s) => width += s.len(),
+                // For segments with unicode, we use the unicode-width crate.
+                Segment::Utf8(s) => width += s.width(),
+                // ANSI escape codes have zero display width.
+                Segment::AnsiEscapes(_) => continue,
+            }
+        }
+        width
     }
 }

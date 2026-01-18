@@ -1,17 +1,14 @@
 use bumpalo::Bump;
-use codespan_reporting::{
-    diagnostic::{self, Diagnostic, Label},
-    term::{self, termcolor::ColorChoice},
-};
+use codespan_reporting::diagnostic::{Diagnostic, Label};
 use std::borrow::Cow;
 use toml_span::{
     Value as TomlValue,
-    value::{Array as TomlArray, Key, Table, ValueInner},
+    value::{Table, ValueInner},
 };
 
 use crate::config::{
-    Alias, AliasListExpr, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, StringExpr, StringListExpr,
-    TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, WorkspaceConfig,
+    Alias, AliasListExpr, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, StringExpr, StringListExpr, TaskCall,
+    TaskConfigExpr, TaskKind, TestConfigExpr, WorkspaceConfig,
 };
 
 fn mismatched_in_object(report_error: &mut dyn FnMut(Diagnostic<usize>), expected: &str, found: &TomlValue, key: &str) {
@@ -207,7 +204,6 @@ fn parse_alias_list_expr<'a>(
 
 fn parse_task<'a>(
     alloc: &'a Bump,
-    name: &'a str,
     task_table: &Table<'a>,
     kind: TaskKind,
     re: &mut dyn FnMut(Diagnostic<usize>),
@@ -595,11 +591,12 @@ fn parse_task_call<'a>(
 }
 
 pub fn parse<'a>(
+    base_path: &'a std::path::Path,
     alloc: &'a Bump,
     data: &'a str,
     re: &mut dyn FnMut(Diagnostic<usize>),
 ) -> Result<WorkspaceConfig<'a>, ()> {
-    let mut value = match toml_span::parse(data) {
+    let value = match toml_span::parse(data) {
         Ok(value) => value,
         Err(err) => {
             re(err.to_diagnostic(0));
@@ -621,7 +618,7 @@ pub fn parse<'a>(
                 return Err(());
             };
             let name_str = alloc.alloc_str(name.name.as_ref()) as &str;
-            let task = parse_task(alloc, name_str, task_table, TaskKind::Action, re)?;
+            let task = parse_task(alloc, task_table, TaskKind::Action, re)?;
             tasks_vec.push((name_str, task));
         }
     }
@@ -634,7 +631,7 @@ pub fn parse<'a>(
                 return Err(());
             };
             let name_str = alloc.alloc_str(name.name.as_ref()) as &str;
-            let task = parse_task(alloc, name_str, task_table, TaskKind::Service, re)?;
+            let task = parse_task(alloc, task_table, TaskKind::Service, re)?;
             tasks_vec.push((name_str, task));
         }
     }
@@ -687,7 +684,7 @@ pub fn parse<'a>(
     }
 
     Ok(WorkspaceConfig {
-        base_path: alloc.alloc(std::path::Path::new(".")) as &std::path::Path,
+        base_path,
         tasks: tasks_vec.into_bump_slice(),
         tests: tests_vec.into_bump_slice(),
         groups: groups_vec.into_bump_slice(),
@@ -696,24 +693,24 @@ pub fn parse<'a>(
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use codespan_reporting::diagnostic::{Diagnostic, Label};
-    use codespan_reporting::files::SimpleFiles;
-    use codespan_reporting::term::termcolor::StandardStream;
-    use jsony_value::ValueMap;
+    use std::path::Path;
 
+    use super::*;
+    use codespan_reporting::diagnostic::Diagnostic;
+    use codespan_reporting::files::SimpleFiles;
+    use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
     #[test]
     fn simple() {
         let text = std::fs::read_to_string("./devsm.toml").unwrap();
         let mut files = SimpleFiles::new();
-        let fid = files.add("devsm.toml", &text);
+        files.add("devsm.toml", &text);
         let mut writer = StandardStream::stderr(ColorChoice::Auto);
-        let mut config = codespan_reporting::term::Config::default();
+        let config = codespan_reporting::term::Config::default();
         let mut error = |diag: Diagnostic<usize>| {
             codespan_reporting::term::emit_to_write_style(&mut writer, &config, &files, &diag).unwrap();
         };
         let bump = Bump::new();
-        match parse(&bump, &text, &mut error) {
+        match parse(Path::new("/"), &bump, &text, &mut error) {
             Ok(config) => {
                 println!("Parsed {} tasks and {} groups", config.tasks.len(), config.groups.len());
                 for (name, task) in config.tasks {
@@ -732,7 +729,7 @@ mod test {
     #[test]
     fn test_parse_string_expr() {
         let text = r#"hello = "world""#;
-        let mut value = toml_span::parse(text).unwrap();
+        let value = toml_span::parse(text).unwrap();
         let table = value.as_table().unwrap();
         let bump = Bump::new();
         let mut errors = Vec::new();
@@ -752,7 +749,7 @@ mod test {
     #[test]
     fn test_parse_var_expr() {
         let text = r#"path = { var = "dir" }"#;
-        let mut value = toml_span::parse(text).unwrap();
+        let value = toml_span::parse(text).unwrap();
         let table = value.as_table().unwrap();
         let bump = Bump::new();
         let mut errors = Vec::new();
@@ -772,7 +769,7 @@ mod test {
     #[test]
     fn test_parse_if_expr() {
         let text = r#"arg = { if.profile = "verbose", then = "-al" }"#;
-        let mut value = toml_span::parse(text).unwrap();
+        let value = toml_span::parse(text).unwrap();
         let table = value.as_table().unwrap();
         let bump = Bump::new();
         let mut errors = Vec::new();
@@ -805,7 +802,7 @@ require = ["build"]
             errors.push(diag);
         };
 
-        let result = parse(&bump, text, &mut error);
+        let result = parse(Path::new("/"), &bump, text, &mut error);
         assert!(result.is_ok(), "Expected successful parse");
         let config = result.unwrap();
         assert_eq!(config.tasks.len(), 1);
@@ -827,7 +824,7 @@ cache = {}
             errors.push(diag);
         };
 
-        let result = parse(&bump, text, &mut error);
+        let result = parse(Path::new("/"), &bump, text, &mut error);
         assert!(result.is_ok(), "Expected successful parse");
         let config = result.unwrap();
         assert_eq!(config.tasks.len(), 1);
@@ -849,7 +846,7 @@ cache = {}
             errors.push(diag);
         };
 
-        let result = parse(&bump, text, &mut error);
+        let result = parse(Path::new("/"), &bump, text, &mut error);
         assert!(result.is_err(), "Expected error for cache on service");
         assert!(!errors.is_empty());
         assert!(errors[0].message.contains("cache"));
@@ -868,7 +865,7 @@ before = ["build"]
             errors.push(diag);
         };
 
-        let result = parse(&bump, text, &mut error);
+        let result = parse(Path::new("/"), &bump, text, &mut error);
         assert!(result.is_err(), "Expected error for deprecated 'before'");
         assert!(!errors.is_empty());
         assert!(errors[0].message.contains("deprecated"));
@@ -887,7 +884,7 @@ before_once = ["setup"]
             errors.push(diag);
         };
 
-        let result = parse(&bump, text, &mut error);
+        let result = parse(Path::new("/"), &bump, text, &mut error);
         assert!(result.is_err(), "Expected error for deprecated 'before_once'");
         assert!(!errors.is_empty());
         assert!(errors[0].message.contains("deprecated"));
@@ -915,7 +912,7 @@ require = ["build"]
             errors.push(diag);
         };
 
-        let result = parse(&bump, text, &mut error);
+        let result = parse(Path::new("/"), &bump, text, &mut error);
         assert!(result.is_ok(), "Expected successful parse");
         let config = result.unwrap();
         assert_eq!(config.tasks.len(), 3);
@@ -946,7 +943,7 @@ cache.key = [
             errors.push(diag);
         };
 
-        let result = parse(&bump, text, &mut error);
+        let result = parse(Path::new("/"), &bump, text, &mut error);
         assert!(result.is_ok(), "Expected successful parse: {:?}", errors);
         let config = result.unwrap();
         assert_eq!(config.tasks.len(), 1);

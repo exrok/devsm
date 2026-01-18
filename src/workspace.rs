@@ -1,10 +1,7 @@
 use crate::{
     cli::TestFilter,
-    config::{
-        CARGO_AUTO_EXPR, CacheKeyInput, Command, Enviroment, TaskConfigExpr, TaskConfigRc, TaskKind, TestConfigExpr,
-        TestConfigRc, WorkspaceConfig,
-    },
-    log_storage::{JobLogCorrelation, LogId, Logs},
+    config::{CARGO_AUTO_EXPR, CacheKeyInput, Enviroment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig},
+    log_storage::{LogGroup, LogId, Logs},
     process_manager::MioChannel,
 };
 pub use job_index_list::JobIndexList;
@@ -21,6 +18,12 @@ mod job_index_list;
 pub struct BaseTaskIndex(pub u32);
 
 impl BaseTaskIndex {
+    pub fn new_or_panic(index: usize) -> BaseTaskIndex {
+        if index > 0xfff as usize {
+            panic!("BaseTaskIndex overflow for index {}", index);
+        }
+        BaseTaskIndex(index as u32)
+    }
     pub fn idx(self) -> usize {
         self.0 as usize
     }
@@ -47,9 +50,10 @@ pub enum ExitCause {
 
 pub struct Job {
     pub process_status: JobStatus,
-    pub job_id: JobLogCorrelation,
+    pub log_group: LogGroup,
     pub task: TaskConfigRc,
     pub started_at: Instant,
+    #[expect(unused, reason = "TODO use an optimization for log filtering")]
     pub log_start: LogId,
     /// Computed cache key for cache invalidation. Empty string means no key-based caching.
     pub cache_key: String,
@@ -112,10 +116,20 @@ impl ScheduleRequirement {
 
 #[derive(Debug)]
 pub enum JobStatus {
-    Scheduled { after: Vec<ScheduleRequirement> },
+    Scheduled {
+        after: Vec<ScheduleRequirement>,
+    },
     Starting,
-    Running { process_index: usize },
-    Exited { finished_at: Instant, log_end: LogId, cause: ExitCause, status: u32 },
+    Running {
+        process_index: usize,
+    },
+    Exited {
+        finished_at: Instant,
+        #[expect(unused, reason = "TODO optimization in log filtering")]
+        log_end: LogId,
+        cause: ExitCause,
+        status: u32,
+    },
     Cancelled,
 }
 
@@ -137,13 +151,6 @@ impl JobStatus {
     }
 }
 
-struct FinishedJob {
-    job: Job,
-    finished_at: Instant,
-    log_end: LogId,
-    termination_cause: ExitCause,
-}
-
 pub struct LatestConfig {
     modified_time: SystemTime,
     path: PathBuf,
@@ -158,6 +165,7 @@ impl LatestConfig {
         let current = crate::config::load_workspace_config_leaking(path.parent().unwrap(), content)?;
         Ok(Self { modified_time, path, current })
     }
+    #[expect(unused, reason = "Auto Config Updating not implemented")]
     fn refresh(&mut self) -> anyhow::Result<bool> {
         let metadata = self.path.metadata()?;
         let modified = metadata.modified()?;
@@ -174,7 +182,7 @@ impl LatestConfig {
     fn update_base_tasks(
         &self,
         base_tasks: &mut Vec<BaseTask>,
-        name_map: &mut std::collections::HashMap<&'static str, usize>,
+        name_map: &mut std::collections::HashMap<&'static str, BaseTaskIndex>,
     ) {
         for base_task in base_tasks.iter_mut() {
             base_task.removed = true;
@@ -183,17 +191,19 @@ impl LatestConfig {
         for (name, config) in self.current.tasks {
             match name_map.entry(name) {
                 std::collections::hash_map::Entry::Occupied(occupied_entry) => {
-                    let base_task = &mut base_tasks[*occupied_entry.get()];
+                    let base_task = &mut base_tasks[occupied_entry.get().idx()];
                     base_task.removed = false;
                     base_task.config = config;
                 }
                 std::collections::hash_map::Entry::Vacant(vacant_entry) => {
-                    vacant_entry.insert(base_tasks.len());
+                    if base_tasks.len() > u32::MAX as usize {
+                        panic!("Too many base tasks");
+                    }
+                    vacant_entry.insert(BaseTaskIndex(base_tasks.len() as u32));
                     base_tasks.push(BaseTask {
                         name,
                         config,
                         removed: false,
-                        last_spawn: None,
                         jobs: JobIndexList::default(),
                         profile_change_counter: 0,
                         last_profile: None,
@@ -202,7 +212,6 @@ impl LatestConfig {
                 }
             }
         }
-        // Add tests - each variant becomes a separate base task
         for (base_name, variants) in self.current.tests {
             for (variant_index, config) in variants.iter().enumerate() {
                 // Generate unique name: "~test:name" for single variant, "~test:name:0" for multiple
@@ -216,18 +225,17 @@ impl LatestConfig {
 
                 match name_map.entry(task_name) {
                     std::collections::hash_map::Entry::Occupied(occupied_entry) => {
-                        let base_task = &mut base_tasks[*occupied_entry.get()];
+                        let base_task = &mut base_tasks[occupied_entry.get().idx()];
                         base_task.removed = false;
                         base_task.config = task_config;
                         base_task.test_info = test_info;
                     }
                     std::collections::hash_map::Entry::Vacant(vacant_entry) => {
-                        vacant_entry.insert(base_tasks.len());
+                        vacant_entry.insert(BaseTaskIndex::new_or_panic(base_tasks.len()));
                         base_tasks.push(BaseTask {
                             name: task_name,
                             config: task_config,
                             removed: false,
-                            last_spawn: None,
                             jobs: JobIndexList::default(),
                             profile_change_counter: 0,
                             last_profile: None,
@@ -251,7 +259,6 @@ pub struct BaseTask {
     pub name: &'static str,
     pub config: &'static TaskConfigExpr<'static>,
     pub removed: bool,
-    pub last_spawn: Option<Instant>,
     pub jobs: JobIndexList,
     /// Counter incremented when the task's profile changes (not on first run).
     /// Used as cache key input for `profile_changed` invalidation.
@@ -291,47 +298,9 @@ pub enum TestJobStatus {
 /// A single test job within a test run.
 pub struct TestJob {
     /// Index into base_tasks for this test.
-    pub base_task_index: usize,
+    pub base_task_index: BaseTaskIndex,
     pub job_index: JobIndex,
     pub status: TestJobStatus,
-}
-
-impl TestJob {
-    /// Returns the display name for this test.
-    pub fn display_name(&self, base_tasks: &[BaseTask]) -> String {
-        let base_task = &base_tasks[self.base_task_index];
-        let Some(test_info) = &base_task.test_info else {
-            return base_task.name.to_string();
-        };
-
-        let env = Enviroment { profile: "", param: jsony_value::ValueMap::new() };
-        let cmd_preview = match base_task.config.eval(&env) {
-            Ok(task_config) => {
-                let cmd = task_config.config();
-                match &cmd.command {
-                    Command::Cmd(args) => args.first().copied().unwrap_or("").to_string(),
-                    Command::Sh(script) => {
-                        if script.len() > 40 {
-                            script[..40].to_string()
-                        } else {
-                            script.to_string()
-                        }
-                    }
-                }
-            }
-            Err(_) => String::new(),
-        };
-        let is_single = !base_tasks.iter().any(|bt| {
-            bt.test_info
-                .as_ref()
-                .is_some_and(|ti| ti.base_name == test_info.base_name && ti.variant_index != test_info.variant_index)
-        });
-        if is_single {
-            format!("{}: {}", test_info.base_name, cmd_preview)
-        } else {
-            format!("{}[{}]: {}", test_info.base_name, test_info.variant_index, cmd_preview)
-        }
-    }
 }
 
 /// Tracks the state of a test run (multiple tests executed together).
@@ -349,7 +318,7 @@ pub struct WorkspaceState {
     pub config: LatestConfig,
     pub base_tasks: Vec<BaseTask>,
     pub change_number: u32,
-    pub name_map: std::collections::HashMap<&'static str, usize>,
+    pub name_map: std::collections::HashMap<&'static str, BaseTaskIndex>,
     pub jobs: Vec<Job>,
     pub active_test_run: Option<TestRun>,
 }
@@ -382,8 +351,10 @@ impl WorkspaceState {
                     key.push(';');
                 }
                 CacheKeyInput::ProfileChanged(task_name) => {
-                    let counter =
-                        self.name_map.get(*task_name).map_or(0, |&idx| self.base_tasks[idx].profile_change_counter);
+                    let counter = self
+                        .name_map
+                        .get(*task_name)
+                        .map_or(0, |&bti| self.base_tasks[bti.idx()].profile_change_counter);
                     key.push_str("profile_changed:");
                     key.push_str(task_name);
                     key.push('=');
@@ -395,7 +366,7 @@ impl WorkspaceState {
         key
     }
 
-    pub fn base_index_by_name(&mut self, name: &str) -> Option<usize> {
+    pub fn base_index_by_name(&mut self, name: &str) -> Option<BaseTaskIndex> {
         if let Some(index) = self.name_map.get(name) {
             return Some(*index);
         }
@@ -405,12 +376,15 @@ impl WorkspaceState {
                 name: "~cargo",
                 config: &CARGO_AUTO_EXPR,
                 removed: false,
-                last_spawn: None,
                 jobs: JobIndexList::default(),
                 profile_change_counter: 0,
                 last_profile: None,
                 test_info: None,
             });
+            if index > u32::MAX as usize {
+                panic!("Too many base tasks");
+            }
+            let index = BaseTaskIndex(index as u32);
             self.name_map.insert("~cargo", index);
             return Some(index);
         }
@@ -420,12 +394,12 @@ impl WorkspaceState {
         &mut self,
         workspace_id: u32,
         channel: &MioChannel,
-        base_task: usize,
+        base_task: BaseTaskIndex,
         log_start: LogId,
         params: ValueMap,
         profile: &str,
     ) -> JobIndex {
-        let bt = &mut self.base_tasks[base_task];
+        let bt = &mut self.base_tasks[base_task.idx()];
         bt.update_profile_tracking(profile);
         let mut pred = Vec::new();
 
@@ -445,21 +419,21 @@ impl WorkspaceState {
                 JobStatus::Running { process_index } => {
                     pred.push(ScheduleRequirement { job: *job_index, predicate: JobPredicate::Terminated });
                     channel.send(crate::process_manager::ProcessRequest::TerminateJob {
-                        job_id: job.job_id,
+                        job_id: job.log_group,
                         process_index: *process_index,
                     })
                 }
                 _ => (),
             }
         }
-        let task = self.base_tasks[base_task].config.eval(&Enviroment { profile, param: params }).unwrap();
+        let task = bt.config.eval(&Enviroment { profile, param: params }).unwrap();
 
         'outer: for dep_alias in task.config().require {
             let Some(&dep_base_task) = self.name_map.get(&**dep_alias) else {
                 kvlog::error!("unknown alias", dep_alias);
                 continue;
             };
-            let dep_config = &self.base_tasks[dep_base_task].config;
+            let dep_config = &self.base_tasks[dep_base_task.idx()].config;
 
             match dep_config.kind {
                 TaskKind::Action => {
@@ -474,7 +448,7 @@ impl WorkspaceState {
                     };
 
                     let expected_cache_key = self.compute_cache_key(cache_config.key);
-                    let spawner = &self.base_tasks[dep_base_task];
+                    let spawner = &self.base_tasks[dep_base_task.idx()];
 
                     for ji in spawner.jobs.all().iter().rev() {
                         let job = &self[*ji];
@@ -506,7 +480,7 @@ impl WorkspaceState {
                     });
                 }
                 TaskKind::Service => {
-                    let spawner = &self.base_tasks[dep_base_task];
+                    let spawner = &self.base_tasks[dep_base_task.idx()];
                     for &ji in spawner.jobs.running() {
                         pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
                         continue 'outer;
@@ -523,9 +497,9 @@ impl WorkspaceState {
         let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
 
         let job_index = JobIndex(self.jobs.len() as u32);
-        let bt = &mut self.base_tasks[base_task];
+        let bt = &mut self.base_tasks[base_task.idx()];
         let pc = bt.jobs.len();
-        let job_id = JobLogCorrelation((pc.wrapping_shl(12) as u32) | base_task as u32);
+        let job_id = LogGroup::new(base_task, pc);
 
         let spawn = pred.is_empty();
         if spawn {
@@ -536,7 +510,7 @@ impl WorkspaceState {
 
         self.jobs.push(Job {
             process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
-            job_id,
+            log_group: job_id,
             task: task.clone(),
             started_at: Instant::now(),
             log_start,
@@ -571,8 +545,8 @@ impl WorkspaceState {
     #[track_caller]
     pub fn update_job_status(&mut self, job_index: JobIndex, status: JobStatus) {
         let job = &mut self.jobs[job_index.idx()];
-        let job_id = job.job_id;
-        let jobs_list = &mut self.base_tasks[job_id.base_task_index() as usize].jobs;
+        let job_id = job.log_group;
+        let jobs_list = &mut self.base_tasks[job_id.base_task_index().idx()].jobs;
 
         use JobStatus as S;
         match (&job.process_status, &status) {
@@ -610,14 +584,7 @@ impl WorkspaceState {
         let mut base_tasks = Vec::new();
         let mut name_map = std::collections::HashMap::new();
         config.update_base_tasks(&mut base_tasks, &mut name_map);
-        Ok(WorkspaceState {
-            change_number: 0,
-            config,
-            name_map,
-            base_tasks,
-            jobs: Vec::new(),
-            active_test_run: None,
-        })
+        Ok(WorkspaceState { change_number: 0, config, name_map, base_tasks, jobs: Vec::new(), active_test_run: None })
     }
 
     /// Brute force scheduling useful testing will provided an optimized alternative later
@@ -680,7 +647,7 @@ impl Workspace {
         state.spawn_task(
             self.workspace_id,
             &self.process_channel,
-            base_task.idx(),
+            base_task,
             self.logs.read().unwrap().tail(),
             params,
             profile,
@@ -695,42 +662,11 @@ impl Workspace {
             let job = &state.jobs[job_index.idx()];
             if let JobStatus::Running { process_index } = &job.process_status {
                 self.process_channel.send(crate::process_manager::ProcessRequest::TerminateJob {
-                    job_id: job.job_id,
+                    job_id: job.log_group,
                     process_index: *process_index,
                 })
             }
         }
-    }
-    pub fn spawn_task_simple_from_base_task(&self, base_task: usize) {
-        let state = &mut *self.state.write().unwrap();
-        let job_index = JobIndex(state.jobs.len() as u32);
-        state.change_number = state.change_number.wrapping_add(1);
-        let bt = &mut state.base_tasks[base_task];
-        bt.update_profile_tracking("");
-        let pc = bt.jobs.len();
-        let job_id = JobLogCorrelation((pc.wrapping_shl(12) as u32) | base_task as u32);
-        bt.jobs.push_active(job_index);
-
-        let task =
-            state.base_tasks[base_task].config.eval(&Enviroment { profile: "", param: ValueMap::new() }).unwrap();
-
-        let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| state.compute_cache_key(c.key));
-
-        state.jobs.push(Job {
-            process_status: JobStatus::Starting,
-            job_id,
-            task: task.clone(),
-            started_at: Instant::now(),
-            log_start: self.logs.write().unwrap().tail(),
-            cache_key,
-        });
-
-        self.process_channel.send(crate::process_manager::ProcessRequest::Spawn {
-            task,
-            job_index,
-            workspace_id: self.workspace_id,
-            job_id,
-        });
     }
 
     /// Starts a test run with the given filters.
@@ -744,8 +680,7 @@ impl Workspace {
 
         // First pass: collect matching tests from base_tasks where kind=Test
         struct MatchedTest {
-            base_task_idx: usize,
-            base_name: &'static str,
+            base_task_idx: BaseTaskIndex,
             task_config: TaskConfigRc,
         }
         let mut matched_tests = Vec::new();
@@ -765,7 +700,7 @@ impl Workspace {
                 kvlog::error!("Failed to evaluate test config", name = base_task.name);
                 continue;
             };
-            matched_tests.push(MatchedTest { base_task_idx, base_name: test_info.base_name, task_config });
+            matched_tests.push(MatchedTest { base_task_idx: BaseTaskIndex::new_or_panic(base_task_idx), task_config });
         }
 
         // Second pass: create jobs for matched tests
@@ -774,23 +709,18 @@ impl Workspace {
             let task_config = matched.task_config;
 
             // Get require list as owned strings to avoid borrow issues
-            let requires: Vec<String> = task_config
-                .config()
-                .require
-                .iter()
-                .map(|a| (**a).to_string())
-                .collect();
+            let requires: Vec<String> = task_config.config().require.iter().map(|a| (**a).to_string()).collect();
 
             // Build requirements from test dependencies
             let mut pred = Vec::new();
             for dep_alias in &requires {
                 if let Some(&dep_base_task) = state.name_map.get(dep_alias.as_str()) {
-                    let dep_config = &state.base_tasks[dep_base_task].config;
+                    let dep_config = &state.base_tasks[dep_base_task.idx()].config;
                     match dep_config.kind {
                         TaskKind::Action => {
                             if let Some(cache_config) = dep_config.cache.as_ref() {
                                 let expected_cache_key = state.compute_cache_key(cache_config.key);
-                                let spawner = &state.base_tasks[dep_base_task];
+                                let spawner = &state.base_tasks[dep_base_task.idx()];
                                 let mut found_cached = false;
                                 for ji in spawner.jobs.all().iter().rev() {
                                     let job = &state.jobs[ji.idx()];
@@ -823,7 +753,7 @@ impl Workspace {
                             });
                         }
                         TaskKind::Service => {
-                            let spawner = &state.base_tasks[dep_base_task];
+                            let spawner = &state.base_tasks[dep_base_task.idx()];
                             let mut found_running = false;
                             for &ji in spawner.jobs.running() {
                                 pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
@@ -855,9 +785,9 @@ impl Workspace {
 
             // Create job - use standard job_id encoding since tests are now in base_tasks
             let job_index = JobIndex(state.jobs.len() as u32);
-            let base_task = &mut state.base_tasks[matched.base_task_idx];
+            let base_task = &mut state.base_tasks[matched.base_task_idx.idx()];
             let pc = base_task.jobs.len();
-            let job_id = JobLogCorrelation((pc.wrapping_shl(12) as u32) | matched.base_task_idx as u32);
+            let job_id = LogGroup::new(matched.base_task_idx, pc);
 
             let spawn = pred.is_empty();
             if spawn {
@@ -868,7 +798,7 @@ impl Workspace {
 
             state.jobs.push(Job {
                 process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
-                job_id,
+                log_group: job_id,
                 task: task_config.clone(),
                 started_at: Instant::now(),
                 log_start,
@@ -892,11 +822,8 @@ impl Workspace {
         }
 
         let test_run = TestRun { run_id, started_at: Instant::now(), test_jobs };
-        state.active_test_run = Some(TestRun {
-            run_id: test_run.run_id,
-            started_at: test_run.started_at,
-            test_jobs: Vec::new(),
-        });
+        state.active_test_run =
+            Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
 
         test_run
     }

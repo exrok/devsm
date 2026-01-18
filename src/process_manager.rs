@@ -3,7 +3,7 @@ use crate::{
     config::{Command, TaskConfigRc},
     daemon::WorkspaceCommand,
     line_width::{Segment, apply_raw_display_mode_vt_to_style},
-    log_storage::{JobLogCorrelation, LogWriter},
+    log_storage::{LogGroup, LogWriter},
 };
 use anyhow::{Context, bail};
 use jsony_value::ValueMap;
@@ -37,7 +37,7 @@ pub(crate) enum Pipe {
 type WorkspaceIndex = u32;
 pub(crate) struct ActiveProcess {
     // active stdout
-    pub(crate) job_id: JobLogCorrelation,
+    pub(crate) log_group: LogGroup,
     pub(crate) job_index: JobIndex,
     pub(crate) workspace_index: WorkspaceIndex,
     pub(crate) alive: bool,
@@ -60,7 +60,7 @@ impl ActiveProcess {
                 }
             }
 
-            writer.push_line(text, width as u32, self.job_id, self.style);
+            writer.push_line(text, width as u32, self.log_group, self.style);
             self.style = new_style;
         }
     }
@@ -95,23 +95,17 @@ impl Buffer {
     }
 }
 
+enum ClientKind {
+    Tui,
+    Run { log_group: LogGroup },
+    TestRun,
+}
+
 struct ClientEntry {
     workspace: WorkspaceIndex,
     channel: Arc<ClientChannel>,
     socket: UnixStream,
-}
-
-struct RunClientEntry {
-    workspace: WorkspaceIndex,
-    channel: Arc<ForwarderChannel>,
-    socket: UnixStream,
-    job_id: JobLogCorrelation,
-}
-
-struct TestRunClientEntry {
-    workspace: WorkspaceIndex,
-    channel: Arc<ForwarderChannel>,
-    socket: UnixStream,
+    kind: ClientKind,
 }
 
 pub struct WorkspaceEntry {
@@ -121,8 +115,6 @@ pub struct WorkspaceEntry {
 
 pub(crate) struct ProcessManager {
     clients: Slab<ClientEntry>,
-    run_clients: Slab<RunClientEntry>,
-    test_run_clients: Slab<TestRunClientEntry>,
     workspaces: slab::Slab<WorkspaceEntry>,
     workspace_map: HashMap<Box<Path>, WorkspaceIndex>,
     processes: slab::Slab<ActiveProcess>,
@@ -236,7 +228,7 @@ impl ProcessManager {
                 }
 
                 if let Some(workspace) = self.workspaces.get_mut(process.workspace_index as usize) {
-                    workspace.line_writer.push_line(text, width as u32, process.job_id, process.style);
+                    workspace.line_writer.push_line(text, width as u32, process.log_group, process.style);
                 }
                 process.style = new_style;
             }
@@ -262,11 +254,11 @@ impl ProcessManager {
                     workspace::Scheduled::Ready(job_index) => {
                         kvlog::info!("Scheduled task is ready");
                         let job = &state.jobs[job_index.idx()];
-                        let job_id = job.job_id;
+                        let job_correlation = job.log_group;
                         let job_index = job_index;
                         let job_task = job.task.clone();
                         drop(state);
-                        let _ = self.spawn(wsi as WorkspaceIndex, job_id, job_index, job_task);
+                        let _ = self.spawn(wsi as WorkspaceIndex, job_correlation, job_index, job_task);
                         continue 'outer;
                     }
                     workspace::Scheduled::Never(job_index) => {
@@ -287,7 +279,7 @@ impl ProcessManager {
     pub(crate) fn spawn(
         &mut self,
         workspace_index: WorkspaceIndex,
-        job_id: JobLogCorrelation,
+        job_id: LogGroup,
         job_index: JobIndex,
         task: TaskConfigRc,
     ) -> anyhow::Result<()> {
@@ -378,7 +370,7 @@ impl ProcessManager {
         let process_index = self.processes.insert(ActiveProcess {
             workspace_index,
             job_index,
-            job_id,
+            log_group: job_id,
             alive: true,
             stdout_buffer: None,
             stderr_buffer: None,
@@ -393,85 +385,71 @@ impl ProcessManager {
     }
 }
 
+pub(crate) enum AttachKind {
+    Tui,
+    Run { task_name: Box<str>, params: Vec<u8> },
+    TestRun { filters: Vec<u8> },
+}
+
 pub(crate) enum ProcessRequest {
     WorkspaceCommand { workspace_config: PathBuf, socket: UnixStream, command: Vec<u8> },
-    Spawn { task: TaskConfigRc, workspace_id: WorkspaceIndex, job_id: JobLogCorrelation, job_index: JobIndex },
-    AttachClient { stdin: OwnedFd, stdout: OwnedFd, socket: UnixStream, workspace_config: PathBuf },
-    AttachRun {
-        stdin: OwnedFd,
-        stdout: OwnedFd,
-        socket: UnixStream,
-        workspace_config: PathBuf,
-        task_name: Box<str>,
-        params: Vec<u8>,
-    },
-    AttachTestRun {
-        stdin: OwnedFd,
-        stdout: OwnedFd,
-        socket: UnixStream,
-        workspace_config: PathBuf,
-        filters: Vec<u8>,
-    },
-    TerminateJob { job_id: JobLogCorrelation, process_index: usize },
+    Spawn { task: TaskConfigRc, workspace_id: WorkspaceIndex, job_id: LogGroup, job_index: JobIndex },
+    AttachClient { stdin: OwnedFd, stdout: OwnedFd, socket: UnixStream, workspace_config: PathBuf, kind: AttachKind },
+    TerminateJob { job_id: LogGroup, process_index: usize },
     ClientExited { index: usize },
-    RunClientExited { index: usize },
-    TestRunClientExited { index: usize },
     ProcessExited { pid: u32, status: u32 },
     GlobalTermination,
 }
 
-pub(crate) struct ClientChannel {
-    pub(crate) waker: vtui::event::polling::Waker,
-    pub(crate) state: AtomicU64,
-    pub(crate) selected: AtomicU64,
-    pub(crate) events: Mutex<Vec<()>>,
-}
-
-/// Channel for communicating with a log forwarder thread.
+/// Channel for communicating with a client thread (TUI or forwarder).
 ///
-/// Allows the process manager to wake the forwarder when new logs arrive
-/// and signal termination when the client disconnects.
-pub struct ForwarderChannel {
+/// For TUI clients, all fields are used. For forwarder clients, only `waker`
+/// and `state` are used; `selected` and `events` are ignored.
+pub struct ClientChannel {
     pub waker: vtui::event::polling::Waker,
+    /// Encodes termination flag (high bits > u32::MAX) and resize counter (low bits).
     pub state: AtomicU64,
-}
-
-impl ForwarderChannel {
-    /// Wakes the forwarder thread to check for new logs.
-    pub fn wake(&self) -> std::io::Result<()> {
-        self.waker.wake()
-    }
-
-    /// Returns true if the forwarder should terminate.
-    pub fn is_terminated(&self) -> bool {
-        self.state.load(std::sync::atomic::Ordering::Relaxed) != 0
-    }
-
-    /// Signals the forwarder to terminate.
-    pub fn set_terminated(&self) {
-        self.state.store(1, std::sync::atomic::Ordering::Relaxed);
-    }
+    /// Tracks selected base task index. Only used by TUI clients.
+    pub selected: AtomicU64,
+    /// Event queue. Only used by TUI clients.
+    pub events: Mutex<Vec<()>>,
 }
 
 pub enum Action {
     Resized,
     Terminated,
 }
+
 impl ClientChannel {
-    pub(crate) fn wake(&self) -> std::io::Result<()> {
+    /// Wakes the client thread to check for new events or logs.
+    pub fn wake(&self) -> std::io::Result<()> {
         self.waker.wake()
     }
-    pub(crate) fn swap_recv(&self, buf: &mut Vec<()>) {
+
+    /// Returns true if the client should terminate.
+    pub fn is_terminated(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Relaxed) > u32::MAX as u64
+    }
+
+    /// Signals the client to terminate.
+    pub fn set_terminated(&self) {
+        self.state.store(1u64 << 32, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[expect(unused, reason = "No events added yet")]
+    pub fn swap_recv(&self, buf: &mut Vec<()>) {
         let mut events = self.events.lock().unwrap();
         buf.clear();
         std::mem::swap(buf, &mut events);
     }
-    pub(crate) fn try_send(&self, req: ()) -> anyhow::Result<()> {
+
+    pub fn try_send(&self, req: ()) -> anyhow::Result<()> {
         let mut events = self.events.lock().unwrap();
         events.push(req);
         self.waker.wake()?;
         Ok(())
     }
+
     pub fn actions(&self, previous: &mut u64) -> Option<Action> {
         let state = self.state.load(std::sync::atomic::Ordering::Relaxed);
         if state > u32::MAX as u64 {
@@ -483,7 +461,9 @@ impl ClientChannel {
         }
         None
     }
-    pub(crate) fn send(&self, req: ()) {
+
+    #[expect(unused, reason = "No events added yet")]
+    pub fn send(&self, req: ()) {
         if let Err(err) = self.try_send(req) {
             kvlog::error!("Failed to send request", ?err);
         }
@@ -558,7 +538,7 @@ impl ProcessManager {
                 let (name, profile) = name.rsplit_once(":").unwrap_or((&*name, ""));
                 if let Some(index) = state.base_index_by_name(name) {
                     drop(state);
-                    ws.handle.restart_task(workspace::BaseTaskIndex(index as u32), params, profile);
+                    ws.handle.restart_task(index, params, profile);
                 }
             }
         }
@@ -578,11 +558,11 @@ impl ProcessManager {
             }
             ProcessRequest::TerminateJob { job_id, process_index } => {
                 if let Some(process) = self.processes.get_mut(process_index) {
-                    if process.job_id != job_id {
+                    if process.log_group != job_id {
                         kvlog::error!(
                             "Mismatched job id for termination",
                             ?job_id,
-                            expected = ?process.job_id
+                            expected = ?process.log_group
                         );
                         return false;
                     }
@@ -605,7 +585,7 @@ impl ProcessManager {
                 // }
                 false
             }
-            ProcessRequest::AttachClient { stdin, stdout, socket, workspace_config } => {
+            ProcessRequest::AttachClient { stdin, stdout, socket, workspace_config, kind } => {
                 let ws_index = match self.workspace_index(workspace_config) {
                     Ok(ws) => ws,
                     Err(err) => {
@@ -613,34 +593,18 @@ impl ProcessManager {
                         return false;
                     }
                 };
-                let ws = &mut self.workspaces[ws_index as usize];
-                let ws_handle = ws.handle.clone();
-                let vtui_channel = Arc::new(ClientChannel {
-                    waker: vtui::event::polling::Waker::new().unwrap(),
-                    events: Mutex::new(Vec::new()),
-                    selected: AtomicU64::new(0),
-                    state: AtomicU64::new(0),
-                });
-                let next = self.clients.vacant_key();
-                let _ = self.poll.registry().register(
-                    &mut SourceFd(&socket.as_raw_fd()),
-                    TokenHandle::Client(next as u32).into(),
-                    Interest::READABLE,
-                );
-                let _ = socket.set_nonblocking(true);
-                let client_entry = ClientEntry { channel: vtui_channel.clone(), workspace: ws_index, socket };
-                let index = self.clients.insert(client_entry);
-                kvlog::info!("Client Attached");
-                let keybinds = global_keybinds();
-                std::thread::spawn(move || {
-                    let _ = std::panic::catch_unwind(|| {
-                        if let Err(err) = crate::tui::run(stdin, stdout, &ws_handle, vtui_channel, keybinds) {
-                            kvlog::error!("TUI exited with error", %err);
-                        }
-                    });
-                    kvlog::info!("Terminating Clinet");
-                    ws_handle.process_channel.send(ProcessRequest::ClientExited { index });
-                });
+
+                match kind {
+                    AttachKind::Tui => {
+                        self.attach_tui_client(stdin, stdout, socket, ws_index);
+                    }
+                    AttachKind::Run { task_name, params } => {
+                        self.attach_run_client(stdin, stdout, socket, ws_index, task_name, params);
+                    }
+                    AttachKind::TestRun { filters } => {
+                        self.attach_test_run_client(stdin, stdout, socket, ws_index, filters);
+                    }
+                }
 
                 false
             }
@@ -757,197 +721,216 @@ impl ProcessManager {
                 }
                 return false;
             }
-            ProcessRequest::AttachRun {
-                stdin,
-                stdout,
-                socket,
-                workspace_config,
-                task_name,
-                params,
-            } => {
-                let ws_index = match self.workspace_index(workspace_config) {
-                    Ok(ws) => ws,
-                    Err(err) => {
-                        kvlog::info!("Error spawning workspace", %err);
-                        return false;
-                    }
-                };
-
-                let params: ValueMap = jsony::from_binary(&params).unwrap_or_else(|_| ValueMap::new());
-                let (name, profile) = task_name.rsplit_once(":").unwrap_or((&*task_name, ""));
-
-                let ws = &self.workspaces[ws_index as usize];
-                let job_id = {
-                    let mut state = ws.handle.state.write().unwrap();
-                    let Some(base_index) = state.base_index_by_name(name) else {
-                        drop(state);
-                        let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
-                        let _ = std::io::Write::write_all(&mut file, b"Task not found\n");
-                        std::mem::forget(file);
-                        return false;
-                    };
-                    drop(state);
-                    ws.handle.restart_task(workspace::BaseTaskIndex(base_index as u32), params, profile);
-
-                    let state = ws.handle.state.read().unwrap();
-                    let bt = &state.base_tasks[base_index];
-                    bt.jobs.all().last().map(|ji| state[*ji].job_id)
-                };
-
-                let Some(job_id) = job_id else {
-                    let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
-                    let _ = std::io::Write::write_all(&mut file, b"Failed to start task\n");
-                    std::mem::forget(file);
-                    return false;
-                };
-
-                let forwarder_channel = Arc::new(ForwarderChannel {
-                    waker: vtui::event::polling::Waker::new().unwrap(),
-                    state: AtomicU64::new(0),
-                });
-
-                let next = self.run_clients.vacant_key();
-                let _ = self.poll.registry().register(
-                    &mut SourceFd(&socket.as_raw_fd()),
-                    TokenHandle::RunClient(next as u32).into(),
-                    Interest::READABLE,
-                );
-                let _ = socket.set_nonblocking(true);
-
-                let forwarder_socket = socket.try_clone().ok();
-
-                let run_client_entry = RunClientEntry {
-                    channel: forwarder_channel.clone(),
-                    workspace: ws_index,
-                    socket,
-                    job_id,
-                };
-                let index = self.run_clients.insert(run_client_entry);
-
-                let ws_handle = ws.handle.clone();
-                let request_channel = self.request.clone();
-                std::thread::spawn(move || {
-                    let _ = std::panic::catch_unwind(|| {
-                        if let Err(err) =
-                            crate::forwarder::run(stdin, stdout, forwarder_socket, &ws_handle, job_id, forwarder_channel)
-                        {
-                            kvlog::error!("Forwarder exited with error", %err);
-                        }
-                    });
-                    kvlog::info!("Terminating run client");
-                    request_channel.send(ProcessRequest::RunClientExited { index });
-                });
-
-                false
-            }
-            ProcessRequest::RunClientExited { index } => {
-                self.terminate_run_client(index as u32);
-                false
-            }
-            ProcessRequest::AttachTestRun {
-                stdin,
-                stdout,
-                socket,
-                workspace_config,
-                filters,
-            } => {
-                let ws_index = match self.workspace_index(workspace_config) {
-                    Ok(ws) => ws,
-                    Err(err) => {
-                        kvlog::info!("Error spawning workspace", %err);
-                        return false;
-                    }
-                };
-
-                let filters: crate::daemon::TestFilters =
-                    jsony::from_binary(&filters).unwrap_or_else(|_| crate::daemon::TestFilters::default());
-
-                // Convert TestFilters to Vec<TestFilter>
-                let test_filters: Vec<crate::cli::TestFilter> = {
-                    let mut v = Vec::new();
-                    for tag in &filters.exclude_tags {
-                        v.push(crate::cli::TestFilter::ExcludeTag(tag));
-                    }
-                    for tag in &filters.include_tags {
-                        v.push(crate::cli::TestFilter::IncludeTag(tag));
-                    }
-                    for name in &filters.include_names {
-                        v.push(crate::cli::TestFilter::IncludeName(name));
-                    }
-                    v
-                };
-
-                let ws = &self.workspaces[ws_index as usize];
-                let test_run = ws.handle.start_test_run(&test_filters);
-
-                if test_run.test_jobs.is_empty() {
-                    let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
-                    let _ = std::io::Write::write_all(&mut file, b"No tests matched the filters\n");
-                    std::mem::forget(file);
-                    return false;
-                }
-
-                let forwarder_channel = Arc::new(ForwarderChannel {
-                    waker: vtui::event::polling::Waker::new().unwrap(),
-                    state: AtomicU64::new(0),
-                });
-
-                let next = self.test_run_clients.vacant_key();
-                let _ = self.poll.registry().register(
-                    &mut SourceFd(&socket.as_raw_fd()),
-                    TokenHandle::TestRunClient(next as u32).into(),
-                    Interest::READABLE,
-                );
-                let _ = socket.set_nonblocking(true);
-
-                let forwarder_socket = socket.try_clone().ok();
-
-                let test_run_client_entry = TestRunClientEntry {
-                    channel: forwarder_channel.clone(),
-                    workspace: ws_index,
-                    socket,
-                };
-                let index = self.test_run_clients.insert(test_run_client_entry);
-
-                let ws_handle = ws.handle.clone();
-                let request_channel = self.request.clone();
-                std::thread::spawn(move || {
-                    let _ = std::panic::catch_unwind(|| {
-                        if let Err(err) = crate::test_forwarder::run(
-                            stdin,
-                            stdout,
-                            forwarder_socket,
-                            &ws_handle,
-                            test_run,
-                            forwarder_channel,
-                        ) {
-                            kvlog::error!("Test forwarder exited with error", %err);
-                        }
-                    });
-                    kvlog::info!("Terminating test run client");
-                    request_channel.send(ProcessRequest::TestRunClientExited { index });
-                });
-
-                false
-            }
-            ProcessRequest::TestRunClientExited { index } => {
-                self.terminate_test_run_client(index as u32);
-                false
-            }
         }
+    }
+
+    fn attach_tui_client(&mut self, stdin: OwnedFd, stdout: OwnedFd, socket: UnixStream, ws_index: WorkspaceIndex) {
+        let ws = &mut self.workspaces[ws_index as usize];
+        let ws_handle = ws.handle.clone();
+        let channel = Arc::new(ClientChannel {
+            waker: vtui::event::polling::Waker::new().unwrap(),
+            events: Mutex::new(Vec::new()),
+            selected: AtomicU64::new(0),
+            state: AtomicU64::new(0),
+        });
+        let next = self.clients.vacant_key();
+        let _ = self.poll.registry().register(
+            &mut SourceFd(&socket.as_raw_fd()),
+            TokenHandle::Client(next as u32).into(),
+            Interest::READABLE,
+        );
+        let _ = socket.set_nonblocking(true);
+        let client_entry = ClientEntry { channel: channel.clone(), workspace: ws_index, socket, kind: ClientKind::Tui };
+        let index = self.clients.insert(client_entry);
+        kvlog::info!("Client Attached");
+        let keybinds = global_keybinds();
+        let channel_clone = channel.clone();
+        std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(|| {
+                if let Err(err) = crate::tui::run(stdin, stdout, &ws_handle, channel_clone, keybinds) {
+                    kvlog::error!("TUI exited with error", %err);
+                }
+            });
+            kvlog::info!("Terminating Client");
+            ws_handle.process_channel.send(ProcessRequest::ClientExited { index });
+        });
+    }
+
+    fn attach_run_client(
+        &mut self,
+        stdin: OwnedFd,
+        stdout: OwnedFd,
+        socket: UnixStream,
+        ws_index: WorkspaceIndex,
+        task_name: Box<str>,
+        params: Vec<u8>,
+    ) {
+        let params: ValueMap = jsony::from_binary(&params).unwrap_or_else(|_| ValueMap::new());
+        let (name, profile) = task_name.rsplit_once(":").unwrap_or((&*task_name, ""));
+
+        let ws = &self.workspaces[ws_index as usize];
+        let job_id = {
+            let mut state = ws.handle.state.write().unwrap();
+            let Some(base_index) = state.base_index_by_name(name) else {
+                drop(state);
+                let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
+                let _ = std::io::Write::write_all(&mut file, b"Task not found\n");
+                std::mem::forget(file);
+                return;
+            };
+            drop(state);
+            ws.handle.restart_task(base_index, params, profile);
+
+            let state = ws.handle.state.read().unwrap();
+            let bt = &state.base_tasks[base_index.idx()];
+            bt.jobs.all().last().map(|ji| state[*ji].log_group)
+        };
+
+        let Some(job_id) = job_id else {
+            let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
+            let _ = std::io::Write::write_all(&mut file, b"Failed to start task\n");
+            std::mem::forget(file);
+            return;
+        };
+
+        let channel = Arc::new(ClientChannel {
+            waker: vtui::event::polling::Waker::new().unwrap(),
+            events: Mutex::new(Vec::new()),
+            selected: AtomicU64::new(0),
+            state: AtomicU64::new(0),
+        });
+
+        let next = self.clients.vacant_key();
+        let _ = self.poll.registry().register(
+            &mut SourceFd(&socket.as_raw_fd()),
+            TokenHandle::Client(next as u32).into(),
+            Interest::READABLE,
+        );
+        let _ = socket.set_nonblocking(true);
+
+        let forwarder_socket = socket.try_clone().ok();
+
+        let client_entry = ClientEntry {
+            channel: channel.clone(),
+            workspace: ws_index,
+            socket,
+            kind: ClientKind::Run { log_group: job_id },
+        };
+        let index = self.clients.insert(client_entry);
+
+        let ws_handle = ws.handle.clone();
+        let request_channel = self.request.clone();
+        std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(|| {
+                if let Err(err) =
+                    crate::log_fowarder_ui::run(stdin, stdout, forwarder_socket, &ws_handle, job_id, channel)
+                {
+                    kvlog::error!("Forwarder exited with error", %err);
+                }
+            });
+            kvlog::info!("Terminating run client");
+            request_channel.send(ProcessRequest::ClientExited { index });
+        });
+    }
+
+    fn attach_test_run_client(
+        &mut self,
+        stdin: OwnedFd,
+        stdout: OwnedFd,
+        socket: UnixStream,
+        ws_index: WorkspaceIndex,
+        filters: Vec<u8>,
+    ) {
+        let filters: crate::daemon::TestFilters =
+            jsony::from_binary(&filters).unwrap_or_else(|_| crate::daemon::TestFilters::default());
+
+        let test_filters: Vec<crate::cli::TestFilter> = {
+            let mut v = Vec::new();
+            for tag in &filters.exclude_tags {
+                v.push(crate::cli::TestFilter::ExcludeTag(tag));
+            }
+            for tag in &filters.include_tags {
+                v.push(crate::cli::TestFilter::IncludeTag(tag));
+            }
+            for name in &filters.include_names {
+                v.push(crate::cli::TestFilter::IncludeName(name));
+            }
+            v
+        };
+
+        let ws = &self.workspaces[ws_index as usize];
+        let test_run = ws.handle.start_test_run(&test_filters);
+
+        if test_run.test_jobs.is_empty() {
+            let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
+            let _ = std::io::Write::write_all(&mut file, b"No tests matched the filters\n");
+            std::mem::forget(file);
+            return;
+        }
+
+        let channel = Arc::new(ClientChannel {
+            waker: vtui::event::polling::Waker::new().unwrap(),
+            events: Mutex::new(Vec::new()),
+            selected: AtomicU64::new(0),
+            state: AtomicU64::new(0),
+        });
+
+        let next = self.clients.vacant_key();
+        let _ = self.poll.registry().register(
+            &mut SourceFd(&socket.as_raw_fd()),
+            TokenHandle::Client(next as u32).into(),
+            Interest::READABLE,
+        );
+        let _ = socket.set_nonblocking(true);
+
+        let forwarder_socket = socket.try_clone().ok();
+
+        let client_entry =
+            ClientEntry { channel: channel.clone(), workspace: ws_index, socket, kind: ClientKind::TestRun };
+        let index = self.clients.insert(client_entry);
+
+        let ws_handle = ws.handle.clone();
+        let request_channel = self.request.clone();
+        std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(|| {
+                if let Err(err) =
+                    crate::test_summary_ui::run(stdin, stdout, forwarder_socket, &ws_handle, test_run, channel)
+                {
+                    kvlog::error!("Test forwarder exited with error", %err);
+                }
+            });
+            kvlog::info!("Terminating test run client");
+            request_channel.send(ProcessRequest::ClientExited { index });
+        });
     }
     fn terminate_client(&mut self, client_index: ClientIndex) {
         let Some(client) = self.clients.try_remove(client_index as usize) else {
-            kvlog::error!("Client ready index for missing client_index", index = client_index as usize);
+            kvlog::error!("Terminate for missing client", index = client_index as usize);
             return;
         };
-        client.channel.state.store(1 << 0u64, std::sync::atomic::Ordering::Relaxed);
+        client.channel.set_terminated();
         let _ = client.channel.wake();
         let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
     }
-    fn handle_client_read_ready(&mut self, client_index: ClientIndex) {
+
+    fn handle_client_read(&mut self, client_index: ClientIndex) {
+        let Some(client) = self.clients.get(client_index as usize) else {
+            kvlog::error!("Read for missing client", index = client_index as usize);
+            return;
+        };
+
+        match &client.kind {
+            ClientKind::Tui => self.handle_tui_client_read(client_index),
+            ClientKind::Run { log_group: job_id } => {
+                let job_id = *job_id;
+                self.handle_run_client_read(client_index, job_id);
+            }
+            ClientKind::TestRun => self.handle_test_run_client_read(client_index),
+        }
+    }
+
+    fn handle_tui_client_read(&mut self, client_index: ClientIndex) {
         let Some(client) = self.clients.get_mut(client_index as usize) else {
-            kvlog::error!("Client ready index for missing client_index", index = client_index as usize);
             return;
         };
         let mut buffer = self.buffer_pool.pop().unwrap_or_default();
@@ -989,16 +972,9 @@ impl ProcessManager {
             let _ = client.channel.wake();
         }
     }
-    fn terminate_run_client(&mut self, client_index: u32) {
-        let Some(client) = self.run_clients.try_remove(client_index as usize) else {
-            return;
-        };
-        client.channel.set_terminated();
-        let _ = client.channel.wake();
-        let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
-    }
-    fn handle_run_client_read(&mut self, client_index: u32) {
-        let Some(client) = self.run_clients.get_mut(client_index as usize) else {
+
+    fn handle_run_client_read(&mut self, client_index: ClientIndex, job_id: LogGroup) {
+        let Some(client) = self.clients.get_mut(client_index as usize) else {
             return;
         };
         let mut buffer = [0u8; 4];
@@ -1022,9 +998,8 @@ impl ProcessManager {
         }
 
         if kill_task {
-            let job_id = client.job_id;
             for (_, process) in &self.processes {
-                if process.job_id == job_id {
+                if process.log_group == job_id {
                     let child_pid = process.child.id();
                     let pgid = -(child_pid as i32);
                     unsafe {
@@ -1036,19 +1011,12 @@ impl ProcessManager {
         }
 
         if terminate {
-            self.terminate_run_client(client_index);
+            self.terminate_client(client_index);
         }
     }
-    fn terminate_test_run_client(&mut self, client_index: u32) {
-        let Some(client) = self.test_run_clients.try_remove(client_index as usize) else {
-            return;
-        };
-        client.channel.set_terminated();
-        let _ = client.channel.wake();
-        let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
-    }
-    fn handle_test_run_client_read(&mut self, client_index: u32) {
-        let Some(client) = self.test_run_clients.get_mut(client_index as usize) else {
+
+    fn handle_test_run_client_read(&mut self, client_index: ClientIndex) {
+        let Some(client) = self.clients.get_mut(client_index as usize) else {
             return;
         };
         let mut buffer = [0u8; 4];
@@ -1070,7 +1038,7 @@ impl ProcessManager {
         }
 
         if terminate {
-            self.terminate_test_run_client(client_index);
+            self.terminate_client(client_index);
         }
     }
 }
@@ -1079,8 +1047,6 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
     let mut events = Events::with_capacity(128);
     let mut job_manager = ProcessManager {
         clients: Slab::new(),
-        run_clients: Slab::new(),
-        test_run_clients: Slab::new(),
         request,
         workspace_map: HashMap::new(),
         workspaces: slab::Slab::new(),
@@ -1116,23 +1082,11 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
                     job_manager.scheduled();
                 }
                 TokenHandle::Client(index) => {
-                    job_manager.handle_client_read_ready(index);
-                }
-                TokenHandle::RunClient(index) => {
-                    job_manager.handle_run_client_read(index);
-                }
-                TokenHandle::TestRunClient(index) => {
-                    job_manager.handle_test_run_client_read(index);
+                    job_manager.handle_client_read(index);
                 }
             }
         }
         for (_, client) in &job_manager.clients {
-            let _ = client.channel.wake();
-        }
-        for (_, client) in &job_manager.run_clients {
-            let _ = client.channel.wake();
-        }
-        for (_, client) in &job_manager.test_run_clients {
             let _ = client.channel.wake();
         }
     }
@@ -1150,17 +1104,12 @@ impl TaskPipe {
     pub fn pipe(self) -> Pipe {
         if (self.0 & 1) == 0 { Pipe::Stdout } else { Pipe::Stderr }
     }
-    pub fn token(self) -> Token {
-        Token(self.0 as usize)
-    }
 }
 
 enum TokenHandle {
     RequestChannel,
     Task(TaskPipe),
     Client(ClientIndex),
-    RunClient(u32),
-    TestRunClient(u32),
 }
 
 impl From<Token> for TokenHandle {
@@ -1170,12 +1119,6 @@ impl From<Token> for TokenHandle {
         } else if token.0 & (1 << 29) != 0 {
             let index = token.0 & !(1 << 29);
             TokenHandle::Client(index as ClientIndex)
-        } else if token.0 & (1 << 28) != 0 {
-            let index = token.0 & !(1 << 28);
-            TokenHandle::RunClient(index as u32)
-        } else if token.0 & (1 << 27) != 0 {
-            let index = token.0 & !(1 << 27);
-            TokenHandle::TestRunClient(index as u32)
         } else {
             let pipe = TaskPipe(token.0 as u32);
             TokenHandle::Task(pipe)
@@ -1188,8 +1131,6 @@ impl From<TokenHandle> for Token {
         match handle {
             TokenHandle::RequestChannel => CHANNEL_TOKEN,
             TokenHandle::Client(index) => Token((1 << 29) | (index as usize)),
-            TokenHandle::RunClient(index) => Token((1 << 28) | (index as usize)),
-            TokenHandle::TestRunClient(index) => Token((1 << 27) | (index as usize)),
             TokenHandle::Task(pipe) => Token(pipe.0 as usize),
         }
     }

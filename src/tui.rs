@@ -2,7 +2,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 
 use jsony_value::ValueMap;
-use vtui::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use vtui::event::{Event, KeyEvent};
 use vtui::vt::BufferWrite;
 use vtui::{Color, DoubleBuffer, Rect, Style, TerminalFlags, vt};
 
@@ -79,15 +79,10 @@ fn render<'a>(
 
     // Set highlighted log for search mode
     tui.logs.highlight = match &tui.overlay {
-        FocusOverlap::LogSearch { state } => {
-            state.selected_match().map(|m| crate::scroll_view::LogHighlight {
-                log_id: m.log_id,
-                match_info: crate::line_width::MatchHighlight {
-                    start: m.match_start,
-                    len: state.pattern_len() as u32,
-                },
-            })
-        }
+        FocusOverlap::LogSearch { state } => state.selected_match().map(|m| crate::scroll_view::LogHighlight {
+            log_id: m.log_id,
+            match_info: crate::line_width::MatchHighlight { start: m.match_start, len: state.pattern_len() as u32 },
+        }),
         _ => None,
     };
 
@@ -96,11 +91,7 @@ fn render<'a>(
 
     let mut bot = Rect { x: 0, y: 0, w, h: menu_height };
 
-    bot.take_top(1)
-        .with(Color::Grey[6].with_fg(Color::Grey[25]))
-        .fill(&mut tui.frame)
-        .skip(1)
-        .text(&mut tui.frame, "Placeholder");
+    bot.take_top(1).with(Color::Grey[6].with_fg(Color::Grey[25])).fill(&mut tui.frame).skip(1).text(&mut tui.frame, "");
     {
         let mut task_tree_rect = bot.take_top(19);
 
@@ -165,7 +156,13 @@ fn render<'a>(
     pre_truncate(&mut tui.frame.buf)
 }
 
-fn render_help_menu(frame: &mut DoubleBuffer, mut rect: Rect, keybinds: &Keybinds, help: &mut HelpMenu, current_mode: Mode) {
+fn render_help_menu(
+    frame: &mut DoubleBuffer,
+    mut rect: Rect,
+    keybinds: &Keybinds,
+    help: &mut HelpMenu,
+    current_mode: Mode,
+) {
     // Collect bindings from current mode first, then add global bindings not overridden
     let mut bindings: Vec<_> = keybinds.mode_bindings(current_mode).collect();
     let mode_keys: std::collections::HashSet<_> = bindings.iter().map(|(k, _)| *k).collect();
@@ -191,11 +188,7 @@ fn render_help_menu(frame: &mut DoubleBuffer, mut rect: Rect, keybinds: &Keybind
 
     // Header
     let header = rect.take_top(1);
-    header
-        .with(Color::Grey[6].with_fg(Color::Grey[25]))
-        .fill(frame)
-        .skip(1)
-        .text(frame, "Keybindings (? to close)");
+    header.with(Color::Grey[6].with_fg(Color::Grey[25])).fill(frame).skip(1).text(frame, "Keybindings (? to close)");
 
     // Render bindings
     for (input, cmd) in bindings.iter().skip(help.scroll) {
@@ -222,12 +215,7 @@ fn render_help_menu(frame: &mut DoubleBuffer, mut rect: Rect, keybinds: &Keybind
     }
 }
 
-fn process_key<'a>(
-    tui: &'a mut TuiState,
-    workspace: &Workspace,
-    key_event: KeyEvent,
-    keybinds: &Keybinds,
-) -> bool {
+fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyEvent, keybinds: &Keybinds) -> bool {
     let input = InputEvent::from(key_event);
 
     // Check for quit command first (always active)
@@ -258,7 +246,7 @@ fn process_key<'a>(
                             }
                             drop(ws1);
                             for (task, vars, profile) in new_tasks {
-                                workspace.restart_task(BaseTaskIndex(task as u32), vars, profile);
+                                workspace.restart_task(task, vars, profile);
                             }
                         }
                     }
@@ -325,7 +313,7 @@ fn process_key<'a>(
                 log_stack::Mode::All => LogFilter::All,
                 log_stack::Mode::OnlySelected(sel) | log_stack::Mode::Hybrid(sel) => {
                     if let Some(job) = sel.job {
-                        LogFilter::IsJob(ws_state[job].job_id)
+                        LogFilter::IsGroup(ws_state[job].log_group)
                     } else {
                         LogFilter::IsBaseTask(sel.base_task)
                     }
@@ -455,7 +443,7 @@ pub enum ScrollTarget {
     None,
 }
 
-fn scroll_target(w: u16, h: u16, tui: &TuiState, x: u16, y: u16) -> ScrollTarget {
+fn scroll_target(w: u16, h: u16, x: u16, y: u16) -> ScrollTarget {
     let menu_height = 10;
     let mut dest = Rect { x: 0, y: 0, w, h: h };
     let mut bot = dest.take_bottom(menu_height);
@@ -551,7 +539,7 @@ pub fn run(
                 Event::Mouse(mouse) => {
                     let x = mouse.column;
                     let y = mouse.row;
-                    let target = scroll_target(w, h, &tui, x, y);
+                    let target = scroll_target(w, h, x, y);
                     println!("{} {} -> {:?}", x, y, target);
                     match mouse.kind {
                         vtui::event::MouseEventKind::ScrollDown => match target {

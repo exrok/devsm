@@ -1,10 +1,6 @@
-#![allow(unused, dead_code)]
 use std::{
     io::{ErrorKind, Read, Write},
-    os::{
-        fd::AsRawFd,
-        unix::{net::UnixStream, process::CommandExt},
-    },
+    os::unix::{net::UnixStream, process::CommandExt},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
@@ -18,14 +14,14 @@ mod cli;
 mod collection;
 mod config;
 mod daemon;
-mod forwarder;
 mod keybinds;
 mod line_width;
+mod log_fowarder_ui;
 mod log_storage;
 mod process_manager;
 mod scroll_view;
 mod searcher;
-mod test_forwarder;
+mod test_summary_ui;
 mod tui;
 mod user_config;
 mod workspace;
@@ -50,8 +46,6 @@ fn main() {
         cli::Command::RestartSelected => {
             workspace_command(WorkspaceCommand::RestartSelected).unwrap();
         }
-        cli::Command::TriggerPrimary => todo!(),
-        cli::Command::TriggerSecondary => todo!(),
         cli::Command::Restart { job, value_map } => {
             workspace_command(WorkspaceCommand::Run { name: job.into(), params: value_map }).unwrap()
         }
@@ -102,11 +96,7 @@ fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
         }
     }
 
-    let test_filters = daemon::TestFilters {
-        include_tags,
-        exclude_tags,
-        include_names,
-    };
+    let test_filters = daemon::TestFilters { include_tags, exclude_tags, include_names };
 
     socket.send_with_fd(
         &jsony::to_binary(&daemon::RequestMessage {
@@ -117,7 +107,6 @@ fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
     )?;
 
     let mut buf = [0u8; 4];
-    let mut has_failures = false;
 
     loop {
         let flags = SIGNAL_FLAGS.swap(0, Ordering::Relaxed);
@@ -138,10 +127,6 @@ fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => bail!("Socket read failed: {}", e),
         }
-    }
-
-    if has_failures {
-        std::process::exit(1);
     }
 
     Ok(())

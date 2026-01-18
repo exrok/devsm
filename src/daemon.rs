@@ -138,6 +138,7 @@ fn handle_request(
                 stdout: fds.pop_front().unwrap(),
                 socket,
                 workspace_config: config.into(),
+                kind: crate::process_manager::AttachKind::Tui,
             });
         }
         Request::AttachRun { config, name, params } => {
@@ -145,13 +146,15 @@ fn handle_request(
             if fds.len() != 2 {
                 bail!("Expected 2 FD's found only one");
             }
-            pm.request.send(crate::process_manager::ProcessRequest::AttachRun {
+            pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
                 stdin: fds.pop_front().unwrap(),
                 stdout: fds.pop_front().unwrap(),
                 socket,
                 workspace_config: config.into(),
-                task_name: name,
-                params: jsony::to_binary(&params),
+                kind: crate::process_manager::AttachKind::Run {
+                    task_name: name,
+                    params: jsony::to_binary(&params),
+                },
             });
         }
         Request::AttachTests { config, filters } => {
@@ -159,12 +162,14 @@ fn handle_request(
             if fds.len() != 2 {
                 bail!("Expected 2 FD's found only one");
             }
-            pm.request.send(crate::process_manager::ProcessRequest::AttachTestRun {
+            pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
                 stdin: fds.pop_front().unwrap(),
                 stdout: fds.pop_front().unwrap(),
                 socket,
                 workspace_config: config.into(),
-                filters: jsony::to_binary(&filters),
+                kind: crate::process_manager::AttachKind::TestRun {
+                    filters: jsony::to_binary(&filters),
+                },
             });
         }
     }

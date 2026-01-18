@@ -14,8 +14,8 @@ use std::{
 };
 
 use crate::{
-    log_storage::{JobLogCorrelation, LogFilter, LogId},
-    process_manager::ForwarderChannel,
+    log_storage::{LogFilter, LogGroup, LogId},
+    process_manager::ClientChannel,
     workspace::{ExitCause, JobStatus, Workspace},
 };
 
@@ -62,8 +62,8 @@ pub fn run(
     stdout: OwnedFd,
     mut socket: Option<UnixStream>,
     workspace: &Workspace,
-    job_id: JobLogCorrelation,
-    channel: Arc<ForwarderChannel>,
+    log_group: LogGroup,
+    channel: Arc<ClientChannel>,
 ) -> anyhow::Result<()> {
     let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
     std::mem::forget(stdout);
@@ -73,13 +73,13 @@ pub fn run(
 
     loop {
         if channel.is_terminated() {
-            forward_new_logs(&mut file, &mut socket, workspace, job_id, &mut last_log_id, &mut phase)?;
+            forward_new_logs(&mut file, &mut socket, workspace, log_group, &mut last_log_id, &mut phase)?;
             send_termination(&mut socket);
             break;
         }
 
         let (job_exited, exit_code) =
-            forward_new_logs(&mut file, &mut socket, workspace, job_id, &mut last_log_id, &mut phase)?;
+            forward_new_logs(&mut file, &mut socket, workspace, log_group, &mut last_log_id, &mut phase)?;
 
         if job_exited {
             if let Some(code) = exit_code {
@@ -94,7 +94,7 @@ pub fn run(
                 let mut buf = [0u8; 64];
                 let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n == 0 {
-                    forward_new_logs(&mut file, &mut socket, workspace, job_id, &mut last_log_id, &mut phase)?;
+                    forward_new_logs(&mut file, &mut socket, workspace, log_group, &mut last_log_id, &mut phase)?;
                     let _ = file.write_all(b"Detached. Task will continue running in background.\n");
                     send_termination(&mut socket);
                     break;
@@ -111,7 +111,7 @@ fn forward_new_logs(
     file: &mut std::fs::File,
     socket: &mut Option<UnixStream>,
     workspace: &Workspace,
-    job_id: JobLogCorrelation,
+    log_group: LogGroup,
     last_log_id: &mut LogId,
     phase: &mut Phase,
 ) -> anyhow::Result<(bool, Option<i32>)> {
@@ -121,7 +121,7 @@ fn forward_new_logs(
     if *last_log_id >= current_tail {
         let state = workspace.state.read().unwrap();
         for job in &state.jobs {
-            if job.job_id != job_id {
+            if job.log_group != log_group {
                 continue;
             }
             match &job.process_status {
@@ -159,7 +159,7 @@ fn forward_new_logs(
         return Ok((false, None));
     }
 
-    let view = logs.view(LogFilter::IsJob(job_id));
+    let view = logs.view(LogFilter::IsGroup(log_group));
     let (a, b) = logs.slices_range(*last_log_id, LogId(current_tail.0.saturating_sub(1)));
 
     for slice in [a, b] {
@@ -178,7 +178,7 @@ fn forward_new_logs(
 
     let state = workspace.state.read().unwrap();
     for job in &state.jobs {
-        if job.job_id != job_id {
+        if job.log_group != log_group {
             continue;
         }
         match &job.process_status {

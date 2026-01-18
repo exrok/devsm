@@ -74,8 +74,6 @@ pub enum Command<'a> {
     Cli,
     Server,
     RestartSelected,
-    TriggerPrimary,
-    TriggerSecondary,
     Restart { job: &'a str, value_map: ValueMap<'a> },
     Exec { job: &'a str, value_map: ValueMap<'a> },
     Run { job: &'a str, value_map: ValueMap<'a> },

@@ -21,14 +21,14 @@ impl Mode {
             Mode::All => LogFilter::All,
             Mode::OnlySelected(ss) => {
                 if let Some(job) = ss.job {
-                    LogFilter::IsJob(ws[job].job_id)
+                    LogFilter::IsGroup(ws[job].log_group)
                 } else {
                     LogFilter::IsBaseTask(ss.base_task)
                 }
             }
             Mode::Hybrid(ss) => {
                 if let Some(job) = ss.job {
-                    LogFilter::NotJob(ws[job].job_id)
+                    LogFilter::NotGroup(ws[job].log_group)
                 } else {
                     LogFilter::NotBaseTask(ss.base_task)
                 }
@@ -41,7 +41,7 @@ impl Mode {
             Mode::OnlySelected(..) => None,
             Mode::Hybrid(ss) => {
                 if let Some(job) = ss.job {
-                    Some(LogFilter::IsJob(ws[job].job_id))
+                    Some(LogFilter::IsGroup(ws[job].log_group))
                 } else {
                     Some(LogFilter::IsBaseTask(ss.base_task))
                 }
@@ -67,14 +67,6 @@ impl LogStack {
         self.mode
     }
 
-    /// Returns the current tail position of the top log view.
-    pub fn current_tail(&self) -> LogId {
-        match &self.top {
-            LogWidget::Tail(tail) => tail.tail(),
-            LogWidget::Scroll(scroll) => scroll.tail(),
-        }
-    }
-
     /// Forces the appropriate log view into scroll mode at the current position.
     /// In Hybrid mode, this affects the bottom (narrowed) view since that's where search results are.
     pub fn enter_scroll_mode(&mut self, ws: &Workspace) {
@@ -88,7 +80,7 @@ impl LogStack {
             }
             Mode::OnlySelected(ss) => {
                 let filter = if let Some(job) = ss.job {
-                    LogFilter::IsJob(ws_state[job].job_id)
+                    LogFilter::IsGroup(ws_state[job].log_group)
                 } else {
                     LogFilter::IsBaseTask(ss.base_task)
                 };
@@ -98,7 +90,7 @@ impl LogStack {
             Mode::Hybrid(ss) => {
                 // In Hybrid mode, search results are in the bottom (selected task) view
                 let filter = if let Some(job) = ss.job {
-                    LogFilter::IsJob(ws_state[job].job_id)
+                    LogFilter::IsGroup(ws_state[job].log_group)
                 } else {
                     LogFilter::IsBaseTask(ss.base_task)
                 };
@@ -121,7 +113,7 @@ impl LogStack {
             }
             Mode::OnlySelected(ss) => {
                 let filter = if let Some(job) = ss.job {
-                    LogFilter::IsJob(ws_state[job].job_id)
+                    LogFilter::IsGroup(ws_state[job].log_group)
                 } else {
                     LogFilter::IsBaseTask(ss.base_task)
                 };
@@ -131,7 +123,7 @@ impl LogStack {
             Mode::Hybrid(ss) => {
                 // In Hybrid mode, search results are in the bottom (selected task) view
                 let filter = if let Some(job) = ss.job {
-                    LogFilter::IsJob(ws_state[job].job_id)
+                    LogFilter::IsGroup(ws_state[job].log_group)
                 } else {
                     LogFilter::IsBaseTask(ss.base_task)
                 };

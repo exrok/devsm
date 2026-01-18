@@ -5,11 +5,11 @@ use vtui::{
 
 use crate::{
     line_width::{self, MatchHighlight, Segment},
-    log_storage::{JobLogCorrelation, LogEntry, LogId, LogView, Logs},
+    log_storage::{LogEntry, LogGroup, LogId, LogView, Logs},
 };
 
 fn get_entry_height(entry: &LogEntry, style: &LogStyle, width: u32) -> u32 {
-    let prefix_width = style.prefix(entry.job_id).map(|p| p.width).unwrap_or(0) as u32;
+    let prefix_width = style.prefix(entry.log_group).map(|p| p.width).unwrap_or(0) as u32;
 
     let first_line_width = width.saturating_sub(prefix_width);
 
@@ -42,7 +42,7 @@ fn render_single_entry(
     let highlight_info = style.highlight.filter(|h| h.log_id == log_id);
     let highlight_style = Color::DarkOrange.as_bg();
 
-    let prefix = style.prefix(entry.job_id);
+    let prefix = style.prefix(entry.log_group);
     let prefix_width = prefix.map(|p| p.width).unwrap_or(0) as u16;
     let prefix_bytes = prefix.map(|p| p.bytes.as_bytes()).unwrap_or(b"");
 
@@ -136,11 +136,8 @@ fn render_single_entry(
         text_slice = &text_slice[first_line_len..];
 
         // Calculate stripped offset for wrapped lines
-        let stripped_offset = if highlight_info.is_some() {
-            calculate_stripped_len(&text[..first_line_len])
-        } else {
-            0
-        };
+        let stripped_offset =
+            if highlight_info.is_some() { calculate_stripped_len(&text[..first_line_len]) } else { 0 };
 
         let lines = line_width::naive_line_splitting(text_slice, entry.style, width.into())
             .skip(current_skip as usize)
@@ -165,10 +162,7 @@ fn render_single_entry(
                     // Calculate overlap within this line
                     let overlap_start = hl_start.saturating_sub(line_start);
                     let overlap_end = hl_end.saturating_sub(line_start).min(line_stripped_len);
-                    MatchHighlight {
-                        start: overlap_start as u32,
-                        len: (overlap_end - overlap_start) as u32,
-                    }
+                    MatchHighlight { start: overlap_start as u32, len: (overlap_end - overlap_start) as u32 }
                 } else {
                     // No overlap - zero-length highlight
                     MatchHighlight { start: 0, len: 0 }
@@ -318,9 +312,8 @@ pub struct LogStyle {
 }
 
 impl LogStyle {
-    pub fn prefix(&self, job: JobLogCorrelation) -> Option<&Prefix> {
-        let index = job.0 & 0x3ff;
-        self.prefixes.get(index as usize)
+    pub fn prefix(&self, job: LogGroup) -> Option<&Prefix> {
+        self.prefixes.get(job.base_task_index().idx())
     }
 }
 
@@ -354,20 +347,6 @@ pub struct LogTailWidget {
 impl Default for LogTailWidget {
     fn default() -> Self {
         Self { tail: Default::default(), next_screen_offset: Default::default(), previous: Rect::EMPTY }
-    }
-}
-
-impl LogTailWidget {
-    /// Returns the current tail LogId.
-    pub fn tail(&self) -> LogId {
-        self.tail
-    }
-}
-
-impl LogScrollWidget {
-    /// Returns the current tail LogId.
-    pub fn tail(&self) -> LogId {
-        self.tail
     }
 }
 
@@ -755,8 +734,16 @@ impl LogScrollWidget {
             if remaining_height == 0 {
                 return 0;
             }
-            let rendered =
-                render_single_entry(buf, view.logs, rect.w, &entry, log_id, self.scroll_shift_up, remaining_height, style);
+            let rendered = render_single_entry(
+                buf,
+                view.logs,
+                rect.w,
+                &entry,
+                log_id,
+                self.scroll_shift_up,
+                remaining_height,
+                style,
+            );
             remaining_height = remaining_height.saturating_sub(rendered);
         }
 
@@ -836,7 +823,8 @@ impl LogScrollWidget {
             if remaining_height == 0 {
                 return;
             }
-            let rendered = render_single_entry(buf, view.logs, rect.w, &entry, log_id, sub_line_skip, remaining_height, style);
+            let rendered =
+                render_single_entry(buf, view.logs, rect.w, &entry, log_id, sub_line_skip, remaining_height, style);
             remaining_height = remaining_height.saturating_sub(rendered);
         }
 
@@ -885,7 +873,7 @@ impl LogTailWidget {
                 buf.extend_from_slice(b"\n\r");
             }
 
-            let prefix = style.prefix(entry.job_id);
+            let prefix = style.prefix(entry.log_group);
             let prefix_width = prefix.map(|p| p.width).unwrap_or(0);
             let prefix_bytes = prefix.map(|p| p.bytes.as_bytes()).unwrap_or(b"");
 

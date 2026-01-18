@@ -6,7 +6,7 @@ use vtui::{
 
 use crate::{
     keybinds::{Command, InputEvent, Keybinds, Mode},
-    line_width::{strip_ansi_to_buffer, MatchHighlight, Segment},
+    line_width::{MatchHighlight, Segment, strip_ansi_to_buffer},
     log_storage::{LogEntry, LogFilter, LogId, Logs},
     tui::constrain_scroll_offset,
 };
@@ -102,11 +102,6 @@ impl LogSearchIndex {
             // Move past this match to find next
             search_pos = abs_pos + 1;
         }
-    }
-
-    /// Returns the number of indexed entries.
-    pub fn len(&self) -> usize {
-        self.offsets.len()
     }
 }
 
@@ -301,18 +296,12 @@ impl LogSearchState {
         input_rect.with(Color::Grey[16].as_fg()).text(out, "/").with(Style::DEFAULT).text(out, &self.pattern);
 
         // Cursor rendering
-        let cursor_rect = Rect {
-            x: input_rect.x + 1 + self.pattern[..self.cursor].width() as u16,
-            w: 1,
-            ..input_rect
-        };
+        let cursor_rect = Rect { x: input_rect.x + 1 + self.pattern[..self.cursor].width() as u16, w: 1, ..input_rect };
         cursor_rect.with(Color::Grey[28].with_fg(Color::Grey[2])).fill(out);
 
         // Status line
         let status_rect = rect.take_top(1);
-        status_rect
-            .with(Color::Grey[8].as_fg())
-            .fmt(out, format_args!("{} matches", self.matches.len()));
+        status_rect.with(Color::Grey[8].as_fg()).fmt(out, format_args!("{} matches", self.matches.len()));
 
         if self.matches.is_empty() {
             return;
@@ -344,10 +333,7 @@ impl LogSearchState {
             }
 
             // Render with ANSI stripped and match highlighted
-            let highlight = MatchHighlight {
-                start: log_match.match_start,
-                len: self.pattern_lower_len as u32,
-            };
+            let highlight = MatchHighlight { start: log_match.match_start, len: self.pattern_lower_len as u32 };
 
             render_stripped_with_highlight(entry_rect, out, text, base_style, highlight_style, highlight);
         }
@@ -368,10 +354,10 @@ impl LogSearchState {
 fn filter_contains(filter: LogFilter, entry: &LogEntry) -> bool {
     match filter {
         LogFilter::All => true,
-        LogFilter::IsJob(job_id) => entry.job_id == job_id,
-        LogFilter::NotJob(job_id) => entry.job_id != job_id,
-        LogFilter::IsBaseTask(base_task) => entry.job_id.base_task_index() == base_task.0,
-        LogFilter::NotBaseTask(base_task) => entry.job_id.base_task_index() != base_task.0,
+        LogFilter::IsGroup(log_group) => entry.log_group == log_group,
+        LogFilter::NotGroup(log_group) => entry.log_group != log_group,
+        LogFilter::IsBaseTask(base_task) => entry.log_group.base_task_index() == base_task,
+        LogFilter::NotBaseTask(base_task) => entry.log_group.base_task_index() != base_task,
     }
 }
 

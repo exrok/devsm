@@ -10,12 +10,11 @@ use std::{
         unix::net::UnixStream,
     },
     sync::Arc,
-    time::Instant,
 };
 
 use crate::{
-    process_manager::ForwarderChannel,
-    workspace::{BaseTask, JobIndex, JobStatus, TestJob, TestJobStatus, TestRun, Workspace},
+    process_manager::ClientChannel,
+    workspace::{BaseTask, JobStatus, TestJob, TestJobStatus, TestRun, Workspace},
 };
 
 const TERMINATION_CODE: u32 = 0xcf_04_43_58;
@@ -36,7 +35,7 @@ pub fn run(
     mut socket: Option<UnixStream>,
     workspace: &Workspace,
     mut test_run: TestRun,
-    channel: Arc<ForwarderChannel>,
+    channel: Arc<ClientChannel>,
 ) -> anyhow::Result<()> {
     let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
     std::mem::forget(stdout);
@@ -133,7 +132,7 @@ fn update_test_statuses(
 }
 
 fn format_test_name(test_job: &TestJob, base_tasks: &[BaseTask]) -> String {
-    let base_task = &base_tasks[test_job.base_task_index];
+    let base_task = &base_tasks[test_job.base_task_index.idx()];
     let Some(test_info) = &base_task.test_info else {
         return base_task.name.to_string();
     };
@@ -151,25 +150,12 @@ fn format_test_name(test_job: &TestJob, base_tasks: &[BaseTask]) -> String {
 
 fn print_summary(file: &mut std::fs::File, test_run: &TestRun, base_tasks: &[BaseTask]) {
     let elapsed = test_run.started_at.elapsed();
-    let passed = test_run
-        .test_jobs
-        .iter()
-        .filter(|j| matches!(j.status, TestJobStatus::Passed))
-        .count();
-    let failed: Vec<&TestJob> = test_run
-        .test_jobs
-        .iter()
-        .filter(|j| matches!(j.status, TestJobStatus::Failed(_)))
-        .collect();
+    let passed = test_run.test_jobs.iter().filter(|j| matches!(j.status, TestJobStatus::Passed)).count();
+    let failed: Vec<&TestJob> =
+        test_run.test_jobs.iter().filter(|j| matches!(j.status, TestJobStatus::Failed(_))).collect();
 
     let _ = writeln!(file);
-    let _ = writeln!(
-        file,
-        "Tests: {} passed, {} failed ({:.1}s)",
-        passed,
-        failed.len(),
-        elapsed.as_secs_f64()
-    );
+    let _ = writeln!(file, "Tests: {} passed, {} failed ({:.1}s)", passed, failed.len(), elapsed.as_secs_f64());
 
     if !failed.is_empty() {
         let _ = writeln!(file, "\nFailed:");
