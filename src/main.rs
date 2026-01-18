@@ -1,19 +1,30 @@
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
+use std::io::Write;
+use std::mem::needs_drop;
 use std::os::fd::RawFd;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+use unicode_width::UnicodeWidthStr;
+use vtui::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use vtui::vt::BufferWrite;
+use vtui::{Rect, Style, TerminalFlags, vt};
 
 use anyhow::Context;
 
-use crate::line_buffer::{LineBuffer, LineBufferWriter};
+use crate::line_buffer::{JobId, Line, LineId, LineTable, LineTableWriter};
+use crate::line_width::{Segment, apply_raw_display_mode_vt_to_style};
+use crate::scroll_view::{MultiView, TailView};
 
 mod line_buffer;
+mod line_width;
+mod scroll_view;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct JobId(pub u32);
+// #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// pub struct JobId(pub u32);
 
 #[derive(Clone, Copy, Debug)]
 enum Pipe {
@@ -27,6 +38,7 @@ struct ActiveProcess {
     alive: bool,
     stdout_buffer: Option<Buffer>,
     stderr_buffer: Option<Buffer>,
+    style: Style,
     child: Child,
 }
 
@@ -68,9 +80,8 @@ impl Buffer {
         }
     }
 }
-
 struct ProcessManager {
-    line_writer: LineBufferWriter,
+    line_writer: LineTableWriter,
     processes: slab::Slab<ActiveProcess>,
     buffer_pool: Vec<Vec<u8>>,
 }
@@ -111,6 +122,23 @@ fn try_read(fd: RawFd, buffer: &mut Vec<u8>) -> ReadResult {
     }
 }
 
+// let child_pid = child.id();
+// let pgid_to_kill = -(child_pid as i32);
+
+// unsafe {
+//     // Send SIGTERM for a graceful shutdown. This allows processes
+//     // to clean up resources.
+//     if libc::kill(pgid_to_kill, libc::SIGTERM) == -1 {
+//         // If libc::kill returns -1, an error occurred.
+//         let err = std::io::Error::last_os_error();
+//         eprintln!(
+//             "Failed to send SIGTERM to process group {}: {}",
+//             child_pid, err
+//         );
+//         // In a real-world scenario, you might fallback to SIGKILL here.
+//     }
+// }
+
 impl ProcessManager {
     fn read(&mut self, poll: &mut Poll, index: ProcessIndex, pipe: Pipe) -> anyhow::Result<()> {
         let process = self
@@ -149,11 +177,7 @@ impl ProcessManager {
                 ReadResult::Done | ReadResult::WouldBlock => break,
                 ReadResult::More => continue,
                 ReadResult::EOF => {
-                    if let Err(err) = poll.registry().register(
-                        &mut SourceFd(&fd),
-                        Token((index << 1) | (pipe as usize)),
-                        Interest::READABLE,
-                    ) {
+                    if let Err(err) = poll.registry().deregister(&mut SourceFd(&fd)) {
                         kvlog::error!("Failed to unregister fd", ?err);
                     }
                     match pipe {
@@ -172,7 +196,21 @@ impl ProcessManager {
 
         while let Some(line) = buffer.readline() {
             if let Ok(text) = std::str::from_utf8(line) {
-                self.line_writer.push_line(text, 0, process.job_id);
+                let mut new_style = process.style;
+                let mut width = 0;
+                for segment in Segment::iterator(text) {
+                    match segment {
+                        Segment::Ascii(text) => width += text.len(),
+                        Segment::AnsiEscapes(escape) => {
+                            apply_raw_display_mode_vt_to_style(&mut new_style, escape)
+                        }
+                        Segment::Utf8(text) => width += text.width(),
+                    }
+                }
+
+                self.line_writer
+                    .push_line(text, width as u32, process.job_id, process.style);
+                process.style = new_style;
             }
         }
         if buffer.is_empty() || !expecting_more {
@@ -195,6 +233,19 @@ impl ProcessManager {
         mut command: Command,
     ) -> anyhow::Result<()> {
         let index = self.processes.vacant_key();
+        unsafe {
+            command.pre_exec(|| {
+                // Create process group to allow nested cleanup
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         let mut child = command.spawn().context("Failed to spawn process")?;
@@ -228,6 +279,7 @@ impl ProcessManager {
             alive: true,
             stdout_buffer: None,
             stderr_buffer: None,
+            style: Style::default(),
             child,
         });
         Ok(())
@@ -241,6 +293,32 @@ enum ProcessRequest {
     },
 }
 
+struct CrosstermChannel {
+    waker: &'static vtui::event::polling::Waker,
+    events: Mutex<Vec<()>>,
+}
+
+impl CrosstermChannel {
+    fn wake(&self) -> std::io::Result<()> {
+        self.waker.wake()
+    }
+    fn swap_recv(&self, buf: &mut Vec<()>) {
+        let mut events = self.events.lock().unwrap();
+        buf.clear();
+        std::mem::swap(buf, &mut events);
+    }
+    fn try_send(&self, req: ()) -> anyhow::Result<()> {
+        let mut events = self.events.lock().unwrap();
+        events.push(req);
+        self.waker.wake()?;
+        Ok(())
+    }
+    fn send(&self, req: ()) {
+        if let Err(err) = self.try_send(req) {
+            kvlog::error!("Failed to send request", ?err);
+        }
+    }
+}
 struct MioChannel {
     waker: Waker,
     events: Mutex<Vec<ProcessRequest>>,
@@ -265,11 +343,16 @@ impl MioChannel {
 }
 
 struct ProcessManagerHandle {
-    lines: Arc<RwLock<LineBuffer>>,
+    lines: Arc<RwLock<LineTable>>,
     request: Arc<MioChannel>,
 }
 
-fn process_worker(line_writer: LineBufferWriter, request: Arc<MioChannel>, mut poll: Poll) {
+fn process_worker(
+    line_writer: LineTableWriter,
+    request: Arc<MioChannel>,
+    resp: Arc<CrosstermChannel>,
+    mut poll: Poll,
+) {
     let mut events = Events::with_capacity(128);
     let mut job_manager = ProcessManager {
         line_writer,
@@ -301,13 +384,14 @@ fn process_worker(line_writer: LineBufferWriter, request: Arc<MioChannel>, mut p
                 kvlog::error!("Received invalid token", ?tok);
             }
         }
+        let _ = resp.wake();
     }
 }
 
 const CHANNEL_TOKEN: Token = Token(1 << 30);
 impl ProcessManagerHandle {
-    fn spawn() -> std::io::Result<ProcessManagerHandle> {
-        let writer = line_buffer::LineBufferWriter::new();
+    fn spawn(resp: Arc<CrosstermChannel>) -> std::io::Result<ProcessManagerHandle> {
+        let writer = line_buffer::LineTableWriter::new();
         let lines = writer.reader();
         let poll = Poll::new()?;
         let request = Arc::new(MioChannel {
@@ -316,33 +400,221 @@ impl ProcessManagerHandle {
         });
         let r = request.clone();
         std::thread::spawn(move || {
-            process_worker(writer, r, poll);
+            process_worker(writer, r, resp, poll);
         });
         Ok(ProcessManagerHandle { lines, request })
     }
 }
 
+/// State for optimized VT list rendered directly to the terminal
+/// Smartly using native VT scroll and the native line wrapping of
+/// the terminal.
+///
+/// Assumes the list rendered to the full width of terminal, which
+/// is a requirement to make use of the scrolling escape codes.
+struct RawListRenderer {
+    rect: Rect,
+    sub_offset: i32,
+    tail: i16,
+    last_visible_item_index: usize,
+}
+
 fn main() -> anyhow::Result<()> {
-    let manager = ProcessManagerHandle::spawn()?;
-    let mut comm = Command::new("ping");
-    comm.arg("127.0.0.1");
+    let _log_guard = kvlog::collector::init_file_logger("/tmp/.dfj.log");
+    let resp = Arc::new(CrosstermChannel {
+        waker: vtui::event::polling::resize_waker().unwrap(),
+        events: Mutex::new(Vec::new()),
+    });
+    let mode = TerminalFlags::RAW_MODE
+        | TerminalFlags::MOUSE_CAPTURE
+        | TerminalFlags::ALT_SCREEN
+        | TerminalFlags::EXTENDED_KEYBOARD_INPUTS;
+    let mut terminal = vtui::Terminal::open(mode).expect("Valid TTY");
+    let mut events = vtui::event::parse::Events::default();
+    use std::io::Write;
+    let mut buf = Vec::new();
+    vt::move_cursor_to_origin(&mut buf);
+    buf.extend_from_slice(vt::CLEAR_BELOW);
+
+    terminal.write_all(&buf)?;
+    let stdin = std::io::stdin();
+    let mut line_buffer = line_buffer::LineTableWriter::new();
+    let mut view = MultiView::Tail(TailView::default());
+    for i in 0..10 {
+        let text = format!("Initial line number {}", i);
+        line_buffer.push_line(&text, text.len() as u32, JobId(1), Style::DEFAULT);
+    }
+    let reader = line_buffer.reader();
+    let mut add_next = false;
+    let mut scroll_request: Option<i32> = None;
+    loop {
+        let (w, h) = terminal.size()?;
+        let dest = Rect {
+            x: 0,
+            y: 5,
+            width: w,
+            height: 5,
+        };
+        vt::move_cursor(&mut buf, 0, dest.y - 1);
+        for i in 0..w {
+            buf.push(b'=');
+        }
+        vt::move_cursor(&mut buf, 0, dest.y + dest.height);
+        for i in 0..w {
+            buf.push(b'=');
+        }
+        if let Some(scroll_request) = scroll_request.take() {
+            let reader = reader.read().unwrap();
+            if scroll_request < 0 {
+                view.scroll_down(-scroll_request as u32, &mut buf, dest, reader.view_all());
+            } else if scroll_request > 0 {
+                view.scroll_up(scroll_request as u32, &mut buf, dest, reader.view_all());
+            }
+        }
+        {
+            let reader = reader.read().unwrap();
+            if let MultiView::Tail(tail) = &mut view {
+                tail.render(&mut buf, dest, reader.view_all());
+            }
+        }
+        terminal.write_all(&buf)?;
+        buf.clear();
+        match vtui::event::poll(&stdin, None)? {
+            vtui::event::Polled::ReadReady => {
+                events.read_from(&stdin)?;
+            }
+            vtui::event::Polled::Woken => {
+                // resize event
+            }
+            vtui::event::Polled::TimedOut => {}
+        }
+        while let Some(event) = events.next(terminal.is_raw()) {
+            if add_next {
+                add_next = false;
+                let text = format!("{:?}", event);
+                line_buffer.push_line(&text, text.len() as u32, JobId(3), Style::DEFAULT);
+            }
+            match event {
+                Event::Key(key_event) => {
+                    use KeyCode::*;
+                    const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+                    // const NORM: KeyModifiers = KeyModifiers::empty();
+
+                    match (key_event.modifiers, key_event.code) {
+                        (CTRL, Char('c')) => return Ok(()),
+                        (_, Char('n')) => add_next = true,
+                        (_, Char('k')) => {
+                            if let Some(value) = scroll_request {
+                                scroll_request = Some(value + 1);
+                            } else {
+                                scroll_request = Some(1);
+                            }
+                        }
+                        (_, Char('j')) => {
+                            if let Some(value) = scroll_request {
+                                scroll_request = Some(value - 1);
+                            } else {
+                                scroll_request = Some(-1);
+                            }
+                        }
+                        _ => (),
+                    }
+                }
+                Event::Resized => (),
+                _ => (),
+            }
+        }
+    }
+
+    Ok(())
+}
+fn main2() -> anyhow::Result<()> {
+    let _log_guard = kvlog::collector::init_file_logger("/tmp/.dfj.log");
+    let resp = Arc::new(CrosstermChannel {
+        waker: vtui::event::polling::resize_waker().unwrap(),
+        events: Mutex::new(Vec::new()),
+    });
+    let manager = ProcessManagerHandle::spawn(resp)?;
+    // let mut comm = Command::new("cargo");
+    // comm.arg("run")
+    //     .current_dir("/home/user/am/libra/backend")
+    //     .env("CARGO_TERM_COLOR", "always");
+
+    let mut comm = Command::new("cargo");
+    comm.arg("run")
+        .current_dir("/home/user/am/libra/backend")
+        .env("CARGO_TERM_COLOR", "always");
     manager.request.send(ProcessRequest::Spawn {
         command: Box::new(comm),
-        job_id: JobId(32),
+        job_id: JobId(3),
     });
-    // let mut comm = Command::new("ping");
-    // comm.arg("1.1.1.1");
-    // manager.request.send(ProcessRequest::Spawn {
-    //     command: Box::new(comm),
-    //     job_id: JobId(54),
-    // });
-    for _ in 1..100 {
-        std::thread::sleep(Duration::from_millis(500));
+    let mut comm = Command::new("ping");
+    comm.arg("127.0.0.1");
+    comm.current_dir("/home/user/am/libra/frontend/app")
+        .env("FORCE_COLOR", "2");
+
+    manager.request.send(ProcessRequest::Spawn {
+        command: Box::new(comm),
+        job_id: JobId(2),
+    });
+    let mut start = LineId::default();
+
+    let mode = TerminalFlags::RAW_MODE
+        | TerminalFlags::MOUSE_CAPTURE
+        | TerminalFlags::ALT_SCREEN
+        | TerminalFlags::EXTENDED_KEYBOARD_INPUTS;
+    let mut terminal = vtui::Terminal::open(mode).expect("Valid TTY");
+    let mut events = vtui::event::parse::Events::default();
+    use std::io::Write;
+    let mut buf = Vec::new();
+    vt::move_cursor_to_origin(&mut buf);
+    buf.extend_from_slice(vt::CLEAR_BELOW);
+    terminal.write_all(&buf)?;
+    let stdin = std::io::stdin();
+    loop {
         let lines = manager.lines.read().unwrap();
-        lines.for_each(|_, j, text, _| {
-            println!("{j:?}: {text}");
-            std::ops::ControlFlow::Continue(())
-        });
+        // start = lines.for_each_from(start, |_, j, text, _| std::ops::ControlFlow::Continue(()));
+        let (w, h) = terminal.size()?;
+        buf.clear();
+        let dest = Rect {
+            x: 0,
+            y: 5,
+            width: w,
+            height: 5,
+        };
+        vt::move_cursor(&mut buf, 0, dest.y - 1);
+        for i in 0..w {
+            buf.push(b'=');
+        }
+        vt::move_cursor(&mut buf, 0, dest.y + dest.height);
+        for i in 0..w {
+            buf.push(b'=');
+        }
+        std::fs::write("/tmp/output.txt", &buf);
+        terminal.write_all(&buf)?;
+        match vtui::event::poll(&stdin, None)? {
+            vtui::event::Polled::ReadReady => {
+                events.read_from(&stdin)?;
+            }
+            vtui::event::Polled::Woken => {}
+            vtui::event::Polled::TimedOut => {}
+        }
+        while let Some(event) = events.next(terminal.is_raw()) {
+            match event {
+                Event::Key(key_event) => {
+                    use KeyCode::*;
+                    const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+                    // const NORM: KeyModifiers = KeyModifiers::empty();
+                    match (key_event.modifiers, key_event.code) {
+                        (CTRL, Char('c')) => return Ok(()),
+                        (_, Char('n')) => return Ok(()),
+                        _ => (),
+                    }
+                }
+                Event::Resized => (),
+                _ => (),
+            }
+        }
     }
 
     Ok(())
