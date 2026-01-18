@@ -1,2 +1,3 @@
 [workspace]
 members = ["devsm", "devsm-rpc"]
+resolver = "3"

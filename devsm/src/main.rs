@@ -9,21 +9,19 @@ use anyhow::bail;
 use sendfd::SendWithFd;
 
 use crate::daemon::{GLOBAL_SOCKET, WorkspaceCommand};
-use crate::rpc::{
-    ClientProtocol, DecodeResult, RpcMessageKind, ResizeNotification,
-    JobStatusEvent, JobStatusKind, JobExitedEvent,
+use devsm_rpc::{
+    ClientProtocol, DecodeResult, JobExitedEvent, JobStatusEvent, JobStatusKind, ResizeNotification, RpcMessageKind,
 };
 
 mod cli;
 mod collection;
 mod config;
-mod daemon;
+pub mod daemon;
 mod keybinds;
 mod line_width;
 mod log_fowarder_ui;
 mod log_storage;
 mod process_manager;
-mod rpc;
 mod scroll_view;
 mod searcher;
 mod test_summary_ui;

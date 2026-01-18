@@ -16,12 +16,9 @@ use std::{
 use crate::{
     log_storage::{LogFilter, LogGroup, LogId},
     process_manager::ClientChannel,
-    rpc::{
-        Encoder, ExitCause as RpcExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind,
-        RpcMessageKind,
-    },
     workspace::{ExitCause, JobIndex, JobStatus, Workspace},
 };
+use devsm_rpc::{Encoder, ExitCause as RpcExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -38,7 +35,13 @@ fn send_status(encoder: &mut Encoder, socket: &mut Option<UnixStream>, status: J
     encoder.clear();
 }
 
-fn send_exit_status(encoder: &mut Encoder, socket: &mut Option<UnixStream>, exit_code: i32, job_index: JobIndex, cause: RpcExitCause) {
+fn send_exit_status(
+    encoder: &mut Encoder,
+    socket: &mut Option<UnixStream>,
+    exit_code: i32,
+    job_index: JobIndex,
+    cause: RpcExitCause,
+) {
     let Some(socket) = socket.as_mut() else { return };
     encoder.encode_push(RpcMessageKind::JobExited, &JobExitedEvent { job_index: job_index.as_u32(), exit_code, cause });
     let _ = socket.write_all(encoder.output());
@@ -78,13 +81,30 @@ pub fn run(
 
     loop {
         if channel.is_terminated() {
-            forward_new_logs(&mut encoder, &mut file, &mut socket, workspace, log_group, &mut last_log_id, &mut phase, &mut current_job)?;
+            forward_new_logs(
+                &mut encoder,
+                &mut file,
+                &mut socket,
+                workspace,
+                log_group,
+                &mut last_log_id,
+                &mut phase,
+                &mut current_job,
+            )?;
             send_termination(&mut encoder, &mut socket);
             break;
         }
 
-        let (job_exited, exit_code, cause) =
-            forward_new_logs(&mut encoder, &mut file, &mut socket, workspace, log_group, &mut last_log_id, &mut phase, &mut current_job)?;
+        let (job_exited, exit_code, cause) = forward_new_logs(
+            &mut encoder,
+            &mut file,
+            &mut socket,
+            workspace,
+            log_group,
+            &mut last_log_id,
+            &mut phase,
+            &mut current_job,
+        )?;
 
         if job_exited {
             if let (Some(code), Some(job_index)) = (exit_code, current_job) {
@@ -99,7 +119,16 @@ pub fn run(
                 let mut buf = [0u8; 64];
                 let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n == 0 {
-                    forward_new_logs(&mut encoder, &mut file, &mut socket, workspace, log_group, &mut last_log_id, &mut phase, &mut current_job)?;
+                    forward_new_logs(
+                        &mut encoder,
+                        &mut file,
+                        &mut socket,
+                        workspace,
+                        log_group,
+                        &mut last_log_id,
+                        &mut phase,
+                        &mut current_job,
+                    )?;
                     let _ = file.write_all(b"Detached. Task will continue running in background.\n");
                     send_termination(&mut encoder, &mut socket);
                     break;

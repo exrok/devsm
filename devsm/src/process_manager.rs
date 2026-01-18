@@ -4,9 +4,9 @@ use crate::{
     daemon::WorkspaceCommand,
     line_width::{Segment, apply_raw_display_mode_vt_to_style},
     log_storage::{LogGroup, LogWriter},
-    rpc::{RpcMessageKind, DecodeResult, DecodingState},
 };
 use anyhow::{Context, bail};
+use devsm_rpc::{DecodeResult, DecodingState, RpcMessageKind};
 use jsony_value::ValueMap;
 use mio::{Events, Interest, Poll, Token, Waker, unix::SourceFd};
 use slab::Slab;
@@ -94,10 +94,17 @@ impl Buffer {
     }
 }
 
+#[derive(Default)]
+struct RpcSubscriptions {
+    job_status: bool,
+    job_exits: bool,
+}
+
 enum ClientKind {
     Tui,
     Run { log_group: LogGroup },
     TestRun,
+    Rpc { subscriptions: RpcSubscriptions },
 }
 
 struct ClientEntry {
@@ -381,6 +388,7 @@ impl ProcessManager {
             let mut ws = workspace.handle.state.write().unwrap();
             ws.update_job_status(job_index, JobStatus::Running { process_index });
         }
+        self.broadcast_job_status(workspace_index, job_index, devsm_rpc::JobStatusKind::Running);
         Ok(())
     }
 }
@@ -389,12 +397,19 @@ pub(crate) enum AttachKind {
     Tui,
     Run { task_name: Box<str>, params: Vec<u8> },
     TestRun { filters: Vec<u8> },
+    Rpc { subscribe: bool },
 }
 
 pub(crate) enum ProcessRequest {
     WorkspaceCommand { workspace_config: PathBuf, socket: UnixStream, command: Vec<u8> },
     Spawn { task: TaskConfigRc, workspace_id: WorkspaceIndex, job_id: LogGroup, job_index: JobIndex },
-    AttachClient { stdin: OwnedFd, stdout: OwnedFd, socket: UnixStream, workspace_config: PathBuf, kind: AttachKind },
+    AttachClient {
+        stdin: Option<OwnedFd>,
+        stdout: Option<OwnedFd>,
+        socket: UnixStream,
+        workspace_config: PathBuf,
+        kind: AttachKind,
+    },
     TerminateJob { job_id: LogGroup, process_index: usize },
     ClientExited { index: usize },
     ProcessExited { pid: u32, status: u32 },
@@ -596,13 +611,28 @@ impl ProcessManager {
 
                 match kind {
                     AttachKind::Tui => {
+                        let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+                            kvlog::error!("TUI client requires stdin/stdout FDs");
+                            return false;
+                        };
                         self.attach_tui_client(stdin, stdout, socket, ws_index);
                     }
                     AttachKind::Run { task_name, params } => {
+                        let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+                            kvlog::error!("Run client requires stdin/stdout FDs");
+                            return false;
+                        };
                         self.attach_run_client(stdin, stdout, socket, ws_index, task_name, params);
                     }
                     AttachKind::TestRun { filters } => {
+                        let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+                            kvlog::error!("Test client requires stdin/stdout FDs");
+                            return false;
+                        };
                         self.attach_test_run_client(stdin, stdout, socket, ws_index, filters);
+                    }
+                    AttachKind::Rpc { subscribe } => {
+                        self.attach_rpc_client(socket, ws_index, subscribe);
                     }
                 }
 
@@ -697,19 +727,27 @@ impl ProcessManager {
                             kvlog::error!("Failed to unregister fd", ?err);
                         }
                     }
-                    if let Some(workspace) = self.workspaces.get(process.workspace_index as usize) {
+                    let ws_idx = process.workspace_index;
+                    let job_idx = process.job_index;
+                    if let Some(workspace) = self.workspaces.get(ws_idx as usize) {
                         let mut ws = workspace.handle.state.write().unwrap();
                         ws.update_job_status(
-                            process.job_index,
+                            job_idx,
                             JobStatus::Exited {
                                 finished_at: std::time::Instant::now(),
                                 log_end: workspace.line_writer.tail(),
                                 cause: ExitCause::Unknown,
-                                status: status,
+                                status,
                             },
                         );
                     }
                     self.processes.remove(index);
+                    let exit_code = if libc::WIFEXITED(status as i32) {
+                        libc::WEXITSTATUS(status as i32)
+                    } else {
+                        -1
+                    };
+                    self.broadcast_job_exited(ws_idx, job_idx, exit_code, devsm_rpc::ExitCause::Unknown);
                     return false;
                 }
                 kvlog::info!("Didn't Find ProcessExited");
@@ -915,6 +953,198 @@ impl ProcessManager {
             request_channel.send(ProcessRequest::ClientExited { index });
         });
     }
+
+    fn attach_rpc_client(&mut self, socket: UnixStream, ws_index: WorkspaceIndex, subscribe: bool) {
+        let subscriptions = RpcSubscriptions { job_status: subscribe, job_exits: subscribe };
+
+        let channel = Arc::new(ClientChannel {
+            waker: vtui::event::polling::Waker::new().unwrap(),
+            events: Mutex::new(Vec::new()),
+            selected: AtomicU64::new(0),
+            state: AtomicU64::new(0),
+        });
+
+        let next = self.clients.vacant_key();
+        let _ = self.poll.registry().register(
+            &mut SourceFd(&socket.as_raw_fd()),
+            TokenHandle::Client(next as u32).into(),
+            Interest::READABLE,
+        );
+        let _ = socket.set_nonblocking(true);
+
+        let client_entry = ClientEntry {
+            channel,
+            workspace: ws_index,
+            socket,
+            kind: ClientKind::Rpc { subscriptions },
+            partial_rpc_read: None,
+        };
+        let client_index = self.clients.insert(client_entry);
+
+        let mut encoder = devsm_rpc::Encoder::new();
+        encoder.encode_response(
+            devsm_rpc::RpcMessageKind::OpenWorkspaceAck,
+            0,
+            &devsm_rpc::OpenWorkspaceResponse { success: true, error: None },
+        );
+        let client = &mut self.clients[client_index];
+        let _ = client.socket.write_all(encoder.output());
+
+        kvlog::info!("RPC client attached", workspace = ws_index, subscribe);
+    }
+
+    fn handle_rpc_client_read(&mut self, client_index: ClientIndex) {
+        let Some(client) = self.clients.get_mut(client_index as usize) else {
+            return;
+        };
+        let ws_index = client.workspace;
+
+        let (mut state, mut buffer) = client
+            .partial_rpc_read
+            .take()
+            .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
+
+        let mut terminate = false;
+        loop {
+            match try_read(client.socket.as_raw_fd(), &mut buffer) {
+                ReadResult::More => continue,
+                ReadResult::EOF => {
+                    terminate = true;
+                    break;
+                }
+                ReadResult::Done | ReadResult::WouldBlock => break,
+                ReadResult::OtherError(err) => {
+                    kvlog::error!("RPC client read error", ?err);
+                    terminate = true;
+                    break;
+                }
+            }
+        }
+
+        let mut encoder = devsm_rpc::Encoder::new();
+
+        loop {
+            match state.decode(&buffer) {
+                DecodeResult::Message { kind, correlation, payload } => {
+                    self.handle_rpc_message(client_index, ws_index, kind, correlation, payload, &mut encoder);
+                }
+                DecodeResult::MissingData { .. } => break,
+                DecodeResult::Empty => {
+                    buffer.clear();
+                    break;
+                }
+                DecodeResult::Error(e) => {
+                    kvlog::error!("RPC protocol decode error", ?e);
+                    terminate = true;
+                    break;
+                }
+            }
+        }
+
+        state.compact(&mut buffer, 4096);
+
+        if !encoder.output().is_empty() {
+            let Some(client) = self.clients.get_mut(client_index as usize) else {
+                self.buffer_pool.push(buffer);
+                return;
+            };
+            let _ = client.socket.write_all(encoder.output());
+        }
+
+        if terminate {
+            self.buffer_pool.push(buffer);
+            self.terminate_client(client_index);
+        } else if buffer.is_empty() {
+            self.buffer_pool.push(buffer);
+        } else {
+            let Some(client) = self.clients.get_mut(client_index as usize) else { return };
+            client.partial_rpc_read = Some((state, buffer));
+        }
+    }
+
+    fn handle_rpc_message(
+        &mut self,
+        client_index: ClientIndex,
+        ws_index: WorkspaceIndex,
+        kind: RpcMessageKind,
+        correlation: u16,
+        payload: &[u8],
+        encoder: &mut devsm_rpc::Encoder,
+    ) {
+        match kind {
+            RpcMessageKind::Subscribe => {
+                let Ok(filter) = jsony::from_binary::<devsm_rpc::SubscriptionFilter>(payload) else {
+                    encoder.encode_response(
+                        RpcMessageKind::ErrorResponse,
+                        correlation,
+                        &devsm_rpc::ErrorResponsePayload {
+                            code: 1,
+                            message: "Invalid subscription filter".into(),
+                        },
+                    );
+                    return;
+                };
+                let Some(client) = self.clients.get_mut(client_index as usize) else { return };
+                let ClientKind::Rpc { subscriptions } = &mut client.kind else { return };
+                subscriptions.job_status = filter.job_status;
+                subscriptions.job_exits = filter.job_exits;
+                encoder.encode_response(RpcMessageKind::SubscribeAck, correlation, &devsm_rpc::SubscribeAck { success: true });
+            }
+            RpcMessageKind::RunTask => {
+                let Ok(req) = jsony::from_binary::<devsm_rpc::RunTaskRequest>(payload) else {
+                    encoder.encode_response(
+                        RpcMessageKind::ErrorResponse,
+                        correlation,
+                        &devsm_rpc::ErrorResponsePayload { code: 2, message: "Invalid run task request".into() },
+                    );
+                    return;
+                };
+                let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
+                let ws = &self.workspaces[ws_index as usize];
+                let mut state = ws.handle.state.write().unwrap();
+                let Some(base_index) = state.base_index_by_name(req.task_name) else {
+                    drop(state);
+                    encoder.encode_response(
+                        RpcMessageKind::RunTaskAck,
+                        correlation,
+                        &devsm_rpc::RunTaskResponse {
+                            success: false,
+                            job_index: None,
+                            error: Some(format!("Task '{}' not found", req.task_name).into()),
+                        },
+                    );
+                    return;
+                };
+                drop(state);
+
+                ws.handle.restart_task(base_index, params, req.profile);
+
+                let ws_state = ws.handle.state.read().unwrap();
+                let bt = &ws_state.base_tasks[base_index.idx()];
+                let job_index = bt.jobs.all().last().map(|ji| ji.as_u32());
+
+                encoder.encode_response(
+                    RpcMessageKind::RunTaskAck,
+                    correlation,
+                    &devsm_rpc::RunTaskResponse { success: true, job_index, error: None },
+                );
+            }
+            RpcMessageKind::Terminate => {
+                encoder.encode_empty(RpcMessageKind::TerminateAck, correlation);
+            }
+            RpcMessageKind::OpenWorkspace => {
+                encoder.encode_response(
+                    RpcMessageKind::OpenWorkspaceAck,
+                    correlation,
+                    &devsm_rpc::OpenWorkspaceResponse { success: true, error: None },
+                );
+            }
+            _ => {
+                kvlog::warn!("Unexpected RPC message kind from client", ?kind);
+            }
+        }
+    }
+
     fn terminate_client(&mut self, client_index: ClientIndex) {
         let Some(client) = self.clients.try_remove(client_index as usize) else {
             kvlog::error!("Terminate for missing client", index = client_index as usize);
@@ -938,6 +1168,7 @@ impl ProcessManager {
                 self.handle_run_client_read(client_index, job_id);
             }
             ClientKind::TestRun => self.handle_test_run_client_read(client_index),
+            ClientKind::Rpc { .. } => self.handle_rpc_client_read(client_index),
         }
     }
 
@@ -1153,6 +1384,48 @@ impl ProcessManager {
         } else {
             let Some(client) = self.clients.get_mut(client_index as usize) else { return };
             client.partial_rpc_read = Some((state, buffer));
+        }
+    }
+
+    fn broadcast_job_status(&mut self, ws_index: WorkspaceIndex, job_index: JobIndex, status: devsm_rpc::JobStatusKind) {
+        let event = devsm_rpc::JobStatusEvent { job_index: job_index.as_u32(), status };
+        let mut encoder = devsm_rpc::Encoder::new();
+        encoder.encode_push(RpcMessageKind::JobStatus, &event);
+        let output = encoder.output();
+
+        for (_, client) in &mut self.clients {
+            if client.workspace != ws_index {
+                continue;
+            }
+            let ClientKind::Rpc { subscriptions } = &client.kind else { continue };
+            if !subscriptions.job_status {
+                continue;
+            }
+            let _ = client.socket.write_all(output);
+        }
+    }
+
+    fn broadcast_job_exited(
+        &mut self,
+        ws_index: WorkspaceIndex,
+        job_index: JobIndex,
+        exit_code: i32,
+        cause: devsm_rpc::ExitCause,
+    ) {
+        let event = devsm_rpc::JobExitedEvent { job_index: job_index.as_u32(), exit_code, cause };
+        let mut encoder = devsm_rpc::Encoder::new();
+        encoder.encode_push(RpcMessageKind::JobExited, &event);
+        let output = encoder.output();
+
+        for (_, client) in &mut self.clients {
+            if client.workspace != ws_index {
+                continue;
+            }
+            let ClientKind::Rpc { subscriptions } = &client.kind else { continue };
+            if !subscriptions.job_exits {
+                continue;
+            }
+            let _ = client.socket.write_all(output);
         }
     }
 }

@@ -44,6 +44,7 @@ dependencies = [
  "anyhow",
  "bumpalo",
  "codespan-reporting",
+ "devsm-rpc",
  "foldhash",
  "hashbrown",
  "jsony",
@@ -64,6 +65,11 @@ dependencies = [
 [[package]]
 name = "devsm-rpc"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jsony",
+ "jsony_value",
+]
 
 [[package]]
 name = "errno"

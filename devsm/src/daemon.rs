@@ -77,6 +77,11 @@ pub enum Request<'a> {
         config: &'a Path,
         filters: TestFilters<'a>,
     },
+    AttachRpc {
+        #[jsony(with = unix_path)]
+        config: &'a Path,
+        subscribe: bool,
+    },
 }
 
 struct FdSet<'a>(&'a [i32]);
@@ -134,8 +139,8 @@ fn handle_request(
                 bail!("Expected 2 FD's found only one");
             }
             pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
-                stdin: fds.pop_front().unwrap(),
-                stdout: fds.pop_front().unwrap(),
+                stdin: Some(fds.pop_front().unwrap()),
+                stdout: Some(fds.pop_front().unwrap()),
                 socket,
                 workspace_config: config.into(),
                 kind: crate::process_manager::AttachKind::Tui,
@@ -147,8 +152,8 @@ fn handle_request(
                 bail!("Expected 2 FD's found only one");
             }
             pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
-                stdin: fds.pop_front().unwrap(),
-                stdout: fds.pop_front().unwrap(),
+                stdin: Some(fds.pop_front().unwrap()),
+                stdout: Some(fds.pop_front().unwrap()),
                 socket,
                 workspace_config: config.into(),
                 kind: crate::process_manager::AttachKind::Run {
@@ -163,13 +168,23 @@ fn handle_request(
                 bail!("Expected 2 FD's found only one");
             }
             pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
-                stdin: fds.pop_front().unwrap(),
-                stdout: fds.pop_front().unwrap(),
+                stdin: Some(fds.pop_front().unwrap()),
+                stdout: Some(fds.pop_front().unwrap()),
                 socket,
                 workspace_config: config.into(),
                 kind: crate::process_manager::AttachKind::TestRun {
                     filters: jsony::to_binary(&filters),
                 },
+            });
+        }
+        Request::AttachRpc { config, subscribe } => {
+            kvlog::info!("Attaching RPC client");
+            pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
+                stdin: None,
+                stdout: None,
+                socket,
+                workspace_config: config.into(),
+                kind: crate::process_manager::AttachKind::Rpc { subscribe },
             });
         }
     }

@@ -699,32 +699,6 @@ mod test {
     use codespan_reporting::diagnostic::Diagnostic;
     use codespan_reporting::files::SimpleFiles;
     use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
-    #[test]
-    fn simple() {
-        let text = std::fs::read_to_string("./devsm.toml").unwrap();
-        let mut files = SimpleFiles::new();
-        files.add("devsm.toml", &text);
-        let mut writer = StandardStream::stderr(ColorChoice::Auto);
-        let config = codespan_reporting::term::Config::default();
-        let mut error = |diag: Diagnostic<usize>| {
-            codespan_reporting::term::emit_to_write_style(&mut writer, &config, &files, &diag).unwrap();
-        };
-        let bump = Bump::new();
-        match parse(Path::new("/"), &bump, &text, &mut error) {
-            Ok(config) => {
-                println!("Parsed {} tasks and {} groups", config.tasks.len(), config.groups.len());
-                for (name, task) in config.tasks {
-                    println!("  Task: {:?} - {:?}", name, task.kind);
-                }
-                for (name, group) in config.groups {
-                    println!("  Group: {:?} with {} calls", name, group.len());
-                }
-            }
-            Err(_) => {
-                panic!("Failed to parse");
-            }
-        }
-    }
 
     #[test]
     fn test_parse_string_expr() {
