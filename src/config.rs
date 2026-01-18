@@ -34,6 +34,7 @@ pub struct TaskCall<'a> {
 pub enum TaskKind {
     Service,
     Action,
+    Test,
 }
 
 /// A single cache key input that contributes to cache invalidation.
@@ -63,6 +64,79 @@ impl TaskConfigRc {
     pub fn config<'a>(&'a self) -> &'a TaskConfig<'a> {
         unsafe { std::mem::transmute::<&'a TaskConfig<'static>, &'a TaskConfig<'a>>(&self.0.0) }
     }
+
+    /// Creates a TaskConfigRc from a TestConfig.
+    /// This allows tests to be executed using the same job infrastructure as tasks.
+    /// The test config data is copied into a new bump allocator.
+    pub fn from_test_config(tc: &TestConfig<'_>) -> Self {
+        let mut new = Arc::new((
+            TaskConfig {
+                kind: TaskKind::Action, // Tests are action-like
+                pwd: "",
+                command: Command::Cmd(&[]),
+                profiles: &["default"],
+                envvar: &[],
+                require: &[],
+                cache: None,
+            },
+            Bump::new(),
+        ));
+        let alloc = Arc::get_mut(&mut new).unwrap();
+        let bump = &alloc.1;
+
+        // Copy strings into the bump allocator
+        let pwd = bump.alloc_str(tc.pwd);
+        let command = match &tc.command {
+            Command::Cmd(args) => {
+                let mut args_vec = bumpalo::collections::Vec::new_in(bump);
+                for arg in *args {
+                    args_vec.push(bump.alloc_str(arg) as &str);
+                }
+                Command::Cmd(args_vec.into_bump_slice())
+            }
+            Command::Sh(script) => Command::Sh(bump.alloc_str(script)),
+        };
+        let mut envvar_vec = bumpalo::collections::Vec::new_in(bump);
+        for (k, v) in tc.envvar {
+            envvar_vec.push((bump.alloc_str(k) as &str, bump.alloc_str(v) as &str));
+        }
+        let mut require_vec = bumpalo::collections::Vec::new_in(bump);
+        for alias in tc.require {
+            require_vec.push(Alias(bump.alloc_str(&**alias)));
+        }
+        let envvar = envvar_vec.into_bump_slice();
+        let require = require_vec.into_bump_slice();
+
+        // Copy cache config if present
+        let cache = tc.cache.as_ref().map(|c| {
+            let mut key_vec = bumpalo::collections::Vec::new_in(bump);
+            for input in c.key {
+                match input {
+                    CacheKeyInput::Modified(path) => {
+                        key_vec.push(CacheKeyInput::Modified(bump.alloc_str(path)));
+                    }
+                    CacheKeyInput::ProfileChanged(task) => {
+                        key_vec.push(CacheKeyInput::ProfileChanged(bump.alloc_str(task)));
+                    }
+                }
+            }
+            CacheConfig { key: key_vec.into_bump_slice() }
+        });
+
+        // The data is now in the bump, use unsafe to extend lifetimes
+        unsafe {
+            alloc.0 = TaskConfig {
+                kind: TaskKind::Action,
+                pwd: std::mem::transmute::<&str, &'static str>(pwd),
+                command: std::mem::transmute::<Command<'_>, Command<'static>>(command),
+                profiles: &["default"],
+                envvar: std::mem::transmute::<&[(&str, &str)], &'static [(&'static str, &'static str)]>(envvar),
+                require: std::mem::transmute::<&[Alias<'_>], &'static [Alias<'static>]>(require),
+                cache: std::mem::transmute::<Option<CacheConfig<'_>>, Option<CacheConfig<'static>>>(cache),
+            };
+        }
+        TaskConfigRc(new)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -80,6 +154,29 @@ pub struct TaskConfig<'a> {
     pub envvar: &'a [(&'a str, &'a str)],
     pub require: &'a [Alias<'a>],
     pub cache: Option<CacheConfig<'a>>,
+}
+
+/// Evaluated test configuration (runtime form).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TestConfig<'a> {
+    pub pwd: &'a str,
+    pub command: Command<'a>,
+    pub envvar: &'a [(&'a str, &'a str)],
+    pub require: &'a [Alias<'a>],
+    pub tags: &'a [&'a str],
+    pub cache: Option<CacheConfig<'a>>,
+}
+
+/// Thread-safe reference-counted wrapper for evaluated test config.
+#[derive(Clone)]
+pub struct TestConfigRc(Arc<(TestConfig<'static>, Bump)>);
+unsafe impl Send for TestConfigRc {}
+unsafe impl Sync for TestConfigRc {}
+
+impl TestConfigRc {
+    pub fn config<'a>(&'a self) -> &'a TestConfig<'a> {
+        unsafe { std::mem::transmute::<&'a TestConfig<'static>, &'a TestConfig<'a>>(&self.0.0) }
+    }
 }
 
 pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
@@ -137,10 +234,13 @@ pub fn load_workspace_config_leaking(
 pub struct WorkspaceConfig<'a> {
     pub base_path: &'a Path,
     pub tasks: &'a [(&'a str, TaskConfigExpr<'a>)],
+    /// Tests stored as (name, variants) where variants is an array of test configs.
+    /// Single tests `[test.name]` have one variant, arrays `[[test.name]]` have multiple.
+    pub tests: &'a [(&'a str, &'a [TestConfigExpr<'a>])],
     pub groups: &'a [(&'a str, &'a [TaskCall<'a>])],
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CommandExpr<'a> {
     Cmd(StringListExpr<'a>),
     Sh(StringExpr<'a>),
@@ -156,6 +256,38 @@ pub struct TaskConfigExpr<'a> {
     envvar: &'a [(&'a str, StringExpr<'a>)],
     require: AliasListExpr<'a>,
     pub cache: Option<CacheConfig<'a>>,
+    /// Tags for test filtering. Empty for non-test tasks.
+    pub tags: &'a [&'a str],
+}
+
+/// Test configuration expression (parsed form, not yet evaluated).
+#[derive(Debug)]
+pub struct TestConfigExpr<'a> {
+    pub info: &'a str,
+    pwd: StringExpr<'a>,
+    command: CommandExpr<'a>,
+    envvar: &'a [(&'a str, StringExpr<'a>)],
+    require: AliasListExpr<'a>,
+    pub tags: &'a [&'a str],
+    pub cache: Option<CacheConfig<'a>>,
+}
+
+impl TestConfigExpr<'static> {
+    /// Converts this test config to a TaskConfigExpr with kind=Test.
+    /// The result is leaked and valid for 'static lifetime.
+    pub fn to_task_config_expr(&self) -> &'static TaskConfigExpr<'static> {
+        Box::leak(Box::new(TaskConfigExpr {
+            kind: TaskKind::Test,
+            info: self.info,
+            pwd: self.pwd.clone(),
+            command: self.command.clone(),
+            profiles: &[],
+            envvar: self.envvar,
+            require: self.require.clone(),
+            cache: self.cache.clone(),
+            tags: self.tags,
+        }))
+    }
 }
 
 pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
@@ -171,6 +303,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         envvar: &[],
         require: AliasListExpr::List(&[]),
         cache: None,
+        tags: &[],
     }
 };
 
@@ -231,6 +364,53 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
             require: self.require.bump_eval(env, bump)?,
             cache: self.cache.clone(),
             profiles: self.profiles,
+            envvar: if self.envvar.is_empty() {
+                &[]
+            } else {
+                let mut result = bumpalo::collections::Vec::new_in(bump);
+                for (key, value_expr) in self.envvar.iter() {
+                    let value = value_expr.bump_eval(env, bump)?;
+                    result.push((*key, value));
+                }
+                result.into_bump_slice()
+            },
+        })
+    }
+}
+
+impl TestConfigExpr<'static> {
+    pub fn eval(&self, env: &Enviroment) -> Result<TestConfigRc, EvalError> {
+        let mut new = Arc::new((
+            TestConfig {
+                pwd: "",
+                command: Command::Cmd(&[]),
+                require: &[],
+                tags: &[],
+                cache: None,
+                envvar: &[],
+            },
+            Bump::new(),
+        ));
+        let alloc = Arc::get_mut(&mut new).unwrap();
+        {
+            let evaluated = self.bump_eval(env, &alloc.1)?;
+            unsafe {
+                alloc.0 = std::mem::transmute::<TestConfig<'_>, TestConfig<'static>>(evaluated);
+            }
+        }
+        Ok(TestConfigRc(new))
+    }
+}
+
+impl<'a> BumpEval<'a> for TestConfigExpr<'static> {
+    type Object = TestConfig<'a>;
+    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<TestConfig<'a>, EvalError> {
+        Ok(TestConfig {
+            pwd: self.pwd.bump_eval(env, bump)?,
+            command: self.command.bump_eval(env, bump)?,
+            require: self.require.bump_eval(env, bump)?,
+            tags: self.tags,
+            cache: self.cache.clone(),
             envvar: if self.envvar.is_empty() {
                 &[]
             } else {
@@ -380,7 +560,7 @@ fn eval_append_str<'a>(
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum Predicate<'a> {
     Profile(&'a str),
 }
@@ -392,14 +572,14 @@ impl<'a> Predicate<'a> {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 struct If<'a, T> {
     cond: Predicate<'a>,
     then: T,
     or_else: Option<T>,
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum StringExpr<'a> {
     Literal(&'a str),
     Var(&'a str),
@@ -423,7 +603,7 @@ impl<'a, T: BumpEval<'a>> BumpEval<'a> for If<'a, T> {
     }
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum StringListExpr<'a> {
     Literal(&'a str),
     List(&'a [StringListExpr<'a>]),
@@ -431,7 +611,7 @@ enum StringListExpr<'a> {
     If(&'a If<'a, StringListExpr<'a>>),
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum AliasListExpr<'a> {
     Literal(Alias<'a>),
     List(&'a [AliasListExpr<'a>]),

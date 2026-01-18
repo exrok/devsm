@@ -25,6 +25,7 @@ mod log_storage;
 mod process_manager;
 mod scroll_view;
 mod searcher;
+mod test_forwarder;
 mod tui;
 mod user_config;
 mod workspace;
@@ -67,7 +68,83 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::Test { filters } => {
+            let _log_guard = kvlog::collector::init_file_logger("/tmp/.client.devsm.log");
+            if let Err(err) = test_client(filters) {
+                eprintln!("test failed: {}", err);
+                std::process::exit(1);
+            }
+        }
     }
+}
+
+fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
+    reset_terminal_to_canonical();
+
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    setup_signal_handler(libc::SIGTERM, term_handler)?;
+    setup_signal_handler(libc::SIGINT, term_handler)?;
+
+    let mut socket = connect_or_spawn_daemon()?;
+
+    // Convert filters to TestFilters for IPC
+    let mut include_tags = Vec::new();
+    let mut exclude_tags = Vec::new();
+    let mut include_names = Vec::new();
+    for filter in &filters {
+        match filter {
+            cli::TestFilter::IncludeTag(tag) => include_tags.push(*tag),
+            cli::TestFilter::ExcludeTag(tag) => exclude_tags.push(*tag),
+            cli::TestFilter::IncludeName(name) => include_names.push(*name),
+        }
+    }
+
+    let test_filters = daemon::TestFilters {
+        include_tags,
+        exclude_tags,
+        include_names,
+    };
+
+    socket.send_with_fd(
+        &jsony::to_binary(&daemon::RequestMessage {
+            cwd: &cwd,
+            request: daemon::Request::AttachTests { config: &config, filters: test_filters },
+        }),
+        &[0, 1],
+    )?;
+
+    let mut buf = [0u8; 4];
+    let mut has_failures = false;
+
+    loop {
+        let flags = SIGNAL_FLAGS.swap(0, Ordering::Relaxed);
+
+        if flags & TERMINATION_FLAG != 0 {
+            socket.write_all(&TERMINATION_CODE.to_ne_bytes())?;
+        }
+
+        match socket.read(&mut buf) {
+            Ok(0) => break,
+            Ok(4) => {
+                let code = u32::from_ne_bytes(buf);
+                if code == TERMINATION_CODE {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => bail!("Socket read failed: {}", e),
+        }
+    }
+
+    if has_failures {
+        std::process::exit(1);
+    }
+
+    Ok(())
 }
 
 const RESIZE_CODE: u32 = 0x85_06_09_44;

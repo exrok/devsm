@@ -11,7 +11,7 @@ use toml_span::{
 
 use crate::config::{
     Alias, AliasListExpr, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, StringExpr, StringListExpr,
-    TaskCall, TaskConfigExpr, TaskKind, WorkspaceConfig,
+    TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, WorkspaceConfig,
 };
 
 fn mismatched_in_object(report_error: &mut dyn FnMut(Diagnostic<usize>), expected: &str, found: &TomlValue, key: &str) {
@@ -362,6 +362,164 @@ fn parse_task<'a>(
         envvar: envvar_vec.into_bump_slice(),
         require,
         cache,
+        tags: &[],
+    })
+}
+
+/// Parse cache config from a table (shared between tasks and tests).
+fn parse_cache_config<'a>(
+    alloc: &'a Bump,
+    cache_table: &Table<'a>,
+    re: &mut dyn FnMut(Diagnostic<usize>),
+) -> Result<CacheConfig<'a>, ()> {
+    let mut key_inputs = bumpalo::collections::Vec::new_in(alloc);
+    if let Some(key_value) = cache_table.get("key") {
+        let Some(key_array) = key_value.as_array() else {
+            mismatched_in_object(re, "array", key_value, "key");
+            return Err(());
+        };
+        for item in key_array {
+            let Some(item_table) = item.as_table() else {
+                mismatched_in_object(re, "table", item, "cache key input");
+                return Err(());
+            };
+            if let Some(modified_val) = item_table.get("modified") {
+                let Some(path) = modified_val.as_str() else {
+                    mismatched_in_object(re, "string", modified_val, "modified");
+                    return Err(());
+                };
+                key_inputs.push(CacheKeyInput::Modified(alloc.alloc_str(path)));
+            } else if let Some(profile_val) = item_table.get("profile_changed") {
+                let Some(task_name) = profile_val.as_str() else {
+                    mismatched_in_object(re, "string", profile_val, "profile_changed");
+                    return Err(());
+                };
+                key_inputs.push(CacheKeyInput::ProfileChanged(alloc.alloc_str(task_name)));
+            } else {
+                re(Diagnostic::error()
+                    .with_message("cache key input must have either `modified` or `profile_changed`")
+                    .with_label(Label::primary(0, item.span)));
+                return Err(());
+            }
+        }
+    }
+    Ok(CacheConfig { key: key_inputs.into_bump_slice() })
+}
+
+/// Parse a test configuration from a TOML table.
+/// Tests have: cmd/sh, pwd, env, require, tag, cache (optional).
+fn parse_test<'a>(
+    alloc: &'a Bump,
+    _name: &'a str,
+    test_table: &Table<'a>,
+    re: &mut dyn FnMut(Diagnostic<usize>),
+) -> Result<TestConfigExpr<'a>, ()> {
+    let mut pwd = StringExpr::Literal("./");
+    let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
+    let mut require = AliasListExpr::List(&[]);
+    let mut tags_vec = bumpalo::collections::Vec::new_in(alloc);
+    let mut cache: Option<CacheConfig<'a>> = None;
+    let mut info = "";
+    let mut cmd: Option<StringListExpr> = None;
+    let mut sh: Option<StringExpr> = None;
+
+    for (key, value) in test_table.iter() {
+        let key_str = key.name.as_ref();
+        match key_str {
+            "pwd" => {
+                pwd = parse_string_expr(alloc, value, re)?;
+            }
+            "cmd" => {
+                cmd = Some(parse_string_list_expr(alloc, value, re)?);
+            }
+            "sh" => {
+                sh = Some(parse_string_expr(alloc, value, re)?);
+            }
+            "env" => {
+                let Some(env_table) = value.as_table() else {
+                    mismatched_in_object(re, "table", value, "env");
+                    return Err(());
+                };
+                envvar_vec.clear();
+                for (env_key, env_value) in env_table.iter() {
+                    let key_str = alloc.alloc_str(env_key.name.as_ref()) as &str;
+                    let val_expr = parse_string_expr(alloc, env_value, re)?;
+                    envvar_vec.push((key_str, val_expr));
+                }
+            }
+            "require" => {
+                require = parse_alias_list_expr(alloc, value, re)?;
+            }
+            "tag" => {
+                // Tag can be a single string or an array of strings
+                match &value.value {
+                    ValueInner::String(s) => {
+                        tags_vec.push(alloc.alloc_str(as_str(s)) as &str);
+                    }
+                    ValueInner::Array(arr) => {
+                        for item in arr {
+                            let Some(s) = item.as_str() else {
+                                mismatched_in_object(re, "string", item, "tag");
+                                return Err(());
+                            };
+                            tags_vec.push(alloc.alloc_str(s) as &str);
+                        }
+                    }
+                    _ => {
+                        mismatched_in_object(re, "string or array", value, "tag");
+                        return Err(());
+                    }
+                }
+            }
+            "cache" => {
+                let Some(cache_table) = value.as_table() else {
+                    mismatched_in_object(re, "table", value, "cache");
+                    return Err(());
+                };
+                cache = Some(parse_cache_config(alloc, cache_table, re)?);
+            }
+            "info" => {
+                let Some(s) = value.as_str() else {
+                    mismatched_in_object(re, "string", value, "info");
+                    return Err(());
+                };
+                info = alloc.alloc_str(s);
+            }
+            _ => {
+                re(Diagnostic::error()
+                    .with_message(format_args!("unknown key `{}` in test definition", key_str))
+                    .with_label(Label::primary(0, value.span)));
+                return Err(());
+            }
+        }
+    }
+
+    // Validate that exactly one of cmd or sh is specified
+    let command = match (cmd, sh) {
+        (Some(cmd), None) => CommandExpr::Cmd(cmd),
+        (None, Some(sh)) => CommandExpr::Sh(sh),
+        (Some(_), Some(_)) => {
+            re(Diagnostic::error()
+                .with_message("fields `cmd` and `sh` are mutually exclusive")
+                .with_label(Label::primary(0, 0..0)));
+            return Err(());
+        }
+        (None, None) => {
+            re(Diagnostic::error()
+                .with_message("either `cmd` or `sh` field is required")
+                .with_label(Label::primary(0, 0..0)));
+            return Err(());
+        }
+    };
+
+    Ok(TestConfigExpr {
+        info,
+        pwd,
+        command,
+        envvar: envvar_vec.into_bump_slice(),
+        require,
+        tags: tags_vec.into_bump_slice(),
+        cache,
     })
 }
 
@@ -452,6 +610,7 @@ pub fn parse<'a>(
     let root = value.as_table().unwrap();
 
     let mut tasks_vec = bumpalo::collections::Vec::new_in(alloc);
+    let mut tests_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut groups_vec = bumpalo::collections::Vec::new_in(alloc);
 
     // Parse [action.*] tables
@@ -496,9 +655,41 @@ pub fn parse<'a>(
         }
     }
 
+    // Parse [test.*] tables - handles both single [test.name] and [[test.name]] arrays
+    if let Some(test_table) = table(root, "test", re)? {
+        for (name, test_value) in test_table.iter() {
+            let name_str = alloc.alloc_str(name.name.as_ref()) as &str;
+            match &test_value.value {
+                // Single test: [test.name]
+                ValueInner::Table(single_test_table) => {
+                    let test = parse_test(alloc, name_str, single_test_table, re)?;
+                    let test_slice = std::slice::from_ref(alloc.alloc(test));
+                    tests_vec.push((name_str, test_slice));
+                }
+                // Array of tests: [[test.name]]
+                ValueInner::Array(arr) => {
+                    let mut test_array = bumpalo::collections::Vec::new_in(alloc);
+                    for item in arr {
+                        let Some(item_table) = item.as_table() else {
+                            mismatched_in_object(re, "table", item, name.name.as_ref());
+                            return Err(());
+                        };
+                        test_array.push(parse_test(alloc, name_str, item_table, re)?);
+                    }
+                    tests_vec.push((name_str, test_array.into_bump_slice()));
+                }
+                _ => {
+                    mismatched_in_object(re, "table or array", test_value, name.name.as_ref());
+                    return Err(());
+                }
+            }
+        }
+    }
+
     Ok(WorkspaceConfig {
         base_path: alloc.alloc(std::path::Path::new(".")) as &std::path::Path,
         tasks: tasks_vec.into_bump_slice(),
+        tests: tests_vec.into_bump_slice(),
         groups: groups_vec.into_bump_slice(),
     })
 }

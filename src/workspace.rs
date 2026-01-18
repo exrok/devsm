@@ -1,5 +1,9 @@
 use crate::{
-    config::{CARGO_AUTO_EXPR, CacheKeyInput, Enviroment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig},
+    cli::TestFilter,
+    config::{
+        CARGO_AUTO_EXPR, CacheKeyInput, Command, Enviroment, TaskConfigExpr, TaskConfigRc, TaskKind, TestConfigExpr,
+        TestConfigRc, WorkspaceConfig,
+    },
     log_storage::{JobLogCorrelation, LogId, Logs},
     process_manager::MioChannel,
 };
@@ -175,6 +179,7 @@ impl LatestConfig {
         for base_task in base_tasks.iter_mut() {
             base_task.removed = true;
         }
+        // Add regular tasks (actions and services)
         for (name, config) in self.current.tasks {
             match name_map.entry(name) {
                 std::collections::hash_map::Entry::Occupied(occupied_entry) => {
@@ -192,11 +197,54 @@ impl LatestConfig {
                         jobs: JobIndexList::default(),
                         profile_change_counter: 0,
                         last_profile: None,
+                        test_info: None,
                     });
                 }
             }
         }
+        // Add tests - each variant becomes a separate base task
+        for (base_name, variants) in self.current.tests {
+            for (variant_index, config) in variants.iter().enumerate() {
+                // Generate unique name: "~test:name" for single variant, "~test:name:0" for multiple
+                let task_name: &'static str = if variants.len() == 1 {
+                    format!("~test:{}", base_name).leak()
+                } else {
+                    format!("~test:{}:{}", base_name, variant_index).leak()
+                };
+                let task_config = config.to_task_config_expr();
+                let test_info = Some(TestInfo { base_name, variant_index: variant_index as u32 });
+
+                match name_map.entry(task_name) {
+                    std::collections::hash_map::Entry::Occupied(occupied_entry) => {
+                        let base_task = &mut base_tasks[*occupied_entry.get()];
+                        base_task.removed = false;
+                        base_task.config = task_config;
+                        base_task.test_info = test_info;
+                    }
+                    std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                        vacant_entry.insert(base_tasks.len());
+                        base_tasks.push(BaseTask {
+                            name: task_name,
+                            config: task_config,
+                            removed: false,
+                            last_spawn: None,
+                            jobs: JobIndexList::default(),
+                            profile_change_counter: 0,
+                            last_profile: None,
+                            test_info,
+                        });
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Test-specific metadata for base tasks that are tests.
+pub struct TestInfo {
+    /// The test group name (e.g., "frontend" for test variant "frontend:0").
+    pub base_name: &'static str,
+    pub variant_index: u32,
 }
 
 pub struct BaseTask {
@@ -210,6 +258,8 @@ pub struct BaseTask {
     pub profile_change_counter: u32,
     /// The profile used for the last spawn (for tracking profile changes).
     pub last_profile: Option<String>,
+    /// Test-specific metadata. Present only for tests (kind == Test).
+    pub test_info: Option<TestInfo>,
 }
 
 impl BaseTask {
@@ -229,6 +279,68 @@ impl BaseTask {
     }
 }
 
+/// Status of a test job execution.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TestJobStatus {
+    Pending,
+    Running,
+    Passed,
+    Failed(i32),
+}
+
+/// A single test job within a test run.
+pub struct TestJob {
+    /// Index into base_tasks for this test.
+    pub base_task_index: usize,
+    pub job_index: JobIndex,
+    pub status: TestJobStatus,
+}
+
+impl TestJob {
+    /// Returns the display name for this test.
+    pub fn display_name(&self, base_tasks: &[BaseTask]) -> String {
+        let base_task = &base_tasks[self.base_task_index];
+        let Some(test_info) = &base_task.test_info else {
+            return base_task.name.to_string();
+        };
+
+        let env = Enviroment { profile: "", param: jsony_value::ValueMap::new() };
+        let cmd_preview = match base_task.config.eval(&env) {
+            Ok(task_config) => {
+                let cmd = task_config.config();
+                match &cmd.command {
+                    Command::Cmd(args) => args.first().copied().unwrap_or("").to_string(),
+                    Command::Sh(script) => {
+                        if script.len() > 40 {
+                            script[..40].to_string()
+                        } else {
+                            script.to_string()
+                        }
+                    }
+                }
+            }
+            Err(_) => String::new(),
+        };
+        let is_single = !base_tasks.iter().any(|bt| {
+            bt.test_info
+                .as_ref()
+                .is_some_and(|ti| ti.base_name == test_info.base_name && ti.variant_index != test_info.variant_index)
+        });
+        if is_single {
+            format!("{}: {}", test_info.base_name, cmd_preview)
+        } else {
+            format!("{}[{}]: {}", test_info.base_name, test_info.variant_index, cmd_preview)
+        }
+    }
+}
+
+/// Tracks the state of a test run (multiple tests executed together).
+pub struct TestRun {
+    pub run_id: u32,
+    pub started_at: Instant,
+    pub test_jobs: Vec<TestJob>,
+}
+
 /// Stores that state of the current workspace including:
 /// - Past running tasks
 /// - Current running tasks
@@ -239,6 +351,7 @@ pub struct WorkspaceState {
     pub change_number: u32,
     pub name_map: std::collections::HashMap<&'static str, usize>,
     pub jobs: Vec<Job>,
+    pub active_test_run: Option<TestRun>,
 }
 
 impl WorkspaceState {
@@ -296,6 +409,7 @@ impl WorkspaceState {
                 jobs: JobIndexList::default(),
                 profile_change_counter: 0,
                 last_profile: None,
+                test_info: None,
             });
             self.name_map.insert("~cargo", index);
             return Some(index);
@@ -345,11 +459,11 @@ impl WorkspaceState {
                 kvlog::error!("unknown alias", dep_alias);
                 continue;
             };
-            let dep_config = self.base_tasks[dep_base_task].config;
+            let dep_config = &self.base_tasks[dep_base_task].config;
 
             match dep_config.kind {
                 TaskKind::Action => {
-                    let Some(cache_config) = &dep_config.cache else {
+                    let Some(cache_config) = dep_config.cache.as_ref() else {
                         let new_job =
                             self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
                         pred.push(ScheduleRequirement {
@@ -399,6 +513,9 @@ impl WorkspaceState {
                     }
                     let new_job = self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
                     pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
+                }
+                TaskKind::Test => {
+                    // Tests cannot be dependencies of other tasks
                 }
             }
         }
@@ -454,25 +571,25 @@ impl WorkspaceState {
     #[track_caller]
     pub fn update_job_status(&mut self, job_index: JobIndex, status: JobStatus) {
         let job = &mut self.jobs[job_index.idx()];
-        let bt = &mut self.base_tasks[job.job_id.base_task_index() as usize];
+        let job_id = job.job_id;
+        let jobs_list = &mut self.base_tasks[job_id.base_task_index() as usize].jobs;
 
         use JobStatus as S;
         match (&job.process_status, &status) {
             (S::Scheduled { .. }, S::Cancelled) => {
-                bt.jobs.set_terminal(job_index);
+                jobs_list.set_terminal(job_index);
             }
             (S::Starting, S::Cancelled) => {
-                // todo maybe we need to do something here
-                bt.jobs.set_terminal(job_index);
+                jobs_list.set_terminal(job_index);
             }
             (S::Running { .. }, S::Cancelled) => {
-                bt.jobs.set_terminal(job_index);
+                jobs_list.set_terminal(job_index);
             }
             (S::Scheduled { .. }, S::Starting {}) => {
-                bt.jobs.set_active(job_index);
+                jobs_list.set_active(job_index);
             }
             (S::Running { .. }, S::Exited { .. }) => {
-                bt.jobs.set_terminal(job_index);
+                jobs_list.set_terminal(job_index);
             }
             (S::Starting, S::Running { .. }) => {}
             (prev, to) => {
@@ -493,7 +610,14 @@ impl WorkspaceState {
         let mut base_tasks = Vec::new();
         let mut name_map = std::collections::HashMap::new();
         config.update_base_tasks(&mut base_tasks, &mut name_map);
-        Ok(WorkspaceState { change_number: 0, config, name_map, base_tasks, jobs: Vec::new() })
+        Ok(WorkspaceState {
+            change_number: 0,
+            config,
+            name_map,
+            base_tasks,
+            jobs: Vec::new(),
+            active_test_run: None,
+        })
     }
 
     /// Brute force scheduling useful testing will provided an optimized alternative later
@@ -608,6 +732,222 @@ impl Workspace {
             job_id,
         });
     }
+
+    /// Starts a test run with the given filters.
+    /// Returns the test run containing all scheduled test jobs.
+    pub fn start_test_run(&self, filters: &[TestFilter]) -> TestRun {
+        let state = &mut *self.state.write().unwrap();
+        state.change_number = state.change_number.wrapping_add(1);
+        let log_start = self.logs.read().unwrap().tail();
+
+        let run_id = state.active_test_run.as_ref().map_or(0, |r| r.run_id + 1);
+
+        // First pass: collect matching tests from base_tasks where kind=Test
+        struct MatchedTest {
+            base_task_idx: usize,
+            base_name: &'static str,
+            task_config: TaskConfigRc,
+        }
+        let mut matched_tests = Vec::new();
+        for (base_task_idx, base_task) in state.base_tasks.iter().enumerate() {
+            if base_task.removed {
+                continue;
+            }
+            let Some(test_info) = &base_task.test_info else {
+                continue;
+            };
+            let tags = base_task.config.tags;
+            if !matches_test_filters(test_info.base_name, tags, filters) {
+                continue;
+            }
+            let env = Enviroment { profile: "", param: ValueMap::new() };
+            let Ok(task_config) = base_task.config.eval(&env) else {
+                kvlog::error!("Failed to evaluate test config", name = base_task.name);
+                continue;
+            };
+            matched_tests.push(MatchedTest { base_task_idx, base_name: test_info.base_name, task_config });
+        }
+
+        // Second pass: create jobs for matched tests
+        let mut test_jobs = Vec::new();
+        for matched in matched_tests {
+            let task_config = matched.task_config;
+
+            // Get require list as owned strings to avoid borrow issues
+            let requires: Vec<String> = task_config
+                .config()
+                .require
+                .iter()
+                .map(|a| (**a).to_string())
+                .collect();
+
+            // Build requirements from test dependencies
+            let mut pred = Vec::new();
+            for dep_alias in &requires {
+                if let Some(&dep_base_task) = state.name_map.get(dep_alias.as_str()) {
+                    let dep_config = &state.base_tasks[dep_base_task].config;
+                    match dep_config.kind {
+                        TaskKind::Action => {
+                            if let Some(cache_config) = dep_config.cache.as_ref() {
+                                let expected_cache_key = state.compute_cache_key(cache_config.key);
+                                let spawner = &state.base_tasks[dep_base_task];
+                                let mut found_cached = false;
+                                for ji in spawner.jobs.all().iter().rev() {
+                                    let job = &state.jobs[ji.idx()];
+                                    if matches!(job.process_status, JobStatus::Cancelled) {
+                                        continue;
+                                    }
+                                    if job.process_status.is_successful_completion() {
+                                        if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
+                                            found_cached = true;
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                                if found_cached {
+                                    continue;
+                                }
+                            }
+                            let new_job = state.spawn_task(
+                                self.workspace_id,
+                                &self.process_channel,
+                                dep_base_task,
+                                log_start,
+                                ValueMap::new(),
+                                "",
+                            );
+                            pred.push(ScheduleRequirement {
+                                job: new_job,
+                                predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                            });
+                        }
+                        TaskKind::Service => {
+                            let spawner = &state.base_tasks[dep_base_task];
+                            let mut found_running = false;
+                            for &ji in spawner.jobs.running() {
+                                pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
+                                found_running = true;
+                                break;
+                            }
+                            if !found_running {
+                                let new_job = state.spawn_task(
+                                    self.workspace_id,
+                                    &self.process_channel,
+                                    dep_base_task,
+                                    log_start,
+                                    ValueMap::new(),
+                                    "",
+                                );
+                                pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
+                            }
+                        }
+                        TaskKind::Test => {
+                            // Tests cannot be dependencies of other tests
+                        }
+                    }
+                }
+            }
+
+            // Compute cache key before getting mutable borrow
+            let cache_key =
+                task_config.config().cache.as_ref().map_or(String::new(), |c| state.compute_cache_key(c.key));
+
+            // Create job - use standard job_id encoding since tests are now in base_tasks
+            let job_index = JobIndex(state.jobs.len() as u32);
+            let base_task = &mut state.base_tasks[matched.base_task_idx];
+            let pc = base_task.jobs.len();
+            let job_id = JobLogCorrelation((pc.wrapping_shl(12) as u32) | matched.base_task_idx as u32);
+
+            let spawn = pred.is_empty();
+            if spawn {
+                base_task.jobs.push_active(job_index);
+            } else {
+                base_task.jobs.push_scheduled(job_index);
+            }
+
+            state.jobs.push(Job {
+                process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
+                job_id,
+                task: task_config.clone(),
+                started_at: Instant::now(),
+                log_start,
+                cache_key,
+            });
+
+            test_jobs.push(TestJob {
+                base_task_index: matched.base_task_idx,
+                job_index,
+                status: TestJobStatus::Pending,
+            });
+
+            if spawn {
+                self.process_channel.send(crate::process_manager::ProcessRequest::Spawn {
+                    task: task_config,
+                    job_index,
+                    workspace_id: self.workspace_id,
+                    job_id,
+                });
+            }
+        }
+
+        let test_run = TestRun { run_id, started_at: Instant::now(), test_jobs };
+        state.active_test_run = Some(TestRun {
+            run_id: test_run.run_id,
+            started_at: test_run.started_at,
+            test_jobs: Vec::new(),
+        });
+
+        test_run
+    }
+}
+
+/// Checks if a test matches the given filters.
+/// Filter logic:
+/// - `-tag`: Absolute exclusion (applied first)
+/// - `+tag`: Include tests with this tag (OR combined)
+/// - `name`: Include tests with this name (OR combined)
+/// - If no inclusion filters, include all (minus exclusions)
+fn matches_test_filters(name: &str, tags: &[&str], filters: &[TestFilter]) -> bool {
+    let mut has_include_filters = false;
+    let mut included = false;
+
+    // Check exclusions first (absolute)
+    for filter in filters {
+        if let TestFilter::ExcludeTag(exclude_tag) = filter {
+            if tags.contains(exclude_tag) {
+                return false;
+            }
+        }
+    }
+
+    // Check inclusions (OR combined)
+    for filter in filters {
+        match filter {
+            TestFilter::IncludeName(include_name) => {
+                has_include_filters = true;
+                if name == *include_name {
+                    included = true;
+                }
+            }
+            TestFilter::IncludeTag(include_tag) => {
+                has_include_filters = true;
+                if tags.contains(include_tag) {
+                    included = true;
+                }
+            }
+            TestFilter::ExcludeTag(_) => {
+                // Already handled above
+            }
+        }
+    }
+
+    // If no inclusion filters, include all (that weren't excluded)
+    if !has_include_filters {
+        return true;
+    }
+
+    included
 }
 
 #[cfg(test)]

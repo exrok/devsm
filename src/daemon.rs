@@ -45,6 +45,15 @@ pub enum WorkspaceCommand<'a> {
     Run { name: Box<str>, params: ValueMap<'a> },
 }
 
+/// Filters for test selection (serializable for IPC).
+#[derive(Jsony, Debug, Clone, Default)]
+#[jsony(Binary)]
+pub struct TestFilters<'a> {
+    pub include_tags: Vec<&'a str>,
+    pub exclude_tags: Vec<&'a str>,
+    pub include_names: Vec<&'a str>,
+}
+
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub enum Request<'a> {
@@ -62,6 +71,11 @@ pub enum Request<'a> {
         config: &'a Path,
         name: Box<str>,
         params: ValueMap<'a>,
+    },
+    AttachTests {
+        #[jsony(with = unix_path)]
+        config: &'a Path,
+        filters: TestFilters<'a>,
     },
 }
 
@@ -138,6 +152,19 @@ fn handle_request(
                 workspace_config: config.into(),
                 task_name: name,
                 params: jsony::to_binary(&params),
+            });
+        }
+        Request::AttachTests { config, filters } => {
+            kvlog::info!("Receiving FD for test command");
+            if fds.len() != 2 {
+                bail!("Expected 2 FD's found only one");
+            }
+            pm.request.send(crate::process_manager::ProcessRequest::AttachTestRun {
+                stdin: fds.pop_front().unwrap(),
+                stdout: fds.pop_front().unwrap(),
+                socket,
+                workspace_config: config.into(),
+                filters: jsony::to_binary(&filters),
             });
         }
     }

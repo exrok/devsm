@@ -28,7 +28,7 @@ impl StatusKind {
                 if *status == 0 {
                     match kind {
                         TaskKind::Service => StatusKind::Dead,
-                        TaskKind::Action => StatusKind::Done,
+                        TaskKind::Action | TaskKind::Test => StatusKind::Done,
                     }
                 } else {
                     StatusKind::Fail

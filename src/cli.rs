@@ -79,6 +79,18 @@ pub enum Command<'a> {
     Restart { job: &'a str, value_map: ValueMap<'a> },
     Exec { job: &'a str, value_map: ValueMap<'a> },
     Run { job: &'a str, value_map: ValueMap<'a> },
+    Test { filters: Vec<TestFilter<'a>> },
+}
+
+/// Filter for test selection.
+/// - `+tag`: Include tests with this tag (OR combined with other includes)
+/// - `-tag`: Exclude tests with this tag (absolute exclusion, applied first)
+/// - `name`: Include tests with this name (OR combined with other includes)
+#[derive(Debug, Clone)]
+pub enum TestFilter<'a> {
+    IncludeTag(&'a str),
+    ExcludeTag(&'a str),
+    IncludeName(&'a str),
 }
 
 /// Parses a job name and parameters from remaining arguments.
@@ -136,6 +148,45 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     Ok(Command::Run { job, value_map })
 }
 
+/// Parse test filters from remaining arguments.
+/// - `+tag` includes tests with tag
+/// - `-tag` excludes tests with tag
+/// - `name` includes tests with name
+fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let mut filters = Vec::new();
+    while let Some(component) = parser.next() {
+        match component {
+            Component::Term(arg) => {
+                if let Some(tag) = arg.strip_prefix('+') {
+                    filters.push(TestFilter::IncludeTag(tag));
+                } else if let Some(tag) = arg.strip_prefix('-') {
+                    filters.push(TestFilter::ExcludeTag(tag));
+                } else {
+                    filters.push(TestFilter::IncludeName(arg));
+                }
+            }
+            Component::Long(long) => {
+                bail!("Unexpected flag --{} in test command", long);
+            }
+            Component::Flags(flags) => {
+                // Check if this is actually a negative tag filter (e.g., -slow)
+                // Single-character flags starting with a letter are treated as exclude tags
+                if !flags.is_empty() && flags.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
+                    filters.push(TestFilter::ExcludeTag(flags));
+                } else {
+                    for flag in flags.chars() {
+                        bail!("Unknown flag -{}", flag);
+                    }
+                }
+            }
+            Component::Value(val) => {
+                bail!("Unexpected value: {:?}", val);
+            }
+        }
+    }
+    Ok(Command::Test { filters })
+}
+
 pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Command<'a>)> {
     let mut parser = ArgParser::new(args);
     let mut global = GlobalArguments { from: None };
@@ -172,6 +223,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                 "restart" => break 'command parse_restart(&mut parser)?,
                 "exec" => break 'command parse_exec(&mut parser)?,
                 "run" => break 'command parse_run(&mut parser)?,
+                "test" => break 'command parse_test_filters(&mut parser)?,
                 unknown_command => bail!("Unknown Command: {:?}", unknown_command),
             },
         }
