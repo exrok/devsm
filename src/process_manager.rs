@@ -1,9 +1,13 @@
+use crate::config::TaskConfigRc;
 use crate::line_width::Segment;
 use crate::line_width::apply_raw_display_mode_vt_to_style;
 use crate::log_storage;
 use crate::log_storage::JobId;
 use crate::log_storage::LogWriter;
 use crate::log_storage::Logs;
+use crate::workspace::Job;
+use crate::workspace::Workspace;
+use crate::workspace::WorkspaceState;
 use anyhow::Context;
 use mio::Events;
 use mio::Interest;
@@ -11,15 +15,24 @@ use mio::Poll;
 use mio::Token;
 use mio::Waker;
 use mio::unix::SourceFd;
+use slab::Slab;
+use std::collections::HashMap;
+use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
+use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicU64;
 use unicode_width::UnicodeWidthStr;
 use vtui::Style;
 
@@ -28,10 +41,17 @@ pub(crate) enum Pipe {
     Stdout,
     Stderr,
 }
+impl Pipe {
+    fn of(task: ProcessIndex) -> TaskPipe {
+        TaskPipe((task as u32) << 1)
+    }
+}
 
+type WorkspaceIndex = u32;
 pub(crate) struct ActiveProcess {
     // active stdout
     pub(crate) job_id: JobId,
+    pub(crate) workspace_index: WorkspaceIndex,
     pub(crate) alive: bool,
     pub(crate) stdout_buffer: Option<Buffer>,
     pub(crate) stderr_buffer: Option<Buffer>,
@@ -67,19 +87,6 @@ pub(crate) struct Buffer {
 
 pub(crate) type ProcessIndex = usize;
 
-pub(crate) fn process_from_token(token: Token) -> Option<(usize, Pipe)> {
-    if token.0 >= 1 << 24 {
-        return None;
-    }
-    let index = token.0 >> 1;
-    let pipe = if (token.0 & 1) == 0 {
-        Pipe::Stdout
-    } else {
-        Pipe::Stderr
-    };
-    Some((index as usize, pipe))
-}
-
 impl Buffer {
     pub(crate) fn is_empty(&self) -> bool {
         self.read >= self.data.len()
@@ -102,11 +109,49 @@ impl Buffer {
     }
 }
 
-pub(crate) struct ProcessManager {
+struct ClientHandle {
+    update: AtomicU64,
+    pub waker: vtui::event::polling::Waker,
+    stream: UnixStream,
+}
+
+impl ClientHandle {
+    pub fn consume_update(&self) -> Option<ClientUpdate> {
+        let update = self.update.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if update > u32::MAX as u64 {
+            Some(ClientUpdate::Terminated)
+        } else if update != 0 {
+            Some(ClientUpdate::Resized)
+        } else {
+            None
+        }
+    }
+}
+
+pub enum ClientUpdate {
+    Terminated,
+    Resized,
+}
+
+struct ClientEntry {
+    workspace: WorkspaceIndex,
+    channel: Arc<VtuiChannel>,
+    socket: UnixStream,
+}
+
+pub struct WorkspaceEntry {
     line_writer: LogWriter,
+    handle: Arc<Workspace>,
+}
+
+pub(crate) struct ProcessManager {
+    clients: Slab<ClientEntry>,
+    workspaces: slab::Slab<WorkspaceEntry>,
+    workspace_map: HashMap<Box<Path>, WorkspaceIndex>,
     processes: slab::Slab<ActiveProcess>,
     buffer_pool: Vec<Vec<u8>>,
     wait_thread: std::thread::JoinHandle<()>,
+    request: Arc<MioChannel>,
 }
 
 pub(crate) enum ReadResult {
@@ -227,8 +272,14 @@ impl ProcessManager {
                     }
                 }
 
-                self.line_writer
-                    .push_line(text, width as u32, process.job_id, process.style);
+                if let Some(workspace) = self.workspaces.get_mut(process.workspace_index as usize) {
+                    workspace.line_writer.push_line(
+                        text,
+                        width as u32,
+                        process.job_id,
+                        process.style,
+                    );
+                }
                 process.style = new_style;
             }
         }
@@ -248,10 +299,25 @@ impl ProcessManager {
     pub(crate) fn spawn(
         &mut self,
         poll: &mut Poll,
+        workspace_index: WorkspaceIndex,
         job_id: JobId,
-        mut command: Command,
+        task: TaskConfigRc,
     ) -> anyhow::Result<()> {
         let index = self.processes.vacant_key();
+        let tc = task.config();
+        let [cmd, args @ ..] = tc.cmd else {
+            panic!("Expected atleast one command")
+        };
+        let workspace = &self.workspaces[workspace_index as usize];
+        let mut command = std::process::Command::new(cmd);
+        let path = {
+            let ws = workspace.handle.state.read().unwrap();
+            ws.config.current.base_path.join(tc.pwd)
+        };
+        command
+            .args(args)
+            .current_dir(path)
+            .envs(tc.envvar.iter().copied());
         unsafe {
             command.pre_exec(|| {
                 // Create process group to allow nested cleanup
@@ -293,7 +359,8 @@ impl ProcessManager {
                 Interest::READABLE,
             )?;
         };
-        self.processes.insert(ActiveProcess {
+        let process_index = self.processes.insert(ActiveProcess {
+            workspace_index,
             job_id,
             alive: true,
             stdout_buffer: None,
@@ -301,21 +368,39 @@ impl ProcessManager {
             style: Style::default(),
             child,
         });
+        {
+            let log_start = workspace.handle.logs.read().unwrap().head();
+            let mut ws = workspace.handle.state.write().unwrap();
+            ws.active_jobs.push(Job {
+                job_id,
+                process_index,
+                task,
+                started_at: std::time::Instant::now(),
+                log_start,
+            })
+        }
         Ok(())
     }
 }
 
 pub(crate) enum ProcessRequest {
     Spawn {
-        command: Box<Command>,
+        task: TaskConfigRc,
+        workspace_id: WorkspaceIndex,
         job_id: JobId,
+    },
+    AttachClient {
+        stdin: OwnedFd,
+        stdout: OwnedFd,
+        socket: UnixStream,
+        workspace_config: PathBuf,
     },
     ProcessExited(u32),
     GlobalTermination,
 }
 
 pub(crate) struct VtuiChannel {
-    pub(crate) waker: &'static vtui::event::polling::Waker,
+    pub(crate) waker: vtui::event::polling::Waker,
     pub(crate) events: Mutex<Vec<()>>,
 }
 
@@ -366,15 +451,75 @@ impl MioChannel {
 }
 
 pub(crate) struct ProcessManagerHandle {
-    pub(crate) logs: Arc<RwLock<Logs>>,
     pub(crate) request: Arc<MioChannel>,
-    pub(crate) response: Arc<VtuiChannel>,
     pub(crate) worker_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ProcessManager {
+    fn workspace_index(&mut self, workspace_config: PathBuf) -> anyhow::Result<WorkspaceIndex> {
+        if let Some(index) = self.workspace_map.get(workspace_config.as_path()) {
+            return Ok(*index);
+        }
+        let state = WorkspaceState::new(workspace_config.clone())?;
+        let line_writer = LogWriter::new();
+        let handle = Arc::new(Workspace {
+            workspace_id: self.workspaces.vacant_key() as u32,
+            logs: line_writer.reader(),
+            state: RwLock::new(state),
+            process_channel: self.request.clone(),
+        });
+        let entry = WorkspaceEntry {
+            line_writer,
+            handle: handle.clone(),
+        };
+        let index = self.workspaces.insert(entry) as WorkspaceIndex;
+        self.workspace_map
+            .insert(workspace_config.to_path_buf().into_boxed_path(), index);
+        Ok(index)
+    }
     fn handle_request(&mut self, poll: &mut Poll, req: ProcessRequest) -> bool {
         match req {
+            ProcessRequest::AttachClient {
+                stdin,
+                stdout,
+                socket,
+                workspace_config,
+            } => {
+                let ws_index = match self.workspace_index(workspace_config) {
+                    Ok(ws) => ws,
+                    Err(err) => {
+                        kvlog::info!("Error spawning workspace", %err);
+                        return false;
+                    }
+                };
+                let ws = &mut self.workspaces[ws_index as usize];
+                let ws_handle = ws.handle.clone();
+                let vtui_channel = Arc::new(VtuiChannel {
+                    waker: vtui::event::polling::Waker::new().unwrap(),
+                    events: Mutex::new(Vec::new()),
+                });
+                let next = self.clients.vacant_key();
+                let _ = poll.registry().register(
+                    &mut SourceFd(&socket.as_raw_fd()),
+                    TokenHandle::Client(next as u32).into(),
+                    Interest::READABLE,
+                );
+                let _ = socket.set_nonblocking(true);
+                let client_entry = ClientEntry {
+                    channel: vtui_channel.clone(),
+                    workspace: ws_index,
+                    socket,
+                };
+                let index = self.clients.insert(client_entry);
+                kvlog::info!("Client Attached");
+                std::thread::spawn(move || {
+                    if let Err(err) = crate::tui::run(stdin, stdout, ws_handle, vtui_channel) {
+                        kvlog::error!("TUI exited with error", %err);
+                    }
+                });
+
+                false
+            }
             ProcessRequest::GlobalTermination => {
                 for (_, process) in &mut self.processes {
                     let child_pid = process.child.id();
@@ -413,12 +558,20 @@ impl ProcessManager {
                                 }
                             }
                         }
-                        while let Some(line) = buffer.readline() {
-                            process.append_line(line, &mut self.line_writer);
+                        if let Some(workspace) =
+                            self.workspaces.get_mut(process.workspace_index as usize)
+                        {
+                            while let Some(line) = buffer.readline() {
+                                process.append_line(line, &mut workspace.line_writer);
+                            }
+                            if !buffer.remaining_slice().is_empty() {
+                                process.append_line(
+                                    buffer.remaining_slice(),
+                                    &mut workspace.line_writer,
+                                );
+                            }
                         }
-                        if !buffer.remaining_slice().is_empty() {
-                            process.append_line(buffer.remaining_slice(), &mut self.line_writer);
-                        }
+
                         buffer.reset();
                         self.buffer_pool.push(buffer.data);
                         if let Err(err) = poll
@@ -446,11 +599,18 @@ impl ProcessManager {
                                 }
                             }
                         }
-                        while let Some(line) = buffer.readline() {
-                            process.append_line(line, &mut self.line_writer);
-                        }
-                        if !buffer.remaining_slice().is_empty() {
-                            process.append_line(buffer.remaining_slice(), &mut self.line_writer);
+                        if let Some(workspace) =
+                            self.workspaces.get_mut(process.workspace_index as usize)
+                        {
+                            while let Some(line) = buffer.readline() {
+                                process.append_line(line, &mut workspace.line_writer);
+                            }
+                            if !buffer.remaining_slice().is_empty() {
+                                process.append_line(
+                                    buffer.remaining_slice(),
+                                    &mut workspace.line_writer,
+                                );
+                            }
                         }
                         buffer.reset();
                         self.buffer_pool.push(buffer.data);
@@ -467,8 +627,12 @@ impl ProcessManager {
                 kvlog::info!("Didn't Find ProcessExited");
                 return false;
             }
-            ProcessRequest::Spawn { command, job_id } => {
-                if let Err(err) = self.spawn(poll, job_id, *command) {
+            ProcessRequest::Spawn {
+                task,
+                job_id,
+                workspace_id,
+            } => {
+                if let Err(err) = self.spawn(poll, workspace_id, job_id, task) {
                     kvlog::error!("Failed to spawn process", ?err, ?job_id);
                 }
                 return false;
@@ -478,15 +642,16 @@ impl ProcessManager {
 }
 
 pub(crate) fn process_worker(
-    line_writer: LogWriter,
     request: Arc<MioChannel>,
-    resp: Arc<VtuiChannel>,
     wait_thread: std::thread::JoinHandle<()>,
     mut poll: Poll,
 ) {
     let mut events = Events::with_capacity(128);
     let mut job_manager = ProcessManager {
-        line_writer,
+        clients: Slab::new(),
+        request,
+        workspace_map: HashMap::new(),
+        workspaces: slab::Slab::new(),
         processes: slab::Slab::new(),
         buffer_pool: Vec::new(),
         wait_thread,
@@ -495,25 +660,82 @@ pub(crate) fn process_worker(
         poll.poll(&mut events, None).unwrap();
 
         for event in &events {
-            let tok = event.token();
-            if tok == CHANNEL_TOKEN {
-                let mut reqs = Vec::new();
-                request.swap_recv(&mut reqs);
-                for req in reqs {
-                    if job_manager.handle_request(&mut poll, req) {
-                        // Termination requested
-                        return;
+            match TokenHandle::from(event.token()) {
+                TokenHandle::RequestChannel => {
+                    let mut reqs = Vec::new();
+                    job_manager.request.swap_recv(&mut reqs);
+                    for req in reqs {
+                        if job_manager.handle_request(&mut poll, req) {
+                            // Termination requested
+                            return;
+                        }
                     }
                 }
-            } else if let Some((id, pipe)) = process_from_token(tok) {
-                if let Err(err) = job_manager.read(&mut poll, id, pipe) {
-                    kvlog::error!("Failed to read from process", ?err, ?id, ?pipe);
+                TokenHandle::Task(pipe) => {
+                    if let Err(err) = job_manager.read(&mut poll, pipe.index(), pipe.pipe()) {
+                        kvlog::error!("Failed to read from process", ?err, ?pipe);
+                    }
                 }
-            } else {
-                kvlog::error!("Received invalid token", ?tok);
+                TokenHandle::Client(_) => {
+                    kvlog::error!("Received unexpected client token");
+                }
             }
         }
-        let _ = resp.wake();
+        // todo optimize
+        for (_, client) in &job_manager.clients {
+            let _ = client.channel.wake();
+        }
+    }
+}
+
+type ClientIndex = u32;
+
+#[derive(Clone, Copy, Debug)]
+struct TaskPipe(u32);
+
+impl TaskPipe {
+    pub fn index(self) -> usize {
+        (self.0 >> 1) as usize
+    }
+    pub fn pipe(self) -> Pipe {
+        if (self.0 & 1) == 0 {
+            Pipe::Stdout
+        } else {
+            Pipe::Stderr
+        }
+    }
+    pub fn token(self) -> Token {
+        Token(self.0 as usize)
+    }
+}
+
+enum TokenHandle {
+    RequestChannel,
+    Task(TaskPipe),
+    Client(ClientIndex),
+}
+
+impl From<Token> for TokenHandle {
+    fn from(token: Token) -> Self {
+        if token.0 == CHANNEL_TOKEN.0 {
+            TokenHandle::RequestChannel
+        } else if token.0 & (1 << 29) != 0 {
+            let index = token.0 & !(1 << 29);
+            TokenHandle::Client(index as ClientIndex)
+        } else {
+            let pipe = TaskPipe(token.0 as u32);
+            TokenHandle::Task(pipe)
+        }
+    }
+}
+
+impl From<TokenHandle> for Token {
+    fn from(handle: TokenHandle) -> Self {
+        match handle {
+            TokenHandle::RequestChannel => CHANNEL_TOKEN,
+            TokenHandle::Client(index) => Token((1 << 29) | (index as usize)),
+            TokenHandle::Task(pipe) => Token(pipe.0 as usize),
+        }
     }
 }
 
@@ -548,33 +770,42 @@ fn wait_thread(req: Arc<MioChannel>) {
 }
 
 impl ProcessManagerHandle {
-    pub(crate) fn spawn(
-        waker: &'static vtui::event::polling::Waker,
-    ) -> std::io::Result<ProcessManagerHandle> {
-        let resp = Arc::new(VtuiChannel {
-            waker,
-            events: Mutex::new(Vec::new()),
-        });
-        let writer = log_storage::LogWriter::new();
-        let lines = writer.reader();
+    pub(crate) fn spawn() -> std::io::Result<ProcessManagerHandle> {
         let poll = Poll::new()?;
         let request = Arc::new(MioChannel {
             waker: Waker::new(poll.registry(), CHANNEL_TOKEN)?,
             events: Mutex::new(Vec::new()),
         });
-        let respx = resp.clone();
         let r = request.clone();
-        let wait_thread = std::thread::spawn(move || {
-            wait_thread(r);
-        });
-        let r = request.clone();
+        let main_thread = std::thread::current();
         let worker_thread = std::thread::spawn(move || {
-            process_worker(writer, r, respx, wait_thread, poll);
+            unsafe {
+                // Create a signal set
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut mask);
+                // Add the signals to block to the set
+                libc::sigaddset(&mut mask, libc::SIGTERM);
+                libc::sigaddset(&mut mask, libc::SIGINT);
+
+                // 2. Block these signals for the calling thread (the spawned thread).
+                // This does NOT affect the main thread.
+                if libc::pthread_sigmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
+                    // In a real app, better error handling is needed here.
+                    eprintln!("[Spawned Thread] Failed to set signal mask!");
+                }
+            }
+
+            main_thread.unpark();
+            let r2 = r.clone();
+            let wait_thread = std::thread::spawn(move || {
+                wait_thread(r2);
+            });
+            process_worker(r, wait_thread, poll);
         });
+
+        std::thread::park();
         Ok(ProcessManagerHandle {
-            logs: lines,
             request,
-            response: resp,
             worker_thread: Some(worker_thread),
         })
     }

@@ -26,3 +26,4 @@ compact_str = "0.9.0"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 memchr = "2.7.6"
 jsony_bench.path = "/home/user/Projects/git/jsony/jsony_bench"
+sendfd = "0.4.4"

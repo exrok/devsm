@@ -1,10 +1,13 @@
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    ptr::NonNull,
+    sync::Arc,
+};
 
 use bumpalo::Bump;
-use jsony::{
-    FromJson, Jsony,
-    json::{DecodeError, Parser, Peek},
-};
+use jsony::json::{DecodeError, Parser, Peek};
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct Alias<'a>(&'a str);
@@ -12,6 +15,16 @@ impl<'a> std::ops::Deref for Alias<'a> {
     type Target = str;
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+pub struct TaskConfigRc(Arc<(TaskConfig<'static>, Bump)>);
+unsafe impl Send for TaskConfigRc {}
+unsafe impl Sync for TaskConfigRc {}
+
+impl TaskConfigRc {
+    pub fn config<'a>(&'a self) -> &'a TaskConfig<'a> {
+        unsafe { std::mem::transmute::<&'a TaskConfig<'static>, &'a TaskConfig<'a>>(&self.0.0) }
     }
 }
 
@@ -47,6 +60,22 @@ fn next_const(parser: &mut Parser<'static>) -> Option<&'static str> {
     }
     None
 }
+pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
+    let mut pwd = path.to_path_buf();
+    loop {
+        pwd.push("dfj.js");
+        if pwd.exists() {
+            return Some(pwd);
+        }
+        if !pwd.pop() {
+            break;
+        }
+        if !pwd.pop() {
+            break;
+        }
+    }
+    None
+}
 
 pub fn load_from_env() -> anyhow::Result<WorkspaceConfig<'static>> {
     let mut pwd = std::env::current_dir()?;
@@ -55,7 +84,7 @@ pub fn load_from_env() -> anyhow::Result<WorkspaceConfig<'static>> {
         if pwd.exists() {
             let content = std::fs::read_to_string(&pwd)?.leak();
             pwd.pop();
-            return leaky_mc_leaker_face(&pwd, content);
+            return load_workspace_config_leaking(&pwd, content);
         }
         if !pwd.pop() {
             break;
@@ -69,7 +98,7 @@ pub fn load_from_env() -> anyhow::Result<WorkspaceConfig<'static>> {
     ))
 }
 
-fn leaky_mc_leaker_face(
+pub fn load_workspace_config_leaking(
     base_path: &Path,
     content: &'static str,
 ) -> anyhow::Result<WorkspaceConfig<'static>> {
@@ -123,6 +152,13 @@ impl<'a> WorkspaceConfig<'a> {
     }
 }
 
+enum Value<'a> {
+    Int(i64),
+    Float(f64),
+    Str(&'a str),
+    Bool(bool),
+}
+
 #[derive(Debug)]
 pub struct TaskConfigExpr<'a> {
     info: &'a str,
@@ -144,21 +180,46 @@ pub enum EvalError {
     EmptyBranch,
 }
 
+impl TaskConfigExpr<'static> {
+    pub fn eval(&self, env: &Enviroment) -> Result<TaskConfigRc, EvalError> {
+        let mut new = Arc::new((
+            TaskConfig {
+                pwd: "",
+                cmd: &[],
+                before: &[],
+                before_once: &[],
+                profiles: &[],
+                envvar: &[],
+            },
+            Bump::new(),
+        ));
+        let alloc = Arc::get_mut(&mut new).unwrap();
+        {
+            let env = self.bump_eval(env, &alloc.1)?;
+            unsafe {
+                alloc.0 = std::mem::transmute::<TaskConfig<'_>, TaskConfig<'static>>(env);
+            }
+        }
+
+        Ok(TaskConfigRc(new))
+    }
+}
+
 impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
     type Object = TaskConfig<'a>;
-    fn eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<TaskConfig<'a>, EvalError> {
+    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<TaskConfig<'a>, EvalError> {
         Ok(TaskConfig {
-            pwd: self.pwd.eval(env, bump)?,
-            cmd: self.cmd.eval(env, bump)?,
-            before: self.before.eval(env, bump)?,
-            before_once: self.before_once.eval(env, bump)?,
+            pwd: self.pwd.bump_eval(env, bump)?,
+            cmd: self.cmd.bump_eval(env, bump)?,
+            before: self.before.bump_eval(env, bump)?,
+            before_once: self.before_once.bump_eval(env, bump)?,
             profiles: self.profiles,
             envvar: if self.envvar.is_empty() {
                 &[]
             } else {
                 let mut result = bumpalo::collections::Vec::new_in(bump);
                 for (key, value_expr) in self.envvar.iter() {
-                    let value = value_expr.eval(env, bump)?;
+                    let value = value_expr.bump_eval(env, bump)?;
                     result.push((*key, value));
                 }
                 result.into_bump_slice()
@@ -169,17 +230,17 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
 
 impl<'a> BumpEval<'a> for StringExpr<'static> {
     type Object = &'a str;
-    fn eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a str, EvalError> {
+    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a str, EvalError> {
         match self {
             StringExpr::Literal(s) => Ok(*s),
-            StringExpr::If(if_expr) => Ok(if_expr.eval(env, bump)?),
+            StringExpr::If(if_expr) => Ok(if_expr.bump_eval(env, bump)?),
         }
     }
 }
 
 impl<'a> BumpEval<'a> for AliasListExpr<'static> {
     type Object = &'a [Alias<'a>];
-    fn eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a [Alias<'a>], EvalError> {
+    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a [Alias<'a>], EvalError> {
         match self {
             AliasListExpr::List([AliasListExpr::Literal(s)]) => Ok(std::slice::from_ref(s)),
             _ => {
@@ -192,7 +253,7 @@ impl<'a> BumpEval<'a> for AliasListExpr<'static> {
 }
 impl<'a> BumpEval<'a> for StringListExpr<'static> {
     type Object = &'a [&'a str];
-    fn eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a [&'a str], EvalError> {
+    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a [&'a str], EvalError> {
         match self {
             StringListExpr::List([StringListExpr::Literal(s)]) => Ok(std::slice::from_ref(s)),
             _ => {
@@ -376,13 +437,13 @@ enum StringExpr<'a> {
 }
 impl<'a, T: BumpEval<'a>> BumpEval<'a> for If<'a, T> {
     type Object = T::Object;
-    fn eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<Self::Object, EvalError> {
+    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<Self::Object, EvalError> {
         match &self.cond {
             Predicate::ProfileIs(p) => {
                 if *p == env.profile {
-                    self.then.eval(env, bump)
+                    self.then.bump_eval(env, bump)
                 } else if let Some(or_else) = &self.or_else {
-                    or_else.eval(env, bump)
+                    or_else.bump_eval(env, bump)
                 } else {
                     Err(EvalError::EmptyBranch)
                 }
@@ -475,7 +536,7 @@ fn take_string<'a>(
 
 pub trait BumpEval<'a> {
     type Object: Sized;
-    fn eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<Self::Object, EvalError>;
+    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<Self::Object, EvalError>;
 }
 
 trait BumpJsonDecode<'a>: Sized {
@@ -655,7 +716,7 @@ mod test {
         };
         let mut bump2 = Bump::new();
         let res = asdf
-            .eval(&Enviroment { profile: "default" }, &bump2)
+            .bump_eval(&Enviroment { profile: "default" }, &bump2)
             .unwrap();
         println!("{:#?}", res);
     }
