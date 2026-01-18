@@ -38,6 +38,7 @@ impl ClientResult {
 struct TestHarness {
     temp_dir: PathBuf,
     socket_path: PathBuf,
+    server_log_path: PathBuf,
     server: Option<Child>,
 }
 
@@ -50,8 +51,9 @@ impl TestHarness {
         fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
 
         let socket_path = temp_dir.join("devsm.socket");
+        let server_log_path = temp_dir.join("server.log");
 
-        Self { temp_dir, socket_path, server: None }
+        Self { temp_dir, socket_path, server_log_path, server: None }
     }
 
     /// Writes a devsm.toml configuration file.
@@ -63,16 +65,18 @@ impl TestHarness {
 
     /// Spawns the server with isolated socket path.
     ///
-    /// Does not wait for the server to be ready; the client's built-in
-    /// connection retry handles that.
+    /// Server output is captured to a log file for debugging on failure.
     fn spawn_server(&mut self) -> &mut Self {
+        let log_file = fs::File::create(&self.server_log_path).expect("Failed to create server log");
+        let log_file_err = log_file.try_clone().expect("Failed to clone log file");
+
         let server = Command::new(cargo_bin_path())
             .arg("server")
             .env("DEVSM_SOCKET", &self.socket_path)
             .env("DEVSM_LOG_STDOUT", "1")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err))
             .spawn()
             .expect("Failed to spawn server");
 
@@ -123,6 +127,23 @@ impl TestHarness {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    /// Returns the server log contents for debugging.
+    fn server_log(&self) -> String {
+        fs::read_to_string(&self.server_log_path).unwrap_or_else(|_| "<no server log>".to_string())
+    }
+
+    /// Waits for a file to exist with timeout, useful for checking task completion.
+    fn wait_for_file(&self, path: &PathBuf, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
         false
     }
@@ -269,7 +290,7 @@ fn cargo_bin_path() -> PathBuf {
 }
 
 #[test]
-fn test_run_simple_action() {
+fn run_simple_action() {
     let mut harness = TestHarness::new("run_simple");
     harness.write_config(
         r#"
@@ -287,7 +308,7 @@ cmd = ["echo", "hello from devsm"]
 }
 
 #[test]
-fn test_run_with_exit_code() {
+fn run_with_exit_code() {
     let mut harness = TestHarness::new("run_exit_code");
     harness.write_config(
         r#"
@@ -305,7 +326,7 @@ sh = "exit 42"
 }
 
 #[test]
-fn test_test_command_passes() {
+fn test_command_passes() {
     let mut harness = TestHarness::new("test_passes");
     harness.write_config(
         r#"
@@ -322,7 +343,7 @@ sh = "exit 0"
 }
 
 #[test]
-fn test_test_command_fails() {
+fn test_command_fails() {
     let mut harness = TestHarness::new("test_fails");
     harness.write_config(
         r#"
@@ -339,7 +360,7 @@ sh = "exit 1"
 }
 
 #[test]
-fn test_client_fails_without_server() {
+fn client_fails_without_server() {
     let harness = TestHarness::new("no_server");
     harness.write_config(
         r#"
@@ -359,7 +380,7 @@ cmd = ["true"]
 }
 
 #[test]
-fn test_run_with_profile() {
+fn run_with_profile() {
     let mut harness = TestHarness::new("run_with_profile");
     let output_file = harness.temp_dir.join("output.txt");
     // Use env field to pass profile to shell script
@@ -395,7 +416,7 @@ env.PROFILE = {{ if.profile = "formal", then = "formal", or_else = "default" }}
 }
 
 #[test]
-fn test_profile_affects_command_args() {
+fn profile_affects_command_args() {
     let mut harness = TestHarness::new("profile_cmd_args");
     let marker = harness.temp_dir.join("marker.txt");
     // Use conditional in cmd to demonstrate profile-based argument changes
@@ -425,7 +446,7 @@ env.PROFILE_VAL = {{ if.profile = "verbose", then = "verbose", or_else = "defaul
 }
 
 #[test]
-fn test_require_runs_dependency_first() {
+fn require_runs_dependency_first() {
     let mut harness = TestHarness::new("require_order");
     let order_file = harness.temp_dir.join("order.txt");
     harness.write_config(&format!(
@@ -452,7 +473,7 @@ require = ["setup"]
 }
 
 #[test]
-fn test_require_waits_for_success() {
+fn require_waits_for_success() {
     let mut harness = TestHarness::new("require_waits");
     let marker = harness.temp_dir.join("marker.txt");
     harness.write_config(&format!(
@@ -513,7 +534,7 @@ require = ["dep"]
 }
 
 #[test]
-fn test_require_fails_on_dependency_failure() {
+fn require_fails_on_dependency_failure() {
     let mut harness = TestHarness::new("require_fails");
     let marker = harness.temp_dir.join("main_ran.txt");
     harness.write_config(&format!(
@@ -539,7 +560,7 @@ require = ["failing_dep"]
 }
 
 #[test]
-fn test_deep_dependency_chain() {
+fn deep_dependency_chain() {
     let mut harness = TestHarness::new("deep_chain");
     let output_file = harness.temp_dir.join("output.txt");
     harness.write_config(&format!(
@@ -581,7 +602,7 @@ require = ["step4"]
 }
 
 #[test]
-fn test_diamond_dependency() {
+fn diamond_dependency() {
     let mut harness = TestHarness::new("diamond_dep");
     let output_file = harness.temp_dir.join("output.txt");
     // Use cache = {} on setup to ensure it only runs once even when required by multiple tasks
@@ -629,7 +650,7 @@ require = ["left", "right"]
 }
 
 #[test]
-fn test_cache_skips_on_hit() {
+fn cache_skips_on_hit() {
     let mut harness = TestHarness::new("cache_skip");
     let marker = harness.temp_dir.join("gen_marker.txt");
     let counter = harness.temp_dir.join("counter.txt");
@@ -677,7 +698,7 @@ require = ["gen"]
 }
 
 #[test]
-fn test_cache_invalidates_on_file_modified() {
+fn cache_invalidates_on_file_modified() {
     let mut harness = TestHarness::new("cache_invalidate");
     let trigger = harness.temp_dir.join("trigger.txt");
     let output = harness.temp_dir.join("output.txt");
@@ -731,7 +752,7 @@ require = ["gen"]
 }
 
 #[test]
-fn test_cache_profile_changed() {
+fn cache_profile_changed() {
     let mut harness = TestHarness::new("cache_profile");
     let dep_counter = harness.temp_dir.join("dep_counter.txt");
     let main_counter = harness.temp_dir.join("main_counter.txt");
@@ -807,7 +828,7 @@ require = ["main"]
 }
 
 #[test]
-fn test_rpc_status_sequence_simple() {
+fn rpc_status_sequence_simple() {
     let mut harness = TestHarness::new("rpc_simple");
     harness.write_config(
         r#"
@@ -857,7 +878,7 @@ sh = "echo hello"
 }
 
 #[test]
-fn test_rpc_status_sequence_with_dependency() {
+fn rpc_status_sequence_with_dependency() {
     let mut harness = TestHarness::new("rpc_dep");
     harness.write_config(
         r#"
@@ -914,7 +935,7 @@ require = ["dep"]
 }
 
 #[test]
-fn test_rpc_multiple_status_transitions() {
+fn rpc_multiple_status_transitions() {
     let mut harness = TestHarness::new("rpc_transitions");
     harness.write_config(
         r#"
@@ -962,7 +983,7 @@ sh = "sleep 0.01 && echo done"
 }
 
 #[test]
-fn test_require_with_profile() {
+fn require_with_profile() {
     let mut harness = TestHarness::new("require_profile");
     let output_file = harness.temp_dir.join("output.txt");
     harness.write_config(&format!(
@@ -996,7 +1017,7 @@ require = ["dep:release"]
 }
 
 #[test]
-fn test_require_with_params() {
+fn require_with_params() {
     let mut harness = TestHarness::new("require_params");
     let output_file = harness.temp_dir.join("output.txt");
     // Use { var = "name" } syntax to reference params in env
@@ -1024,7 +1045,7 @@ require = [["dep", {{ msg = "hello_from_params" }}]]
 }
 
 #[test]
-fn test_require_cache_per_profile() {
+fn require_cache_per_profile() {
     let mut harness = TestHarness::new("cache_per_profile");
     let counter = harness.temp_dir.join("counter.txt");
     let output = harness.temp_dir.join("output.txt");
@@ -1084,7 +1105,7 @@ require = ["dep:release"]
 }
 
 #[test]
-fn test_require_cache_per_params() {
+fn require_cache_per_params() {
     let mut harness = TestHarness::new("cache_per_params");
     let counter = harness.temp_dir.join("counter.txt");
     let output = harness.temp_dir.join("output.txt");
@@ -1140,4 +1161,180 @@ require = [["dep", {{ value = "bbb" }}]]
     let content = fs::read_to_string(&output).unwrap_or_default();
     assert!(content.contains("aaa_"), "should have aaa output: {}", content);
     assert!(content.contains("bbb_"), "should have bbb output: {}", content);
+}
+
+#[test]
+fn service_restart_on_different_params() {
+    let mut harness = TestHarness::new("service_restart_params");
+    let service_log = harness.temp_dir.join("service.log");
+    let task_a_marker = harness.temp_dir.join("task_a.done");
+    let task_b_marker = harness.temp_dir.join("task_b.done");
+
+    harness.write_config(&format!(
+        r#"
+[service.backend]
+sh = '''
+echo "started MODE=$MODE" >> {service_log}
+while true; do sleep 1; done
+'''
+env.MODE = {{ var = "mode" }}
+
+[action.task_a]
+sh = "touch {task_a_marker}"
+require = [["backend", {{ mode = "alpha" }}]]
+
+[action.task_b]
+sh = "touch {task_b_marker}"
+require = [["backend", {{ mode = "beta" }}]]
+"#,
+        service_log = service_log.display(),
+        task_a_marker = task_a_marker.display(),
+        task_b_marker = task_b_marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "task_a"]);
+    assert!(
+        result.success() && harness.wait_for_file(&task_a_marker, Duration::from_secs(2)),
+        "task_a failed: stderr={}, server_log={}",
+        result.stderr,
+        harness.server_log()
+    );
+
+    let result = harness.run_client(&["run", "task_b"]);
+    assert!(
+        result.success() && harness.wait_for_file(&task_b_marker, Duration::from_secs(2)),
+        "task_b failed: stderr={}, server_log={}",
+        result.stderr,
+        harness.server_log()
+    );
+
+    let log = fs::read_to_string(&service_log).unwrap_or_default();
+    let alpha_count = log.lines().filter(|l| l.contains("MODE=alpha")).count();
+    let beta_count = log.lines().filter(|l| l.contains("MODE=beta")).count();
+    assert_eq!(alpha_count, 1, "backend:alpha should start once, log: {}", log);
+    assert_eq!(beta_count, 1, "backend:beta should start once, log: {}", log);
+}
+
+#[test]
+fn service_reuse_on_matching_params() {
+    let mut harness = TestHarness::new("service_reuse_params");
+    let service_log = harness.temp_dir.join("service.log");
+    let task_1_marker = harness.temp_dir.join("task_1.done");
+    let task_2_marker = harness.temp_dir.join("task_2.done");
+
+    harness.write_config(&format!(
+        r#"
+[service.backend]
+sh = '''
+echo "started MODE=$MODE" >> {service_log}
+while true; do sleep 1; done
+'''
+env.MODE = {{ var = "mode" }}
+
+[action.task_1]
+sh = "touch {task_1_marker}"
+require = [["backend", {{ mode = "same" }}]]
+
+[action.task_2]
+sh = "touch {task_2_marker}"
+require = [["backend", {{ mode = "same" }}]]
+"#,
+        service_log = service_log.display(),
+        task_1_marker = task_1_marker.display(),
+        task_2_marker = task_2_marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "task_1"]);
+    assert!(
+        result.success() && harness.wait_for_file(&task_1_marker, Duration::from_secs(2)),
+        "task_1 failed: stderr={}, server_log={}",
+        result.stderr,
+        harness.server_log()
+    );
+
+    let result = harness.run_client(&["run", "task_2"]);
+    assert!(
+        result.success() && harness.wait_for_file(&task_2_marker, Duration::from_secs(2)),
+        "task_2 failed: stderr={}, server_log={}",
+        result.stderr,
+        harness.server_log()
+    );
+
+    let log = fs::read_to_string(&service_log).unwrap_or_default();
+    let start_count = log.lines().filter(|l| l.contains("started")).count();
+    assert_eq!(start_count, 1, "Service should start only once with matching params, log: {}", log);
+}
+
+#[test]
+fn service_different_profiles() {
+    let mut harness = TestHarness::new("service_profiles");
+    let service_log = harness.temp_dir.join("service.log");
+    let dev_marker = harness.temp_dir.join("dev.done");
+    let prod_marker = harness.temp_dir.join("prod.done");
+    let dev2_marker = harness.temp_dir.join("dev2.done");
+
+    harness.write_config(&format!(
+        r#"
+[service.db]
+sh = '''
+echo "db profile=$PROFILE_VAL" >> {service_log}
+while true; do sleep 1; done
+'''
+profiles = ["dev", "prod"]
+env.PROFILE_VAL = {{ if.profile = "prod", then = "prod", or_else = "dev" }}
+
+[action.dev_task]
+sh = "touch {dev_marker}"
+require = ["db"]
+
+[action.prod_task]
+sh = "touch {prod_marker}"
+require = ["db:prod"]
+
+[action.dev_task_2]
+sh = "touch {dev2_marker}"
+require = ["db"]
+"#,
+        service_log = service_log.display(),
+        dev_marker = dev_marker.display(),
+        prod_marker = prod_marker.display(),
+        dev2_marker = dev2_marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "dev_task"]);
+    assert!(
+        result.success() && harness.wait_for_file(&dev_marker, Duration::from_secs(2)),
+        "dev_task failed: stderr={}, server_log={}",
+        result.stderr,
+        harness.server_log()
+    );
+
+    let result = harness.run_client(&["run", "prod_task"]);
+    assert!(
+        result.success() && harness.wait_for_file(&prod_marker, Duration::from_secs(2)),
+        "prod_task failed: stderr={}, server_log={}",
+        result.stderr,
+        harness.server_log()
+    );
+
+    let result = harness.run_client(&["run", "dev_task_2"]);
+    assert!(
+        result.success() && harness.wait_for_file(&dev2_marker, Duration::from_secs(2)),
+        "dev_task_2 failed: stderr={}, server_log={}",
+        result.stderr,
+        harness.server_log()
+    );
+
+    let log = fs::read_to_string(&service_log).unwrap_or_default();
+    let dev_starts = log.lines().filter(|l| l.contains("profile=dev")).count();
+    let prod_starts = log.lines().filter(|l| l.contains("profile=prod")).count();
+
+    assert_eq!(dev_starts, 1, "db:dev should start once, log: {}", log);
+    assert_eq!(prod_starts, 1, "db:prod should start once, log: {}", log);
 }

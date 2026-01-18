@@ -117,7 +117,7 @@ impl ScheduleRequirement {
             },
             JobPredicate::Active => match &job.process_status {
                 JobStatus::Scheduled { .. } => RequirementStatus::Pending,
-                JobStatus::Starting => RequirementStatus::Never,
+                JobStatus::Starting => RequirementStatus::Pending,
                 JobStatus::Cancelled => RequirementStatus::Never,
                 JobStatus::Running { .. } => RequirementStatus::Met,
                 JobStatus::Exited { .. } => RequirementStatus::Never,
