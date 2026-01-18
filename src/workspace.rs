@@ -1,5 +1,5 @@
 use crate::{
-    config::{CARGO_AUTO_EXPR, Enviroment, TaskConfigExpr, TaskConfigRc, WorkspaceConfig},
+    config::{CARGO_AUTO_EXPR, Enviroment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig},
     log_storage::{JobLogCorrelation, LogId, Logs},
     process_manager::MioChannel,
 };
@@ -273,26 +273,60 @@ impl WorkspaceState {
         }
         let task = self.base_tasks[base_task].config.eval(&Enviroment { profile, param: params }).unwrap();
 
-        'outer: for before in task.config().before_once {
-            let Some(dep_base_task) = self.name_map.get(&**before) else {
-                kvlog::error!("unknown alias", before);
+        'outer: for dep_alias in task.config().require {
+            let Some(&dep_base_task) = self.name_map.get(&**dep_alias) else {
+                kvlog::error!("unknown alias", dep_alias);
                 continue;
             };
-            let spawner = &self.base_tasks[*dep_base_task];
-            for ji in spawner.jobs.all().iter().rev() {
-                let job = &self[*ji];
-                if job.process_status.is_successful_completion() {
-                    continue 'outer;
+            let dep_config = self.base_tasks[dep_base_task].config;
+
+            match dep_config.kind {
+                TaskKind::Action => {
+                    if dep_config.cache.is_some() {
+                        let spawner = &self.base_tasks[dep_base_task];
+                        for ji in spawner.jobs.all().iter().rev() {
+                            let job = &self[*ji];
+                            if matches!(job.process_status, JobStatus::Cancelled) {
+                                continue;
+                            }
+                            if job.process_status.is_successful_completion() {
+                                continue 'outer;
+                            }
+                            if job.process_status.is_pending_completion() {
+                                pred.push(ScheduleRequirement {
+                                    job: *ji,
+                                    predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                                });
+                                continue 'outer;
+                            }
+                            break;
+                        }
+                        let new_job =
+                            self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
+                        pred.push(ScheduleRequirement {
+                            job: new_job,
+                            predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                        });
+                    } else {
+                        let new_job =
+                            self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
+                        pred.push(ScheduleRequirement {
+                            job: new_job,
+                            predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                        });
+                    }
                 }
-                if job.process_status.is_pending_completion() {
-                    pred.push(ScheduleRequirement {
-                        job: *ji,
-                        predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
-                    });
+                TaskKind::Service => {
+                    let spawner = &self.base_tasks[dep_base_task];
+                    for &ji in spawner.jobs.running() {
+                        pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
+                        continue 'outer;
+                    }
+                    let new_job =
+                        self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
+                    pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
                 }
             }
-            let new_job = self.spawn_task(workspace_id, channel, *dep_base_task, log_start, ValueMap::new(), "");
-            pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::TerminatedNaturallyAndSucessfully });
         }
 
         let job_index = JobIndex(self.jobs.len() as u32);
@@ -495,213 +529,64 @@ impl Workspace {
     }
 }
 
-// #[cfg(test)]
-// mod parametric_tests {
-//     use super::*;
-//     use proptest::prelude::*;
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
 
-//     // --- 1. The Reference Model (Oracle) ---
-//     // This represents the "Truth". It uses simple Vec manipulations that are
-//     // easy to verify visually, unlike the optimized rotate logic in the SUT.
-//     #[derive(Debug, Default, Clone)]
-//     struct Model {
-//         terminal: Vec<JobIndex>,
-//         running: Vec<JobIndex>,
-//         scheduled: Vec<JobIndex>,
-//     }
+    #[test]
+    fn test_job_status_is_pending_completion() {
+        assert!(JobStatus::Scheduled { after: vec![] }.is_pending_completion());
+        assert!(JobStatus::Starting.is_pending_completion());
+        assert!(JobStatus::Running { process_index: 0 }.is_pending_completion());
+        assert!(!JobStatus::Exited {
+            finished_at: Instant::now(),
+            log_end: LogId(0),
+            cause: ExitCause::Unknown,
+            status: 0
+        }
+        .is_pending_completion());
+        assert!(!JobStatus::Cancelled.is_pending_completion());
+    }
 
-//     impl Model {
-//         fn push_terminated(&mut self, job: JobIndex) {
-//             self.terminal.push(job);
-//         }
+    #[test]
+    fn test_job_status_is_successful_completion() {
+        assert!(!JobStatus::Scheduled { after: vec![] }.is_successful_completion());
+        assert!(!JobStatus::Starting.is_successful_completion());
+        assert!(!JobStatus::Running { process_index: 0 }.is_successful_completion());
+        assert!(!JobStatus::Cancelled.is_successful_completion());
 
-//         fn push_running(&mut self, job: JobIndex) {
-//             self.running.push(job);
-//         }
+        assert!(JobStatus::Exited {
+            finished_at: Instant::now(),
+            log_end: LogId(0),
+            cause: ExitCause::Unknown,
+            status: 0
+        }
+        .is_successful_completion());
 
-//         fn push_scheduled(&mut self, job: JobIndex) {
-//             self.scheduled.push(job);
-//         }
+        assert!(!JobStatus::Exited {
+            finished_at: Instant::now(),
+            log_end: LogId(0),
+            cause: ExitCause::Unknown,
+            status: 1
+        }
+        .is_successful_completion());
 
-//         fn run(&mut self, job: JobIndex) {
-//             if let Some(pos) = self.scheduled.iter().position(|&j| j == job) {
-//                 let j = self.scheduled.remove(pos);
-//                 // Based on SUT logic: moves from Scheduled to the END of Running
-//                 self.running.push(j);
-//             }
-//         }
+        // Note: is_successful_completion only checks status code, not exit cause.
+        // The ScheduleRequirement::status method does check for Killed separately
+        // when evaluating the TerminatedNaturallyAndSucessfully predicate.
+        assert!(JobStatus::Exited {
+            finished_at: Instant::now(),
+            log_end: LogId(0),
+            cause: ExitCause::Killed,
+            status: 0
+        }
+        .is_successful_completion());
+    }
 
-//         fn terminate(&mut self, job: JobIndex) {
-//             if let Some(pos) = self.running.iter().position(|&j| j == job) {
-//                 let j = self.running.remove(pos);
-//                 // Based on SUT logic: moves to the END of Terminal
-//                 self.terminal.push(j);
-//                 return;
-//             }
-//             if let Some(pos) = self.scheduled.iter().position(|&j| j == job) {
-//                 let j = self.scheduled.remove(pos);
-//                 // Based on SUT logic: moves to the END of Terminal
-//                 self.terminal.push(j);
-//                 return;
-//             }
-//         }
-
-//         fn terminate_scheduled(&mut self) {
-//             // Based on SUT logic: All scheduled tasks move to Terminal
-//             // specifically, they are appended to Terminal.
-//             self.terminal.append(&mut self.scheduled);
-//         }
-
-//         fn terminate_all(&mut self) {
-//             self.terminal.append(&mut self.running);
-//             self.terminal.append(&mut self.scheduled);
-//         }
-
-//         fn clear(&mut self) {
-//             self.terminal.clear();
-//             self.running.clear();
-//             self.scheduled.clear();
-//         }
-
-//         // Helper to get all non-terminal jobs for selecting a valid index to terminate
-//         fn non_terminal(&self) -> Vec<JobIndex> {
-//             let mut v = self.running.clone();
-//             v.extend(self.scheduled.iter());
-//             v
-//         }
-//     }
-
-//     // --- 2. Action Definitions ---
-//     #[derive(Debug, Clone)]
-//     enum Action {
-//         PushTerm(u32),
-//         PushRun(u32),
-//         PushSched(u32),
-//         // We use indices instead of raw JobIndices to guarantee we pick existing items
-//         RunIndex(usize),
-//         TermIndex(usize),
-//         TermSched,
-//         TermAll,
-//         Clear,
-//     }
-
-//     // --- 3. Property Strategy ---
-//     fn action_strategy() -> impl Strategy<Value = Action> {
-//         prop_oneof![
-//             // Insertion
-//             any::<u32>().prop_map(Action::PushTerm),
-//             any::<u32>().prop_map(Action::PushRun),
-//             any::<u32>().prop_map(Action::PushSched),
-//             // State Transitions
-//             any::<usize>().prop_map(Action::RunIndex),
-//             any::<usize>().prop_map(Action::TermIndex),
-//             // Batch Operations
-//             Just(Action::TermSched),
-//             Just(Action::TermAll),
-//             // Allocation Reuse / Reset
-//             Just(Action::Clear),
-//         ]
-//     }
-
-//     // --- 4. The Test Runner ---
-//     proptest! {
-//         // Run 1000 random sequences of actions.
-//         // Each sequence can be up to 100 steps long.
-//         #![proptest_config(ProptestConfig::with_cases(1000))]
-//         #[test]
-//         fn check_job_index_list_consistency(actions in proptest::collection::vec(action_strategy(), 0..100)) {
-//             let mut sut = JobIndexList::default();
-//             let mut model = Model::default();
-
-//             // Used to ensure unique Job IDs for easier debugging/tracking,
-//             // though the logic handles duplicates, unique IDs make state transitions clearer.
-//             let mut id_counter = 0u32;
-
-//             for action in actions {
-//                 match action {
-//                     Action::PushTerm(_) => {
-//                         id_counter += 1;
-//                         let job = JobIndex(id_counter);
-//                         sut.push_terminated(job);
-//                         model.push_terminated(job);
-//                     }
-//                     Action::PushRun(_) => {
-//                         id_counter += 1;
-//                         let job = JobIndex(id_counter);
-//                         sut.push_active(job);
-//                         model.push_running(job);
-//                     }
-//                     Action::PushSched(_) => {
-//                         id_counter += 1;
-//                         let job = JobIndex(id_counter);
-//                         sut.push_scheduled(job);
-//                         model.push_scheduled(job);
-//                     }
-//                     Action::RunIndex(idx) => {
-//                         // SUT panics if we call run on a job that isn't scheduled.
-//                         // We must pick a valid scheduled job.
-//                         if !model.scheduled.is_empty() {
-//                             let actual_idx = idx % model.scheduled.len();
-//                             let job = model.scheduled[actual_idx];
-
-//                             sut.set_active(job);
-//                             model.run(job);
-//                         }
-//                     }
-//                     Action::TermIndex(idx) => {
-//                         // SUT panics if we call terminate on a job that is already terminal.
-//                         // We must pick a valid non-terminal job.
-//                         let candidates = model.non_terminal();
-//                         if !candidates.is_empty() {
-//                             let actual_idx = idx % candidates.len();
-//                             let job = candidates[actual_idx];
-
-//                             sut.set_terminal(job);
-//                             model.terminate(job);
-//                         }
-//                     }
-//                     Action::TermSched => {
-//                         sut.terminate_scheduled();
-//                         model.terminate_scheduled();
-//                     }
-//                     Action::TermAll => {
-//                         sut.terminate_all();
-//                         model.terminate_all();
-//                     }
-//                     Action::Clear => {
-//                         sut.clear();
-//                         model.clear();
-//                         // Reset counter to test reuse with low numbers again?
-//                         // Optional, but keeping it monotonic is fine.
-//                     }
-//                 }
-
-//                 // --- Invariant Checks ---
-
-//                 // 1. Lengths must match
-//                 assert_eq!(sut.terminal().len(), model.terminal.len(), "Terminal lengths mismatch");
-//                 assert_eq!(sut.running().len(), model.running.len(), "Running lengths mismatch");
-//                 assert_eq!(sut.scheduled().len(), model.scheduled.len(), "Scheduled lengths mismatch");
-
-//                 // 2. Exact Content and Order must match
-//                 // The SUT guarantees order is preserved/rotated deterministically.
-//                 assert_eq!(sut.terminal(), model.terminal.as_slice(), "Terminal content mismatch");
-//                 assert_eq!(sut.running(), model.running.as_slice(), "Running content mismatch");
-//                 assert_eq!(sut.scheduled(), model.scheduled.as_slice(), "Scheduled content mismatch");
-
-//                 // 3. API Consistency checks
-//                 assert_eq!(sut.len(), model.terminal.len() + model.running.len() + model.scheduled.len());
-
-//                 let non_term_sut = sut.non_terminal();
-//                 let non_term_model = model.non_terminal();
-//                 assert_eq!(non_term_sut, non_term_model.as_slice(), "Non-terminal query mismatch");
-//             }
-//         }
-//     }
-//     #[test]
-//     fn panic_split_line_tests() {
-//         let line = "thread 'log_storage::tests::test_rotation_on_max_lines' (143789) panicked at src/log_storage.rs:639:9:";
-//         let extracted = extract_rust_panic_from_line(line);
-//         assert_eq!(extracted, Some(("src/log_storage.rs", 639)));
-//     }
-// }
+    #[test]
+    fn panic_split_line_tests() {
+        let line = "thread 'log_storage::tests::test_rotation_on_max_lines' (143789) panicked at src/log_storage.rs:639:9:";
+        let extracted = extract_rust_panic_from_line(line);
+        assert_eq!(extracted, Some(("src/log_storage.rs", 639)));
+    }
+}

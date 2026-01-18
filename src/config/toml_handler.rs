@@ -10,8 +10,8 @@ use toml_span::{
 };
 
 use crate::config::{
-    Alias, AliasListExpr, CommandExpr, If, Predicate, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind,
-    WorkspaceConfig,
+    Alias, AliasListExpr, CacheConfig, CommandExpr, If, Predicate, StringExpr, StringListExpr, TaskCall,
+    TaskConfigExpr, TaskKind, WorkspaceConfig,
 };
 
 fn mismatched_in_object(report_error: &mut dyn FnMut(Diagnostic<usize>), expected: &str, found: &TomlValue, key: &str) {
@@ -216,8 +216,8 @@ fn parse_task<'a>(
     let mut profiles_vec = bumpalo::collections::Vec::new_in(alloc);
     profiles_vec.push("default");
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
-    let mut before = AliasListExpr::List(&[]);
-    let mut before_once = AliasListExpr::List(&[]);
+    let mut require = AliasListExpr::List(&[]);
+    let mut cache: Option<CacheConfig> = None;
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
@@ -260,11 +260,35 @@ fn parse_task<'a>(
                     envvar_vec.push((key_str, val_expr));
                 }
             }
+            "require" => {
+                require = parse_alias_list_expr(alloc, value, re)?;
+            }
+            "cache" => {
+                if kind != TaskKind::Action {
+                    re(Diagnostic::error()
+                        .with_message("`cache` is only valid for actions")
+                        .with_label(Label::primary(0, value.span)));
+                    return Err(());
+                }
+                if !value.as_table().map_or(false, |t| t.is_empty()) {
+                    re(Diagnostic::error()
+                        .with_message("`cache` must be an empty table `{}`")
+                        .with_label(Label::primary(0, value.span)));
+                    return Err(());
+                }
+                cache = Some(CacheConfig {});
+            }
             "before" => {
-                before = parse_alias_list_expr(alloc, value, re)?;
+                re(Diagnostic::error()
+                    .with_message("`before` is deprecated, use `require` instead")
+                    .with_label(Label::primary(0, value.span)));
+                return Err(());
             }
             "before_once" => {
-                before_once = parse_alias_list_expr(alloc, value, re)?;
+                re(Diagnostic::error()
+                    .with_message("`before_once` is deprecated, use `require` with `cache = {}` instead")
+                    .with_label(Label::primary(0, value.span)));
+                return Err(());
             }
             "info" => {
                 let Some(s) = value.as_str() else {
@@ -307,8 +331,8 @@ fn parse_task<'a>(
         command,
         profiles: profiles_vec.into_bump_slice(),
         envvar: envvar_vec.into_bump_slice(),
-        before,
-        before_once,
+        require,
+        cache,
     })
 }
 
@@ -546,5 +570,143 @@ mod test {
             }
             _ => panic!("Expected if expression"),
         }
+    }
+
+    #[test]
+    fn test_parse_require_field() {
+        let text = r#"
+[action.test]
+cmd = ["cargo", "test"]
+require = ["build"]
+"#;
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic<usize>| {
+            errors.push(diag);
+        };
+
+        let result = parse(&bump, text, &mut error);
+        assert!(result.is_ok(), "Expected successful parse");
+        let config = result.unwrap();
+        assert_eq!(config.tasks.len(), 1);
+        let (name, task) = &config.tasks[0];
+        assert_eq!(*name, "test");
+        assert_eq!(task.kind, TaskKind::Action);
+    }
+
+    #[test]
+    fn test_parse_cache_field() {
+        let text = r#"
+[action.build]
+cmd = ["cargo", "build"]
+cache = {}
+"#;
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic<usize>| {
+            errors.push(diag);
+        };
+
+        let result = parse(&bump, text, &mut error);
+        assert!(result.is_ok(), "Expected successful parse");
+        let config = result.unwrap();
+        assert_eq!(config.tasks.len(), 1);
+        let (name, task) = &config.tasks[0];
+        assert_eq!(*name, "build");
+        assert!(task.cache.is_some());
+    }
+
+    #[test]
+    fn test_cache_invalid_for_service() {
+        let text = r#"
+[service.server]
+cmd = ["./server"]
+cache = {}
+"#;
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic<usize>| {
+            errors.push(diag);
+        };
+
+        let result = parse(&bump, text, &mut error);
+        assert!(result.is_err(), "Expected error for cache on service");
+        assert!(!errors.is_empty());
+        assert!(errors[0].message.contains("cache"));
+    }
+
+    #[test]
+    fn test_deprecated_before_errors() {
+        let text = r#"
+[action.test]
+cmd = ["cargo", "test"]
+before = ["build"]
+"#;
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic<usize>| {
+            errors.push(diag);
+        };
+
+        let result = parse(&bump, text, &mut error);
+        assert!(result.is_err(), "Expected error for deprecated 'before'");
+        assert!(!errors.is_empty());
+        assert!(errors[0].message.contains("deprecated"));
+    }
+
+    #[test]
+    fn test_deprecated_before_once_errors() {
+        let text = r#"
+[action.test]
+cmd = ["cargo", "test"]
+before_once = ["setup"]
+"#;
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic<usize>| {
+            errors.push(diag);
+        };
+
+        let result = parse(&bump, text, &mut error);
+        assert!(result.is_err(), "Expected error for deprecated 'before_once'");
+        assert!(!errors.is_empty());
+        assert!(errors[0].message.contains("deprecated"));
+    }
+
+    #[test]
+    fn test_require_with_cache() {
+        let text = r#"
+[action.setup]
+cmd = ["./setup.sh"]
+cache = {}
+
+[action.build]
+cmd = ["cargo", "build"]
+require = ["setup"]
+cache = {}
+
+[action.test]
+cmd = ["cargo", "test"]
+require = ["build"]
+"#;
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic<usize>| {
+            errors.push(diag);
+        };
+
+        let result = parse(&bump, text, &mut error);
+        assert!(result.is_ok(), "Expected successful parse");
+        let config = result.unwrap();
+        assert_eq!(config.tasks.len(), 3);
+
+        let setup = &config.tasks.iter().find(|(n, _)| *n == "setup").unwrap().1;
+        assert!(setup.cache.is_some());
+
+        let build = &config.tasks.iter().find(|(n, _)| *n == "build").unwrap().1;
+        assert!(build.cache.is_some());
+
+        let test = &config.tasks.iter().find(|(n, _)| *n == "test").unwrap().1;
+        assert!(test.cache.is_none());
     }
 }

@@ -35,6 +35,12 @@ pub enum TaskKind {
     Service,
     Action,
 }
+
+/// Cache configuration for actions. When present, the action's result
+/// is cached for the session - it won't re-run via `require` if the
+/// last non-cancelled run was successful.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CacheConfig {}
 #[derive(Clone)]
 pub struct TaskConfigRc(Arc<(TaskConfig<'static>, Bump)>);
 unsafe impl Send for TaskConfigRc {}
@@ -59,8 +65,8 @@ pub struct TaskConfig<'a> {
     pub command: Command<'a>,
     pub profiles: &'a [&'a str],
     pub envvar: &'a [(&'a str, &'a str)],
-    pub before: &'a [Alias<'a>],
-    pub before_once: &'a [Alias<'a>],
+    pub require: &'a [Alias<'a>],
+    pub cache: Option<CacheConfig>,
 }
 
 pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
@@ -133,8 +139,8 @@ pub struct TaskConfigExpr<'a> {
     command: CommandExpr<'a>,
     pub profiles: &'a [&'a str],
     envvar: &'a [(&'a str, StringExpr<'a>)],
-    before: AliasListExpr<'a>,
-    before_once: AliasListExpr<'a>,
+    require: AliasListExpr<'a>,
+    pub cache: Option<CacheConfig>,
 }
 
 pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
@@ -148,8 +154,8 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         ])),
         profiles: &["default"],
         envvar: &[],
-        before: AliasListExpr::List(&[]),
-        before_once: AliasListExpr::List(&[]),
+        require: AliasListExpr::List(&[]),
+        cache: None,
     }
 };
 
@@ -171,8 +177,8 @@ impl TaskConfigExpr<'static> {
                 kind: TaskKind::Action,
                 pwd: "",
                 command: Command::Cmd(&[]),
-                before: &[],
-                before_once: &[],
+                require: &[],
+                cache: None,
                 profiles: &[],
                 envvar: &[],
             },
@@ -207,8 +213,8 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
             kind: self.kind,
             pwd: self.pwd.bump_eval(env, bump)?,
             command: self.command.bump_eval(env, bump)?,
-            before: self.before.bump_eval(env, bump)?,
-            before_once: self.before_once.bump_eval(env, bump)?,
+            require: self.require.bump_eval(env, bump)?,
+            cache: self.cache,
             profiles: self.profiles,
             envvar: if self.envvar.is_empty() {
                 &[]
