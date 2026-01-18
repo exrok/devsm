@@ -281,7 +281,6 @@ fn scroll_target(w: u16, h: u16, tui: &TuiState, x: u16, y: u16) -> ScrollTarget
     bot.take_top(1);
     let task_tree_rect = bot.take_top(19);
     let (p, mut s) = task_tree_rect.h_split(0.5);
-    println!("{:?}", p);
     s.take_left(1);
     if p.contains(x, y) {
         ScrollTarget::TaskList

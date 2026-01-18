@@ -36,11 +36,24 @@ pub enum TaskKind {
     Action,
 }
 
+/// A single cache key input that contributes to cache invalidation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheKeyInput<'a> {
+    /// Invalidate cache when the file's modification time changes.
+    Modified(&'a str),
+    /// Invalidate cache when the referenced task's profile changes.
+    ProfileChanged(&'a str),
+}
+
 /// Cache configuration for actions. When present, the action's result
 /// is cached for the session - it won't re-run via `require` if the
 /// last non-cancelled run was successful.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct CacheConfig {}
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CacheConfig<'a> {
+    /// Cache key inputs that determine when the cache should be invalidated.
+    /// Empty means no key-based invalidation (simple success-based caching).
+    pub key: &'a [CacheKeyInput<'a>],
+}
 #[derive(Clone)]
 pub struct TaskConfigRc(Arc<(TaskConfig<'static>, Bump)>);
 unsafe impl Send for TaskConfigRc {}
@@ -66,7 +79,7 @@ pub struct TaskConfig<'a> {
     pub profiles: &'a [&'a str],
     pub envvar: &'a [(&'a str, &'a str)],
     pub require: &'a [Alias<'a>],
-    pub cache: Option<CacheConfig>,
+    pub cache: Option<CacheConfig<'a>>,
 }
 
 pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
@@ -112,7 +125,9 @@ pub fn load_workspace_config_leaking(
     let bump = Box::leak(Box::new(Bump::new()));
     // todo put in the bump allocator
     let base_path = Box::leak(Box::new(base_path.to_path_buf()));
-    match toml_handler::parse(bump, content, &mut |_| ()) {
+    match toml_handler::parse(bump, content, &mut |err| {
+        println!("{:#?}", err);
+    }) {
         Ok(value) => Ok(value),
         Err(_) => bail!("Failed to parse config"),
     }
@@ -140,7 +155,7 @@ pub struct TaskConfigExpr<'a> {
     pub profiles: &'a [&'a str],
     envvar: &'a [(&'a str, StringExpr<'a>)],
     require: AliasListExpr<'a>,
-    pub cache: Option<CacheConfig>,
+    pub cache: Option<CacheConfig<'a>>,
 }
 
 pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
@@ -214,7 +229,7 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
             pwd: self.pwd.bump_eval(env, bump)?,
             command: self.command.bump_eval(env, bump)?,
             require: self.require.bump_eval(env, bump)?,
-            cache: self.cache,
+            cache: self.cache.clone(),
             profiles: self.profiles,
             envvar: if self.envvar.is_empty() {
                 &[]

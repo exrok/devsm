@@ -1,12 +1,14 @@
 #:schema ./devsm-schema.json
 
-[action.gen_key]
-sh = 'head -c10 /dev/random | base64 > /tmp/devsm.test.key'
-cache = {}
 
 [action.print_key]
 sh = 'cat /tmp/devsm.test.key'
 require = ["gen_key"]
+profiles = ["alpha", "beta"]
+
+[action.gen_key]
+sh = 'head -c10 /dev/random | base64 > /tmp/devsm.test.key'
+cache.key = [{ modified = "/tmp/cat" }, { profile_changed = "print_key" }]
 
 [action.ls]
 cmd = ["ls", { if.profile = "verbose", then = "-al" }, { var = "dir" }]

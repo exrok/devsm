@@ -1,5 +1,5 @@
 use crate::{
-    config::{CARGO_AUTO_EXPR, Enviroment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig},
+    config::{CARGO_AUTO_EXPR, CacheKeyInput, Enviroment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig},
     log_storage::{JobLogCorrelation, LogId, Logs},
     process_manager::MioChannel,
 };
@@ -47,6 +47,8 @@ pub struct Job {
     pub task: TaskConfigRc,
     pub started_at: Instant,
     pub log_start: LogId,
+    /// Computed cache key for cache invalidation. Empty string means no key-based caching.
+    pub cache_key: String,
 }
 
 #[derive(Debug)]
@@ -188,6 +190,8 @@ impl LatestConfig {
                         removed: false,
                         last_spawn: None,
                         jobs: JobIndexList::default(),
+                        profile_change_counter: 0,
+                        last_profile: None,
                     });
                 }
             }
@@ -201,6 +205,28 @@ pub struct BaseTask {
     pub removed: bool,
     pub last_spawn: Option<Instant>,
     pub jobs: JobIndexList,
+    /// Counter incremented when the task's profile changes (not on first run).
+    /// Used as cache key input for `profile_changed` invalidation.
+    pub profile_change_counter: u32,
+    /// The profile used for the last spawn (for tracking profile changes).
+    pub last_profile: Option<String>,
+}
+
+impl BaseTask {
+    /// Updates the profile change counter for a task if the profile changed.
+    ///
+    /// Does not increment on first run (when `last_profile` is `None`).
+    /// Returns the new profile as a leaked static string.
+    fn update_profile_tracking(&mut self, profile: &str) {
+        if let Some(last) = &self.last_profile {
+            if last != profile {
+                self.profile_change_counter += 1;
+            } else {
+                return;
+            }
+        }
+        self.last_profile = Some(profile.into());
+    }
 }
 
 /// Stores that state of the current workspace including:
@@ -216,6 +242,46 @@ pub struct WorkspaceState {
 }
 
 impl WorkspaceState {
+    /// Computes a cache key from the cache configuration.
+    ///
+    /// The key is a concatenation of all key inputs, formatted as:
+    /// - `modified:<path>=<mtime_nanos>;` for file modification times
+    /// - `profile_changed:<task>=<counter>;` for profile change counters
+    ///
+    /// Returns an empty string if there are no key inputs.
+    fn compute_cache_key(&self, cache_key_inputs: &[CacheKeyInput]) -> String {
+        if cache_key_inputs.is_empty() {
+            return String::new();
+        }
+        let mut key = String::new();
+        for input in cache_key_inputs {
+            match input {
+                CacheKeyInput::Modified(path) => {
+                    let full_path = self.config.current.base_path.join(path);
+                    let mtime = match std::fs::metadata(&full_path).and_then(|m| m.modified()) {
+                        Ok(time) => time.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos()),
+                        Err(_) => 0,
+                    };
+                    key.push_str("modified:");
+                    key.push_str(path);
+                    key.push('=');
+                    key.push_str(&mtime.to_string());
+                    key.push(';');
+                }
+                CacheKeyInput::ProfileChanged(task_name) => {
+                    let counter =
+                        self.name_map.get(*task_name).map_or(0, |&idx| self.base_tasks[idx].profile_change_counter);
+                    key.push_str("profile_changed:");
+                    key.push_str(task_name);
+                    key.push('=');
+                    key.push_str(&counter.to_string());
+                    key.push(';');
+                }
+            }
+        }
+        key
+    }
+
     pub fn base_index_by_name(&mut self, name: &str) -> Option<usize> {
         if let Some(index) = self.name_map.get(name) {
             return Some(*index);
@@ -228,6 +294,8 @@ impl WorkspaceState {
                 removed: false,
                 last_spawn: None,
                 jobs: JobIndexList::default(),
+                profile_change_counter: 0,
+                last_profile: None,
             });
             self.name_map.insert("~cargo", index);
             return Some(index);
@@ -244,11 +312,11 @@ impl WorkspaceState {
         profile: &str,
     ) -> JobIndex {
         let bt = &mut self.base_tasks[base_task];
+        bt.update_profile_tracking(profile);
         let mut pred = Vec::new();
 
         for job_index in bt.jobs.terminate_scheduled() {
             let job = &mut self.jobs[job_index.idx()];
-            // todo should handle scheuild
             match &job.process_status {
                 JobStatus::Scheduled { .. } => {
                     job.process_status = JobStatus::Cancelled;
@@ -259,7 +327,6 @@ impl WorkspaceState {
 
         for job_index in bt.jobs.running() {
             let job = &mut self.jobs[job_index.idx()];
-            // todo should handle scheuild
             match &job.process_status {
                 JobStatus::Running { process_index } => {
                     pred.push(ScheduleRequirement { job: *job_index, predicate: JobPredicate::Terminated });
@@ -282,17 +349,32 @@ impl WorkspaceState {
 
             match dep_config.kind {
                 TaskKind::Action => {
-                    if dep_config.cache.is_some() {
-                        let spawner = &self.base_tasks[dep_base_task];
-                        for ji in spawner.jobs.all().iter().rev() {
-                            let job = &self[*ji];
-                            if matches!(job.process_status, JobStatus::Cancelled) {
-                                continue;
-                            }
-                            if job.process_status.is_successful_completion() {
+                    let Some(cache_config) = &dep_config.cache else {
+                        let new_job =
+                            self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
+                        pred.push(ScheduleRequirement {
+                            job: new_job,
+                            predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                        });
+                        continue;
+                    };
+
+                    let expected_cache_key = self.compute_cache_key(cache_config.key);
+                    let spawner = &self.base_tasks[dep_base_task];
+
+                    for ji in spawner.jobs.all().iter().rev() {
+                        let job = &self[*ji];
+                        if matches!(job.process_status, JobStatus::Cancelled) {
+                            continue;
+                        }
+                        if job.process_status.is_successful_completion() {
+                            if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
                                 continue 'outer;
                             }
-                            if job.process_status.is_pending_completion() {
+                            break;
+                        }
+                        if job.process_status.is_pending_completion() {
+                            if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
                                 pred.push(ScheduleRequirement {
                                     job: *ji,
                                     predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
@@ -301,20 +383,13 @@ impl WorkspaceState {
                             }
                             break;
                         }
-                        let new_job =
-                            self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
-                        pred.push(ScheduleRequirement {
-                            job: new_job,
-                            predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
-                        });
-                    } else {
-                        let new_job =
-                            self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
-                        pred.push(ScheduleRequirement {
-                            job: new_job,
-                            predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
-                        });
+                        break;
                     }
+                    let new_job = self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
+                    pred.push(ScheduleRequirement {
+                        job: new_job,
+                        predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                    });
                 }
                 TaskKind::Service => {
                     let spawner = &self.base_tasks[dep_base_task];
@@ -322,12 +397,13 @@ impl WorkspaceState {
                         pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
                         continue 'outer;
                     }
-                    let new_job =
-                        self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
+                    let new_job = self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
                     pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
                 }
             }
         }
+
+        let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
 
         let job_index = JobIndex(self.jobs.len() as u32);
         let bt = &mut self.base_tasks[base_task];
@@ -347,6 +423,7 @@ impl WorkspaceState {
             task: task.clone(),
             started_at: Instant::now(),
             log_start,
+            cache_key,
         });
         if spawn {
             channel.send(crate::process_manager::ProcessRequest::Spawn { task, job_index, workspace_id, job_id });
@@ -505,6 +582,7 @@ impl Workspace {
         let job_index = JobIndex(state.jobs.len() as u32);
         state.change_number = state.change_number.wrapping_add(1);
         let bt = &mut state.base_tasks[base_task];
+        bt.update_profile_tracking("");
         let pc = bt.jobs.len();
         let job_id = JobLogCorrelation((pc.wrapping_shl(12) as u32) | base_task as u32);
         bt.jobs.push_active(job_index);
@@ -512,12 +590,15 @@ impl Workspace {
         let task =
             state.base_tasks[base_task].config.eval(&Enviroment { profile: "", param: ValueMap::new() }).unwrap();
 
+        let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| state.compute_cache_key(c.key));
+
         state.jobs.push(Job {
             process_status: JobStatus::Starting,
             job_id,
             task: task.clone(),
             started_at: Instant::now(),
             log_start: self.logs.write().unwrap().tail(),
+            cache_key,
         });
 
         self.process_channel.send(crate::process_manager::ProcessRequest::Spawn {
@@ -538,13 +619,10 @@ mod scheduling_tests {
         assert!(JobStatus::Scheduled { after: vec![] }.is_pending_completion());
         assert!(JobStatus::Starting.is_pending_completion());
         assert!(JobStatus::Running { process_index: 0 }.is_pending_completion());
-        assert!(!JobStatus::Exited {
-            finished_at: Instant::now(),
-            log_end: LogId(0),
-            cause: ExitCause::Unknown,
-            status: 0
-        }
-        .is_pending_completion());
+        assert!(
+            !JobStatus::Exited { finished_at: Instant::now(), log_end: LogId(0), cause: ExitCause::Unknown, status: 0 }
+                .is_pending_completion()
+        );
         assert!(!JobStatus::Cancelled.is_pending_completion());
     }
 
@@ -555,37 +633,29 @@ mod scheduling_tests {
         assert!(!JobStatus::Running { process_index: 0 }.is_successful_completion());
         assert!(!JobStatus::Cancelled.is_successful_completion());
 
-        assert!(JobStatus::Exited {
-            finished_at: Instant::now(),
-            log_end: LogId(0),
-            cause: ExitCause::Unknown,
-            status: 0
-        }
-        .is_successful_completion());
+        assert!(
+            JobStatus::Exited { finished_at: Instant::now(), log_end: LogId(0), cause: ExitCause::Unknown, status: 0 }
+                .is_successful_completion()
+        );
 
-        assert!(!JobStatus::Exited {
-            finished_at: Instant::now(),
-            log_end: LogId(0),
-            cause: ExitCause::Unknown,
-            status: 1
-        }
-        .is_successful_completion());
+        assert!(
+            !JobStatus::Exited { finished_at: Instant::now(), log_end: LogId(0), cause: ExitCause::Unknown, status: 1 }
+                .is_successful_completion()
+        );
 
         // Note: is_successful_completion only checks status code, not exit cause.
         // The ScheduleRequirement::status method does check for Killed separately
         // when evaluating the TerminatedNaturallyAndSucessfully predicate.
-        assert!(JobStatus::Exited {
-            finished_at: Instant::now(),
-            log_end: LogId(0),
-            cause: ExitCause::Killed,
-            status: 0
-        }
-        .is_successful_completion());
+        assert!(
+            JobStatus::Exited { finished_at: Instant::now(), log_end: LogId(0), cause: ExitCause::Killed, status: 0 }
+                .is_successful_completion()
+        );
     }
 
     #[test]
     fn panic_split_line_tests() {
-        let line = "thread 'log_storage::tests::test_rotation_on_max_lines' (143789) panicked at src/log_storage.rs:639:9:";
+        let line =
+            "thread 'log_storage::tests::test_rotation_on_max_lines' (143789) panicked at src/log_storage.rs:639:9:";
         let extracted = extract_rust_panic_from_line(line);
         assert_eq!(extracted, Some(("src/log_storage.rs", 639)));
     }

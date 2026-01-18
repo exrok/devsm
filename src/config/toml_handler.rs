@@ -10,8 +10,8 @@ use toml_span::{
 };
 
 use crate::config::{
-    Alias, AliasListExpr, CacheConfig, CommandExpr, If, Predicate, StringExpr, StringListExpr, TaskCall,
-    TaskConfigExpr, TaskKind, WorkspaceConfig,
+    Alias, AliasListExpr, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, StringExpr, StringListExpr,
+    TaskCall, TaskConfigExpr, TaskKind, WorkspaceConfig,
 };
 
 fn mismatched_in_object(report_error: &mut dyn FnMut(Diagnostic<usize>), expected: &str, found: &TomlValue, key: &str) {
@@ -217,7 +217,7 @@ fn parse_task<'a>(
     profiles_vec.push("default");
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut require = AliasListExpr::List(&[]);
-    let mut cache: Option<CacheConfig> = None;
+    let mut cache: Option<CacheConfig<'a>> = None;
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
@@ -270,13 +270,42 @@ fn parse_task<'a>(
                         .with_label(Label::primary(0, value.span)));
                     return Err(());
                 }
-                if !value.as_table().map_or(false, |t| t.is_empty()) {
-                    re(Diagnostic::error()
-                        .with_message("`cache` must be an empty table `{}`")
-                        .with_label(Label::primary(0, value.span)));
+                let Some(cache_table) = value.as_table() else {
+                    mismatched_in_object(re, "table", value, "cache");
                     return Err(());
+                };
+                let mut key_inputs = bumpalo::collections::Vec::new_in(alloc);
+                if let Some(key_value) = cache_table.get("key") {
+                    let Some(key_array) = key_value.as_array() else {
+                        mismatched_in_object(re, "array", key_value, "key");
+                        return Err(());
+                    };
+                    for item in key_array {
+                        let Some(item_table) = item.as_table() else {
+                            mismatched_in_object(re, "table", item, "cache key input");
+                            return Err(());
+                        };
+                        if let Some(modified_val) = item_table.get("modified") {
+                            let Some(path) = modified_val.as_str() else {
+                                mismatched_in_object(re, "string", modified_val, "modified");
+                                return Err(());
+                            };
+                            key_inputs.push(CacheKeyInput::Modified(alloc.alloc_str(path)));
+                        } else if let Some(profile_val) = item_table.get("profile_changed") {
+                            let Some(task_name) = profile_val.as_str() else {
+                                mismatched_in_object(re, "string", profile_val, "profile_changed");
+                                return Err(());
+                            };
+                            key_inputs.push(CacheKeyInput::ProfileChanged(alloc.alloc_str(task_name)));
+                        } else {
+                            re(Diagnostic::error()
+                                .with_message("cache key input must have either `modified` or `profile_changed`")
+                                .with_label(Label::primary(0, item.span)));
+                            return Err(());
+                        }
+                    }
                 }
-                cache = Some(CacheConfig {});
+                cache = Some(CacheConfig { key: key_inputs.into_bump_slice() });
             }
             "before" => {
                 re(Diagnostic::error()
@@ -708,5 +737,41 @@ require = ["build"]
 
         let test = &config.tasks.iter().find(|(n, _)| *n == "test").unwrap().1;
         assert!(test.cache.is_none());
+    }
+
+    #[test]
+    fn test_parse_cache_with_key() {
+        let text = r#"
+[action.init_db]
+cmd = ["./init-db.sh"]
+cache.key = [
+    { modified = "./backend/database/schema.sql" },
+    { profile_changed = "backend" },
+]
+"#;
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic<usize>| {
+            errors.push(diag);
+        };
+
+        let result = parse(&bump, text, &mut error);
+        assert!(result.is_ok(), "Expected successful parse: {:?}", errors);
+        let config = result.unwrap();
+        assert_eq!(config.tasks.len(), 1);
+
+        let (name, task) = &config.tasks[0];
+        assert_eq!(*name, "init_db");
+        let cache = task.cache.as_ref().expect("cache should be present");
+        assert_eq!(cache.key.len(), 2);
+
+        match &cache.key[0] {
+            CacheKeyInput::Modified(path) => assert_eq!(*path, "./backend/database/schema.sql"),
+            _ => panic!("Expected Modified cache key input"),
+        }
+        match &cache.key[1] {
+            CacheKeyInput::ProfileChanged(task_name) => assert_eq!(*task_name, "backend"),
+            _ => panic!("Expected ProfileChanged cache key input"),
+        }
     }
 }
