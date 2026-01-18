@@ -247,8 +247,8 @@ fn naive_line_splitting_inner(
                     }
                 }
             }
-            if let Some(segement) = segments.next() {
-                current_segment = segement
+            if let Some(segment) = segments.next() {
+                current_segment = segment
             } else {
                 current_segment = Segment::AnsiEscapes("");
                 return None;
@@ -289,10 +289,10 @@ mod tests {
     #[test]
     fn splitter() {
         // let values: Vec<_> = naive_line_splitting("abcd1234value", 4).collect();
-        // assert_eq!(values, vec!["abcd", "1234", "valu", "e"]);
+        // assert_eq!(values, vec!["abcd", "1234", "value", "e"]);
 
         // let values: Vec<_> = naive_line_splitting("ab\x1b[31mcd1234value", 4).collect();
-        // assert_eq!(values, vec!["ab\x1b[31mcd", "1234", "valu", "e"]);
+        // assert_eq!(values, vec!["ab\x1b[31mcd", "1234", "value", "e"]);
 
         // let values: Vec<_> = naive_line_splitting("ab\x1b[31mcd123👍value", 4).collect();
         // assert_eq!(values, vec!["ab\x1b[31mcd", "123", "👍va", "lue"]);
@@ -309,14 +309,14 @@ mod tests {
             segments,
             vec![
                 Segment::Ascii("hello "),
-                Segment::AnsiEscapes("\x1b[31m"),
+                Segment::AnsiEscapes("31"),
                 Segment::Ascii("world"),
-                Segment::AnsiEscapes("\x1b[0m"),
+                Segment::AnsiEscapes("0"),
                 Segment::Ascii("! "),
                 Segment::Utf8("これは"),
                 Segment::Ascii("ASCII"),
                 Segment::Utf8("ではありません"),
-                Segment::AnsiEscapes("\x1b[0m"),
+                Segment::AnsiEscapes("0"),
                 Segment::Utf8("りません"),
             ]
         );
@@ -329,10 +329,10 @@ mod tests {
         assert_eq!(
             segments,
             vec![
-                Segment::AnsiEscapes("\x1b[1m"),
-                Segment::AnsiEscapes("\x1b[31m"),
+                Segment::AnsiEscapes("1"),
+                Segment::AnsiEscapes("31"),
                 Segment::Ascii("bold red"),
-                Segment::AnsiEscapes("\x1b[0m"),
+                Segment::AnsiEscapes("0"),
             ]
         );
     }

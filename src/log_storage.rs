@@ -12,69 +12,74 @@ use unicode_width::UnicodeWidthStr;
 use vtui::Style;
 
 #[derive(Clone, Copy)]
-enum LineFilter {
-    None,
+pub enum LogFilter {
+    All,
+    Job(JobId),
 }
 
-impl<'a> LineTableView<'a> {
-    pub fn contains(&self, line: &Line) -> bool {
-        true
+impl<'a> LogView<'a> {
+    pub fn contains(&self, line: &LogEntry) -> bool {
+        match self.filter {
+            LogFilter::All => true,
+            LogFilter::Job(job_id) => line.job_id == job_id,
+        }
     }
 }
 #[derive(Clone, Copy)]
-pub struct LineTableView<'a> {
-    pub(crate) table: &'a LineTable,
-    pub(crate) tail: LineId,
-    pub(crate) filter: LineFilter,
+pub struct LogView<'a> {
+    pub(crate) logs: &'a Logs,
+    pub(crate) tail: LogId,
+    pub(crate) filter: LogFilter,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct JobId(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, Default)]
-pub struct LineId(pub usize);
+pub struct LogId(pub usize);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Line {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LogEntry {
     pub job_id: JobId,
     start: u32,
     len: u32,
     pub width: u32,
     pub style: Style,
 }
-impl Line {
+impl LogEntry {
     /// Safety: The Line must be from the providd LineBuffer and
     /// the LineBuffer must not have been mutated since the Line
     /// was taking from said buffer.
-    pub unsafe fn text(&self, buf: &LineTable) -> &str {
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-            buf.buffer.add(self.start as usize).as_ptr(),
-            self.len as usize,
-        ))
+    pub unsafe fn text(&self, buf: &Logs) -> &str {
+        unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                buf.buffer.add(self.start as usize).as_ptr(),
+                self.len as usize,
+            ))
+        }
     }
 }
 
 #[cfg(not(test))]
 const MAX_LINES: usize = 16 * 4096;
 #[cfg(not(test))]
-const MAX_CAPACITY: usize = 16 * 1024;
+const MAX_CAPACITY: usize = 16 * 1024 * 1024;
 
-// NOTE: Modified for effective testing
 #[cfg(test)]
 const MAX_LINES: usize = 16;
 #[cfg(test)]
 const MAX_CAPACITY: usize = 256;
 
-unsafe impl Send for LineTable {}
-unsafe impl Sync for LineTable {}
+unsafe impl Send for Logs {}
+unsafe impl Sync for Logs {}
 
-impl Drop for LineTable {
+impl Drop for Logs {
     fn drop(&mut self) {
         unsafe {
             let layout = std::alloc::Layout::from_size_align(MAX_CAPACITY, 1).unwrap();
             std::alloc::dealloc(self.buffer.as_ptr(), layout);
-            let layout = std::alloc::Layout::array::<Line>(MAX_LINES).unwrap();
-            std::alloc::dealloc(self.line_entires.as_ptr() as *mut u8, layout);
+            let layout = std::alloc::Layout::array::<LogEntry>(MAX_LINES).unwrap();
+            std::alloc::dealloc(self.line_entries.as_ptr() as *mut u8, layout);
         }
     }
 }
@@ -84,9 +89,9 @@ struct WrappingBufferRange {
     len: u32,
 }
 
-pub struct LineTable {
+pub struct Logs {
     buffer: NonNull<u8>,
-    line_entires: NonNull<Line>,
+    line_entries: NonNull<LogEntry>,
     // This MUST be atomic as it's modified under a read lock.
     line_count: AtomicUsize,
     /// The absolute, ever-increasing LineId of the first line in the buffer.
@@ -94,16 +99,16 @@ pub struct LineTable {
     start_line_id: usize,
 }
 
-pub struct LineIndexer<'a> {
-    buffer: NonNull<Line>,
+pub struct LogIndexer<'a> {
+    buffer: NonNull<LogEntry>,
     end: usize,
     start: usize,
     _marker: PhantomData<&'a ()>,
 }
 
-impl std::ops::Index<LineId> for LineIndexer<'_> {
-    type Output = Line;
-    fn index(&self, id: LineId) -> &Self::Output {
+impl std::ops::Index<LogId> for LogIndexer<'_> {
+    type Output = LogEntry;
+    fn index(&self, id: LogId) -> &Self::Output {
         if id.0 < self.start && id.0 >= self.end {
             panic!("LineId out of bounds");
         }
@@ -111,18 +116,25 @@ impl std::ops::Index<LineId> for LineIndexer<'_> {
     }
 }
 
-impl LineTable {
-    pub fn view_all(&self) -> LineTableView<'_> {
-        LineTableView {
-            table: self,
+impl Logs {
+    pub fn view(&self, filter: LogFilter) -> LogView<'_> {
+        LogView {
+            logs: self,
             tail: self.tail(),
-            filter: LineFilter::None,
+            filter,
         }
     }
-    pub fn indexer(&self) -> LineIndexer<'_> {
+    pub fn view_all(&self) -> LogView<'_> {
+        LogView {
+            logs: self,
+            tail: self.tail(),
+            filter: LogFilter::All,
+        }
+    }
+    pub fn indexer(&self) -> LogIndexer<'_> {
         let len = self.line_count.load(Ordering::Acquire);
-        LineIndexer {
-            buffer: self.line_entires,
+        LogIndexer {
+            buffer: self.line_entries,
             start: self.start_line_id,
             end: self.start_line_id + len,
             _marker: PhantomData,
@@ -131,32 +143,32 @@ impl LineTable {
     fn index_start(&self) -> usize {
         self.start_line_id & (MAX_LINES - 1)
     }
-    pub fn head(&self) -> LineId {
-        LineId(self.start_line_id)
+    pub fn head(&self) -> LogId {
+        LogId(self.start_line_id)
     }
-    pub fn tail(&self) -> LineId {
+    pub fn tail(&self) -> LogId {
         let len = self.line_count.load(Ordering::Acquire);
-        LineId(self.start_line_id + len)
+        LogId(self.start_line_id + len)
     }
 
-    pub fn slices(&self) -> (&[Line], &[Line]) {
+    pub fn slices(&self) -> (&[LogEntry], &[LogEntry]) {
         let len = self.line_count.load(Ordering::Acquire);
         let start = self.index_start();
         if start + len <= MAX_LINES {
             unsafe {
-                let slice = std::slice::from_raw_parts(self.line_entires.as_ptr().add(start), len);
+                let slice = std::slice::from_raw_parts(self.line_entries.as_ptr().add(start), len);
                 return (slice, &[]);
             }
         }
         let first_len = MAX_LINES - start;
         unsafe {
-            let a = std::slice::from_raw_parts(self.line_entires.as_ptr().add(start), first_len);
-            let b = std::slice::from_raw_parts(self.line_entires.as_ptr(), len - first_len);
+            let a = std::slice::from_raw_parts(self.line_entries.as_ptr().add(start), first_len);
+            let b = std::slice::from_raw_parts(self.line_entries.as_ptr(), len - first_len);
             return (a, b);
         }
     }
 
-    pub fn slices_range(&self, min: LineId, max: LineId) -> (&[Line], &[Line]) {
+    pub fn slices_range(&self, min: LogId, max: LogId) -> (&[LogEntry], &[LogEntry]) {
         if min.0 > max.0 {
             return (&[], &[]);
         }
@@ -185,7 +197,7 @@ impl LineTable {
         if physical_start + count <= MAX_LINES {
             unsafe {
                 let slice = std::slice::from_raw_parts(
-                    self.line_entires.as_ptr().add(physical_start),
+                    self.line_entries.as_ptr().add(physical_start),
                     count,
                 );
                 (slice, &[])
@@ -195,22 +207,22 @@ impl LineTable {
             let second_len = count - first_len;
             unsafe {
                 let a = std::slice::from_raw_parts(
-                    self.line_entires.as_ptr().add(physical_start),
+                    self.line_entries.as_ptr().add(physical_start),
                     first_len,
                 );
-                let b = std::slice::from_raw_parts(self.line_entires.as_ptr(), second_len);
+                let b = std::slice::from_raw_parts(self.line_entries.as_ptr(), second_len);
                 (a, b)
             }
         }
     }
 
-    pub fn slices_from(&self, start_id: LineId) -> (&[Line], &[Line], LineId) {
+    pub fn slices_from(&self, start_id: LogId) -> (&[LogEntry], &[LogEntry], LogId) {
         let first_id = self.start_line_id;
         let len = self.line_count.load(Ordering::Acquire);
 
         let end_line_id = first_id + len;
         if len == 0 {
-            return (&[], &[], LineId(end_line_id)); // Buffer is empty, try again from the same spot later.
+            return (&[], &[], LogId(end_line_id)); // Buffer is empty, try again from the same spot later.
         }
 
         let start_logical_offset = start_id.0.saturating_sub(first_id);
@@ -218,7 +230,7 @@ impl LineTable {
         if start_logical_offset >= len {
             // The requested start_id is past the end of our buffer.
             // The next valid ID to request is the one after our last line.
-            return (&[], &[], LineId(end_line_id));
+            return (&[], &[], LogId(end_line_id));
         }
 
         let physical_start_index = (first_id + start_logical_offset) & (MAX_LINES - 1);
@@ -228,7 +240,7 @@ impl LineTable {
             unsafe {
                 (
                     std::slice::from_raw_parts(
-                        self.line_entires.as_ptr().add(physical_start_index),
+                        self.line_entries.as_ptr().add(physical_start_index),
                         num_lines_to_iterate,
                     ),
                     &[][..],
@@ -239,20 +251,20 @@ impl LineTable {
             unsafe {
                 (
                     std::slice::from_raw_parts(
-                        self.line_entires.as_ptr().add(physical_start_index),
+                        self.line_entries.as_ptr().add(physical_start_index),
                         first_slice_len,
                     ),
                     std::slice::from_raw_parts(
-                        self.line_entires.as_ptr(),
+                        self.line_entries.as_ptr(),
                         num_lines_to_iterate - first_slice_len,
                     ),
                 )
             }
         };
-        (a, b, LineId(end_line_id))
+        (a, b, LogId(end_line_id))
     }
 
-    pub fn for_each(&self, mut func: impl FnMut(LineId, JobId, &str, u32) -> ControlFlow<(), ()>) {
+    pub fn for_each(&self, mut func: impl FnMut(LogId, JobId, &str, u32) -> ControlFlow<(), ()>) {
         let (a, b) = self.slices();
         let first_id = self.start_line_id;
         let mut logical_index = 0;
@@ -265,7 +277,7 @@ impl LineTable {
                     ))
                 };
                 match func(
-                    LineId(first_id + logical_index),
+                    LogId(first_id + logical_index),
                     entry.job_id,
                     data,
                     entry.width,
@@ -280,9 +292,9 @@ impl LineTable {
 
     pub fn for_each_from(
         &self,
-        start_id: LineId,
-        mut func: impl FnMut(LineId, JobId, &str, u32) -> ControlFlow<(), ()>,
-    ) -> LineId {
+        start_id: LogId,
+        mut func: impl FnMut(LogId, JobId, &str, u32) -> ControlFlow<(), ()>,
+    ) -> LogId {
         let first_id = self.start_line_id;
         let len = self.line_count.load(Ordering::Acquire);
 
@@ -296,7 +308,7 @@ impl LineTable {
         if start_logical_offset >= len {
             // The requested start_id is past the end of our buffer.
             // The next valid ID to request is the one after our last line.
-            return LineId(end_line_id);
+            return LogId(end_line_id);
         }
 
         let physical_start_index = (first_id + start_logical_offset) & (MAX_LINES - 1);
@@ -306,7 +318,7 @@ impl LineTable {
             unsafe {
                 (
                     std::slice::from_raw_parts(
-                        self.line_entires.as_ptr().add(physical_start_index),
+                        self.line_entries.as_ptr().add(physical_start_index),
                         num_lines_to_iterate,
                     ),
                     &[][..],
@@ -317,11 +329,11 @@ impl LineTable {
             unsafe {
                 (
                     std::slice::from_raw_parts(
-                        self.line_entires.as_ptr().add(physical_start_index),
+                        self.line_entries.as_ptr().add(physical_start_index),
                         first_slice_len,
                     ),
                     std::slice::from_raw_parts(
-                        self.line_entires.as_ptr(),
+                        self.line_entries.as_ptr(),
                         num_lines_to_iterate - first_slice_len,
                     ),
                 )
@@ -337,13 +349,13 @@ impl LineTable {
                         entry.len as usize,
                     ))
                 };
-                let current_line_id = LineId(first_id + current_logical_offset);
+                let current_line_id = LogId(first_id + current_logical_offset);
                 match func(current_line_id, entry.job_id, data, entry.width) {
                     ControlFlow::Continue(_) => (),
                     ControlFlow::Break(_) => {
                         // Iteration was stopped early. The next ID to start from
                         // is the one after the line we just processed.
-                        return LineId(current_line_id.0 + 1);
+                        return LogId(current_line_id.0 + 1);
                     }
                 }
                 current_logical_offset += 1;
@@ -352,7 +364,7 @@ impl LineTable {
 
         // If we finished the whole loop, the next ID to start from is
         // the one after the very last line in the buffer.
-        LineId(end_line_id)
+        LogId(end_line_id)
     }
 
     fn free_lines(&mut self, amount: usize) -> WrappingBufferRange {
@@ -369,7 +381,7 @@ impl LineTable {
             }
             let last_line_idx = (index_start + curr - 1) & (MAX_LINES - 1);
             let end_of_used_buffer = unsafe {
-                let value = self.line_entires.add(last_line_idx).read();
+                let value = self.line_entries.add(last_line_idx).read();
                 value.start + value.len
             };
             if curr == MAX_LINES {
@@ -379,7 +391,7 @@ impl LineTable {
                 };
             }
             let start_of_used_buffer = unsafe {
-                let value = self.line_entires.add(index_start).read();
+                let value = self.line_entries.add(index_start).read();
                 value.start
             };
             return WrappingBufferRange {
@@ -391,7 +403,7 @@ impl LineTable {
 
         let last_line_index_before_free = (index_start + curr - 1) & (MAX_LINES - 1);
         let end_of_used_buffer = unsafe {
-            let value = self.line_entires.add(last_line_index_before_free).read();
+            let value = self.line_entries.add(last_line_index_before_free).read();
             value.start + value.len
         };
 
@@ -402,7 +414,7 @@ impl LineTable {
         if new_line_count > 0 {
             let new_index_start = self.index_start();
             let start_of_used_buffer =
-                unsafe { self.line_entires.add(new_index_start).read().start };
+                unsafe { self.line_entries.add(new_index_start).read().start };
             WrappingBufferRange {
                 start: end_of_used_buffer,
                 len: (start_of_used_buffer + MAX_CAPACITY as u32 - end_of_used_buffer)
@@ -420,10 +432,12 @@ impl LineTable {
 impl WrappingBufferRange {
     fn munch(&mut self, len: usize) -> Option<u32> {
         if len > self.len as usize {
+            kvlog::warn!("MAX capacity hit");
             return None;
         }
         let end = self.start + len as u32;
         if end > MAX_CAPACITY as u32 {
+            kvlog::warn!("MAX capacity hit");
             let wasted = MAX_CAPACITY - self.start as usize;
             if self.len as usize - wasted < len {
                 return None;
@@ -441,14 +455,14 @@ impl WrappingBufferRange {
     }
 }
 
-pub struct LineTableWriter {
-    buffer: Arc<RwLock<LineTable>>,
+pub struct LogWriter {
+    buffer: Arc<RwLock<Logs>>,
     range: WrappingBufferRange,
     remaining: usize,
 }
 
 fn write_line_unchecked(
-    buf: &LineTable,
+    buf: &Logs,
     start: u32,
     line: &str,
     width: u32,
@@ -464,7 +478,7 @@ fn write_line_unchecked(
             buf.buffer.add(start as usize).as_ptr(),
             line.len(),
         );
-        buf.line_entires.add(next).write(Line {
+        buf.line_entries.add(next).write(LogEntry {
             job_id,
             start,
             len: line.len() as u32,
@@ -475,8 +489,8 @@ fn write_line_unchecked(
     }
 }
 
-impl LineTableWriter {
-    pub fn new() -> LineTableWriter {
+impl LogWriter {
+    pub fn new() -> LogWriter {
         let buffer = {
             let layout = std::alloc::Layout::from_size_align(MAX_CAPACITY, 1).unwrap();
             let ptr = unsafe { std::alloc::alloc(layout) };
@@ -486,20 +500,20 @@ impl LineTableWriter {
             NonNull::new(ptr).unwrap()
         };
         let line_entries = {
-            let layout = std::alloc::Layout::array::<Line>(MAX_LINES).unwrap();
+            let layout = std::alloc::Layout::array::<LogEntry>(MAX_LINES).unwrap();
             let ptr = unsafe { std::alloc::alloc(layout) };
             if ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            NonNull::new(ptr as *mut Line).unwrap()
+            NonNull::new(ptr as *mut LogEntry).unwrap()
         };
-        let line_buffer = LineTable {
+        let line_buffer = Logs {
             buffer,
-            line_entires: line_entries,
+            line_entries: line_entries,
             line_count: AtomicUsize::new(0),
             start_line_id: 0,
         };
-        LineTableWriter {
+        LogWriter {
             buffer: Arc::new(RwLock::new(line_buffer)),
             remaining: MAX_LINES,
             range: WrappingBufferRange {
@@ -509,7 +523,7 @@ impl LineTableWriter {
         }
     }
 
-    pub fn reader(&self) -> Arc<RwLock<LineTable>> {
+    pub fn reader(&self) -> Arc<RwLock<Logs>> {
         self.buffer.clone()
     }
 
@@ -525,6 +539,7 @@ impl LineTableWriter {
             let mut lock = self.buffer.write().unwrap();
             let count = (lock.line_count.load(Ordering::Acquire) as usize + 1) / 2;
             self.range = lock.free_lines(count);
+            kvlog::warn!("After cleanup new capcity is", count = self.range.len);
             self.remaining = MAX_LINES - *lock.line_count.get_mut();
             if let Some(offset) = self.range.munch(line.len())
                 && self.remaining > 0
@@ -547,7 +562,7 @@ mod tests {
     use std::ops::ControlFlow;
 
     // Helper to collect all lines from the buffer for easy assertion.
-    fn collect_lines(reader: &Arc<RwLock<LineTable>>) -> Vec<(LineId, JobId, String, u32)> {
+    fn collect_lines(reader: &Arc<RwLock<Logs>>) -> Vec<(LogId, JobId, String, u32)> {
         let mut lines = Vec::new();
         let buffer = reader.read().unwrap();
         buffer.for_each(|id, job, data, width| {
@@ -559,9 +574,9 @@ mod tests {
 
     // Helper to collect lines from a specific starting ID.
     fn collect_lines_from(
-        reader: &Arc<RwLock<LineTable>>,
-        start_id: LineId,
-    ) -> Vec<(LineId, JobId, String, u32)> {
+        reader: &Arc<RwLock<Logs>>,
+        start_id: LogId,
+    ) -> Vec<(LogId, JobId, String, u32)> {
         let mut lines = Vec::new();
         let buffer = reader.read().unwrap();
         buffer.for_each_from(start_id, |id, job, data, width| {
@@ -573,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_basic_push_and_read() {
-        let mut writer = LineTableWriter::new();
+        let mut writer = LogWriter::new();
         let reader = writer.reader();
 
         for i in 0..5 {
@@ -583,7 +598,7 @@ mod tests {
         let lines = collect_lines(&reader);
         assert_eq!(lines.len(), 5);
         for i in 0..5 {
-            assert_eq!(lines[i].0, LineId(i));
+            assert_eq!(lines[i].0, LogId(i));
             assert_eq!(lines[i].1, JobId(1));
             assert_eq!(lines[i].2, format!("Line {}", i));
             assert_eq!(lines[i].3, 10);
@@ -592,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_rotation_on_max_lines() {
-        let mut writer = LineTableWriter::new();
+        let mut writer = LogWriter::new();
         let reader = writer.reader();
 
         // Push MAX_LINES + 1 lines to trigger a rotation.
@@ -618,15 +633,15 @@ mod tests {
 
         let lines = collect_lines(&reader);
         assert_eq!(lines.len(), 9);
-        assert_eq!(lines[0].0, LineId(8));
+        assert_eq!(lines[0].0, LogId(8));
         assert_eq!(lines[0].2, "line_8");
-        assert_eq!(lines[8].0, LineId(16));
+        assert_eq!(lines[8].0, LogId(16));
         assert_eq!(lines[8].2, "line_16");
     }
 
     #[test]
     fn test_rotation_on_max_capacity() {
-        let mut writer = LineTableWriter::new();
+        let mut writer = LogWriter::new();
         let reader = writer.reader();
 
         // MAX_CAPACITY is 256. Push 5 lines of 60 bytes each. 4 will fit, 5th triggers rotation.
@@ -651,15 +666,15 @@ mod tests {
 
         let lines = collect_lines(&reader);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0].0, LineId(2)); // Original 3rd line
-        assert_eq!(lines[1].0, LineId(3)); // Original 4th line
-        assert_eq!(lines[2].0, LineId(4)); // The new line
+        assert_eq!(lines[0].0, LogId(2)); // Original 3rd line
+        assert_eq!(lines[1].0, LogId(3)); // Original 4th line
+        assert_eq!(lines[2].0, LogId(4)); // The new line
         assert!(lines.iter().all(|l| l.2 == line_data));
     }
 
     #[test]
     fn test_byte_buffer_wrapping_and_data_integrity() {
-        let mut writer = LineTableWriter::new();
+        let mut writer = LogWriter::new();
         let reader = writer.reader();
 
         // 1. Push a line that fills most of the buffer. Capacity is 256.
@@ -682,18 +697,18 @@ mod tests {
         assert_eq!(lines.len(), 2);
 
         // Check that the remaining line (line_b) and the new line (line_c) are correct.
-        assert_eq!(lines[0].0, LineId(1));
+        assert_eq!(lines[0].0, LogId(1));
         assert_eq!(lines[0].2, line_b);
         assert_eq!(lines[0].1, JobId(1));
 
-        assert_eq!(lines[1].0, LineId(2));
+        assert_eq!(lines[1].0, LogId(2));
         assert_eq!(lines[1].2, line_c);
         assert_eq!(lines[1].1, JobId(2));
     }
 
     #[test]
     fn test_for_each_from_after_rotation() {
-        let mut writer = LineTableWriter::new();
+        let mut writer = LogWriter::new();
         let reader = writer.reader();
 
         // Push 20 lines to trigger one rotation and populate the buffer.
@@ -709,31 +724,31 @@ mod tests {
         drop(lock);
 
         // Case 1: Start ID is before the first available line. Should start from the beginning.
-        let lines_from_5 = collect_lines_from(&reader, LineId(5));
+        let lines_from_5 = collect_lines_from(&reader, LogId(5));
         assert_eq!(lines_from_5.len(), 12);
-        assert_eq!(lines_from_5[0].0, LineId(8)); // Starts from the first available line
-        assert_eq!(lines_from_5[11].0, LineId(19));
+        assert_eq!(lines_from_5[0].0, LogId(8)); // Starts from the first available line
+        assert_eq!(lines_from_5[11].0, LogId(19));
 
         // Case 2: Start ID is in the middle of the available lines.
-        let lines_from_15 = collect_lines_from(&reader, LineId(15));
+        let lines_from_15 = collect_lines_from(&reader, LogId(15));
         assert_eq!(lines_from_15.len(), 5); // Lines 15, 16, 17, 18, 19
-        assert_eq!(lines_from_15[0].0, LineId(15));
-        assert_eq!(lines_from_15[4].0, LineId(19));
+        assert_eq!(lines_from_15[0].0, LogId(15));
+        assert_eq!(lines_from_15[4].0, LogId(19));
 
         // Case 3: Start ID is after the last available line.
-        let lines_from_25 = collect_lines_from(&reader, LineId(25));
+        let lines_from_25 = collect_lines_from(&reader, LogId(25));
         assert_eq!(lines_from_25.len(), 0);
 
         // Case 4: Start ID is exactly the first line.
-        let lines_from_8 = collect_lines_from(&reader, LineId(8));
+        let lines_from_8 = collect_lines_from(&reader, LogId(8));
         assert_eq!(lines_from_8.len(), 12);
-        assert_eq!(lines_from_8[0].0, LineId(8));
+        assert_eq!(lines_from_8[0].0, LogId(8));
     }
 
     #[test]
     #[should_panic(expected = "Line is too long to fit in the freed buffer space")]
     fn test_line_too_long_panics() {
-        let mut writer = LineTableWriter::new();
+        let mut writer = LogWriter::new();
 
         // Fill both MAX_LINES and MAX_CAPACITY.
         // 16 lines * 16 bytes/line = 256 bytes.
