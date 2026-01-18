@@ -37,6 +37,14 @@ impl JobIndex {
     pub fn idx(self) -> usize {
         self.0 as usize
     }
+
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+
+    pub fn from_usize(idx: usize) -> Self {
+        Self(idx as u32)
+    }
 }
 
 #[derive(Debug)]

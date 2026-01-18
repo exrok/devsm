@@ -4,6 +4,7 @@ use crate::{
     daemon::WorkspaceCommand,
     line_width::{Segment, apply_raw_display_mode_vt_to_style},
     log_storage::{LogGroup, LogWriter},
+    rpc::{RpcMessageKind, DecodeResult, DecodingState},
 };
 use anyhow::{Context, bail};
 use jsony_value::ValueMap;
@@ -26,8 +27,6 @@ use std::{
 use unicode_width::UnicodeWidthStr;
 use vtui::Style;
 
-const RESIZE_CODE: u32 = 0x85_06_09_44;
-const TERMINATION_CODE: u32 = 0xcf_04_43_58;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Pipe {
     Stdout,
@@ -106,6 +105,7 @@ struct ClientEntry {
     channel: Arc<ClientChannel>,
     socket: UnixStream,
     kind: ClientKind,
+    partial_rpc_read: Option<(DecodingState, Vec<u8>)>,
 }
 
 pub struct WorkspaceEntry {
@@ -740,7 +740,13 @@ impl ProcessManager {
             Interest::READABLE,
         );
         let _ = socket.set_nonblocking(true);
-        let client_entry = ClientEntry { channel: channel.clone(), workspace: ws_index, socket, kind: ClientKind::Tui };
+        let client_entry = ClientEntry {
+            channel: channel.clone(),
+            workspace: ws_index,
+            socket,
+            kind: ClientKind::Tui,
+            partial_rpc_read: None,
+        };
         let index = self.clients.insert(client_entry);
         kvlog::info!("Client Attached");
         let keybinds = global_keybinds();
@@ -815,6 +821,7 @@ impl ProcessManager {
             workspace: ws_index,
             socket,
             kind: ClientKind::Run { log_group: job_id },
+            partial_rpc_read: None,
         };
         let index = self.clients.insert(client_entry);
 
@@ -885,8 +892,13 @@ impl ProcessManager {
 
         let forwarder_socket = socket.try_clone().ok();
 
-        let client_entry =
-            ClientEntry { channel: channel.clone(), workspace: ws_index, socket, kind: ClientKind::TestRun };
+        let client_entry = ClientEntry {
+            channel: channel.clone(),
+            workspace: ws_index,
+            socket,
+            kind: ClientKind::TestRun,
+            partial_rpc_read: None,
+        };
         let index = self.clients.insert(client_entry);
 
         let ws_handle = ws.handle.clone();
@@ -933,7 +945,11 @@ impl ProcessManager {
         let Some(client) = self.clients.get_mut(client_index as usize) else {
             return;
         };
-        let mut buffer = self.buffer_pool.pop().unwrap_or_default();
+        let (mut state, mut buffer) = client
+            .partial_rpc_read
+            .take()
+            .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
+
         let mut terminate = false;
         loop {
             match try_read(client.socket.as_raw_fd(), &mut buffer) {
@@ -951,25 +967,51 @@ impl ProcessManager {
                 }
             }
         }
-        let mut requests = &buffer[..];
+
         let mut wake = false;
-        while let Some((a, remaining)) = requests.split_first_chunk() {
-            let command = u32::from_le_bytes(*a);
-            requests = remaining;
-            if command == RESIZE_CODE {
-                client.channel.state.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                wake = true;
-            } else if command == TERMINATION_CODE {
-                terminate = true;
-            } else {
-                kvlog::error!("Unknown command from client", ?command);
+        loop {
+            match state.decode(&buffer) {
+                DecodeResult::Message { kind, .. } => match kind {
+                    RpcMessageKind::Resize => {
+                        client.channel.state.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        wake = true;
+                    }
+                    RpcMessageKind::Terminate => {
+                        terminate = true;
+                    }
+                    _ => {
+                        kvlog::error!("Unexpected message kind from TUI client", ?kind);
+                    }
+                },
+                DecodeResult::MissingData { .. } => break,
+                DecodeResult::Empty => {
+                    buffer.clear();
+                    break;
+                }
+                DecodeResult::Error(e) => {
+                    kvlog::error!("Protocol decode error", ?e);
+                    terminate = true;
+                    break;
+                }
             }
         }
 
+        state.compact(&mut buffer, 4096);
+
         if terminate {
+            self.buffer_pool.push(buffer);
             self.terminate_client(client_index);
-        } else if wake {
-            let _ = client.channel.wake();
+        } else {
+            if buffer.is_empty() {
+                self.buffer_pool.push(buffer);
+            } else {
+                let Some(client) = self.clients.get_mut(client_index as usize) else { return };
+                client.partial_rpc_read = Some((state, buffer));
+            }
+            if wake {
+                let Some(client) = self.clients.get_mut(client_index as usize) else { return };
+                let _ = client.channel.wake();
+            }
         }
     }
 
@@ -977,25 +1019,55 @@ impl ProcessManager {
         let Some(client) = self.clients.get_mut(client_index as usize) else {
             return;
         };
-        let mut buffer = [0u8; 4];
+        let (mut state, mut buffer) = client
+            .partial_rpc_read
+            .take()
+            .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
+
         let mut terminate = false;
         let mut kill_task = false;
-        match std::io::Read::read(&mut &client.socket, &mut buffer) {
-            Ok(4) => {
-                let code = u32::from_le_bytes(buffer);
-                if code == TERMINATION_CODE {
-                    kill_task = true;
+
+        loop {
+            match try_read(client.socket.as_raw_fd(), &mut buffer) {
+                ReadResult::More => continue,
+                ReadResult::EOF => {
                     terminate = true;
+                    break;
+                }
+                ReadResult::Done => break,
+                ReadResult::WouldBlock => break,
+                ReadResult::OtherError(_) => {
+                    terminate = true;
+                    break;
                 }
             }
-            Ok(0) => {
-                terminate = true;
-            }
-            Err(_) => {
-                terminate = true;
-            }
-            _ => {}
         }
+
+        loop {
+            match state.decode(&buffer) {
+                DecodeResult::Message { kind, .. } => match kind {
+                    RpcMessageKind::Terminate => {
+                        kill_task = true;
+                        terminate = true;
+                    }
+                    _ => {
+                        kvlog::error!("Unexpected message kind from run client", ?kind);
+                    }
+                },
+                DecodeResult::MissingData { .. } => break,
+                DecodeResult::Empty => {
+                    buffer.clear();
+                    break;
+                }
+                DecodeResult::Error(e) => {
+                    kvlog::error!("Protocol decode error", ?e);
+                    terminate = true;
+                    break;
+                }
+            }
+        }
+
+        state.compact(&mut buffer, 4096);
 
         if kill_task {
             for (_, process) in &self.processes {
@@ -1011,7 +1083,13 @@ impl ProcessManager {
         }
 
         if terminate {
+            self.buffer_pool.push(buffer);
             self.terminate_client(client_index);
+        } else if buffer.is_empty() {
+            self.buffer_pool.push(buffer);
+        } else {
+            let Some(client) = self.clients.get_mut(client_index as usize) else { return };
+            client.partial_rpc_read = Some((state, buffer));
         }
     }
 
@@ -1019,26 +1097,62 @@ impl ProcessManager {
         let Some(client) = self.clients.get_mut(client_index as usize) else {
             return;
         };
-        let mut buffer = [0u8; 4];
+        let (mut state, mut buffer) = client
+            .partial_rpc_read
+            .take()
+            .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
+
         let mut terminate = false;
-        match std::io::Read::read(&mut &client.socket, &mut buffer) {
-            Ok(4) => {
-                let code = u32::from_le_bytes(buffer);
-                if code == TERMINATION_CODE {
+
+        loop {
+            match try_read(client.socket.as_raw_fd(), &mut buffer) {
+                ReadResult::More => continue,
+                ReadResult::EOF => {
                     terminate = true;
+                    break;
+                }
+                ReadResult::Done => break,
+                ReadResult::WouldBlock => break,
+                ReadResult::OtherError(_) => {
+                    terminate = true;
+                    break;
                 }
             }
-            Ok(0) => {
-                terminate = true;
-            }
-            Err(_) => {
-                terminate = true;
-            }
-            _ => {}
         }
 
+        loop {
+            match state.decode(&buffer) {
+                DecodeResult::Message { kind, .. } => match kind {
+                    RpcMessageKind::Terminate => {
+                        terminate = true;
+                    }
+                    _ => {
+                        kvlog::error!("Unexpected message kind from test client", ?kind);
+                    }
+                },
+                DecodeResult::MissingData { .. } => break,
+                DecodeResult::Empty => {
+                    buffer.clear();
+                    break;
+                }
+                DecodeResult::Error(e) => {
+                    kvlog::error!("Protocol decode error", ?e);
+                    terminate = true;
+                    break;
+                }
+            }
+        }
+
+        state.compact(&mut buffer, 4096);
+
         if terminate {
+            self.buffer_pool.push(buffer);
             self.terminate_client(client_index);
+        } else if buffer.is_empty() {
+            self.buffer_pool.push(buffer);
+        } else {
+            let Some(client) = self.clients.get_mut(client_index as usize) else { return };
+            client.partial_rpc_read = Some((state, buffer));
         }
     }
 }

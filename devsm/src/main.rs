@@ -9,6 +9,10 @@ use anyhow::bail;
 use sendfd::SendWithFd;
 
 use crate::daemon::{GLOBAL_SOCKET, WorkspaceCommand};
+use crate::rpc::{
+    ClientProtocol, DecodeResult, RpcMessageKind, ResizeNotification,
+    JobStatusEvent, JobStatusKind, JobExitedEvent,
+};
 
 mod cli;
 mod collection;
@@ -19,6 +23,7 @@ mod line_width;
 mod log_fowarder_ui;
 mod log_storage;
 mod process_manager;
+mod rpc;
 mod scroll_view;
 mod searcher;
 mod test_summary_ui;
@@ -84,7 +89,6 @@ fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
 
     let mut socket = connect_or_spawn_daemon()?;
 
-    // Convert filters to TestFilters for IPC
     let mut include_tags = Vec::new();
     let mut exclude_tags = Vec::new();
     let mut include_names = Vec::new();
@@ -106,24 +110,44 @@ fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
         &[0, 1],
     )?;
 
-    let mut buf = [0u8; 4];
+    let mut protocol = ClientProtocol::new();
+    let mut read_buf = Vec::with_capacity(1024);
 
     loop {
         let flags = SIGNAL_FLAGS.swap(0, Ordering::Relaxed);
 
         if flags & TERMINATION_FLAG != 0 {
-            socket.write_all(&TERMINATION_CODE.to_ne_bytes())?;
+            protocol.send_empty(RpcMessageKind::Terminate, 0);
+            socket.write_all(protocol.output())?;
+            protocol.clear_output();
         }
 
-        match socket.read(&mut buf) {
+        read_buf.reserve(1024);
+        let spare = read_buf.spare_capacity_mut();
+        let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
+
+        match socket.read(read_slice) {
             Ok(0) => break,
-            Ok(4) => {
-                let code = u32::from_ne_bytes(buf);
-                if code == TERMINATION_CODE {
-                    break;
+            Ok(n) => {
+                unsafe { read_buf.set_len(read_buf.len() + n) };
+                loop {
+                    match protocol.decode(&read_buf) {
+                        DecodeResult::Message { kind, .. } => match kind {
+                            RpcMessageKind::TerminateAck | RpcMessageKind::Disconnect => {
+                                return Ok(());
+                            }
+                            _ => {}
+                        },
+                        DecodeResult::MissingData { .. } => break,
+                        DecodeResult::Empty => {
+                            read_buf.clear();
+                            break;
+                        }
+                        DecodeResult::Error(_) => return Ok(()),
+                    }
                 }
+                protocol.compact(&mut read_buf, 4096);
             }
-            Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => bail!("Socket read failed: {}", e),
         }
@@ -131,14 +155,6 @@ fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
 
     Ok(())
 }
-
-const RESIZE_CODE: u32 = 0x85_06_09_44;
-const TERMINATION_CODE: u32 = 0xcf_04_43_58;
-
-const STATUS_RESTARTING: u32 = 0x01_52_53_54;
-const STATUS_WAITING: u32 = 0x02_57_41_54;
-const STATUS_RUNNING: u32 = 0x03_52_55_4e;
-const STATUS_EXITED: u32 = 0x04_45_58_54;
 
 // Bit 0 is for termination, Bit 1 is for resize
 const TERMINATION_FLAG: u64 = 1 << 0;
@@ -225,14 +241,12 @@ fn client() -> anyhow::Result<()> {
     let config = config::find_config_path_from(&cwd)
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
-    // Register the signal handlers using libc directly
     setup_signal_handler(libc::SIGTERM, term_handler)?;
     setup_signal_handler(libc::SIGINT, term_handler)?;
     setup_signal_handler(libc::SIGWINCH, winch_handler)?;
 
     let mut socket = connect_or_spawn_daemon()?;
 
-    // socket.write_all()?;
     socket.send_with_fd(
         &jsony::to_binary(&daemon::RequestMessage {
             cwd: &cwd,
@@ -241,31 +255,53 @@ fn client() -> anyhow::Result<()> {
         &[0, 1],
     )?;
 
-    let mut buf = [0; 4];
+    let mut protocol = ClientProtocol::new();
+    let mut read_buf = Vec::with_capacity(1024);
 
     loop {
         let flags = SIGNAL_FLAGS.swap(0, Ordering::Relaxed);
 
         if flags & TERMINATION_FLAG != 0 {
-            socket.write_all(&TERMINATION_CODE.to_ne_bytes())?;
+            protocol.send_empty(RpcMessageKind::Terminate, 0);
+            socket.write_all(protocol.output())?;
+            protocol.clear_output();
             return Ok(());
         }
 
         if flags & RESIZE_FLAG != 0 {
-            socket.write_all(&RESIZE_CODE.to_ne_bytes())?;
+            protocol.send_notify(RpcMessageKind::Resize, &ResizeNotification { width: 0, height: 0 });
+            socket.write_all(protocol.output())?;
+            protocol.clear_output();
         }
-        match socket.read(&mut buf) {
-            Ok(amount) => {
-                if amount == 0 {
-                    break;
+
+        read_buf.reserve(1024);
+        let spare = read_buf.spare_capacity_mut();
+        let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
+
+        match socket.read(read_slice) {
+            Ok(0) => break,
+            Ok(n) => {
+                unsafe { read_buf.set_len(read_buf.len() + n) };
+                loop {
+                    match protocol.decode(&read_buf) {
+                        DecodeResult::Message { kind, .. } => match kind {
+                            RpcMessageKind::TerminateAck | RpcMessageKind::Disconnect => {
+                                return Ok(());
+                            }
+                            _ => {}
+                        },
+                        DecodeResult::MissingData { .. } => break,
+                        DecodeResult::Empty => {
+                            read_buf.clear();
+                            break;
+                        }
+                        DecodeResult::Error(_) => return Ok(()),
+                    }
                 }
-                let received_code = u32::from_ne_bytes(buf);
-                if received_code == TERMINATION_CODE {
-                    break;
-                }
+                protocol.compact(&mut read_buf, 4096);
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {
-                kvlog::info!("Interuped")
+                kvlog::info!("Interrupted")
             }
             Err(e) => {
                 bail!("Socket read failed: {}", e);
@@ -309,7 +345,8 @@ fn run_client(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
         &[0, 1],
     )?;
 
-    let mut buf = [0u8; 4];
+    let mut protocol = ClientProtocol::new();
+    let mut read_buf = Vec::with_capacity(1024);
     let mut exit_status: Option<i32> = None;
     let mut terminated_by_user = false;
 
@@ -318,39 +355,61 @@ fn run_client(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
 
         if flags & TERMINATION_FLAG != 0 {
             terminated_by_user = true;
-            socket.write_all(&TERMINATION_CODE.to_ne_bytes())?;
+            protocol.send_empty(RpcMessageKind::Terminate, 0);
+            socket.write_all(protocol.output())?;
+            protocol.clear_output();
         }
 
-        match socket.read(&mut buf) {
+        read_buf.reserve(1024);
+        let spare = read_buf.spare_capacity_mut();
+        let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
+
+        match socket.read(read_slice) {
             Ok(0) => break,
-            Ok(4) => {
-                let code = u32::from_ne_bytes(buf);
-                match code {
-                    TERMINATION_CODE => {
-                        if terminated_by_user {
-                            if let Some(status) = exit_status {
-                                eprintln!("Task terminated (exit code {})", status);
-                            } else {
-                                eprintln!("Task terminated");
+            Ok(n) => {
+                unsafe { read_buf.set_len(read_buf.len() + n) };
+                loop {
+                    match protocol.decode(&read_buf) {
+                        DecodeResult::Message { kind, payload, .. } => match kind {
+                            RpcMessageKind::TerminateAck | RpcMessageKind::Disconnect => {
+                                if terminated_by_user {
+                                    if let Some(status) = exit_status {
+                                        eprintln!("Task terminated (exit code {})", status);
+                                    } else {
+                                        eprintln!("Task terminated");
+                                    }
+                                } else if let Some(status) = exit_status {
+                                    eprintln!("Task exited (code {})", status);
+                                }
+                                return Ok(());
                             }
-                        } else if let Some(status) = exit_status {
-                            eprintln!("Task exited (code {})", status);
+                            RpcMessageKind::JobStatus => {
+                                if let Ok(event) = jsony::from_binary::<JobStatusEvent>(payload) {
+                                    match event.status {
+                                        JobStatusKind::Restarting => eprintln!("Terminating previous run..."),
+                                        JobStatusKind::Waiting => eprintln!("Waiting for dependencies..."),
+                                        JobStatusKind::Running => eprintln!("Task started"),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            RpcMessageKind::JobExited => {
+                                if let Ok(event) = jsony::from_binary::<JobExitedEvent>(payload) {
+                                    exit_status = Some(event.exit_code);
+                                }
+                            }
+                            _ => {}
+                        },
+                        DecodeResult::MissingData { .. } => break,
+                        DecodeResult::Empty => {
+                            read_buf.clear();
+                            break;
                         }
-                        break;
+                        DecodeResult::Error(_) => break,
                     }
-                    STATUS_RESTARTING => eprintln!("Terminating previous run..."),
-                    STATUS_WAITING => eprintln!("Waiting for dependencies..."),
-                    STATUS_RUNNING => eprintln!("Task started"),
-                    STATUS_EXITED => {
-                        let mut exit_buf = [0u8; 4];
-                        if let Ok(4) = socket.read(&mut exit_buf) {
-                            exit_status = Some(i32::from_ne_bytes(exit_buf));
-                        }
-                    }
-                    _ => {}
                 }
+                protocol.compact(&mut read_buf, 4096);
             }
-            Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => bail!("Socket read failed: {}", e),
         }

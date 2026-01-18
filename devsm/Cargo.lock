@@ -62,10 +62,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "devsm-rpc"
-version = "0.1.0"
-
-[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

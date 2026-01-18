@@ -14,14 +14,15 @@ use std::{
 
 use crate::{
     process_manager::ClientChannel,
+    rpc::{Encoder, RpcMessageKind},
     workspace::{BaseTask, JobStatus, TestJob, TestJobStatus, TestRun, Workspace},
 };
 
-const TERMINATION_CODE: u32 = 0xcf_04_43_58;
-
-fn send_termination(socket: &mut Option<UnixStream>) {
+fn send_termination(encoder: &mut Encoder, socket: &mut Option<UnixStream>) {
     let Some(socket) = socket.as_mut() else { return };
-    let _ = socket.write_all(&TERMINATION_CODE.to_ne_bytes());
+    encoder.encode_empty(RpcMessageKind::TerminateAck, 0);
+    let _ = socket.write_all(encoder.output());
+    encoder.clear();
 }
 
 /// Monitors test jobs and displays their progress and results.
@@ -40,11 +41,13 @@ pub fn run(
     let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
     std::mem::forget(stdout);
 
+    let mut encoder = Encoder::new();
+
     let _ = writeln!(file, "Running {} test(s)...\n", test_run.test_jobs.len());
 
     loop {
         if channel.is_terminated() {
-            send_termination(&mut socket);
+            send_termination(&mut encoder, &mut socket);
             break;
         }
 
@@ -54,7 +57,7 @@ pub fn run(
             let state = workspace.state.read().unwrap();
             print_summary(&mut file, &test_run, &state.base_tasks);
             drop(state);
-            send_termination(&mut socket);
+            send_termination(&mut encoder, &mut socket);
             break;
         }
 
@@ -64,7 +67,7 @@ pub fn run(
                 let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n == 0 {
                     let _ = writeln!(file, "\nDetached. Tests will continue running in background.");
-                    send_termination(&mut socket);
+                    send_termination(&mut encoder, &mut socket);
                     break;
                 }
             }
