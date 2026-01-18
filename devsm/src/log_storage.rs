@@ -39,6 +39,7 @@ impl Default for BaseTaskSet {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum LogFilter {
     All,
     IsGroup(LogGroup),
@@ -202,7 +203,7 @@ impl Logs {
         unsafe {
             let a = std::slice::from_raw_parts(self.line_entries.as_ptr().add(start), first_len);
             let b = std::slice::from_raw_parts(self.line_entries.as_ptr(), len - first_len);
-            return (a, b);
+            (a, b)
         }
     }
 
@@ -280,7 +281,7 @@ impl Logs {
         let len = self.line_count.load(Ordering::Acquire);
 
         if len == 0 {
-            return start_id; // Buffer is empty, try again from the same spot later.
+            return start_id;
         }
 
         let end_line_id = first_id + len;
@@ -458,8 +459,7 @@ impl LogWriter {
             }
             NonNull::new(ptr as *mut LogEntry).unwrap()
         };
-        let line_buffer =
-            Logs { buffer, line_entries: line_entries, line_count: AtomicUsize::new(0), start_line_id: 0 };
+        let line_buffer = Logs { buffer, line_entries, line_count: AtomicUsize::new(0), start_line_id: 0 };
         LogWriter {
             buffer: Arc::new(RwLock::new(line_buffer)),
             remaining: MAX_LINES,
@@ -484,7 +484,7 @@ impl LogWriter {
             offset
         } else {
             let mut lock = self.buffer.write().unwrap();
-            let count = (lock.line_count.load(Ordering::Acquire) as usize + 1) / 2;
+            let count = lock.line_count.load(Ordering::Acquire).div_ceil(2);
             self.range = lock.free_lines(count);
             kvlog::warn!("After cleanup new capcity is", count = self.range.len);
             self.remaining = MAX_LINES - *lock.line_count.get_mut();

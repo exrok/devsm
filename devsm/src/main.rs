@@ -38,7 +38,6 @@ fn main() {
         cli::Command::Cli => {
             let _log_guard = kvlog::collector::init_file_logger("/tmp/.client.devsm.log");
             client().unwrap();
-            return;
         }
         cli::Command::Server => {
             let _log_guard = if std::env::var("DEVSM_LOG_STDOUT").as_deref() == Ok("1") {
@@ -164,17 +163,14 @@ const RESIZE_FLAG: u64 = 1 << 1;
 
 static SIGNAL_FLAGS: AtomicU64 = AtomicU64::new(0);
 
-// Signal handler for termination signals (SIGINT, SIGTERM)
 extern "C" fn term_handler(_sig: i32) {
     SIGNAL_FLAGS.fetch_or(TERMINATION_FLAG, Ordering::Relaxed);
 }
 
-// Signal handler for window resize signal (SIGWINCH)
 extern "C" fn winch_handler(_sig: i32) {
     SIGNAL_FLAGS.fetch_or(RESIZE_FLAG, Ordering::Relaxed);
 }
 
-// Helper function to set up a signal handler using libc::sigaction
 fn setup_signal_handler(sig: i32, handler: unsafe extern "C" fn(i32)) -> anyhow::Result<()> {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -337,9 +333,7 @@ fn reset_terminal_to_canonical() {
     unsafe {
         let mut termios: libc::termios = std::mem::zeroed();
         if libc::tcgetattr(0, &mut termios) == 0 {
-            // Enable canonical mode and echo
             termios.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
-            // Restore input processing
             termios.c_iflag |= libc::ICRNL;
             libc::tcsetattr(0, libc::TCSANOW, &termios);
         }

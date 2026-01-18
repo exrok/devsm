@@ -210,10 +210,7 @@ pub fn worker() -> anyhow::Result<()> {
         loop {
             #[cfg(target_os = "linux")]
             let new_fd = {
-                unsafe {
-                    // Directly call the raw libc::accept function
-                    libc::accept4(listener_fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC)
-                }
+                unsafe { libc::accept4(listener_fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC) }
             };
 
             #[cfg(not(target_os = "linux"))]
@@ -227,28 +224,18 @@ pub fn worker() -> anyhow::Result<()> {
                 }
             };
             let socket = match new_fd {
-                // A new connection was successfully accepted
-                fd if fd >= 0 => unsafe {
-                    // Safely convert the raw file descriptor back into a Rust UnixStream
-                    UnixStream::from_raw_fd(fd)
-                },
-                // The accept call returned an error
+                fd if fd >= 0 => unsafe { UnixStream::from_raw_fd(fd) },
                 _ => {
                     let err = std::io::Error::last_os_error();
-                    // Check if the error was EINTR (Interrupted System Call)
                     if err.kind() == ErrorKind::Interrupted {
-                        // This is expected when a signal is received.
-                        // The loop will continue, check the flag, and then exit.
                         continue;
                     } else {
-                        // For any other error, log it and continue listening
                         kvlog::error!("Error accepting connection", ?err);
                         continue;
                     }
                 }
             };
             let mut fds = [0; 2];
-            // If we have a valid socket, process the incoming message
             match socket.recv_with_fd(&mut buffer, &mut fds) {
                 Ok((amount, fd_count)) => {
                     let fds = unsafe { FdSet::new(&fds[..fd_count]) };

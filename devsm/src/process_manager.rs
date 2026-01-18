@@ -35,7 +35,6 @@ pub(crate) enum Pipe {
 
 type WorkspaceIndex = u32;
 pub(crate) struct ActiveProcess {
-    // active stdout
     pub(crate) log_group: LogGroup,
     pub(crate) job_index: JobIndex,
     pub(crate) workspace_index: WorkspaceIndex,
@@ -263,7 +262,6 @@ impl ProcessManager {
                         kvlog::info!("Scheduled task is ready");
                         let job = &state.jobs[job_index.idx()];
                         let job_correlation = job.log_group;
-                        let job_index = job_index;
                         let job_task = job.task.clone();
                         drop(state);
                         let _ = self.spawn(wsi as WorkspaceIndex, job_correlation, job_index, job_task);
@@ -336,14 +334,12 @@ impl ProcessManager {
             });
         }
 
-        // If using sh, pipe the script to stdin, otherwise use null stdin
         let stdin = if sh_script.is_some() { Stdio::piped() } else { Stdio::null() };
         command.stdin(stdin);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         let mut child = command.spawn().context("Failed to spawn process")?;
 
-        // If using sh, write the script to stdin and close it
         if let (Some(mut stdin), Some(script)) = (child.stdin.take(), sh_script) {
             use std::io::Write;
             let _ = stdin.write_all(script.as_bytes());
@@ -357,11 +353,7 @@ impl ProcessManager {
                     panic!("Failed to set non-blocking");
                 }
             }
-            self.poll.registry().register(
-                &mut SourceFd(&stdout.as_raw_fd()),
-                Token((index << 1) | 0),
-                Interest::READABLE,
-            )?;
+            self.poll.registry().register(&mut SourceFd(&stdout.as_raw_fd()), Token(index << 1), Interest::READABLE)?;
         };
         if let Some(stderr) = &mut child.stderr {
             unsafe {
@@ -561,7 +553,6 @@ impl ProcessManager {
                     }
                     let base_index = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
                     let bti = workspace::BaseTaskIndex(base_index as u32);
-                    // Get the latest job's spawn config if available
                     let ws_state = ws.handle.state();
                     if let Some(bt) = ws_state.base_tasks.get(bti.idx()) {
                         if let Some(&last_ji) = bt.jobs.all().last() {
@@ -579,7 +570,7 @@ impl ProcessManager {
             }
             WorkspaceCommand::GetPanicLocation => {
                 let response = jsony::to_json(&self.workspaces[ws_index as usize].handle.last_rust_panic());
-                let _ = socket.write_all(&response.as_bytes());
+                let _ = socket.write_all(response.as_bytes());
             }
             WorkspaceCommand::Run { name, params } => {
                 let ws = &self.workspaces[ws_index as usize];
@@ -658,7 +649,7 @@ impl ProcessManager {
                             kvlog::error!("Run client requires stdin/stdout FDs");
                             return false;
                         };
-                        self.attach_run_client(stdin, stdout, socket, ws_index, task_name, params);
+                        self.attach_run_client(stdin, stdout, socket, ws_index, &task_name, params);
                     }
                     AttachKind::TestRun { filters } => {
                         let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
@@ -690,7 +681,7 @@ impl ProcessManager {
                         }
                     }
                 }
-                return true;
+                true
             }
             ProcessRequest::ProcessExited { pid, status } => {
                 for (index, process) in &mut self.processes {
@@ -790,13 +781,13 @@ impl ProcessManager {
                     return false;
                 }
                 kvlog::info!("Didn't Find ProcessExited");
-                return false;
+                false
             }
             ProcessRequest::Spawn { task, job_id, workspace_id, job_index } => {
                 if let Err(err) = self.spawn(workspace_id, job_id, job_index, task) {
                     kvlog::error!("Failed to spawn process", ?err, ?job_id);
                 }
-                return false;
+                false
             }
         }
     }
@@ -850,7 +841,7 @@ impl ProcessManager {
         stdout: OwnedFd,
         socket: UnixStream,
         ws_index: WorkspaceIndex,
-        task_name: Box<str>,
+        task_name: &str,
         params: Vec<u8>,
     ) {
         let params: ValueMap = jsony::from_binary(&params).unwrap_or_else(|_| ValueMap::new());
@@ -1506,7 +1497,6 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
                     job_manager.request.swap_recv(&mut reqs);
                     for req in reqs {
                         if job_manager.handle_request(req) {
-                            // Termination requested
                             return;
                         }
                     }

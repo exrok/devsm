@@ -62,7 +62,7 @@ impl<'a> Iterator for ArgParser<'a> {
             return Some(Component::Flags(flags));
         }
 
-        return Some(Component::Term(arg));
+        Some(Component::Term(arg))
     }
 }
 
@@ -118,7 +118,7 @@ fn parse_job_args<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<(&'a str, Va
                 }
             }
             Component::Flags(flags) => {
-                for flag in flags.chars() {
+                if let Some(flag) = flags.chars().next() {
                     bail!("Unknown flag -{}", flag);
                 }
             }
@@ -152,7 +152,7 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
 /// - `name` includes tests with name
 fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     let mut filters = Vec::new();
-    while let Some(component) = parser.next() {
+    for component in parser.by_ref() {
         match component {
             Component::Term(arg) => {
                 if let Some(tag) = arg.strip_prefix('+') {
@@ -171,10 +171,8 @@ fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<
                 // Single-character flags starting with a letter are treated as exclude tags
                 if !flags.is_empty() && flags.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
                     filters.push(TestFilter::ExcludeTag(flags));
-                } else {
-                    for flag in flags.chars() {
-                        bail!("Unknown flag -{}", flag);
-                    }
+                } else if let Some(flag) = flags.chars().next() {
+                    bail!("Unknown flag -{}", flag);
                 }
             }
             Component::Value(val) => {
@@ -195,22 +193,19 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
         };
         match arg {
             Component::Flags(flags) => {
-                for flag in flags.chars() {
+                if let Some(flag) = flags.chars().next() {
                     bail!("Unknown flag, -{}", flag)
                 }
             }
-            Component::Long(long) => match long {
-                "from" => {
-                    if let Some(Component::Long(value) | Component::Value(value)) = parser.next() {
-                        if global.from.is_some() {
-                            bail!("from already specified")
-                        }
-                        global.from = Some(value);
-                    } else {
-                        bail!("Expected value after from");
+            Component::Long(long) => if long == "from" {
+                if let Some(Component::Long(value) | Component::Value(value)) = parser.next() {
+                    if global.from.is_some() {
+                        bail!("from already specified")
                     }
+                    global.from = Some(value);
+                } else {
+                    bail!("Expected value after from");
                 }
-                _ => {}
             },
             Component::Value(value) => {
                 bail!("Dangling value found: {:?}", value)

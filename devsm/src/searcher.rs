@@ -51,7 +51,7 @@ impl FatSearch {
         'cont: while let Some(next) = finder.find(&self.buffer[offset..]) {
             let bytes = &self.buffer[offset..];
             offset += next;
-            while let Some((id, start)) = foof.next() {
+            for (id, start) in foof.by_ref() {
                 if offset < *start {
                     output.push(Entry::new(single_score(bytes, next), last_entry_index));
                     last_entry_index = id;
@@ -79,7 +79,7 @@ impl FatSearch {
             let ot = offset;
             offset += next;
             let (end, index) = 'blk: {
-                while let Some((id, start)) = foof.next() {
+                for (id, start) in foof.by_ref() {
                     if offset < *start {
                         let index = last_entry_index;
                         last_entry_index = id;
@@ -102,11 +102,10 @@ impl FatSearch {
                     let Some(offset) = memchr::memmem::find(rest, r.as_bytes()) else {
                         continue 'cont;
                     };
-                    if offset != 0 {
-                        if rest[offset - 1] == b' ' {
+                    if offset != 0
+                        && rest[offset - 1] == b' ' {
                             score += 1;
                         }
-                    }
                     rest = &rest[offset + r.len()..];
                 }
             }

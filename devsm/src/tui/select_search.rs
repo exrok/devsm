@@ -51,7 +51,7 @@ pub enum Action {
 
 impl SelectSearch {
     fn raw_selected(&self) -> Option<u64> {
-        self.ids.get(self.results.get(self.selected as usize)?.index()).copied()
+        self.ids.get(self.results.get(self.selected)?.index()).copied()
     }
     pub fn selected<Id: PackU64>(&self) -> Option<Id> {
         Some(Id::unpack_u64(self.raw_selected()?))
@@ -59,7 +59,6 @@ impl SelectSearch {
     pub fn process_input(&mut self, key: KeyEvent, keybinds: &Keybinds) -> Action {
         let input = InputEvent::from(key);
 
-        // Check keybindings first
         if let Some(cmd) = keybinds.lookup_mode_only(Mode::SelectSearch, input) {
             match cmd {
                 Command::SelectPrev => {
@@ -89,7 +88,6 @@ impl SelectSearch {
             }
         }
 
-        // Handle text input
         match key.code {
             KeyCode::Backspace => {
                 if self.cursor != 0 {

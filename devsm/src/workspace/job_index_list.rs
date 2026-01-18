@@ -6,7 +6,7 @@ use crate::workspace::JobIndex;
 ///
 /// This JobIndexList is optimized around the ideas:
 /// - For specific base task there is rarely more then 1 task either running
-/// or scheduled.
+///   or scheduled.
 /// - A linear search of u32's is quite fast.
 /// - "append only", jobs enter this list and then never removed.
 #[derive(Default)]
@@ -20,7 +20,7 @@ impl<'a> IntoIterator for &'a JobIndexList {
     type Item = &'a JobIndex;
     type IntoIter = std::slice::Iter<'a, JobIndex>;
     fn into_iter(self) -> Self::IntoIter {
-        self.jobs.as_slice().into_iter()
+        self.jobs.as_slice().iter()
     }
 }
 

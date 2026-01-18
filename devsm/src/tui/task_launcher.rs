@@ -39,11 +39,7 @@ pub enum LauncherMode {
 /// Result of processing launcher input.
 pub enum LauncherAction {
     Cancel,
-    Start {
-        base_task: BaseTaskIndex,
-        profile: String,
-        params: ValueMap<'static>,
-    },
+    Start { base_task: BaseTaskIndex, profile: String, params: ValueMap<'static> },
     None,
 }
 
@@ -257,8 +253,7 @@ impl TaskLauncherState {
     fn accept_variable_autocomplete(&mut self) {
         let var_name = if let Some(entry) = self.results.get(self.selected) {
             let assigned: Vec<_> = self.completed_vars.iter().map(|(n, _)| *n).collect();
-            let unassigned: Vec<_> =
-                self.available_variables.iter().filter(|v| !assigned.contains(v)).collect();
+            let unassigned: Vec<_> = self.available_variables.iter().filter(|v| !assigned.contains(v)).collect();
             unassigned.get(entry.index()).copied().copied()
         } else {
             None
@@ -394,13 +389,11 @@ impl TaskLauncherState {
                     return LauncherAction::Cancel;
                 }
                 self.accept_task_autocomplete(ws);
-                self.confirmed_profile = Some(
-                    if self.available_profiles.contains(&"default") {
-                        "default"
-                    } else {
-                        self.available_profiles.first().copied().unwrap_or("default")
-                    },
-                );
+                self.confirmed_profile = Some(if self.available_profiles.contains(&"default") {
+                    "default"
+                } else {
+                    self.available_profiles.first().copied().unwrap_or("default")
+                });
                 return self.try_build_launch().unwrap_or(LauncherAction::Cancel);
             }
             LauncherMode::Profile => {
@@ -440,7 +433,8 @@ impl TaskLauncherState {
             .with(Style::DEFAULT)
             .text(out, &self.input);
 
-        let cursor_x = input_rect.x + label.width() as u16 + prefix.width() as u16 + self.input[..self.cursor].width() as u16;
+        let cursor_x =
+            input_rect.x + label.width() as u16 + prefix.width() as u16 + self.input[..self.cursor].width() as u16;
         let cursor_rect = Rect { x: cursor_x, w: 1, ..input_rect };
         cursor_rect.with(Color::Grey[28].with_fg(Color::Grey[2])).fill(out);
 
@@ -457,13 +451,8 @@ impl TaskLauncherState {
             constrain_scroll_offset(rect.h as usize, self.selected, self.scroll_offset, self.results.len());
 
         let (name_col_width, kind_col_width) = if self.mode == LauncherMode::TaskName {
-            let max_name = self
-                .results
-                .iter()
-                .filter_map(|e| self.task_at_entry(e))
-                .map(|t| t.name.width())
-                .max()
-                .unwrap_or(0);
+            let max_name =
+                self.results.iter().filter_map(|e| self.task_at_entry(e)).map(|t| t.name.width()).max().unwrap_or(0);
             (max_name + 2, 9)
         } else {
             (0, 0)

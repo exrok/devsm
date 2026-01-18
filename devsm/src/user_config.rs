@@ -3,15 +3,11 @@ use std::path::PathBuf;
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 
 /// User configuration loaded from ~/.config/devsm.user.toml
+#[derive(Default)]
 pub struct UserConfig {
     pub keybinds: Keybinds,
 }
 
-impl Default for UserConfig {
-    fn default() -> Self {
-        UserConfig { keybinds: Keybinds::default() }
-    }
-}
 
 /// Returns the path to the user config file.
 pub fn user_config_path() -> Option<PathBuf> {
@@ -72,7 +68,6 @@ fn parse_user_config(content: &str) -> Result<UserConfig, String> {
             for (key_str, cmd_value) in bindings.iter() {
                 let input: InputEvent = key_str.name.parse().map_err(|e: String| e)?;
 
-                // Check for nan (unbind)
                 let command = if let Some(f) = cmd_value.as_float() {
                     if f.is_nan() {
                         None // Unbind

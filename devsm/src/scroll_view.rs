@@ -38,7 +38,6 @@ fn render_single_entry(
         return 0;
     }
 
-    // Determine if this entry should be highlighted and get match info
     let highlight_info = style.highlight.filter(|h| h.log_id == log_id);
     let highlight_style = Color::DarkOrange.as_bg();
 
@@ -60,7 +59,6 @@ fn render_single_entry(
         }
 
         if let Some(hl) = highlight_info {
-            // Render with substring highlighting
             render_text_with_highlight(buf, text, entry.style, hl.match_info, highlight_style);
         } else {
             entry.style.write_to_buffer(buf);
@@ -79,12 +77,7 @@ fn render_single_entry(
     let mut lines_rendered = 0;
     let mut text_slice = text;
 
-    // We only process the first line logic if we haven't skipped past it (skip_lines == 0)
-    // or if we need to advance the text slice to process subsequent lines.
     let first_line_capacity = width.saturating_sub(prefix_width);
-
-    // We use the naive splitter to find where the first line ends given the reduced capacity.
-    // Note: If text is empty (width 0), we still consume one "height" unit.
     let mut first_line_len = 0;
     if entry.width > 0 {
         let mut splitter = line_width::naive_line_splitting(text_slice, entry.style, first_line_capacity.into());
@@ -93,7 +86,6 @@ fn render_single_entry(
             first_line_len = line_text.len();
 
             if current_skip == 0 {
-                // Render the first line
                 if !prefix_bytes.is_empty() {
                     buf.extend_from_slice(prefix_bytes);
                 }
@@ -120,7 +112,6 @@ fn render_single_entry(
             }
         }
     } else if current_skip == 0 {
-        // Handle explicit empty log entry
         if !prefix_bytes.is_empty() {
             buf.extend_from_slice(prefix_bytes);
         }
@@ -135,7 +126,6 @@ fn render_single_entry(
     if first_line_len < text_slice.len() {
         text_slice = &text_slice[first_line_len..];
 
-        // Calculate stripped offset for wrapped lines
         let stripped_offset =
             if highlight_info.is_some() { calculate_stripped_len(&text[..first_line_len]) } else { 0 };
 
@@ -149,7 +139,6 @@ fn render_single_entry(
         // If we just rendered the first line, the style is technically active, but usually splitters reset.
         // The naive splitter returns style for every line.
         for (line, line_style) in lines {
-            // No prefix on wrapped lines
             if let Some(hl) = highlight_info {
                 let line_stripped_len = calculate_stripped_len(line);
                 let line_start = current_stripped_offset;
@@ -157,14 +146,11 @@ fn render_single_entry(
                 let hl_start = hl.match_info.start as usize;
                 let hl_end = hl_start + hl.match_info.len as usize;
 
-                // Check if highlight overlaps with this line
                 let adjusted_hl = if hl_start < line_end && hl_end > line_start {
-                    // Calculate overlap within this line
                     let overlap_start = hl_start.saturating_sub(line_start);
                     let overlap_end = hl_end.saturating_sub(line_start).min(line_stripped_len);
                     MatchHighlight { start: overlap_start as u32, len: (overlap_end - overlap_start) as u32 }
                 } else {
-                    // No overlap - zero-length highlight
                     MatchHighlight { start: 0, len: 0 }
                 };
 
@@ -227,18 +213,14 @@ fn render_text_with_highlight(
                 let seg_end = stripped_pos + s.len();
 
                 if has_highlight && seg_start < match_end && seg_end > match_start {
-                    // This segment overlaps with highlight region
                     let hl_start_in_seg = match_start.saturating_sub(seg_start);
                     let hl_end_in_seg = (match_end - seg_start).min(s.len());
 
-                    // Before highlight
                     if hl_start_in_seg > 0 {
                         buf.extend_from_slice(s[..hl_start_in_seg].as_bytes());
                     }
-                    // Highlighted portion
                     highlight_style.write_to_buffer(buf);
                     buf.extend_from_slice(s[hl_start_in_seg..hl_end_in_seg].as_bytes());
-                    // After highlight - clear all styles then restore current style
                     vt::clear_style(buf);
                     current_style.write_to_buffer(buf);
                     if hl_end_in_seg < s.len() {
@@ -264,7 +246,6 @@ fn render_text_with_highlight(
                         let mut char_buf = [0u8; 4];
                         let encoded = ch.encode_utf8(&mut char_buf);
                         buf.extend_from_slice(encoded.as_bytes());
-                        // Clear all styles then restore current style
                         vt::clear_style(buf);
                         current_style.write_to_buffer(buf);
                     } else {
@@ -277,9 +258,7 @@ fn render_text_with_highlight(
                 }
             }
             Segment::AnsiEscapes(escape) => {
-                // Apply ANSI escapes to current style and write them through
                 line_width::apply_raw_display_mode_vt_to_style(&mut current_style, escape);
-                // Write the original escape sequence
                 buf.extend_from_slice(b"\x1b[");
                 buf.extend_from_slice(escape.as_bytes());
                 buf.extend_from_slice(b"m");
@@ -454,14 +433,12 @@ impl LogWidget {
             return;
         }
 
-        // Find the target LogId in the ids list
         let target_idx = scroll_view.ids.iter().position(|&id| id >= target).unwrap_or(scroll_view.ids.len());
         let target_idx = target_idx.min(scroll_view.ids.len().saturating_sub(1));
 
         let screen_height = scroll_view.previous.h as u32;
         let width = scroll_view.previous.w as u32;
 
-        // If we don't have valid dimensions yet, just set target at top
         if screen_height == 0 || width == 0 {
             scroll_view.top_index = target_idx;
             scroll_view.scroll_shift_up = 0;
@@ -469,11 +446,9 @@ impl LogWidget {
             return;
         }
 
-        // Check if target is already visible
         let mut accumulated_height = 0u32;
         let mut found_visible = false;
 
-        // Start from top_index, accounting for scroll_shift_up
         if let Some(&first_id) = scroll_view.ids.get(scroll_view.top_index) {
             let entry = logs[first_id];
             let entry_height = get_entry_height(&entry, style, width);
@@ -500,18 +475,14 @@ impl LogWidget {
         }
 
         if found_visible {
-            // Target is already visible, no scrolling needed
             return;
         }
 
-        // Target is not visible, calculate centering position
         let target_entry = logs[scroll_view.ids[target_idx]];
         let target_height = get_entry_height(&target_entry, style, width);
 
-        // Calculate how many lines should appear above target to center it
         let lines_above_target = (screen_height.saturating_sub(target_height)) / 2;
 
-        // Work backwards from target to find the top_index that achieves centering
         let mut lines_accumulated = 0u32;
         let mut new_top_index = target_idx;
         let mut new_scroll_shift = 0u16;
@@ -524,20 +495,15 @@ impl LogWidget {
                 lines_accumulated += entry_height;
                 new_top_index = idx;
             } else {
-                // This entry would push us past the center point
-                // We might want to partially include it
                 let remaining = lines_above_target - lines_accumulated;
                 if remaining > 0 {
                     new_top_index = idx;
-                    // scroll_shift_up is how many lines of this entry to skip
                     new_scroll_shift = (entry_height - remaining) as u16;
                 }
                 break;
             }
         }
 
-        // Check if centering would leave empty space at the bottom (scrolled too far up)
-        // Calculate total visible height from new_top_index
         let mut total_visible = 0u32;
         if new_top_index < scroll_view.ids.len() {
             let first_entry = logs[scroll_view.ids[new_top_index]];
@@ -549,7 +515,6 @@ impl LogWidget {
             total_visible += get_entry_height(&entry, style, width);
         }
 
-        // If we can't fill the screen from this position, scroll down to fill it
         if total_visible < screen_height && new_top_index > scroll_view.min_index {
             let deficit = screen_height - total_visible;
             let mut extra_lines = 0u32;
@@ -562,7 +527,6 @@ impl LogWidget {
                 new_scroll_shift = 0;
 
                 if extra_lines >= deficit {
-                    // We might need to partially scroll this entry
                     if extra_lines > deficit {
                         new_scroll_shift = (extra_lines - deficit) as u16;
                     }
@@ -662,7 +626,6 @@ impl LogWidget {
                     }
                 }
             } else {
-                // No ids means empty log, which is effectively "at bottom"
                 is_at_bottom = true;
             }
 
@@ -783,7 +746,14 @@ impl LogScrollWidget {
         self.render_content(buf, rect, view, line_count, style);
     }
 
-    fn render_bottom_lines(&self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, scrolled_lines: u16, style: &LogStyle) {
+    fn render_bottom_lines(
+        &self,
+        buf: &mut Vec<u8>,
+        rect: Rect,
+        view: &LogView,
+        scrolled_lines: u16,
+        style: &LogStyle,
+    ) {
         let logs = view.logs.indexer();
         let mut entries = self.ids[self.top_index..].iter().map(|&id| (id, logs[id]));
         let mut lines_to_skip = rect.h.saturating_sub(scrolled_lines);
@@ -877,7 +847,7 @@ impl LogTailWidget {
             let prefix_width = prefix.map(|p| p.width).unwrap_or(0);
             let prefix_bytes = prefix.map(|p| p.bytes.as_bytes()).unwrap_or(b"");
 
-            let text = unsafe { entry.text(&view.logs) };
+            let text = unsafe { entry.text(view.logs) };
 
             if entry.width as usize + prefix_width <= rect.w as usize {
                 if !prefix_bytes.is_empty() {
@@ -891,7 +861,7 @@ impl LogTailWidget {
                 }
             } else {
                 let limit = (rect.w as usize).saturating_sub(prefix_width);
-                let mut splitter = line_width::naive_line_splitting(text, entry.style, limit.into());
+                let mut splitter = line_width::naive_line_splitting(text, entry.style, limit);
                 let mut first_line_len = 0;
 
                 if let Some((line, l_style)) = splitter.next() {
@@ -960,13 +930,12 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
     let mut screen_lines_left = rect.h;
     let mut entries_to_render = displayed.iter().rev();
 
-    if remaining_v_space < 0 {
-        if let Some((log_id, entry)) = entries_to_render.next() {
+    if remaining_v_space < 0
+        && let Some((log_id, entry)) = entries_to_render.next() {
             let skip = (-remaining_v_space) as u16;
             let rendered = render_single_entry(buf, view.logs, rect.w, entry, *log_id, skip, screen_lines_left, style);
             screen_lines_left = screen_lines_left.saturating_sub(rendered);
         }
-    }
 
     for (log_id, entry) in entries_to_render {
         if screen_lines_left == 0 {

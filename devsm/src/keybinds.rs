@@ -156,43 +156,26 @@ impl FromStr for InputEvent {
 /// Commands that can be triggered by keybindings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    // Global commands
     Quit,
-
-    // Navigation
     SelectNext,
     SelectPrev,
     FocusPrimary,
     FocusSecondary,
-
-    // Task operations
     RestartTask,
     TerminateTask,
     LaunchTask,
-
-    // Overlays
     StartGroup,
     SelectProfile,
     SearchLogs,
-
-    // Log modes
     LogModeAll,
     LogModeSelected,
     LogModeHybrid,
-
-    // Log view tailing
     TailTopLog,
     TailBottomLog,
-
-    // Help
     ToggleHelp,
     HelpScrollUp,
     HelpScrollDown,
-
-    // View mode
     ToggleViewMode,
-
-    // Overlay-specific commands
     OverlayCancel,
     OverlayConfirm,
 }
@@ -303,9 +286,7 @@ impl Keybinds {
         }
     }
 
-    /// Loads the default keybindings.
     fn load_defaults(&mut self) {
-        // Global keybindings
         self.bind(Mode::Global, "C-c", Command::Quit);
         self.bind(Mode::Global, "/", Command::SearchLogs);
         self.bind(Mode::Global, "g", Command::StartGroup);
@@ -327,7 +308,6 @@ impl Keybinds {
         self.bind(Mode::Global, "PGDN", Command::HelpScrollDown);
         self.bind(Mode::Global, "v", Command::ToggleViewMode);
 
-        // SelectSearch overlay keybindings
         self.bind(Mode::SelectSearch, "C-k", Command::SelectPrev);
         self.bind(Mode::SelectSearch, "UP", Command::SelectPrev);
         self.bind(Mode::SelectSearch, "C-j", Command::SelectNext);
@@ -337,7 +317,6 @@ impl Keybinds {
         self.bind(Mode::SelectSearch, "C-l", Command::OverlayConfirm);
         self.bind(Mode::SelectSearch, "ENTER", Command::OverlayConfirm);
 
-        // LogSearch overlay keybindings
         self.bind(Mode::LogSearch, "C-k", Command::SelectPrev);
         self.bind(Mode::LogSearch, "UP", Command::SelectPrev);
         self.bind(Mode::LogSearch, "C-j", Command::SelectNext);
@@ -346,7 +325,6 @@ impl Keybinds {
         self.bind(Mode::LogSearch, "ESC", Command::OverlayCancel);
         self.bind(Mode::LogSearch, "ENTER", Command::OverlayConfirm);
 
-        // TaskLauncher overlay keybindings
         self.bind(Mode::TaskLauncher, "C-k", Command::SelectPrev);
         self.bind(Mode::TaskLauncher, "UP", Command::SelectPrev);
         self.bind(Mode::TaskLauncher, "C-j", Command::SelectNext);
@@ -405,13 +383,10 @@ impl Keybinds {
     /// Looks up a command for the given input in the specified mode.
     /// Falls back to global bindings if no mode-specific binding exists.
     pub fn lookup(&self, mode: Mode, input: InputEvent) -> Option<Command> {
-        // First check mode-specific bindings
-        if mode != Mode::Global {
-            if let Some(cmd) = self.table_lookup(self.table_for_mode(mode), input) {
+        if mode != Mode::Global
+            && let Some(cmd) = self.table_lookup(self.table_for_mode(mode), input) {
                 return Some(cmd);
             }
-        }
-        // Fall back to global bindings
         self.table_lookup(&self.global, input)
     }
 

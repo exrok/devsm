@@ -183,17 +183,16 @@ sh = "while true; do sleep 1; done"
     assert!(state.is_some(), "Should see my_service task, server_log: {}", harness.server_log());
 
     tui.send_key(b" ");
-    let state = tui.wait_until(|s| s.overlay.as_ref().map(|o| o.kind.as_deref() == Some("TaskLauncher")).unwrap_or(false), timeout);
+    let state = tui.wait_until(
+        |s| s.overlay.as_ref().map(|o| o.kind.as_deref() == Some("TaskLauncher")).unwrap_or(false),
+        timeout,
+    );
     assert!(state.is_some(), "Task launcher should open, server_log: {}", harness.server_log());
 
     tui.send_key(b"\r");
 
     let state = tui.wait_until(
-        |s| {
-            s.find_task_by_name("my_service")
-                .map(|t| t.jobs.iter().any(|j| j.status == "Running"))
-                .unwrap_or(false)
-        },
+        |s| s.find_task_by_name("my_service").map(|t| t.jobs.iter().any(|j| j.status == "Running")).unwrap_or(false),
         timeout,
     );
     assert!(state.is_some(), "Service should be running, server_log: {}", harness.server_log());
@@ -249,10 +248,7 @@ sh = "while true; do sleep 1; done"
     let tui = TuiTestClient::spawn(&harness);
     let timeout = Duration::from_secs(3);
 
-    let state = tui.wait_until(
-        |s| s.base_tasks.len() >= 3 && s.selection.is_some(),
-        timeout,
-    );
+    let state = tui.wait_until(|s| s.base_tasks.len() >= 3 && s.selection.is_some(), timeout);
     assert!(state.is_some(), "Should receive initial JSON state, server_log: {}", harness.server_log());
 
     let state = state.unwrap();

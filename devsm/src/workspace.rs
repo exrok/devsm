@@ -19,7 +19,7 @@ pub struct BaseTaskIndex(pub u32);
 
 impl BaseTaskIndex {
     pub fn new_or_panic(index: usize) -> BaseTaskIndex {
-        if index > 0xfff as usize {
+        if index > 0xfff_usize {
             panic!("BaseTaskIndex overflow for index {}", index);
         }
         BaseTaskIndex(index as u32)
@@ -185,7 +185,7 @@ impl LatestConfig {
         let new_config = crate::config::load_workspace_config_leaking(self.current.base_path, content)?;
         self.current = new_config;
         self.modified_time = modified;
-        return Ok(true);
+        Ok(true)
     }
 
     fn update_base_tasks(
@@ -196,7 +196,6 @@ impl LatestConfig {
         for base_task in base_tasks.iter_mut() {
             base_task.removed = true;
         }
-        // Add regular tasks (actions and services)
         for (name, config) in self.current.tasks {
             match name_map.entry(name) {
                 std::collections::hash_map::Entry::Occupied(occupied_entry) => {
@@ -223,7 +222,6 @@ impl LatestConfig {
         }
         for (base_name, variants) in self.current.tests {
             for (variant_index, config) in variants.iter().enumerate() {
-                // Generate unique name: "~test:name" for single variant, "~test:name:0" for multiple
                 let task_name: &'static str = if variants.len() == 1 {
                     format!("~test:{}", base_name).leak()
                 } else {
@@ -403,7 +401,7 @@ impl WorkspaceState {
         if !params.entries().is_empty() {
             key.push_str("require_params:");
             for (k, v) in params.entries() {
-                key.push_str(&**k);
+                key.push_str(k);
                 key.push('=');
                 key.push_str(&v.to_string());
                 key.push(',');
@@ -567,9 +565,7 @@ impl WorkspaceState {
                         self.spawn_task(workspace_id, channel, dep_base_task, log_start, dep_params, dep_profile);
                     pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
                 }
-                TaskKind::Test => {
-                    // Tests cannot be dependencies of other tasks
-                }
+                TaskKind::Test => {}
             }
         }
 
@@ -655,7 +651,7 @@ impl WorkspaceState {
             (S::Running { .. }, S::Cancelled) => {
                 jobs_list.set_terminal(job_index);
             }
-            (S::Scheduled { .. }, S::Starting {}) => {
+            (S::Scheduled { .. }, S::Starting) => {
                 jobs_list.set_active(job_index);
             }
             (S::Running { .. }, S::Exited { .. }) => {
@@ -694,7 +690,7 @@ impl WorkspaceState {
                 };
                 kvlog::info!("checking req", ?after);
                 for req in after {
-                    match req.status(&self) {
+                    match req.status(self) {
                         RequirementStatus::Pending => continue 'pending,
                         RequirementStatus::Never => return Scheduled::Never(job_index),
                         RequirementStatus::Met => (),
@@ -727,7 +723,7 @@ impl Workspace {
         for s in [b, a] {
             for entry in s {
                 let text = unsafe { entry.text(&logs) };
-                if let Some((file, line)) = extract_rust_panic_from_line(&text) {
+                if let Some((file, line)) = extract_rust_panic_from_line(text) {
                     return Some((file.to_string(), line));
                 }
             }
@@ -778,7 +774,6 @@ impl Workspace {
 
         let run_id = state.active_test_run.as_ref().map_or(0, |r| r.run_id + 1);
 
-        // First pass: collect matching tests from base_tasks where kind=Test
         struct MatchedTest {
             base_task_idx: BaseTaskIndex,
             task_config: TaskConfigRc,
@@ -803,7 +798,6 @@ impl Workspace {
             matched_tests.push(MatchedTest { base_task_idx: BaseTaskIndex::new_or_panic(base_task_idx), task_config });
         }
 
-        // Second pass: create jobs for matched tests
         let mut test_jobs = Vec::new();
         for matched in matched_tests {
             let task_config = matched.task_config;
@@ -825,7 +819,6 @@ impl Workspace {
                 })
                 .collect();
 
-            // Build requirements from test dependencies
             let mut pred = Vec::new();
             for req in &requires {
                 let Some(&dep_base_task) = state.name_map.get(req.name.as_str()) else {
@@ -892,17 +885,13 @@ impl Workspace {
                             pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
                         }
                     }
-                    TaskKind::Test => {
-                        // Tests cannot be dependencies of other tests
-                    }
+                    TaskKind::Test => {}
                 }
             }
 
-            // Compute cache key before getting mutable borrow
             let cache_key =
                 task_config.config().cache.as_ref().map_or(String::new(), |c| state.compute_cache_key(c.key));
 
-            // Create job - use standard job_id encoding since tests are now in base_tasks
             let job_index = JobIndex(state.jobs.len() as u32);
             let base_task = &mut state.base_tasks[matched.base_task_idx.idx()];
             let pc = base_task.jobs.len();
@@ -960,16 +949,13 @@ fn matches_test_filters(name: &str, tags: &[&str], filters: &[TestFilter]) -> bo
     let mut has_include_filters = false;
     let mut included = false;
 
-    // Check exclusions first (absolute)
     for filter in filters {
-        if let TestFilter::ExcludeTag(exclude_tag) = filter {
-            if tags.contains(exclude_tag) {
+        if let TestFilter::ExcludeTag(exclude_tag) = filter
+            && tags.contains(exclude_tag) {
                 return false;
             }
-        }
     }
 
-    // Check inclusions (OR combined)
     for filter in filters {
         match filter {
             TestFilter::IncludeName(include_name) => {
@@ -984,13 +970,10 @@ fn matches_test_filters(name: &str, tags: &[&str], filters: &[TestFilter]) -> bo
                     included = true;
                 }
             }
-            TestFilter::ExcludeTag(_) => {
-                // Already handled above
-            }
+            TestFilter::ExcludeTag(_) => {}
         }
     }
 
-    // If no inclusion filters, include all (that weren't excluded)
     if !has_include_filters {
         return true;
     }

@@ -247,7 +247,6 @@ impl TaskTreeState {
         self.primary_list.clear();
 
         if self.collapsed {
-            // Collapsed mode: services individually, tests and actions as meta-groups
             for (i, bt) in ws.base_tasks.iter().enumerate() {
                 if bt.removed {
                     continue;
@@ -257,7 +256,6 @@ impl TaskTreeState {
                 }
             }
 
-            // Add meta-groups if tasks of that kind exist
             let has_tests = ws.base_tasks.iter().any(|bt| !bt.removed && bt.config.kind == TaskKind::Test);
             let has_actions = ws.base_tasks.iter().any(|bt| !bt.removed && bt.config.kind == TaskKind::Action);
 
@@ -268,7 +266,6 @@ impl TaskTreeState {
                 self.primary_list.push(PrimaryEntry::MetaGroup(MetaGroupKind::Tests));
             }
         } else {
-            // Expanded mode: all base tasks
             for (i, bt) in ws.base_tasks.iter().enumerate() {
                 if bt.removed {
                     continue;
@@ -296,7 +293,6 @@ impl TaskTreeState {
             PrimaryEntry::MetaGroup(kind) => {
                 let jobs = ws.jobs_by_kind(kind.task_kind());
                 let job = self.normalize_secondary(&jobs);
-                // When a job is selected within a meta-group, derive the base_task from the job
                 let base_task = job.map(|ji| ws[ji].log_group.base_task_index());
                 Some(SelectionState { base_task, job, meta_group: Some(kind) })
             }
@@ -464,7 +460,12 @@ impl TaskTreeState {
                         .skip(1)
                         .fmt(
                             out,
-                            format_args!("{} R:{} S:{}", task.name, task.jobs.running().len(), task.jobs.scheduled().len()),
+                            format_args!(
+                                "{} R:{} S:{}",
+                                task.name,
+                                task.jobs.running().len(),
+                                task.jobs.scheduled().len()
+                            ),
                         );
                 }
                 PrimaryEntry::MetaGroup(kind) => {
@@ -495,16 +496,9 @@ impl TaskTreeState {
             None => return,
         };
 
-        // Get the job list based on selection type
         let (jobs, show_task_name) = match (sel.base_task, sel.meta_group) {
-            (Some(bti), None) => {
-                // Single task selected
-                (ws.base_tasks[bti.idx()].jobs.all().to_vec(), false)
-            }
-            (_, Some(kind)) => {
-                // Meta-group selected
-                (ws.jobs_by_kind(kind.task_kind()), true)
-            }
+            (Some(bti), None) => (ws.base_tasks[bti.idx()].jobs.all().to_vec(), false),
+            (_, Some(kind)) => (ws.jobs_by_kind(kind.task_kind()), true),
             (None, None) => return,
         };
 
@@ -536,7 +530,6 @@ impl TaskTreeState {
                 }
             };
 
-            // When showing meta-group jobs, prefix with task name
             let display_text = if show_task_name { format!("{}: {}", bt.name, command) } else { command };
 
             let status = StatusKind::of(&job.process_status, bt.config.kind);

@@ -85,21 +85,18 @@ impl LogSearchIndex {
         while let Some(match_pos) = finder.find(&self.buffer[search_pos..]) {
             let abs_pos = search_pos + match_pos;
 
-            // Find which log entry this belongs to
             while offset_idx + 1 < self.offsets.len() && self.offsets[offset_idx + 1].0 <= abs_pos {
                 offset_idx += 1;
             }
 
             let (entry_start, log_id) = self.offsets[offset_idx];
 
-            // Only add one match per log entry
             if last_matched_log_id != Some(log_id) {
                 let match_offset_in_entry = abs_pos - entry_start;
                 matches.push(LogMatch { log_id, match_start: match_offset_in_entry as u32 });
                 last_matched_log_id = Some(log_id);
             }
 
-            // Move past this match to find next
             search_pos = abs_pos + 1;
         }
     }
@@ -190,7 +187,6 @@ impl LogSearchState {
         }
         self.index.indexed_tail = logs.tail();
 
-        // Re-run search if pattern exists
         if self.pattern_updated || !self.pattern.is_empty() {
             self.pattern_updated = true;
         }
@@ -199,16 +195,12 @@ impl LogSearchState {
     /// Flushes pending search if pattern was updated.
     pub fn flush(&mut self) {
         if self.pattern_updated {
-            // Preserve current selection by LogId if possible
             let current_log_id = self.selected_log_id();
-
-            // Store lowercased pattern length for highlighting
             self.pattern_lower_len = self.pattern.to_lowercase().len();
 
             self.index.search(&self.pattern, &mut self.matches);
             self.scroll_offset = 0;
 
-            // Try to restore selection to the same LogId, or nearest to it
             let target = current_log_id.unwrap_or(self.initial_view_pos);
             self.select_nearest_to(target);
 
@@ -223,7 +215,6 @@ impl LogSearchState {
             return;
         }
 
-        // Binary search for closest match
         let pos = self
             .matches
             .binary_search_by_key(&target, |m| m.log_id)
@@ -236,7 +227,6 @@ impl LogSearchState {
     pub fn process_input(&mut self, key: KeyEvent, keybinds: &Keybinds) -> SearchAction {
         let input = InputEvent::from(key);
 
-        // Check keybindings first
         if let Some(cmd) = keybinds.lookup_mode_only(Mode::LogSearch, input) {
             match cmd {
                 Command::SelectPrev => {
@@ -266,7 +256,6 @@ impl LogSearchState {
             }
         }
 
-        // Handle text input
         match key.code {
             KeyCode::Backspace => {
                 if self.cursor != 0 {
@@ -291,15 +280,12 @@ impl LogSearchState {
     pub fn render(&mut self, out: &mut DoubleBuffer, mut rect: Rect, logs: &Logs) {
         self.flush();
 
-        // Input box at top
         let input_rect = rect.take_top(1);
         input_rect.with(Color::Grey[16].as_fg()).text(out, "/").with(Style::DEFAULT).text(out, &self.pattern);
 
-        // Cursor rendering
         let cursor_rect = Rect { x: input_rect.x + 1 + self.pattern[..self.cursor].width() as u16, w: 1, ..input_rect };
         cursor_rect.with(Color::Grey[28].with_fg(Color::Grey[2])).fill(out);
 
-        // Status line
         let status_rect = rect.take_top(1);
         status_rect.with(Color::Grey[8].as_fg()).fmt(out, format_args!("{} matches", self.matches.len()));
 
@@ -307,7 +293,6 @@ impl LogSearchState {
             return;
         }
 
-        // Constrain selection and scroll
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
         self.scroll_offset =
             constrain_scroll_offset(rect.h as usize, self.selected, self.scroll_offset, self.matches.len());
@@ -322,7 +307,6 @@ impl LogSearchState {
 
             let is_selected = i == self.selected;
 
-            // Try to get the entry text, handling the case where it may have rotated out
             let entry = indexer[log_match.log_id];
             let text = unsafe { entry.text(logs) };
 
@@ -333,7 +317,6 @@ impl LogSearchState {
                 entry_rect.with(base_style).fill(out);
             }
 
-            // Render with ANSI stripped and match highlighted
             let highlight = MatchHighlight { start: log_match.match_start, len: self.pattern_lower_len as u32 };
 
             render_stripped_with_highlight(entry_rect, out, text, base_style, highlight_style, highlight);
@@ -390,21 +373,16 @@ fn render_stripped_with_highlight(
                 let seg_end = stripped_pos + s.len();
 
                 if has_highlight && seg_start < match_end && seg_end > match_start {
-                    // This segment overlaps with highlight region
                     let hl_start_in_seg = match_start.saturating_sub(seg_start);
                     let hl_end_in_seg = (match_end - seg_start).min(s.len());
 
-                    // Before highlight
                     if hl_start_in_seg > 0 {
                         styled = styled.text(out, &s[..hl_start_in_seg]);
                     }
-                    // Highlighted portion
                     styled = styled.with(highlight_style).text(out, &s[hl_start_in_seg..hl_end_in_seg]);
-                    // After highlight - always reset to base_style
                     if hl_end_in_seg < s.len() {
                         styled = styled.with(base_style).text(out, &s[hl_end_in_seg..]);
                     } else {
-                        // Reset style even when highlight ends at segment boundary
                         styled = styled.with(base_style);
                     }
                 } else {
@@ -413,9 +391,6 @@ fn render_stripped_with_highlight(
                 stripped_pos = seg_end;
             }
             Segment::Utf8(s) => {
-                // For UTF-8 segments, we process char-by-char because
-                // lowercasing can change byte lengths, but we batch consecutive
-                // chars with the same highlighting state for efficiency
                 let mut current_in_highlight = false;
                 let mut batch_start = 0usize;
 
@@ -429,7 +404,6 @@ fn render_stripped_with_highlight(
                     if byte_idx == 0 {
                         current_in_highlight = in_highlight;
                     } else if in_highlight != current_in_highlight {
-                        // Flush the batch
                         let batch = &s[batch_start..byte_idx];
                         if current_in_highlight {
                             styled = styled.with(highlight_style).text(out, batch);
@@ -443,7 +417,6 @@ fn render_stripped_with_highlight(
                     stripped_pos = ch_end;
                 }
 
-                // Flush remaining batch
                 if batch_start < s.len() {
                     let batch = &s[batch_start..];
                     if current_in_highlight {
@@ -453,9 +426,7 @@ fn render_stripped_with_highlight(
                     }
                 }
             }
-            Segment::AnsiEscapes(_) => {
-                // Skip ANSI escapes - they don't contribute to stripped position
-            }
+            Segment::AnsiEscapes(_) => {}
         }
     }
 }

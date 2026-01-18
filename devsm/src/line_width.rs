@@ -22,13 +22,11 @@ struct SegmentIterator<'a> {
     remaining: &'a str,
 }
 
-// given the string after the [b']
-
 fn numericalize_unchecked_iter(text: &str) -> impl Iterator<Item = u8> {
     let mut bytes = text.as_bytes().iter();
     std::iter::from_fn(move || {
         let mut num = bytes.next()?.wrapping_sub(b'0');
-        while let Some(&ch) = bytes.next() {
+        for &ch in bytes.by_ref() {
             if ch == b';' {
                 return Some(num);
             }

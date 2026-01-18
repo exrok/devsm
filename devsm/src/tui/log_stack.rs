@@ -190,7 +190,6 @@ impl LogStack {
             (self.mode.top_filter(&ws), self.mode.bottom_filter(&ws))
         };
 
-        // Apply highlighting to styles
         self.base_task_log_style.highlight = self.highlight;
         let mut def = LogStyle::default();
         def.highlight = self.highlight;
@@ -210,7 +209,6 @@ impl LogStack {
                 Mode::Hybrid(selection_state) => {
                     let ws_state = ws.state();
                     if selection_state.job.is_none() {
-                        // Show what's being excluded
                         if let Some(bti) = selection_state.base_task {
                             let name = ws_state.base_tasks[bti.idx()].name;
                             buf.extend_from_slice(b" NOT ");

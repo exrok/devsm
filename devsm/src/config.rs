@@ -15,7 +15,7 @@ pub struct Alias<'a>(&'a str);
 impl<'a> std::ops::Deref for Alias<'a> {
     type Target = str;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        self.0
     }
 }
 
@@ -184,7 +184,7 @@ impl TestConfigExpr<'static> {
         Box::leak(Box::new(TaskConfigExpr {
             kind: TaskKind::Test,
             info: self.info,
-            pwd: self.pwd.clone(),
+            pwd: self.pwd,
             command: self.command.clone(),
             profiles: &[],
             envvar: self.envvar,
@@ -225,6 +225,7 @@ pub enum EvalError {
 
 impl TaskConfigExpr<'static> {
     pub fn eval(&self, env: &Enviroment) -> Result<TaskConfigRc, EvalError> {
+        #[allow(clippy::arc_with_non_send_sync)]
         let mut new = Arc::new((
             TaskConfig { pwd: "", command: Command::Cmd(&[]), require: &[], cache: None, envvar: &[] },
             Bump::new(),
@@ -279,7 +280,7 @@ impl<'a> BumpEval<'a> for StringExpr<'static> {
         match self {
             StringExpr::Literal(s) => Ok(*s),
             StringExpr::Var(var_name) => match env.param[*var_name].as_ref() {
-                ValueRef::String(value_string) | ValueRef::Other(value_string) => Ok(bump.alloc_str(&value_string)),
+                ValueRef::String(value_string) | ValueRef::Other(value_string) => Ok(bump.alloc_str(value_string)),
                 _ => Err(EvalError::Todo),
             },
             StringExpr::If(if_expr) => Ok(if_expr.bump_eval(env, bump)?),
@@ -312,7 +313,7 @@ fn append_value<'a>(
             target.push(bump.alloc_str(&value_number.to_string()));
         }
         ValueRef::String(value_string) | ValueRef::Other(value_string) => {
-            target.push(bump.alloc_str(&value_string));
+            target.push(bump.alloc_str(value_string));
         }
         ValueRef::Map(_) => return Err(EvalError::Todo),
         ValueRef::List(list) => {
@@ -500,9 +501,8 @@ fn first_literal_from_list(expr: &StringListExpr<'static>) -> Option<&'static st
             None
         }
         StringListExpr::Var(_) => None,
-        StringListExpr::If(if_expr) => {
-            first_literal_from_list(&if_expr.then).or_else(|| if_expr.or_else.as_ref().and_then(first_literal_from_list))
-        }
+        StringListExpr::If(if_expr) => first_literal_from_list(&if_expr.then)
+            .or_else(|| if_expr.or_else.as_ref().and_then(first_literal_from_list)),
     }
 }
 
@@ -510,17 +510,11 @@ fn first_literal_from_string(expr: &StringExpr<'static>) -> Option<&'static str>
     match expr {
         StringExpr::Literal(s) => {
             let s = s.trim();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+            if s.is_empty() { None } else { Some(s) }
         }
         StringExpr::Var(_) => None,
-        StringExpr::If(if_expr) => {
-            first_literal_from_string(&if_expr.then)
-                .or_else(|| if_expr.or_else.as_ref().and_then(first_literal_from_string))
-        }
+        StringExpr::If(if_expr) => first_literal_from_string(&if_expr.then)
+            .or_else(|| if_expr.or_else.as_ref().and_then(first_literal_from_string)),
     }
 }
 

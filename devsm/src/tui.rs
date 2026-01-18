@@ -13,8 +13,8 @@ use crate::process_manager::{Action, ClientChannel};
 use crate::tui::log_search::{LogSearchState, SearchAction};
 use crate::tui::log_stack::LogStack;
 use crate::tui::select_search::SelectSearch;
-use crate::tui::task_launcher::{LauncherAction, TaskLauncherState};
 use crate::tui::task_launcher::LauncherMode;
+use crate::tui::task_launcher::{LauncherAction, TaskLauncherState};
 use crate::tui::task_tree::{MetaGroupKind, SelectionState, TaskTreeState};
 use crate::workspace::{BaseTaskIndex, Workspace, WorkspaceState};
 
@@ -144,7 +144,6 @@ fn render<'a>(
 
     Style::DEFAULT.delta().write_to_buffer(&mut tui.frame.buf);
 
-    // Set highlighted log for search mode
     tui.logs.highlight = match &tui.overlay {
         FocusOverlap::LogSearch { state } => state.selected_match().map(|m| crate::scroll_view::LogHighlight {
             log_id: m.log_id,
@@ -154,7 +153,7 @@ fn render<'a>(
     };
 
     let dest = Rect { x: 0, y: 0, w, h: h - menu_height };
-    tui.logs.render(&mut tui.frame.buf, dest, &workspace);
+    tui.logs.render(&mut tui.frame.buf, dest, workspace);
 
     let mut bot = Rect { x: 0, y: 0, w, h: menu_height };
 
@@ -162,7 +161,6 @@ fn render<'a>(
     {
         let mut task_tree_rect = bot.take_top(19);
 
-        // Take 32 chars from the right for help menu if visible
         let help_rect = if tui.help.visible {
             let help_width = 32.min(task_tree_rect.w as i32);
             Some(task_tree_rect.take_right(help_width))
@@ -197,7 +195,6 @@ fn render<'a>(
             }
         }
 
-        // Render help menu
         if let Some(help_rect) = help_rect {
             let current_mode = match &tui.overlay {
                 FocusOverlap::Group { .. } => Mode::SelectSearch,
@@ -221,11 +218,9 @@ fn render_help_menu(
     help: &mut HelpMenu,
     current_mode: Mode,
 ) {
-    // Collect bindings from current mode first, then add global bindings not overridden
     let mut bindings: Vec<_> = keybinds.mode_bindings(current_mode).collect();
     let mode_keys: std::collections::HashSet<_> = bindings.iter().map(|(k, _)| *k).collect();
 
-    // Add global bindings that aren't overridden by mode-specific ones
     for (input, cmd) in keybinds.global_bindings() {
         if !mode_keys.contains(&input) {
             bindings.push((input, cmd));
@@ -237,32 +232,27 @@ fn render_help_menu(
     let total_items = bindings.len();
     let visible_height = rect.h as usize;
 
-    // Constrain scroll
     if total_items <= visible_height {
         help.scroll = 0;
     } else if help.scroll > total_items - visible_height {
         help.scroll = total_items - visible_height;
     }
 
-    // Header
     let header = rect.take_top(1);
     header.with(Color::Grey[6].with_fg(Color::Grey[25])).fill(frame).skip(1).text(frame, "Keybindings (? to close)");
 
-    // Render bindings
     for (input, cmd) in bindings.iter().skip(help.scroll) {
         let line_rect = rect.take_top(1);
         if line_rect.is_empty() {
             break;
         }
 
-        // Format: "key     command"
         let key_str = input.to_string();
         let cmd_str = cmd.display_name();
 
         let mut styled = line_rect.with(Style::DEFAULT);
         styled = styled.with(Color::Cyan1.as_fg()).text(frame, &key_str);
 
-        // Pad to align command names
         let key_width = key_str.len();
         let pad_width = 10usize.saturating_sub(key_width);
         for _ in 0..pad_width {
@@ -273,15 +263,13 @@ fn render_help_menu(
     }
 }
 
-fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyEvent, keybinds: &Keybinds) -> bool {
+fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, keybinds: &Keybinds) -> bool {
     let input = InputEvent::from(key_event);
 
-    // Check for quit command first (always active)
     if keybinds.lookup(Mode::Global, input) == Some(Command::Quit) {
         return true;
     }
 
-    // Handle overlay-specific input
     match &mut tui.overlay {
         FocusOverlap::Group { selection } => {
             match selection.process_input(key_event, keybinds) {
@@ -298,7 +286,7 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
                         if let Some((_, tasks)) = ws.config.current.groups.get(group) {
                             let mut new_tasks = Vec::new();
                             for task in *tasks {
-                                if let Some(bti) = ws.base_index_by_name(&*task.name) {
+                                if let Some(bti) = ws.base_index_by_name(&task.name) {
                                     new_tasks.push((bti, task.vars.clone(), task.profile.unwrap_or_default()));
                                 }
                             }
@@ -325,12 +313,10 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
                     tui.overlay = FocusOverlap::None;
                 }
                 SearchAction::None => {
-                    // Update index with any new logs
                     let logs = workspace.logs.read().unwrap();
                     state.update_index(&logs);
                     state.flush();
 
-                    // If a match is selected, scroll to it
                     if let Some(log_id) = state.selected_log_id() {
                         drop(logs);
                         tui.logs.scroll_to_log_id(log_id, workspace);
@@ -357,7 +343,6 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
         FocusOverlap::None => {}
     }
 
-    // Handle global commands when no overlay is active
     let Some(command) = keybinds.lookup(Mode::Global, input) else {
         return false;
     };
@@ -388,14 +373,11 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
             let ws = workspace.state();
             if let Some(sel) = tui.task_tree.selection_state(&ws) {
                 let (base_task, params, profile) = if let Some(job_index) = sel.job {
-                    // Use selected job's spawn config
                     let job = &ws[job_index];
                     (job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone())
                 } else if let Some(bti) = sel.base_task {
-                    // Use base task directly
                     (bti, ValueMap::new(), String::new())
                 } else if let Some(kind) = sel.meta_group {
-                    // Use latest job from meta-group's aggregated list
                     let jobs = ws.jobs_by_kind(kind.task_kind());
                     if let Some(&last_ji) = jobs.last() {
                         let job = &ws[last_ji];
@@ -411,13 +393,13 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
             }
         }
         Command::TerminateTask => {
-            if let Some(sel) = tui.task_tree.selection_state(&workspace.state()) {
-                if let Some(bti) = sel.base_task {
-                    workspace.terminate_tasks(bti);
-                }
-                // For meta-groups without a specific job, we could terminate all tasks of that kind
-                // but that seems too destructive - for now we require a specific task to be selected
+            if let Some(sel) = tui.task_tree.selection_state(&workspace.state())
+                && let Some(bti) = sel.base_task
+            {
+                workspace.terminate_tasks(bti);
             }
+            // For meta-groups without a specific job, we could terminate all tasks of that kind
+            // but that seems too destructive - for now we require a specific task to be selected
         }
         Command::LaunchTask => {
             let ws = workspace.state();
@@ -450,9 +432,7 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
                 if profiles.is_empty() {
                     return false;
                 }
-                tui.overlay = FocusOverlap::TaskLauncher {
-                    state: TaskLauncherState::with_task(&ws, bti),
-                };
+                tui.overlay = FocusOverlap::TaskLauncher { state: TaskLauncherState::with_task(&ws, bti) };
             }
         }
         Command::SelectPrev => {
@@ -482,7 +462,6 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
         Command::HelpScrollDown => {
             tui.help.scroll = tui.help.scroll.saturating_add(5);
         }
-        // Overlay commands are handled in overlay sections above
         Command::OverlayCancel | Command::OverlayConfirm => {}
     }
     false
@@ -532,7 +511,7 @@ pub enum ScrollTarget {
 
 fn scroll_target(w: u16, h: u16, x: u16, y: u16) -> ScrollTarget {
     let menu_height = 10;
-    let mut dest = Rect { x: 0, y: 0, w, h: h };
+    let mut dest = Rect { x: 0, y: 0, w, h };
     let mut bot = dest.take_bottom(menu_height);
     let (tl, bl) = dest.v_split(0.5);
     bot.take_top(1);
@@ -569,10 +548,11 @@ fn meta_group_kind_str(kind: MetaGroupKind) -> &'static str {
     }
 }
 
-fn output_json_state(ws: &WorkspaceState, tui: &mut TuiState, out: &OwnedFd) {
+fn output_json_state(ws: &WorkspaceState, tui: &mut TuiState, tty_render_byte_count: usize, out: &OwnedFd) {
     let mut file = unsafe { std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(out.as_raw_fd())) };
     let selection = tui.task_tree.selection_state(ws);
     let mut message = jsony::object! {
+        tty_render_byte_count,
         collapsed: tui.task_tree.is_collapsed(),
         overlay: match &tui.overlay {
             FocusOverlap::Group { selection } => {
@@ -671,7 +651,7 @@ pub fn run(
         buf.extend_from_slice(vt::CLEAR_BELOW);
         terminal.write_all(&buf)?;
     }
-    let (mut w, mut h) = if let Some(terminal) = &terminal { terminal.size()? } else { (120, 60) };
+    let (mut w, mut h) = if let Some(terminal) = &terminal { terminal.size()? } else { (160, 90) };
     let bh = 10;
 
     let mut previous = 0;
@@ -686,14 +666,15 @@ pub fn run(
     let mut delta = Has(0);
     loop {
         if delta.any(Has::RESIZED) {
-            (w, h) = if let Some(terminal) = &terminal { terminal.size()? } else { (90, 70) };
+            (w, h) = if let Some(terminal) = &terminal { terminal.size()? } else { (150, 80) };
         }
         let data = render(w, h, &mut tui, workspace, keybinds, delta);
         if let Some(terminal) = &mut terminal {
             terminal.write_all(data)?;
         } else {
             let ws = workspace.state();
-            output_json_state(&ws, &mut tui, &stdout);
+            let byte_count = data.len();
+            output_json_state(&ws, &mut tui, byte_count, &stdout);
         }
         delta = Has(0);
 

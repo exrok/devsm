@@ -51,7 +51,6 @@ fn parse_string_expr<'a>(
     match &value.value {
         ValueInner::String(s) => Ok(StringExpr::Literal(alloc.alloc_str(as_str(s)))),
         ValueInner::Table(table) => {
-            // Check for { var = "name" }
             if let Some(var_val) = table.get("var") {
                 let Some(var_name) = var_val.as_str() else {
                     mismatched_in_object(re, "string", var_val, "var");
@@ -59,7 +58,6 @@ fn parse_string_expr<'a>(
                 };
                 return Ok(StringExpr::Var(alloc.alloc_str(var_name)));
             }
-            // Check for { if.profile = "...", then = ..., or_else = ... }
             if let Some(if_val) = table.get("if") {
                 let if_table = if_val.as_table().ok_or(())?;
                 let profile_val = if_table.get("profile").ok_or(())?;
@@ -100,7 +98,6 @@ fn parse_string_list_expr<'a>(
     match &value.value {
         ValueInner::String(s) => Ok(StringListExpr::Literal(alloc.alloc_str(as_str(s)))),
         ValueInner::Array(arr) => {
-            // Manually allocate each expression in the array
             let mut items_vec = bumpalo::collections::Vec::new_in(alloc);
             for item in arr {
                 items_vec.push(parse_string_list_expr(alloc, item, re)?);
@@ -108,7 +105,6 @@ fn parse_string_list_expr<'a>(
             Ok(StringListExpr::List(items_vec.into_bump_slice()))
         }
         ValueInner::Table(table) => {
-            // Check for { var = "name" }
             if let Some(var_val) = table.get("var") {
                 let Some(var_name) = var_val.as_str() else {
                     mismatched_in_object(re, "string", var_val, "var");
@@ -116,7 +112,6 @@ fn parse_string_list_expr<'a>(
                 };
                 return Ok(StringListExpr::Var(alloc.alloc_str(var_name)));
             }
-            // Check for { if.profile = "...", then = ..., or_else = ... }
             if let Some(if_val) = table.get("if") {
                 let if_table = if_val.as_table().ok_or(())?;
                 let profile_val = if_table.get("profile").ok_or(())?;
@@ -288,7 +283,6 @@ fn parse_task<'a>(
         }
     }
 
-    // Validate that exactly one of cmd or sh is specified
     let command = match (cmd, sh) {
         (Some(cmd), None) => CommandExpr::Cmd(cmd),
         (None, Some(sh)) => CommandExpr::Sh(sh),
@@ -411,27 +405,24 @@ fn parse_test<'a>(
                 }
                 require = calls.into_bump_slice();
             }
-            "tag" => {
-                // Tag can be a single string or an array of strings
-                match &value.value {
-                    ValueInner::String(s) => {
-                        tags_vec.push(alloc.alloc_str(as_str(s)) as &str);
-                    }
-                    ValueInner::Array(arr) => {
-                        for item in arr {
-                            let Some(s) = item.as_str() else {
-                                mismatched_in_object(re, "string", item, "tag");
-                                return Err(());
-                            };
-                            tags_vec.push(alloc.alloc_str(s) as &str);
-                        }
-                    }
-                    _ => {
-                        mismatched_in_object(re, "string or array", value, "tag");
-                        return Err(());
+            "tag" => match &value.value {
+                ValueInner::String(s) => {
+                    tags_vec.push(alloc.alloc_str(as_str(s)) as &str);
+                }
+                ValueInner::Array(arr) => {
+                    for item in arr {
+                        let Some(s) = item.as_str() else {
+                            mismatched_in_object(re, "string", item, "tag");
+                            return Err(());
+                        };
+                        tags_vec.push(alloc.alloc_str(s) as &str);
                     }
                 }
-            }
+                _ => {
+                    mismatched_in_object(re, "string or array", value, "tag");
+                    return Err(());
+                }
+            },
             "cache" => {
                 let Some(cache_table) = value.as_table() else {
                     mismatched_in_object(re, "table", value, "cache");
@@ -455,7 +446,6 @@ fn parse_test<'a>(
         }
     }
 
-    // Validate that exactly one of cmd or sh is specified
     let command = match (cmd, sh) {
         (Some(cmd), None) => CommandExpr::Cmd(cmd),
         (None, Some(sh)) => CommandExpr::Sh(sh),
@@ -575,7 +565,6 @@ pub fn parse<'a>(
     let mut tests_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut groups_vec = bumpalo::collections::Vec::new_in(alloc);
 
-    // Parse [action.*] tables
     if let Some(action_table) = table(root, "action", re)? {
         for (name, task_value) in action_table.iter() {
             let Some(task_table) = task_value.as_table() else {
@@ -588,7 +577,6 @@ pub fn parse<'a>(
         }
     }
 
-    // Parse [service.*] tables
     if let Some(service_table) = table(root, "service", re)? {
         for (name, task_value) in service_table.iter() {
             let Some(task_table) = task_value.as_table() else {
@@ -601,7 +589,6 @@ pub fn parse<'a>(
         }
     }
 
-    // Parse [group] tables
     if let Some(group_table) = table(root, "group", re)? {
         for (name, group_value) in group_table.iter() {
             let Some(group_array) = group_value.as_array() else {
@@ -617,18 +604,15 @@ pub fn parse<'a>(
         }
     }
 
-    // Parse [test.*] tables - handles both single [test.name] and [[test.name]] arrays
     if let Some(test_table) = table(root, "test", re)? {
         for (name, test_value) in test_table.iter() {
             let name_str = alloc.alloc_str(name.name.as_ref()) as &str;
             match &test_value.value {
-                // Single test: [test.name]
                 ValueInner::Table(single_test_table) => {
                     let test = parse_test(alloc, name_str, single_test_table, re)?;
                     let test_slice = std::slice::from_ref(alloc.alloc(test));
                     tests_vec.push((name_str, test_slice));
                 }
-                // Array of tests: [[test.name]]
                 ValueInner::Array(arr) => {
                     let mut test_array = bumpalo::collections::Vec::new_in(alloc);
                     for item in arr {
