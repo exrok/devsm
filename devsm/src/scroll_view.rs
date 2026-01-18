@@ -367,7 +367,7 @@ impl LogWidget {
         *self = LogWidget::default();
     }
     /// Transitions the view from `Tail` mode to `Scroll` mode if it isn't already.
-    pub fn scrollify(&mut self, view: LogView, style: &LogStyle) -> &mut LogScrollWidget {
+    pub fn scrollify(&mut self, view: &LogView, style: &LogStyle) -> &mut LogScrollWidget {
         if let LogWidget::Tail(tail) = self {
             let mut ids = Vec::new();
             let mut line_id = view.logs.head();
@@ -433,7 +433,7 @@ impl LogWidget {
         }
     }
 
-    pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: LogView, style: &LogStyle) {
+    pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         match self {
             LogWidget::Scroll(scroll_view) => scroll_view.render_reset(buf, rect, view, style),
             LogWidget::Tail(tail_view) => tail_view.render(buf, rect, view, style),
@@ -446,7 +446,7 @@ impl LogWidget {
     /// 1. If the target is already visible, no scrolling occurs
     /// 2. When scrolling is needed, the target is centered in the view
     /// 3. Centering is clamped to avoid scrolling past start or end
-    pub fn scroll_to_log_id(&mut self, target: LogId, view: LogView, style: &LogStyle) {
+    pub fn scroll_to_log_id(&mut self, target: LogId, view: &LogView, style: &LogStyle) {
         let scroll_view = self.scrollify(view, style);
         let logs = view.logs.indexer();
 
@@ -576,7 +576,7 @@ impl LogWidget {
         scroll_view.previous = Rect::EMPTY; // Force full re-render
     }
 
-    pub fn scrollable_render(&mut self, scroll: i32, buf: &mut Vec<u8>, rect: Rect, view: LogView, style: &LogStyle) {
+    pub fn scrollable_render(&mut self, scroll: i32, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         if scroll == 0 {
             self.render(buf, rect, view, style);
         } else if scroll > 0 {
@@ -586,7 +586,7 @@ impl LogWidget {
         }
     }
 
-    pub fn scroll_up(&mut self, amount: u32, buf: &mut Vec<u8>, rect: Rect, view: LogView, style: &LogStyle) {
+    pub fn scroll_up(&mut self, amount: u32, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         let scroll_view = self.scrollify(view, style);
         let logs = view.logs.indexer();
         let mut scrolled_lines = 0;
@@ -611,7 +611,7 @@ impl LogWidget {
         }
     }
 
-    pub fn scroll_down(&mut self, amount: u32, buf: &mut Vec<u8>, rect: Rect, view: LogView, style: &LogStyle) {
+    pub fn scroll_down(&mut self, amount: u32, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         let at_bottom = {
             let scroll_view = self.scrollify(view, style);
             let logs = view.logs.indexer();
@@ -689,7 +689,7 @@ fn handle_scroll_render(
     scroll_view: &mut LogScrollWidget,
     buf: &mut Vec<u8>,
     rect: Rect,
-    view: LogView,
+    view: &LogView,
     scrolled_lines: u32,
     direction: ScrollDirection,
     style: &LogStyle,
@@ -722,7 +722,7 @@ impl LogScrollWidget {
         &self,
         buf: &mut Vec<u8>,
         rect: Rect,
-        view: LogView,
+        view: &LogView,
         lines_to_render: u16,
         style: &LogStyle,
     ) -> u16 {
@@ -757,7 +757,7 @@ impl LogScrollWidget {
         remaining_height
     }
 
-    pub fn render_reset(&mut self, buf: &mut Vec<u8>, rect: Rect, view: LogView, style: &LogStyle) {
+    pub fn render_reset(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         self.previous = rect;
         while let Some(id) = self.ids.get(self.top_index) {
             if *id < view.logs.head() {
@@ -778,12 +778,12 @@ impl LogScrollWidget {
         }
     }
 
-    fn render_top_lines(&self, buf: &mut Vec<u8>, rect: Rect, view: LogView, line_count: u16, style: &LogStyle) {
+    fn render_top_lines(&self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, line_count: u16, style: &LogStyle) {
         vt::move_cursor(buf, rect.x, rect.y);
         self.render_content(buf, rect, view, line_count, style);
     }
 
-    fn render_bottom_lines(&self, buf: &mut Vec<u8>, rect: Rect, view: LogView, scrolled_lines: u16, style: &LogStyle) {
+    fn render_bottom_lines(&self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, scrolled_lines: u16, style: &LogStyle) {
         let logs = view.logs.indexer();
         let mut entries = self.ids[self.top_index..].iter().map(|&id| (id, logs[id]));
         let mut lines_to_skip = rect.h.saturating_sub(scrolled_lines);
@@ -839,7 +839,7 @@ impl LogScrollWidget {
 }
 
 impl LogTailWidget {
-    pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: LogView, style: &LogStyle) {
+    pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         if rect != self.previous {
             self.previous = rect;
             self.next_screen_offset = render_buffer_tail_reset(buf, rect, view, style);
@@ -930,7 +930,7 @@ impl LogTailWidget {
 }
 
 /// Renders the view in "tail" mode from scratch.
-fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: LogView, style: &LogStyle) -> u16 {
+fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) -> u16 {
     let mut displayed: Vec<(LogId, LogEntry)> = Vec::new();
     let (a, b) = view.logs.slices();
     let head = view.logs.head();
@@ -1042,7 +1042,7 @@ mod test {
         let logs = writer.reader();
         let mut view = LogWidget::default();
         let style = LogStyle::default();
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "        "
             "        "
@@ -1050,7 +1050,7 @@ mod test {
             "        "
         }
         writer.push("Line 0");
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 0  "
             "        "
@@ -1058,7 +1058,7 @@ mod test {
             "        "
         }
         writer.push("Line 1");
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 0  "
             "Line 1  "
@@ -1066,7 +1066,7 @@ mod test {
             "        "
         }
         writer.push("Line 2");
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 0  "
             "Line 1  "
@@ -1074,7 +1074,7 @@ mod test {
             "        "
         }
         writer.push("Line 3");
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 0  "
             "Line 1  "
@@ -1082,7 +1082,7 @@ mod test {
             "Line 3  "
         }
         writer.push("Line 4");
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 1  "
             "Line 2  "
@@ -1090,7 +1090,7 @@ mod test {
             "Line 4  "
         }
         writer.push("Line 5");
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 2  "
             "Line 3  "
@@ -1098,63 +1098,63 @@ mod test {
             "Line 5  "
         }
         writer.push("head1234Line 6");
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 4  "
             "Line 5  "
             "head1234"
             "Line 6  "
         }
-        view.scroll_up(1, &mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.scroll_up(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 3  "
             "Line 4  "
             "Line 5  "
             "head1234"
         }
-        view.scroll_up(1, &mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.scroll_up(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 2  "
             "Line 3  "
             "Line 4  "
             "Line 5  "
         }
-        view.scroll_up(1, &mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.scroll_up(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 1  "
             "Line 2  "
             "Line 3  "
             "Line 4  "
         }
-        view.scroll_up(1, &mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.scroll_up(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 0  "
             "Line 1  "
             "Line 2  "
             "Line 3  "
         }
-        view.scroll_up(1, &mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.scroll_up(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 0  "
             "Line 1  "
             "Line 2  "
             "Line 3  "
         }
-        view.scroll_down(1, &mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.scroll_down(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 1  "
             "Line 2  "
             "Line 3  "
             "Line 4  "
         }
-        view.scroll_down(2, &mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.scroll_down(2, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 3  "
             "Line 4  "
             "Line 5  "
             "head1234"
         }
-        view.scroll_down(1, &mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.scroll_down(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 4  "
             "Line 5  "
@@ -1169,7 +1169,7 @@ mod test {
             "head1234"
             "Line 6  "
         }
-        view.scroll_down(1, &mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.scroll_down(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
         assert_scrollview! {
             "Line 5  "
             "head1234"
@@ -1205,21 +1205,21 @@ mod test {
         let style = LogStyle { prefixes: vec![prefix.clone(), prefix], assume_blank: false, highlight: None };
 
         writer.push("Short");
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         parser.process(&buf);
         buf.clear();
 
         expect(&parser, &["P: Short  ", "          ", "          ", "          "]);
 
         writer.push("1234567");
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         parser.process(&buf);
         buf.clear();
 
         expect(&parser, &["P: Short  ", "P: 1234567", "          ", "          "]);
 
         writer.push("12345678");
-        view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
         parser.process(&buf);
         buf.clear();
         expect(&parser, &["P: Short  ", "P: 1234567", "P: 1234567", "8         "]);

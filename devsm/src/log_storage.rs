@@ -11,27 +11,57 @@ use vtui::Style;
 
 use crate::workspace::BaseTaskIndex;
 
-#[derive(Clone, Copy)]
+/// Bitset for filtering logs by a set of base task indices.
+/// Uses [u64; 64] to cover all possible BaseTaskIndex values (0..0xfff = 4096 bits).
+#[derive(Clone)]
+pub struct BaseTaskSet([u64; 64]);
+
+impl BaseTaskSet {
+    pub fn new() -> Self {
+        Self([0; 64])
+    }
+
+    pub fn insert(&mut self, bti: BaseTaskIndex) {
+        let idx = (bti.0 as usize) & 0xfff;
+        self.0[idx & 0x3f] |= 1 << (idx >> 6);
+    }
+
+    pub fn contains(&self, bti: BaseTaskIndex) -> bool {
+        let idx = (bti.0 as usize) & 0xfff;
+        (self.0[idx & 0x3f] & (1 << (idx >> 6))) != 0
+    }
+}
+
+impl Default for BaseTaskSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone)]
 pub enum LogFilter {
     All,
     IsGroup(LogGroup),
     NotGroup(LogGroup),
     IsBaseTask(BaseTaskIndex),
     NotBaseTask(BaseTaskIndex),
+    /// Filter to logs from tasks in the given set.
+    IsInSet(BaseTaskSet),
 }
 
 impl<'a> LogView<'a> {
     pub fn contains(&self, line: &LogEntry) -> bool {
-        match self.filter {
+        match &self.filter {
             LogFilter::All => true,
-            LogFilter::IsGroup(log_group) => line.log_group == log_group,
-            LogFilter::NotGroup(log_group) => line.log_group != log_group,
-            LogFilter::IsBaseTask(base_task) => line.log_group.base_task_index() == base_task,
-            LogFilter::NotBaseTask(base_task) => line.log_group.base_task_index() != base_task,
+            LogFilter::IsGroup(log_group) => line.log_group == *log_group,
+            LogFilter::NotGroup(log_group) => line.log_group != *log_group,
+            LogFilter::IsBaseTask(base_task) => line.log_group.base_task_index() == *base_task,
+            LogFilter::NotBaseTask(base_task) => line.log_group.base_task_index() != *base_task,
+            LogFilter::IsInSet(set) => set.contains(line.log_group.base_task_index()),
         }
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct LogView<'a> {
     pub(crate) logs: &'a Logs,
     pub(crate) tail: LogId,

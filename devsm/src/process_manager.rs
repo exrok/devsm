@@ -560,7 +560,21 @@ impl ProcessManager {
                         continue;
                     }
                     let base_index = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
-                    ws.handle.restart_task(workspace::BaseTaskIndex(base_index as u32), ValueMap::new(), "");
+                    let bti = workspace::BaseTaskIndex(base_index as u32);
+                    // Get the latest job's spawn config if available
+                    let ws_state = ws.handle.state();
+                    if let Some(bt) = ws_state.base_tasks.get(bti.idx()) {
+                        if let Some(&last_ji) = bt.jobs.all().last() {
+                            let job = &ws_state[last_ji];
+                            let params = job.spawn_params.clone();
+                            let profile = job.spawn_profile.clone();
+                            drop(ws_state);
+                            ws.handle.restart_task(bti, params, &profile);
+                        } else {
+                            drop(ws_state);
+                            ws.handle.restart_task(bti, ValueMap::new(), "");
+                        }
+                    }
                 }
             }
             WorkspaceCommand::GetPanicLocation => {

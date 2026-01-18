@@ -614,6 +614,17 @@ impl std::ops::Index<JobIndex> for WorkspaceState {
         &self.jobs[index.idx()]
     }
 }
+
+impl WorkspaceState {
+    /// Returns all job indices for tasks of the given kind.
+    pub fn jobs_by_kind(&self, kind: TaskKind) -> Vec<JobIndex> {
+        self.base_tasks
+            .iter()
+            .filter(|bt| !bt.removed && bt.config.kind == kind)
+            .flat_map(|bt| bt.jobs.all().iter().copied())
+            .collect()
+    }
+}
 impl std::ops::IndexMut<JobIndex> for WorkspaceState {
     fn index_mut(&mut self, index: JobIndex) -> &mut Self::Output {
         &mut self.jobs[index.idx()]

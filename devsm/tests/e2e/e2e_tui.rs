@@ -13,15 +13,33 @@ use jsony::Jsony;
 #[derive(Debug, Clone, Jsony, Default)]
 struct TuiState {
     #[allow(dead_code)]
+    collapsed: bool,
+    #[allow(dead_code)]
     selection: Option<TuiSelection>,
     base_tasks: Vec<TuiBaseTask>,
+    #[allow(dead_code)]
+    meta_groups: Option<TuiMetaGroups>,
 }
 
 #[derive(Debug, Clone, Jsony, Default)]
 #[allow(dead_code)]
 struct TuiSelection {
-    base_task: usize,
+    base_task: Option<usize>,
     job: Option<usize>,
+    meta_group: Option<String>,
+}
+
+#[derive(Debug, Clone, Jsony, Default)]
+#[allow(dead_code)]
+struct TuiMetaGroups {
+    tests: TuiMetaGroup,
+    actions: TuiMetaGroup,
+}
+
+#[derive(Debug, Clone, Jsony, Default)]
+#[allow(dead_code)]
+struct TuiMetaGroup {
+    job_count: usize,
 }
 
 #[derive(Debug, Clone, Jsony, Default)]

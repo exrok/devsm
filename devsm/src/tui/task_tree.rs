@@ -6,6 +6,37 @@ use crate::{
     workspace::{BaseTaskIndex, JobIndex, JobStatus, WorkspaceState},
 };
 
+/// Represents a collapsible category for non-service tasks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MetaGroupKind {
+    Tests,
+    Actions,
+}
+
+impl MetaGroupKind {
+    pub fn task_kind(self) -> TaskKind {
+        match self {
+            MetaGroupKind::Tests => TaskKind::Test,
+            MetaGroupKind::Actions => TaskKind::Action,
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            MetaGroupKind::Tests => "@tests",
+            MetaGroupKind::Actions => "@actions",
+        }
+    }
+}
+
+/// An entry in the primary task list. In collapsed mode, tests and actions are
+/// aggregated under meta-groups; in expanded mode, all base tasks are shown individually.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrimaryEntry {
+    Task(BaseTaskIndex),
+    MetaGroup(MetaGroupKind),
+}
+
 #[derive(Clone, Copy)]
 enum StatusKind {
     Null,
@@ -35,6 +66,20 @@ impl StatusKind {
                 }
             }
             Cancelled => StatusKind::Skip,
+        }
+    }
+
+    /// Returns a priority value for aggregating statuses.
+    /// Higher priority means this status "wins" when aggregating.
+    fn priority(self) -> u8 {
+        match self {
+            StatusKind::Null => 0,
+            StatusKind::Skip => 1,
+            StatusKind::Dead => 2,
+            StatusKind::Done => 3,
+            StatusKind::Wait => 4,
+            StatusKind::Live => 5,
+            StatusKind::Fail => 6,
         }
     }
     fn dark_bg(self) -> Color {
@@ -77,11 +122,15 @@ impl StatusKind {
     }
 }
 pub struct TaskTreeState {
-    primary_list: Vec<BaseTaskIndex>,
+    /// Whether to show collapsed view (meta-groups) or expanded view (all tasks).
+    collapsed: bool,
+    /// The primary list entries (tasks or meta-groups).
+    primary_list: Vec<PrimaryEntry>,
     change_number: u32,
     primary_index: usize,
     primary_scroll_offset: usize,
-    base_task_index: Option<BaseTaskIndex>,
+    /// The currently selected primary entry.
+    selected_entry: Option<PrimaryEntry>,
     job_list_index: usize,
     job_list_scroll_offset: usize,
     job_index: Option<JobIndex>,
@@ -90,10 +139,11 @@ pub struct TaskTreeState {
 impl Default for TaskTreeState {
     fn default() -> Self {
         Self {
+            collapsed: true,
             primary_list: Default::default(),
             change_number: u32::MAX,
             primary_index: Default::default(),
-            base_task_index: Default::default(),
+            selected_entry: Default::default(),
             job_list_index: Default::default(),
             primary_scroll_offset: Default::default(),
             job_list_scroll_offset: Default::default(),
@@ -102,13 +152,33 @@ impl Default for TaskTreeState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Represents the current selection in the task tree.
+///
+/// When a specific task or job is selected, `base_task` contains the task index.
+/// When a meta-group is selected without a specific job, `base_task` is `None`
+/// and `meta_group` contains the group kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SelectionState {
-    pub base_task: BaseTaskIndex,
+    /// The selected base task. `None` when a meta-group is selected without a specific job.
+    pub base_task: Option<BaseTaskIndex>,
+    /// The selected job, if any.
     pub job: Option<JobIndex>,
+    /// The selected meta-group, if any.
+    pub meta_group: Option<MetaGroupKind>,
 }
 
 impl TaskTreeState {
+    /// Toggles between collapsed and expanded view modes.
+    pub fn toggle_collapsed(&mut self) {
+        self.collapsed = !self.collapsed;
+        self.change_number = u32::MAX; // Force rebuild of primary list
+    }
+
+    /// Returns whether the task tree is in collapsed mode.
+    pub fn is_collapsed(&self) -> bool {
+        self.collapsed
+    }
+
     fn normalize_secondary(&mut self, jobs: &[JobIndex]) -> Option<JobIndex> {
         let ji = self.job_index?;
         match jobs.get(self.job_list_index) {
@@ -133,72 +203,134 @@ impl TaskTreeState {
             }
         }
     }
-    fn normalize_primary(&mut self) -> Option<BaseTaskIndex> {
-        let index_bti = self.primary_list.get(self.primary_index).copied();
-        let initial_bti = self.base_task_index;
-        let bti = match (index_bti, self.base_task_index) {
-            (Some(index_bti), Some(current_bti)) if index_bti == current_bti => current_bti,
-            (fallback, Some(current_bti)) => 'bti: {
-                for (i, bti) in self.primary_list.iter().enumerate() {
-                    if *bti == current_bti {
+
+    fn normalize_primary(&mut self) -> Option<PrimaryEntry> {
+        let index_entry = self.primary_list.get(self.primary_index).copied();
+        let initial_entry = self.selected_entry;
+        let entry = match (index_entry, self.selected_entry) {
+            (Some(index_entry), Some(current_entry)) if index_entry == current_entry => current_entry,
+            (fallback, Some(current_entry)) => 'entry: {
+                for (i, e) in self.primary_list.iter().enumerate() {
+                    if *e == current_entry {
                         self.primary_index = i;
-                        break 'bti current_bti;
+                        break 'entry current_entry;
                     }
                 }
                 if let Some(fallback) = fallback {
-                    self.base_task_index = Some(fallback);
+                    self.selected_entry = Some(fallback);
                     fallback
                 } else {
-                    let bti = self.primary_list.last()?;
-                    self.base_task_index = Some(*bti);
-                    *bti
+                    let e = self.primary_list.last()?;
+                    self.selected_entry = Some(*e);
+                    *e
                 }
             }
             (None, None) => {
-                let bti = self.primary_list.last()?;
-                self.base_task_index = Some(*bti);
-                *bti
+                let e = self.primary_list.last()?;
+                self.selected_entry = Some(*e);
+                *e
             }
-            (Some(index_bti), None) => {
-                self.base_task_index = Some(index_bti);
-                index_bti
+            (Some(index_entry), None) => {
+                self.selected_entry = Some(index_entry);
+                index_entry
             }
         };
 
-        if initial_bti != Some(bti) {
+        if initial_entry != Some(entry) {
             self.job_index = None;
             self.job_list_index = usize::MAX;
         }
-        Some(bti)
+        Some(entry)
     }
-    /// normalizes the selection states perfering to keep the indices of the base task and
-    /// job the same. Will only return None, if the filtered list of base tasks is empty.
-    pub fn selection_state(&mut self, ws: &WorkspaceState) -> Option<SelectionState> {
-        if self.change_number != ws.change_number {
-            // In the future, we'll do filtering and sorting here.
-            self.primary_list = ws.base_tasks.iter().enumerate().map(|(i, _)| BaseTaskIndex(i as u32)).collect();
-            self.change_number = ws.change_number;
+
+    fn rebuild_primary_list(&mut self, ws: &WorkspaceState) {
+        self.primary_list.clear();
+
+        if self.collapsed {
+            // Collapsed mode: services individually, tests and actions as meta-groups
+            for (i, bt) in ws.base_tasks.iter().enumerate() {
+                if bt.removed {
+                    continue;
+                }
+                if bt.config.kind == TaskKind::Service {
+                    self.primary_list.push(PrimaryEntry::Task(BaseTaskIndex(i as u32)));
+                }
+            }
+
+            // Add meta-groups if tasks of that kind exist
+            let has_tests = ws.base_tasks.iter().any(|bt| !bt.removed && bt.config.kind == TaskKind::Test);
+            let has_actions = ws.base_tasks.iter().any(|bt| !bt.removed && bt.config.kind == TaskKind::Action);
+
+            if has_actions {
+                self.primary_list.push(PrimaryEntry::MetaGroup(MetaGroupKind::Actions));
+            }
+            if has_tests {
+                self.primary_list.push(PrimaryEntry::MetaGroup(MetaGroupKind::Tests));
+            }
+        } else {
+            // Expanded mode: all base tasks
+            for (i, bt) in ws.base_tasks.iter().enumerate() {
+                if bt.removed {
+                    continue;
+                }
+                self.primary_list.push(PrimaryEntry::Task(BaseTaskIndex(i as u32)));
+            }
         }
 
-        let bti = self.normalize_primary()?;
-        Some(SelectionState { base_task: bti, job: self.normalize_secondary(&ws.base_tasks[bti.idx()].jobs.all()) })
+        self.change_number = ws.change_number;
     }
+
+    /// Normalizes the selection states preferring to keep the indices of the base task and
+    /// job the same. Returns `None` if the filtered list of base tasks is empty.
+    pub fn selection_state(&mut self, ws: &WorkspaceState) -> Option<SelectionState> {
+        if self.change_number != ws.change_number {
+            self.rebuild_primary_list(ws);
+        }
+
+        let entry = self.normalize_primary()?;
+        match entry {
+            PrimaryEntry::Task(bti) => {
+                let job = self.normalize_secondary(ws.base_tasks[bti.idx()].jobs.all());
+                Some(SelectionState { base_task: Some(bti), job, meta_group: None })
+            }
+            PrimaryEntry::MetaGroup(kind) => {
+                let jobs = ws.jobs_by_kind(kind.task_kind());
+                let job = self.normalize_secondary(&jobs);
+                // When a job is selected within a meta-group, derive the base_task from the job
+                let base_task = job.map(|ji| ws[ji].log_group.base_task_index());
+                Some(SelectionState { base_task, job, meta_group: Some(kind) })
+            }
+        }
+    }
+
     pub fn exit_secondary(&mut self) {
         self.job_index = None;
         self.job_list_index = usize::MAX;
     }
+
     pub fn enter_secondary(&mut self, ws: &WorkspaceState) {
-        let bti = match self.normalize_primary() {
-            Some(bti) => bti,
+        let entry = match self.normalize_primary() {
+            Some(entry) => entry,
             None => return,
         };
-        let jobs = &ws.base_tasks[bti.idx()].jobs.all();
+        let jobs: Vec<JobIndex> = match entry {
+            PrimaryEntry::Task(bti) => ws.base_tasks[bti.idx()].jobs.all().to_vec(),
+            PrimaryEntry::MetaGroup(kind) => ws.jobs_by_kind(kind.task_kind()),
+        };
         let Some(last) = jobs.last() else {
             return;
         };
         self.job_list_index = jobs.len() - 1;
         self.job_index = Some(*last);
     }
+
+    fn get_job_list(&self, ws: &WorkspaceState, entry: PrimaryEntry) -> Vec<JobIndex> {
+        match entry {
+            PrimaryEntry::Task(bti) => ws.base_tasks[bti.idx()].jobs.all().to_vec(),
+            PrimaryEntry::MetaGroup(kind) => ws.jobs_by_kind(kind.task_kind()),
+        }
+    }
+
     pub fn move_cursor_down(&mut self, ws: &WorkspaceState) {
         if self.job_index.is_some() {
             // Note since we always render the job list in reverse
@@ -208,11 +340,11 @@ impl TaskTreeState {
             }
             let jli = self.job_list_index - 1;
             self.job_list_index = jli;
-            let bti = match self.normalize_primary() {
-                Some(bti) => bti,
+            let entry = match self.normalize_primary() {
+                Some(entry) => entry,
                 None => return,
             };
-            let jobs = &ws.base_tasks[bti.idx()].jobs.all();
+            let jobs = self.get_job_list(ws, entry);
             self.job_index = Some(jobs[jli]);
         } else {
             if self.primary_index + 1 >= self.primary_list.len() {
@@ -220,19 +352,19 @@ impl TaskTreeState {
             }
             let pti = self.primary_index + 1;
             self.primary_index = pti;
-            self.base_task_index = Some(self.primary_list[pti]);
+            self.selected_entry = Some(self.primary_list[pti]);
         }
     }
+
     pub fn move_cursor_up(&mut self, ws: &WorkspaceState) {
         if self.job_index.is_some() {
             // Note since we always render the job list in reverse
             // moving the cursor up, looks more like moving the cursor down
-
-            let bti = match self.normalize_primary() {
-                Some(bti) => bti,
+            let entry = match self.normalize_primary() {
+                Some(entry) => entry,
                 None => return,
             };
-            let jobs = &ws.base_tasks[bti.idx()].jobs.all();
+            let jobs = self.get_job_list(ws, entry);
             if self.job_list_index + 1 >= jobs.len() {
                 return;
             }
@@ -245,8 +377,49 @@ impl TaskTreeState {
             }
             let pti = self.primary_index - 1;
             self.primary_index = pti;
-            self.base_task_index = Some(self.primary_list[pti]);
+            self.selected_entry = Some(self.primary_list[pti]);
         }
+    }
+
+    fn is_entry_selected(&self, entry: PrimaryEntry, sel: &SelectionState) -> bool {
+        match entry {
+            PrimaryEntry::Task(bti) => sel.base_task == Some(bti) && sel.meta_group.is_none(),
+            PrimaryEntry::MetaGroup(kind) => sel.meta_group == Some(kind),
+        }
+    }
+
+    /// Computes the aggregated status for a meta-group (worst status among all jobs of that kind).
+    fn meta_group_status(&self, ws: &WorkspaceState, kind: MetaGroupKind) -> StatusKind {
+        let task_kind = kind.task_kind();
+        let mut worst = StatusKind::Null;
+        for bt in &ws.base_tasks {
+            if bt.removed || bt.config.kind != task_kind {
+                continue;
+            }
+            for ji in bt.jobs.all() {
+                let status = StatusKind::of(&ws[*ji].process_status, task_kind);
+                // Priority: Fail > Live > Wait > Done > Dead > Skip > Null
+                if status.priority() > worst.priority() {
+                    worst = status;
+                }
+            }
+        }
+        worst
+    }
+
+    /// Counts running and scheduled jobs across all tasks of the given kind.
+    fn meta_group_counts(&self, ws: &WorkspaceState, kind: MetaGroupKind) -> (usize, usize) {
+        let task_kind = kind.task_kind();
+        let mut running = 0;
+        let mut scheduled = 0;
+        for bt in &ws.base_tasks {
+            if bt.removed || bt.config.kind != task_kind {
+                continue;
+            }
+            running += bt.jobs.running().len();
+            scheduled += bt.jobs.scheduled().len();
+        }
+        (running, scheduled)
     }
 
     pub fn render_primary(&mut self, out: &mut DoubleBuffer, mut rect: Rect, ws: &WorkspaceState) {
@@ -256,45 +429,81 @@ impl TaskTreeState {
         };
         self.primary_scroll_offset =
             constrain_scroll_offset(rect.h as usize, self.primary_index, self.primary_scroll_offset);
-        for &task_id in &self.primary_list[self.primary_scroll_offset..] {
+        for &entry in &self.primary_list[self.primary_scroll_offset..] {
             let mut line = rect.take_top(1);
             if line.is_empty() {
                 break;
             }
-            let task = &ws.base_tasks[task_id.idx()];
-            let status = task
-                .jobs
-                .all()
-                .last()
-                .map(|job| StatusKind::of(&ws[*job].process_status, task.config.kind))
-                .unwrap_or(StatusKind::Null);
 
-            line.take_left(6)
-                .with(if task_id == sel.base_task {
-                    status.dark_bg().with_fg(Color::Black)
-                } else {
-                    status.dark_bg().with_bg(Color::Grey[4])
-                })
-                .text(out, status.padded_text());
+            let is_selected = self.is_entry_selected(entry, &sel);
 
-            line.with(if task_id == sel.base_task {
-                status.light_bg().with_fg(Color(236))
-            } else {
-                Color(248).as_fg()
-            })
-            .fill(out)
-            .skip(1)
-            .fmt(out, format_args!("{} R:{} S:{}", task.name, task.jobs.running().len(), task.jobs.scheduled().len()));
+            match entry {
+                PrimaryEntry::Task(task_id) => {
+                    let task = &ws.base_tasks[task_id.idx()];
+                    let status = task
+                        .jobs
+                        .all()
+                        .last()
+                        .map(|job| StatusKind::of(&ws[*job].process_status, task.config.kind))
+                        .unwrap_or(StatusKind::Null);
+
+                    line.take_left(6)
+                        .with(if is_selected {
+                            status.dark_bg().with_fg(Color::Black)
+                        } else {
+                            status.dark_bg().with_bg(Color::Grey[4])
+                        })
+                        .text(out, status.padded_text());
+
+                    line.with(if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() })
+                        .fill(out)
+                        .skip(1)
+                        .fmt(
+                            out,
+                            format_args!("{} R:{} S:{}", task.name, task.jobs.running().len(), task.jobs.scheduled().len()),
+                        );
+                }
+                PrimaryEntry::MetaGroup(kind) => {
+                    let status = self.meta_group_status(ws, kind);
+                    let (running, scheduled) = self.meta_group_counts(ws, kind);
+
+                    line.take_left(6)
+                        .with(if is_selected {
+                            status.dark_bg().with_fg(Color::Black)
+                        } else {
+                            status.dark_bg().with_bg(Color::Grey[4])
+                        })
+                        .text(out, status.padded_text());
+
+                    line.with(if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() })
+                        .fill(out)
+                        .skip(1)
+                        .fmt(out, format_args!("{} R:{} S:{}", kind.display_name(), running, scheduled));
+                }
+            }
         }
     }
+
     pub fn render_secondary(&mut self, out: &mut DoubleBuffer, mut rect: Rect, ws: &WorkspaceState) {
         let now = std::time::Instant::now();
         let sel = match self.selection_state(ws) {
             Some(sel) => sel,
             None => return,
         };
-        let bt = &ws.base_tasks[sel.base_task.idx()];
-        let jobs = bt.jobs.all();
+
+        // Get the job list based on selection type
+        let (jobs, show_task_name) = match (sel.base_task, sel.meta_group) {
+            (Some(bti), None) => {
+                // Single task selected
+                (ws.base_tasks[bti.idx()].jobs.all().to_vec(), false)
+            }
+            (_, Some(kind)) => {
+                // Meta-group selected
+                (ws.jobs_by_kind(kind.task_kind()), true)
+            }
+            (None, None) => return,
+        };
+
         if self.job_index.is_some() {
             self.job_list_scroll_offset = constrain_scroll_offset(
                 rect.h as usize,
@@ -304,20 +513,27 @@ impl TaskTreeState {
         } else {
             self.job_list_scroll_offset = 0;
         }
-        for &ji in bt.jobs.all().iter().rev().skip(self.job_list_scroll_offset) {
+
+        for &ji in jobs.iter().rev().skip(self.job_list_scroll_offset) {
             let mut line = rect.take_top(1);
             if line.is_empty() {
                 break;
             }
             let job = &ws[ji];
+            let bti = job.log_group.base_task_index();
+            let bt = &ws.base_tasks[bti.idx()];
+
             let command = match &job.task.config().command {
                 Command::Cmd(args) => args.join(" "),
                 Command::Sh(script) => {
-                    // Show "sh: " followed by a prefix of the script
                     let prefix = if script.len() > 50 { format!("{}...", &script[..50]) } else { script.to_string() };
                     format!("sh: {}", prefix)
                 }
             };
+
+            // When showing meta-group jobs, prefix with task name
+            let display_text = if show_task_name { format!("{}: {}", bt.name, command) } else { command };
+
             let status = StatusKind::of(&job.process_status, bt.config.kind);
             line.take_left(6)
                 .with(if Some(ji) == sel.job {
@@ -330,7 +546,7 @@ impl TaskTreeState {
                 .with(if Some(ji) == sel.job { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() })
                 .fill(out)
                 .skip(1)
-                .text(out, &command)
+                .text(out, &display_text)
                 .skip(1)
                 .with(HAlign::Right);
 

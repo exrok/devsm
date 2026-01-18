@@ -6,13 +6,14 @@ use vtui::event::{Event, KeyEvent};
 use vtui::vt::BufferWrite;
 use vtui::{Color, DoubleBuffer, Rect, Style, TerminalFlags, vt};
 
+use crate::config::TaskKind;
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
-use crate::log_storage::LogFilter;
+use crate::log_storage::{BaseTaskSet, LogFilter};
 use crate::process_manager::{Action, ClientChannel};
 use crate::tui::log_search::{LogSearchState, SearchAction};
 use crate::tui::log_stack::LogStack;
 use crate::tui::select_search::SelectSearch;
-use crate::tui::task_tree::TaskTreeState;
+use crate::tui::task_tree::{MetaGroupKind, SelectionState, TaskTreeState};
 use crate::workspace::{BaseTaskIndex, Workspace, WorkspaceState};
 
 pub fn constrain_scroll_offset(visible_height: usize, item_index: usize, scroll_offset: usize) -> usize {
@@ -22,6 +23,30 @@ pub fn constrain_scroll_offset(visible_height: usize, item_index: usize, scroll_
         item_index + 1 - visible_height
     } else {
         scroll_offset
+    }
+}
+
+/// Builds a `BaseTaskSet` containing all base tasks of the given kind.
+fn build_task_set(ws: &WorkspaceState, kind: TaskKind) -> BaseTaskSet {
+    let mut set = BaseTaskSet::new();
+    for (i, bt) in ws.base_tasks.iter().enumerate() {
+        if !bt.removed && bt.config.kind == kind {
+            set.insert(BaseTaskIndex(i as u32));
+        }
+    }
+    set
+}
+
+/// Converts a SelectionState to a LogFilter for log filtering.
+fn selection_to_filter(sel: &SelectionState, ws: &WorkspaceState) -> LogFilter {
+    if let Some(job) = sel.job {
+        LogFilter::IsGroup(ws[job].log_group)
+    } else if let Some(bti) = sel.base_task {
+        LogFilter::IsBaseTask(bti)
+    } else if let Some(kind) = sel.meta_group {
+        LogFilter::IsInSet(build_task_set(ws, kind.task_kind()))
+    } else {
+        LogFilter::All
     }
 }
 
@@ -312,11 +337,7 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
             let filter = match tui.logs.mode() {
                 log_stack::Mode::All => LogFilter::All,
                 log_stack::Mode::OnlySelected(sel) | log_stack::Mode::Hybrid(sel) => {
-                    if let Some(job) = sel.job {
-                        LogFilter::IsGroup(ws_state[job].log_group)
-                    } else {
-                        LogFilter::IsBaseTask(sel.base_task)
-                    }
+                    selection_to_filter(&sel, &ws_state)
                 }
             };
             let logs = workspace.logs.read().unwrap();
@@ -332,14 +353,42 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
             tui.overlay = FocusOverlap::Group { selection: entries.collect() }
         }
         Command::RestartTask => {
-            if let Some(sel) = { tui.task_tree.selection_state(&workspace.state()) } {
-                workspace.restart_task(sel.base_task, ValueMap::new(), "");
+            let ws = workspace.state();
+            if let Some(sel) = tui.task_tree.selection_state(&ws) {
+                let (base_task, params, profile) = if let Some(job_index) = sel.job {
+                    // Use selected job's spawn config
+                    let job = &ws[job_index];
+                    (job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone())
+                } else if let Some(bti) = sel.base_task {
+                    // Use base task directly
+                    (bti, ValueMap::new(), String::new())
+                } else if let Some(kind) = sel.meta_group {
+                    // Use latest job from meta-group's aggregated list
+                    let jobs = ws.jobs_by_kind(kind.task_kind());
+                    if let Some(&last_ji) = jobs.last() {
+                        let job = &ws[last_ji];
+                        (job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone())
+                    } else {
+                        return false;
+                    }
+                } else {
+                    return false;
+                };
+                drop(ws);
+                workspace.restart_task(base_task, params, &profile);
             }
         }
         Command::TerminateTask => {
-            if let Some(sel) = { tui.task_tree.selection_state(&workspace.state()) } {
-                workspace.terminate_tasks(sel.base_task);
+            if let Some(sel) = tui.task_tree.selection_state(&workspace.state()) {
+                if let Some(bti) = sel.base_task {
+                    workspace.terminate_tasks(bti);
+                }
+                // For meta-groups without a specific job, we could terminate all tasks of that kind
+                // but that seems too destructive - for now we require a specific task to be selected
             }
+        }
+        Command::ToggleViewMode => {
+            tui.task_tree.toggle_collapsed();
         }
         Command::LogModeAll => {
             tui.logs.set_mode(log_stack::Mode::All);
@@ -357,12 +406,16 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
         Command::SelectProfile => {
             let ws = workspace.state();
             if let Some(sel) = tui.task_tree.selection_state(&ws) {
-                let profiles = ws.base_tasks[sel.base_task.idx()].config.profiles;
+                // SelectProfile only works when a specific base task is selected
+                let Some(bti) = sel.base_task else {
+                    return false;
+                };
+                let profiles = ws.base_tasks[bti.idx()].config.profiles;
                 if profiles.is_empty() {
                     return false;
                 }
                 tui.overlay = FocusOverlap::SpawnProfile {
-                    bti: sel.base_task,
+                    bti,
                     profiles,
                     selection: profiles.into_iter().enumerate().collect(),
                 }
@@ -475,9 +528,18 @@ fn job_status_str(status: &crate::workspace::JobStatus) -> &'static str {
     }
 }
 
+fn meta_group_kind_str(kind: MetaGroupKind) -> &'static str {
+    match kind {
+        MetaGroupKind::Tests => "tests",
+        MetaGroupKind::Actions => "actions",
+    }
+}
+
 fn output_json_state(ws: &WorkspaceState, tui: &mut TuiState, out: &OwnedFd) {
     let mut file = unsafe { std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(out.as_raw_fd())) };
+    let selection = tui.task_tree.selection_state(ws);
     let mut message = jsony::object! {
+        collapsed: tui.task_tree.is_collapsed(),
         overlay: match &tui.overlay {
             FocusOverlap::Group { selection } => {
                 kind: "Group",
@@ -505,11 +567,14 @@ fn output_json_state(ws: &WorkspaceState, tui: &mut TuiState, out: &OwnedFd) {
             },
             FocusOverlap::None => None,
         },
-        @[if let Some(selection) = tui.task_tree.selection_state(ws)]
+        @[if let Some(sel) = &selection]
         selection: {
-            base_task: selection.base_task.idx(),
-            @[if let Some(job) = selection.job]
-            job: job.idx()
+            @[if let Some(bti) = sel.base_task]
+            base_task: bti.idx(),
+            @[if let Some(job) = sel.job]
+            job: job.idx(),
+            @[if let Some(kind) = sel.meta_group]
+            meta_group: meta_group_kind_str(kind)
         },
         base_tasks: [for (i, bt) in ws.base_tasks.iter().enumerate(); {
             index: i,
@@ -520,7 +585,11 @@ fn output_json_state(ws: &WorkspaceState, tui: &mut TuiState, out: &OwnedFd) {
                 @[if let crate::workspace::JobStatus::Exited { status, .. } = &ws[*ji].process_status]
                 exit_code: *status
             }]
-        }]
+        }],
+        meta_groups: {
+            tests: { job_count: ws.jobs_by_kind(TaskKind::Test).len() },
+            actions: { job_count: ws.jobs_by_kind(TaskKind::Action).len() }
+        }
     };
     message.push('\n');
     use std::io::Write;
@@ -589,7 +658,10 @@ pub fn run(
             if let Some(sel) = tui.task_tree.selection_state(&ws) {
                 tui.logs.update_selection(sel);
                 // Update the channel's selected atomic so RestartSelected command works
-                vtui_channel.selected.store(sel.base_task.idx() as u64, std::sync::atomic::Ordering::Relaxed);
+                // For meta-groups, we use the base_task from the selected job if available
+                if let Some(bti) = sel.base_task {
+                    vtui_channel.selected.store(bti.idx() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
 

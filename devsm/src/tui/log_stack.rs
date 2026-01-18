@@ -1,10 +1,11 @@
 use vtui::{Color, Rect, vt::BufferWrite};
 
 use crate::{
-    log_storage::{LogFilter, LogId},
+    config::TaskKind,
+    log_storage::{BaseTaskSet, LogFilter, LogId},
     scroll_view::{LogHighlight, LogStyle, LogWidget},
-    tui::task_tree::SelectionState,
-    workspace::{Workspace, WorkspaceState},
+    tui::task_tree::{MetaGroupKind, SelectionState},
+    workspace::{BaseTaskIndex, Workspace, WorkspaceState},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -15,37 +16,56 @@ pub enum Mode {
     Hybrid(SelectionState),
 }
 
+/// Builds a `BaseTaskSet` containing all base tasks of the given kind.
+fn build_task_set(ws: &WorkspaceState, kind: TaskKind) -> BaseTaskSet {
+    let mut set = BaseTaskSet::new();
+    for (i, bt) in ws.base_tasks.iter().enumerate() {
+        if !bt.removed && bt.config.kind == kind {
+            set.insert(BaseTaskIndex(i as u32));
+        }
+    }
+    set
+}
+
+/// Builds a filter based on the selection state.
+fn selection_filter(ss: &SelectionState, ws: &WorkspaceState) -> LogFilter {
+    if let Some(job) = ss.job {
+        LogFilter::IsGroup(ws[job].log_group)
+    } else if let Some(bti) = ss.base_task {
+        LogFilter::IsBaseTask(bti)
+    } else if let Some(kind) = ss.meta_group {
+        LogFilter::IsInSet(build_task_set(ws, kind.task_kind()))
+    } else {
+        LogFilter::All
+    }
+}
+
+/// Builds the inverse filter for the selection state (used in hybrid mode).
+fn selection_not_filter(ss: &SelectionState, ws: &WorkspaceState) -> LogFilter {
+    if let Some(job) = ss.job {
+        LogFilter::NotGroup(ws[job].log_group)
+    } else if let Some(bti) = ss.base_task {
+        LogFilter::NotBaseTask(bti)
+    } else {
+        // For meta-groups without a job, we don't have a "not in set" filter,
+        // so just return All (show everything in top pane)
+        LogFilter::All
+    }
+}
+
 impl Mode {
     pub fn top_filter(&self, ws: &WorkspaceState) -> LogFilter {
         match self {
             Mode::All => LogFilter::All,
-            Mode::OnlySelected(ss) => {
-                if let Some(job) = ss.job {
-                    LogFilter::IsGroup(ws[job].log_group)
-                } else {
-                    LogFilter::IsBaseTask(ss.base_task)
-                }
-            }
-            Mode::Hybrid(ss) => {
-                if let Some(job) = ss.job {
-                    LogFilter::NotGroup(ws[job].log_group)
-                } else {
-                    LogFilter::NotBaseTask(ss.base_task)
-                }
-            }
+            Mode::OnlySelected(ss) => selection_filter(ss, ws),
+            Mode::Hybrid(ss) => selection_not_filter(ss, ws),
         }
     }
     pub fn bottom_filter(&self, ws: &WorkspaceState) -> Option<LogFilter> {
         match self {
             Mode::All => None,
             Mode::OnlySelected(..) => None,
-            Mode::Hybrid(ss) => {
-                if let Some(job) = ss.job {
-                    Some(LogFilter::IsGroup(ws[job].log_group))
-                } else {
-                    Some(LogFilter::IsBaseTask(ss.base_task))
-                }
-            }
+            Mode::Hybrid(ss) => Some(selection_filter(ss, ws)),
         }
     }
 }
@@ -76,26 +96,18 @@ impl LogStack {
         match &self.mode {
             Mode::All => {
                 let view = logs.view(LogFilter::All);
-                self.top.scrollify(view, &self.base_task_log_style);
+                self.top.scrollify(&view, &self.base_task_log_style);
             }
             Mode::OnlySelected(ss) => {
-                let filter = if let Some(job) = ss.job {
-                    LogFilter::IsGroup(ws_state[job].log_group)
-                } else {
-                    LogFilter::IsBaseTask(ss.base_task)
-                };
+                let filter = selection_filter(ss, &ws_state);
                 let view = logs.view(filter);
-                self.top.scrollify(view, &LogStyle::default());
+                self.top.scrollify(&view, &LogStyle::default());
             }
             Mode::Hybrid(ss) => {
                 // In Hybrid mode, search results are in the bottom (selected task) view
-                let filter = if let Some(job) = ss.job {
-                    LogFilter::IsGroup(ws_state[job].log_group)
-                } else {
-                    LogFilter::IsBaseTask(ss.base_task)
-                };
+                let filter = selection_filter(ss, &ws_state);
                 let view = logs.view(filter);
-                self.bottom.scrollify(view, &LogStyle::default());
+                self.bottom.scrollify(&view, &LogStyle::default());
             }
         }
     }
@@ -109,26 +121,18 @@ impl LogStack {
         match &self.mode {
             Mode::All => {
                 let view = logs.view(LogFilter::All);
-                self.top.scroll_to_log_id(target, view, &self.base_task_log_style);
+                self.top.scroll_to_log_id(target, &view, &self.base_task_log_style);
             }
             Mode::OnlySelected(ss) => {
-                let filter = if let Some(job) = ss.job {
-                    LogFilter::IsGroup(ws_state[job].log_group)
-                } else {
-                    LogFilter::IsBaseTask(ss.base_task)
-                };
+                let filter = selection_filter(ss, &ws_state);
                 let view = logs.view(filter);
-                self.top.scroll_to_log_id(target, view, &LogStyle::default());
+                self.top.scroll_to_log_id(target, &view, &LogStyle::default());
             }
             Mode::Hybrid(ss) => {
                 // In Hybrid mode, search results are in the bottom (selected task) view
-                let filter = if let Some(job) = ss.job {
-                    LogFilter::IsGroup(ws_state[job].log_group)
-                } else {
-                    LogFilter::IsBaseTask(ss.base_task)
-                };
+                let filter = selection_filter(ss, &ws_state);
                 let view = logs.view(filter);
-                self.bottom.scroll_to_log_id(target, view, &LogStyle::default());
+                self.bottom.scroll_to_log_id(target, &view, &LogStyle::default());
             }
         }
     }
@@ -193,28 +197,32 @@ impl LogStack {
 
         let logs = ws.logs.read().unwrap();
         if let Some(bot_filter) = bot_filter {
-            self.bottom.scrollable_render(
-                self.pending_bottom_scroll,
-                buf,
-                dest.take_bottom(0.5),
-                logs.view(bot_filter),
-                &def,
-            );
+            let view = logs.view(bot_filter);
+            self.bottom.scrollable_render(self.pending_bottom_scroll, buf, dest.take_bottom(0.5), &view, &def);
             self.pending_bottom_scroll = 0;
-            // todo don't alaways render the value
+            // todo don't always render the value
             let br = dest.take_bottom(1);
             vtui::vt::move_cursor(buf, br.x, br.y);
             Color::Grey[6].with_fg(Color::Grey[25]).write_to_buffer(buf);
             match &self.mode {
-                Mode::All => todo!(),
-                Mode::OnlySelected(_selection_state) => todo!(),
+                Mode::All => {}
+                Mode::OnlySelected(_selection_state) => {}
                 Mode::Hybrid(selection_state) => {
-                    let ws = ws.state();
-                    if let Some(_job) = selection_state.job {
-                    } else {
-                        let name = ws.base_tasks[selection_state.base_task.idx()].name;
-                        buf.extend_from_slice(b" NOT ");
-                        buf.extend_from_slice(name.as_bytes());
+                    let ws_state = ws.state();
+                    if selection_state.job.is_none() {
+                        // Show what's being excluded
+                        if let Some(bti) = selection_state.base_task {
+                            let name = ws_state.base_tasks[bti.idx()].name;
+                            buf.extend_from_slice(b" NOT ");
+                            buf.extend_from_slice(name.as_bytes());
+                        } else if let Some(kind) = selection_state.meta_group {
+                            buf.extend_from_slice(b" NOT ");
+                            let label = match kind {
+                                MetaGroupKind::Tests => "@tests",
+                                MetaGroupKind::Actions => "@actions",
+                            };
+                            buf.extend_from_slice(label.as_bytes());
+                        }
                     }
                 }
             }
@@ -225,11 +233,12 @@ impl LogStack {
             self.pending_bottom_scroll = 0;
         }
 
+        let view = logs.view(top_filter);
         self.top.scrollable_render(
             self.pending_top_scroll,
             buf,
             dest,
-            logs.view(top_filter),
+            &view,
             match &self.mode {
                 Mode::All => &self.base_task_log_style,
                 Mode::OnlySelected(..) => &def,

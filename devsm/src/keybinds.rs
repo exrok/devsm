@@ -188,6 +188,9 @@ pub enum Command {
     HelpScrollUp,
     HelpScrollDown,
 
+    // View mode
+    ToggleViewMode,
+
     // Overlay-specific commands
     OverlayCancel,
     OverlayConfirm,
@@ -216,6 +219,7 @@ impl FromStr for Command {
             "ToggleHelp" => Command::ToggleHelp,
             "HelpScrollUp" => Command::HelpScrollUp,
             "HelpScrollDown" => Command::HelpScrollDown,
+            "ToggleViewMode" => Command::ToggleViewMode,
             "OverlayCancel" => Command::OverlayCancel,
             "OverlayConfirm" => Command::OverlayConfirm,
             _ => return Err(format!("Unknown command: `{s}`")),
@@ -313,6 +317,7 @@ impl Keybinds {
         self.bind(Mode::Global, "?", Command::ToggleHelp);
         self.bind(Mode::Global, "PGUP", Command::HelpScrollUp);
         self.bind(Mode::Global, "PGDN", Command::HelpScrollDown);
+        self.bind(Mode::Global, "v", Command::ToggleViewMode);
 
         // SelectSearch overlay keybindings
         self.bind(Mode::SelectSearch, "C-k", Command::SelectPrev);
@@ -429,6 +434,7 @@ impl Command {
             Command::ToggleHelp => "Help",
             Command::HelpScrollUp => "Help Up",
             Command::HelpScrollDown => "Help Down",
+            Command::ToggleViewMode => "Toggle View",
             Command::OverlayCancel => "Cancel",
             Command::OverlayConfirm => "Confirm",
         }

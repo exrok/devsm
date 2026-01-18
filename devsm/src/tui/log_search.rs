@@ -36,7 +36,7 @@ pub struct LogSearchIndex {
 
 impl LogSearchIndex {
     /// Builds a search index from filtered logs.
-    pub fn build(logs: &Logs, filter: LogFilter) -> Self {
+    pub fn build(logs: &Logs, filter: &LogFilter) -> Self {
         let mut buffer = Vec::with_capacity(64 * 1024);
         let mut offsets = Vec::new();
 
@@ -142,7 +142,7 @@ pub struct LogSearchState {
 impl LogSearchState {
     /// Creates a new search state for the given logs and filter.
     pub fn new(logs: &Logs, filter: LogFilter, initial_view_pos: LogId) -> Self {
-        let index = LogSearchIndex::build(logs, filter);
+        let index = LogSearchIndex::build(logs, &filter);
         LogSearchState {
             pattern: String::new(),
             pattern_lower_len: 0,
@@ -173,7 +173,7 @@ impl LogSearchState {
 
         for slice in [a, b] {
             for entry in slice {
-                if !filter_contains(self.filter, entry) {
+                if !filter_contains(&self.filter, entry) {
                     current_id.0 += 1;
                     continue;
                 }
@@ -351,13 +351,14 @@ impl LogSearchState {
 }
 
 /// Checks if an entry passes the filter.
-fn filter_contains(filter: LogFilter, entry: &LogEntry) -> bool {
+fn filter_contains(filter: &LogFilter, entry: &LogEntry) -> bool {
     match filter {
         LogFilter::All => true,
-        LogFilter::IsGroup(log_group) => entry.log_group == log_group,
-        LogFilter::NotGroup(log_group) => entry.log_group != log_group,
-        LogFilter::IsBaseTask(base_task) => entry.log_group.base_task_index() == base_task,
-        LogFilter::NotBaseTask(base_task) => entry.log_group.base_task_index() != base_task,
+        LogFilter::IsGroup(log_group) => entry.log_group == *log_group,
+        LogFilter::NotGroup(log_group) => entry.log_group != *log_group,
+        LogFilter::IsBaseTask(base_task) => entry.log_group.base_task_index() == *base_task,
+        LogFilter::NotBaseTask(base_task) => entry.log_group.base_task_index() != *base_task,
+        LogFilter::IsInSet(set) => set.contains(entry.log_group.base_task_index()),
     }
 }
 
