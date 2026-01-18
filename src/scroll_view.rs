@@ -4,7 +4,7 @@ use vtui::{
 };
 
 use crate::{
-    line_width,
+    line_width::{self, MatchHighlight, Segment},
     log_storage::{JobLogCorrelation, LogEntry, LogId, LogView, Logs},
 };
 
@@ -27,13 +27,20 @@ fn render_single_entry(
     logs: &Logs,
     width: u16,
     entry: &LogEntry,
+    log_id: LogId,
     skip_lines: u16,
     max_lines: u16,
     style: &LogStyle,
 ) -> u16 {
+    use vtui::Color;
+
     if max_lines == 0 {
         return 0;
     }
+
+    // Determine if this entry should be highlighted and get match info
+    let highlight_info = style.highlight.filter(|h| h.log_id == log_id);
+    let highlight_style = Color::DarkOrange.as_bg();
 
     let prefix = style.prefix(entry.job_id);
     let prefix_width = prefix.map(|p| p.width).unwrap_or(0) as u16;
@@ -51,8 +58,15 @@ fn render_single_entry(
         if !prefix_bytes.is_empty() {
             buf.extend_from_slice(prefix_bytes);
         }
-        entry.style.write_to_buffer(buf);
-        buf.extend_from_slice(text.as_bytes());
+
+        if let Some(hl) = highlight_info {
+            // Render with substring highlighting
+            render_text_with_highlight(buf, text, entry.style, hl.match_info, highlight_style);
+        } else {
+            entry.style.write_to_buffer(buf);
+            buf.extend_from_slice(text.as_bytes());
+        }
+
         vt::clear_style(buf);
         if !style.assume_blank {
             buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
@@ -84,8 +98,13 @@ fn render_single_entry(
                     buf.extend_from_slice(prefix_bytes);
                 }
 
-                line_style.write_to_buffer(buf);
-                buf.extend_from_slice(line_text.as_bytes());
+                if let Some(hl) = highlight_info {
+                    render_text_with_highlight(buf, line_text, line_style, hl.match_info, highlight_style);
+                } else {
+                    line_style.write_to_buffer(buf);
+                    buf.extend_from_slice(line_text.as_bytes());
+                }
+
                 if !style.assume_blank {
                     buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
                 }
@@ -116,17 +135,52 @@ fn render_single_entry(
     if first_line_len < text_slice.len() {
         text_slice = &text_slice[first_line_len..];
 
+        // Calculate stripped offset for wrapped lines
+        let stripped_offset = if highlight_info.is_some() {
+            calculate_stripped_len(&text[..first_line_len])
+        } else {
+            0
+        };
+
         let lines = line_width::naive_line_splitting(text_slice, entry.style, width.into())
             .skip(current_skip as usize)
             .take((max_lines - lines_rendered) as usize);
+
+        let mut current_stripped_offset = stripped_offset;
 
         // We only set the style if we are just starting to render visible lines (i.e. we skipped some).
         // If we just rendered the first line, the style is technically active, but usually splitters reset.
         // The naive splitter returns style for every line.
         for (line, line_style) in lines {
             // No prefix on wrapped lines
-            line_style.write_to_buffer(buf);
-            buf.extend_from_slice(line.as_bytes());
+            if let Some(hl) = highlight_info {
+                let line_stripped_len = calculate_stripped_len(line);
+                let line_start = current_stripped_offset;
+                let line_end = current_stripped_offset + line_stripped_len;
+                let hl_start = hl.match_info.start as usize;
+                let hl_end = hl_start + hl.match_info.len as usize;
+
+                // Check if highlight overlaps with this line
+                let adjusted_hl = if hl_start < line_end && hl_end > line_start {
+                    // Calculate overlap within this line
+                    let overlap_start = hl_start.saturating_sub(line_start);
+                    let overlap_end = hl_end.saturating_sub(line_start).min(line_stripped_len);
+                    MatchHighlight {
+                        start: overlap_start as u32,
+                        len: (overlap_end - overlap_start) as u32,
+                    }
+                } else {
+                    // No overlap - zero-length highlight
+                    MatchHighlight { start: 0, len: 0 }
+                };
+
+                render_text_with_highlight(buf, line, line_style, adjusted_hl, highlight_style);
+                current_stripped_offset += line_stripped_len;
+            } else {
+                line_style.write_to_buffer(buf);
+                buf.extend_from_slice(line.as_bytes());
+            }
+
             if !style.assume_blank {
                 buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
             }
@@ -139,16 +193,128 @@ fn render_single_entry(
     lines_rendered
 }
 
+/// Calculate the stripped (ANSI-free) length of text for offset tracking.
+fn calculate_stripped_len(text: &str) -> usize {
+    let mut len = 0;
+    for segment in Segment::iterator(text) {
+        match segment {
+            Segment::Ascii(s) => len += s.len(),
+            Segment::Utf8(s) => {
+                for ch in s.chars() {
+                    len += ch.to_lowercase().map(|c| c.len_utf8()).sum::<usize>();
+                }
+            }
+            Segment::AnsiEscapes(_) => {}
+        }
+    }
+    len
+}
+
+/// Render text with substring highlighting to a raw buffer.
+fn render_text_with_highlight(
+    buf: &mut Vec<u8>,
+    text: &str,
+    base_style: vtui::Style,
+    highlight: MatchHighlight,
+    highlight_style: vtui::Style,
+) {
+    let match_start = highlight.start as usize;
+    let match_end = match_start + highlight.len as usize;
+    let has_highlight = highlight.len > 0;
+
+    let mut stripped_pos = 0usize;
+    let mut current_style = base_style;
+    current_style.write_to_buffer(buf);
+
+    for segment in Segment::iterator(text) {
+        match segment {
+            Segment::Ascii(s) => {
+                let seg_start = stripped_pos;
+                let seg_end = stripped_pos + s.len();
+
+                if has_highlight && seg_start < match_end && seg_end > match_start {
+                    // This segment overlaps with highlight region
+                    let hl_start_in_seg = match_start.saturating_sub(seg_start);
+                    let hl_end_in_seg = (match_end - seg_start).min(s.len());
+
+                    // Before highlight
+                    if hl_start_in_seg > 0 {
+                        buf.extend_from_slice(s[..hl_start_in_seg].as_bytes());
+                    }
+                    // Highlighted portion
+                    highlight_style.write_to_buffer(buf);
+                    buf.extend_from_slice(s[hl_start_in_seg..hl_end_in_seg].as_bytes());
+                    // After highlight - clear all styles then restore current style
+                    vt::clear_style(buf);
+                    current_style.write_to_buffer(buf);
+                    if hl_end_in_seg < s.len() {
+                        buf.extend_from_slice(s[hl_end_in_seg..].as_bytes());
+                    }
+                } else {
+                    buf.extend_from_slice(s.as_bytes());
+                }
+                stripped_pos = seg_end;
+            }
+            Segment::Utf8(s) => {
+                // For UTF-8 segments, we process char-by-char because
+                // lowercasing can change byte lengths
+                for ch in s.chars() {
+                    let ch_stripped_len: usize = ch.to_lowercase().map(|c| c.len_utf8()).sum();
+                    let ch_start = stripped_pos;
+                    let ch_end = stripped_pos + ch_stripped_len;
+
+                    let in_highlight = has_highlight && ch_start < match_end && ch_end > match_start;
+
+                    if in_highlight {
+                        highlight_style.write_to_buffer(buf);
+                        let mut char_buf = [0u8; 4];
+                        let encoded = ch.encode_utf8(&mut char_buf);
+                        buf.extend_from_slice(encoded.as_bytes());
+                        // Clear all styles then restore current style
+                        vt::clear_style(buf);
+                        current_style.write_to_buffer(buf);
+                    } else {
+                        let mut char_buf = [0u8; 4];
+                        let encoded = ch.encode_utf8(&mut char_buf);
+                        buf.extend_from_slice(encoded.as_bytes());
+                    }
+
+                    stripped_pos = ch_end;
+                }
+            }
+            Segment::AnsiEscapes(escape) => {
+                // Apply ANSI escapes to current style and write them through
+                line_width::apply_raw_display_mode_vt_to_style(&mut current_style, escape);
+                // Write the original escape sequence
+                buf.extend_from_slice(b"\x1b[");
+                buf.extend_from_slice(escape.as_bytes());
+                buf.extend_from_slice(b"m");
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Prefix {
     pub bytes: Box<str>,
     pub width: usize,
 }
 
+/// Highlight information for a specific log entry.
+#[derive(Clone, Copy, Default)]
+pub struct LogHighlight {
+    /// The LogId to highlight.
+    pub log_id: LogId,
+    /// Position and length of match in stripped text.
+    pub match_info: MatchHighlight,
+}
+
 #[derive(Default)]
 pub struct LogStyle {
     pub prefixes: Vec<Prefix>,
     pub assume_blank: bool,
+    /// Log entry to highlight when rendering. Used for search result highlighting.
+    pub highlight: Option<LogHighlight>,
 }
 
 impl LogStyle {
@@ -191,6 +357,20 @@ impl Default for LogTailWidget {
     }
 }
 
+impl LogTailWidget {
+    /// Returns the current tail LogId.
+    pub fn tail(&self) -> LogId {
+        self.tail
+    }
+}
+
+impl LogScrollWidget {
+    /// Returns the current tail LogId.
+    pub fn tail(&self) -> LogId {
+        self.tail
+    }
+}
+
 pub enum LogWidget {
     Scroll(LogScrollWidget),
     Tail(LogTailWidget),
@@ -208,7 +388,7 @@ impl LogWidget {
         *self = LogWidget::default();
     }
     /// Transitions the view from `Tail` mode to `Scroll` mode if it isn't already.
-    fn scrollify(&mut self, view: LogView, style: &LogStyle) -> &mut LogScrollWidget {
+    pub fn scrollify(&mut self, view: LogView, style: &LogStyle) -> &mut LogScrollWidget {
         if let LogWidget::Tail(tail) = self {
             let mut ids = Vec::new();
             let mut line_id = view.logs.head();
@@ -279,6 +459,142 @@ impl LogWidget {
             LogWidget::Scroll(scroll_view) => scroll_view.render_reset(buf, rect, view, style),
             LogWidget::Tail(tail_view) => tail_view.render(buf, rect, view, style),
         }
+    }
+
+    /// Scrolls the view to show a specific LogId, centering it if possible.
+    ///
+    /// This method is smart about scrolling:
+    /// 1. If the target is already visible, no scrolling occurs
+    /// 2. When scrolling is needed, the target is centered in the view
+    /// 3. Centering is clamped to avoid scrolling past start or end
+    pub fn scroll_to_log_id(&mut self, target: LogId, view: LogView, style: &LogStyle) {
+        let scroll_view = self.scrollify(view, style);
+        let logs = view.logs.indexer();
+
+        if scroll_view.ids.is_empty() {
+            return;
+        }
+
+        // Find the target LogId in the ids list
+        let target_idx = scroll_view.ids.iter().position(|&id| id >= target).unwrap_or(scroll_view.ids.len());
+        let target_idx = target_idx.min(scroll_view.ids.len().saturating_sub(1));
+
+        let screen_height = scroll_view.previous.h as u32;
+        let width = scroll_view.previous.w as u32;
+
+        // If we don't have valid dimensions yet, just set target at top
+        if screen_height == 0 || width == 0 {
+            scroll_view.top_index = target_idx;
+            scroll_view.scroll_shift_up = 0;
+            scroll_view.previous = Rect::EMPTY;
+            return;
+        }
+
+        // Check if target is already visible
+        let mut accumulated_height = 0u32;
+        let mut found_visible = false;
+
+        // Start from top_index, accounting for scroll_shift_up
+        if let Some(&first_id) = scroll_view.ids.get(scroll_view.top_index) {
+            let entry = logs[first_id];
+            let entry_height = get_entry_height(&entry, style, width);
+            let visible_height = entry_height.saturating_sub(scroll_view.scroll_shift_up as u32);
+
+            if scroll_view.top_index == target_idx && scroll_view.scroll_shift_up == 0 {
+                found_visible = true;
+            }
+            accumulated_height += visible_height;
+        }
+
+        if !found_visible {
+            for idx in (scroll_view.top_index + 1)..scroll_view.ids.len() {
+                if accumulated_height >= screen_height {
+                    break;
+                }
+                if idx == target_idx {
+                    found_visible = true;
+                    break;
+                }
+                let entry = logs[scroll_view.ids[idx]];
+                accumulated_height += get_entry_height(&entry, style, width);
+            }
+        }
+
+        if found_visible {
+            // Target is already visible, no scrolling needed
+            return;
+        }
+
+        // Target is not visible, calculate centering position
+        let target_entry = logs[scroll_view.ids[target_idx]];
+        let target_height = get_entry_height(&target_entry, style, width);
+
+        // Calculate how many lines should appear above target to center it
+        let lines_above_target = (screen_height.saturating_sub(target_height)) / 2;
+
+        // Work backwards from target to find the top_index that achieves centering
+        let mut lines_accumulated = 0u32;
+        let mut new_top_index = target_idx;
+        let mut new_scroll_shift = 0u16;
+
+        for idx in (scroll_view.min_index..target_idx).rev() {
+            let entry = logs[scroll_view.ids[idx]];
+            let entry_height = get_entry_height(&entry, style, width);
+
+            if lines_accumulated + entry_height <= lines_above_target {
+                lines_accumulated += entry_height;
+                new_top_index = idx;
+            } else {
+                // This entry would push us past the center point
+                // We might want to partially include it
+                let remaining = lines_above_target - lines_accumulated;
+                if remaining > 0 {
+                    new_top_index = idx;
+                    // scroll_shift_up is how many lines of this entry to skip
+                    new_scroll_shift = (entry_height - remaining) as u16;
+                }
+                break;
+            }
+        }
+
+        // Check if centering would leave empty space at the bottom (scrolled too far up)
+        // Calculate total visible height from new_top_index
+        let mut total_visible = 0u32;
+        if new_top_index < scroll_view.ids.len() {
+            let first_entry = logs[scroll_view.ids[new_top_index]];
+            let first_height = get_entry_height(&first_entry, style, width);
+            total_visible += first_height.saturating_sub(new_scroll_shift as u32);
+        }
+        for idx in (new_top_index + 1)..scroll_view.ids.len() {
+            let entry = logs[scroll_view.ids[idx]];
+            total_visible += get_entry_height(&entry, style, width);
+        }
+
+        // If we can't fill the screen from this position, scroll down to fill it
+        if total_visible < screen_height && new_top_index > scroll_view.min_index {
+            let deficit = screen_height - total_visible;
+            let mut extra_lines = 0u32;
+
+            for idx in (scroll_view.min_index..new_top_index).rev() {
+                let entry = logs[scroll_view.ids[idx]];
+                let entry_height = get_entry_height(&entry, style, width);
+                extra_lines += entry_height;
+                new_top_index = idx;
+                new_scroll_shift = 0;
+
+                if extra_lines >= deficit {
+                    // We might need to partially scroll this entry
+                    if extra_lines > deficit {
+                        new_scroll_shift = (extra_lines - deficit) as u16;
+                    }
+                    break;
+                }
+            }
+        }
+
+        scroll_view.top_index = new_top_index;
+        scroll_view.scroll_shift_up = new_scroll_shift;
+        scroll_view.previous = Rect::EMPTY; // Force full re-render
     }
 
     pub fn scrollable_render(&mut self, scroll: i32, buf: &mut Vec<u8>, rect: Rect, view: LogView, style: &LogStyle) {
@@ -432,23 +748,23 @@ impl LogScrollWidget {
         style: &LogStyle,
     ) -> u16 {
         let logs = view.logs.indexer();
-        let mut entries = self.ids[self.top_index..].iter().map(|id| logs[*id]);
+        let mut entries = self.ids[self.top_index..].iter().map(|&id| (id, logs[id]));
         let mut remaining_height = lines_to_render;
 
-        if let Some(entry) = entries.next() {
+        if let Some((log_id, entry)) = entries.next() {
             if remaining_height == 0 {
                 return 0;
             }
             let rendered =
-                render_single_entry(buf, view.logs, rect.w, &entry, self.scroll_shift_up, remaining_height, style);
+                render_single_entry(buf, view.logs, rect.w, &entry, log_id, self.scroll_shift_up, remaining_height, style);
             remaining_height = remaining_height.saturating_sub(rendered);
         }
 
-        for entry in entries {
+        for (log_id, entry) in entries {
             if remaining_height == 0 {
                 break;
             }
-            let rendered = render_single_entry(buf, view.logs, rect.w, &entry, 0, remaining_height, style);
+            let rendered = render_single_entry(buf, view.logs, rect.w, &entry, log_id, 0, remaining_height, style);
             remaining_height = remaining_height.saturating_sub(rendered);
         }
         remaining_height
@@ -482,17 +798,17 @@ impl LogScrollWidget {
 
     fn render_bottom_lines(&self, buf: &mut Vec<u8>, rect: Rect, view: LogView, scrolled_lines: u16, style: &LogStyle) {
         let logs = view.logs.indexer();
-        let mut entries = self.ids[self.top_index..].iter().map(|id| logs[*id]);
+        let mut entries = self.ids[self.top_index..].iter().map(|&id| (id, logs[id]));
         let mut lines_to_skip = rect.h.saturating_sub(scrolled_lines);
 
-        let mut start_entry = None;
+        let mut start_entry: Option<(LogId, LogEntry)> = None;
         let mut sub_line_skip = 0;
 
-        if let Some(entry) = entries.next() {
+        if let Some((log_id, entry)) = entries.next() {
             let total_height = get_entry_height(&entry, style, rect.w as u32) as u16;
             let visible_height = total_height.saturating_sub(self.scroll_shift_up);
             if lines_to_skip < visible_height {
-                start_entry = Some(entry);
+                start_entry = Some((log_id, entry));
                 sub_line_skip = self.scroll_shift_up + lines_to_skip;
                 lines_to_skip = 0;
             } else {
@@ -501,10 +817,10 @@ impl LogScrollWidget {
         }
 
         if lines_to_skip > 0 {
-            for entry in entries.by_ref() {
+            for (log_id, entry) in entries.by_ref() {
                 let height = get_entry_height(&entry, style, rect.w as u32) as u16;
                 if lines_to_skip < height {
-                    start_entry = Some(entry);
+                    start_entry = Some((log_id, entry));
                     sub_line_skip = lines_to_skip;
                     break;
                 } else {
@@ -516,19 +832,19 @@ impl LogScrollWidget {
         vt::move_cursor(buf, rect.x, rect.y + rect.h - scrolled_lines);
         let mut remaining_height = scrolled_lines;
 
-        if let Some(entry) = start_entry {
+        if let Some((log_id, entry)) = start_entry {
             if remaining_height == 0 {
                 return;
             }
-            let rendered = render_single_entry(buf, view.logs, rect.w, &entry, sub_line_skip, remaining_height, style);
+            let rendered = render_single_entry(buf, view.logs, rect.w, &entry, log_id, sub_line_skip, remaining_height, style);
             remaining_height = remaining_height.saturating_sub(rendered);
         }
 
-        for entry in entries {
+        for (log_id, entry) in entries {
             if remaining_height == 0 {
                 break;
             }
-            let rendered = render_single_entry(buf, view.logs, rect.w, &entry, 0, remaining_height, style);
+            let rendered = render_single_entry(buf, view.logs, rect.w, &entry, log_id, 0, remaining_height, style);
             remaining_height = remaining_height.saturating_sub(rendered);
         }
     }
@@ -627,17 +943,25 @@ impl LogTailWidget {
 
 /// Renders the view in "tail" mode from scratch.
 fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: LogView, style: &LogStyle) -> u16 {
-    let mut displayed: Vec<LogEntry> = Vec::new();
+    let mut displayed: Vec<(LogId, LogEntry)> = Vec::new();
     let (a, b) = view.logs.slices();
+    let head = view.logs.head();
     let mut remaining_v_space = rect.h as i32;
-    'outer: for slice in [b, a] {
-        for entry in slice.iter().rev() {
+
+    // Iterate in reverse (newest first). Slice b comes after a in the logical order.
+    // Compute LogIds: entries in a have LogIds from head to head+a.len()-1
+    //                 entries in b have LogIds from head+a.len() to head+a.len()+b.len()-1
+    let a_len = a.len();
+
+    'outer: for (slice, base_offset) in [(b, a_len), (a, 0)] {
+        for (rev_idx, entry) in slice.iter().rev().enumerate() {
             if !view.contains(entry) {
                 continue;
             }
             let line_count = get_entry_height(entry, style, rect.w as u32);
             remaining_v_space -= line_count as i32;
-            displayed.push(*entry);
+            let log_id = LogId(head.0 + base_offset + (slice.len() - 1 - rev_idx));
+            displayed.push((log_id, *entry));
             if remaining_v_space <= 0 {
                 break 'outer;
             }
@@ -649,18 +973,18 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: LogView, style:
     let mut entries_to_render = displayed.iter().rev();
 
     if remaining_v_space < 0 {
-        if let Some(entry) = entries_to_render.next() {
+        if let Some((log_id, entry)) = entries_to_render.next() {
             let skip = (-remaining_v_space) as u16;
-            let rendered = render_single_entry(buf, view.logs, rect.w, entry, skip, screen_lines_left, style);
+            let rendered = render_single_entry(buf, view.logs, rect.w, entry, *log_id, skip, screen_lines_left, style);
             screen_lines_left = screen_lines_left.saturating_sub(rendered);
         }
     }
 
-    for entry in entries_to_render {
+    for (log_id, entry) in entries_to_render {
         if screen_lines_left == 0 {
             break;
         }
-        let rendered = render_single_entry(buf, view.logs, rect.w, entry, 0, screen_lines_left, style);
+        let rendered = render_single_entry(buf, view.logs, rect.w, entry, *log_id, 0, screen_lines_left, style);
         screen_lines_left = screen_lines_left.saturating_sub(rendered);
     }
 
@@ -890,7 +1214,7 @@ mod test {
 
         // Setup style with a prefix for Job 0
         let prefix = Prefix { bytes: "P: ".into(), width: 3 };
-        let style = LogStyle { prefixes: vec![prefix.clone(), prefix], assume_blank: false };
+        let style = LogStyle { prefixes: vec![prefix.clone(), prefix], assume_blank: false, highlight: None };
 
         writer.push("Short");
         view.render(&mut buf, rect, logs.read().unwrap().view_all(), &style);

@@ -6,7 +6,9 @@ use vtui::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use vtui::vt::BufferWrite;
 use vtui::{Color, DoubleBuffer, Rect, Style, TerminalFlags, vt};
 
+use crate::log_storage::LogFilter;
 use crate::process_manager::{Action, ClientChannel};
+use crate::tui::log_search::{LogSearchState, SearchAction};
 use crate::tui::log_stack::LogStack;
 use crate::tui::select_search::SelectSearch;
 use crate::tui::task_tree::TaskTreeState;
@@ -22,6 +24,7 @@ pub fn constrain_scroll_offset(visible_height: usize, item_index: usize, scroll_
     }
 }
 
+mod log_search;
 mod log_stack;
 mod select_search;
 mod task_tree;
@@ -29,6 +32,7 @@ mod task_tree;
 enum FocusOverlap {
     Group { selection: SelectSearch },
     SpawnProfile { selection: SelectSearch, bti: BaseTaskIndex, profiles: &'static [&'static str] },
+    LogSearch { state: LogSearchState },
     None,
 }
 
@@ -59,7 +63,20 @@ fn render<'a>(w: u16, h: u16, tui: &'a mut TuiState, workspace: &Workspace, delt
 
     Style::DEFAULT.delta().write_to_buffer(&mut tui.frame.buf);
 
-    // Check if we're in search mode
+    // Set highlighted log for search mode
+    tui.logs.highlight = match &tui.overlay {
+        FocusOverlap::LogSearch { state } => {
+            state.selected_match().map(|m| crate::scroll_view::LogHighlight {
+                log_id: m.log_id,
+                match_info: crate::line_width::MatchHighlight {
+                    start: m.match_start,
+                    len: state.pattern_len() as u32,
+                },
+            })
+        }
+        _ => None,
+    };
+
     let dest = Rect { x: 0, y: 0, w, h: h - menu_height };
     tui.logs.render(&mut tui.frame.buf, dest, &workspace);
 
@@ -95,6 +112,10 @@ fn render<'a>(w: u16, h: u16, tui: &'a mut TuiState, workspace: &Workspace, delt
                     }
                     x.text(out, &profiles[prof]);
                 });
+            }
+            FocusOverlap::LogSearch { state } => {
+                let logs = workspace.logs.read().unwrap();
+                state.render(&mut tui.frame, task_tree_rect, &logs);
             }
             FocusOverlap::None => {
                 let (p, mut s) = task_tree_rect.h_split(0.5);
@@ -167,10 +188,54 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
             }
             return false;
         }
+        FocusOverlap::LogSearch { state } => {
+            match state.process_input(key_event) {
+                SearchAction::Cancel => {
+                    tui.overlay = FocusOverlap::None;
+                }
+                SearchAction::Confirm(log_id) => {
+                    tui.logs.scroll_to_log_id(log_id, workspace);
+                    tui.overlay = FocusOverlap::None;
+                }
+                SearchAction::None => {
+                    // Update index with any new logs
+                    let logs = workspace.logs.read().unwrap();
+                    state.update_index(&logs);
+                    state.flush();
+
+                    // If a match is selected, scroll to it
+                    if let Some(log_id) = state.selected_log_id() {
+                        drop(logs);
+                        tui.logs.scroll_to_log_id(log_id, workspace);
+                    }
+                }
+            }
+            return false;
+        }
         FocusOverlap::None => {}
     }
     match (key_event.modifiers, key_event.code) {
         (CTRL, Char('c')) => return true,
+        (_, Char('/')) => {
+            // Enter log search mode
+            let ws_state = workspace.state();
+            let filter = match tui.logs.mode() {
+                log_stack::Mode::All => LogFilter::All,
+                log_stack::Mode::OnlySelected(sel) | log_stack::Mode::Hybrid(sel) => {
+                    if let Some(job) = sel.job {
+                        LogFilter::IsJob(ws_state[job].job_id)
+                    } else {
+                        LogFilter::IsBaseTask(sel.base_task)
+                    }
+                }
+            };
+            let logs = workspace.logs.read().unwrap();
+            let initial_view_pos = logs.tail();
+            let state = LogSearchState::new(&logs, filter, initial_view_pos);
+            drop(logs);
+            tui.logs.enter_scroll_mode(workspace);
+            tui.overlay = FocusOverlap::LogSearch { state };
+        }
         (_, Char('g')) => {
             let ws = workspace.state();
             let entries = ws.config.current.groups.iter().enumerate().map(|(index, (name, _))| (index, name));

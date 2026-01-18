@@ -1,8 +1,8 @@
 use vtui::{Color, Rect, vt::BufferWrite};
 
 use crate::{
-    log_storage::LogFilter,
-    scroll_view::{LogStyle, LogWidget},
+    log_storage::{LogFilter, LogId},
+    scroll_view::{LogHighlight, LogStyle, LogWidget},
     tui::task_tree::SelectionState,
     workspace::{Workspace, WorkspaceState},
 };
@@ -58,8 +58,89 @@ pub struct LogStack {
     pub pending_top_scroll: i32,
     pub pending_bottom_scroll: i32,
     base_task_log_style: LogStyle,
+    /// Highlight info for search result highlighting in the log view.
+    pub highlight: Option<LogHighlight>,
 }
 impl LogStack {
+    /// Returns the current display mode.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Returns the current tail position of the top log view.
+    pub fn current_tail(&self) -> LogId {
+        match &self.top {
+            LogWidget::Tail(tail) => tail.tail(),
+            LogWidget::Scroll(scroll) => scroll.tail(),
+        }
+    }
+
+    /// Forces the appropriate log view into scroll mode at the current position.
+    /// In Hybrid mode, this affects the bottom (narrowed) view since that's where search results are.
+    pub fn enter_scroll_mode(&mut self, ws: &Workspace) {
+        let ws_state = ws.state();
+        let logs = ws.logs.read().unwrap();
+
+        match &self.mode {
+            Mode::All => {
+                let view = logs.view(LogFilter::All);
+                self.top.scrollify(view, &self.base_task_log_style);
+            }
+            Mode::OnlySelected(ss) => {
+                let filter = if let Some(job) = ss.job {
+                    LogFilter::IsJob(ws_state[job].job_id)
+                } else {
+                    LogFilter::IsBaseTask(ss.base_task)
+                };
+                let view = logs.view(filter);
+                self.top.scrollify(view, &LogStyle::default());
+            }
+            Mode::Hybrid(ss) => {
+                // In Hybrid mode, search results are in the bottom (selected task) view
+                let filter = if let Some(job) = ss.job {
+                    LogFilter::IsJob(ws_state[job].job_id)
+                } else {
+                    LogFilter::IsBaseTask(ss.base_task)
+                };
+                let view = logs.view(filter);
+                self.bottom.scrollify(view, &LogStyle::default());
+            }
+        }
+    }
+
+    /// Scrolls the appropriate log view to show a specific LogId.
+    /// In Hybrid mode, this affects the bottom (narrowed) view since that's where search results are.
+    pub fn scroll_to_log_id(&mut self, target: LogId, ws: &Workspace) {
+        let ws_state = ws.state();
+        let logs = ws.logs.read().unwrap();
+
+        match &self.mode {
+            Mode::All => {
+                let view = logs.view(LogFilter::All);
+                self.top.scroll_to_log_id(target, view, &self.base_task_log_style);
+            }
+            Mode::OnlySelected(ss) => {
+                let filter = if let Some(job) = ss.job {
+                    LogFilter::IsJob(ws_state[job].job_id)
+                } else {
+                    LogFilter::IsBaseTask(ss.base_task)
+                };
+                let view = logs.view(filter);
+                self.top.scroll_to_log_id(target, view, &LogStyle::default());
+            }
+            Mode::Hybrid(ss) => {
+                // In Hybrid mode, search results are in the bottom (selected task) view
+                let filter = if let Some(job) = ss.job {
+                    LogFilter::IsJob(ws_state[job].job_id)
+                } else {
+                    LogFilter::IsBaseTask(ss.base_task)
+                };
+                let view = logs.view(filter);
+                self.bottom.scroll_to_log_id(target, view, &LogStyle::default());
+            }
+        }
+    }
+
     pub fn set_mode(&mut self, mode: Mode) {
         if self.mode != mode {
             self.mode = mode;
@@ -102,7 +183,11 @@ impl LogStack {
             (self.mode.top_filter(&ws), self.mode.bottom_filter(&ws))
         };
 
-        let def = LogStyle::default();
+        // Apply highlighting to styles
+        self.base_task_log_style.highlight = self.highlight;
+        let mut def = LogStyle::default();
+        def.highlight = self.highlight;
+
         let logs = ws.logs.read().unwrap();
         if let Some(bot_filter) = bot_filter {
             self.bottom.scrollable_render(

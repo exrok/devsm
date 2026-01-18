@@ -130,6 +130,51 @@ pub fn width_ignoring_vt_ansi_color(text: &str) -> usize {
     width
 }
 
+/// Strips ANSI escape codes from text and appends lowercase content to buffer.
+///
+/// Used for building search indices where case-insensitive matching is needed
+/// and ANSI codes should be ignored.
+pub fn strip_ansi_to_buffer(text: &str, buffer: &mut Vec<u8>) {
+    for segment in Segment::iterator(text) {
+        match segment {
+            Segment::Ascii(s) => {
+                buffer.extend(s.bytes().map(|b| b.to_ascii_lowercase()));
+            }
+            Segment::Utf8(s) => {
+                for c in s.chars().flat_map(|c| c.to_lowercase()) {
+                    let mut buf = [0u8; 4];
+                    let encoded = c.encode_utf8(&mut buf);
+                    buffer.extend_from_slice(encoded.as_bytes());
+                }
+            }
+            Segment::AnsiEscapes(_) => {}
+        }
+    }
+}
+
+/// Match highlight information for rendering.
+#[derive(Clone, Copy, Default)]
+pub struct MatchHighlight {
+    /// Byte offset in stripped (ANSI-free, lowercased) text where match starts.
+    pub start: u32,
+    /// Length of match in stripped text bytes.
+    pub len: u32,
+}
+
+impl MatchHighlight {
+    /// Returns true if the given stripped position is within the highlight range.
+    pub fn contains(&self, stripped_pos: usize) -> bool {
+        self.len > 0
+            && stripped_pos >= self.start as usize
+            && stripped_pos < (self.start + self.len) as usize
+    }
+
+    /// Returns true if the given stripped range overlaps with the highlight range.
+    pub fn overlaps(&self, start: usize, end: usize) -> bool {
+        self.len > 0 && start < (self.start + self.len) as usize && end > self.start as usize
+    }
+}
+
 pub fn apply_raw_display_mode_vt_to_style(style: &mut Style, escape: &str) {
     if escape.is_empty() {
         *style = Style::DEFAULT;
