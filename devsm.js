@@ -12,7 +12,8 @@ let spam = {
     sh: `
     for i in $(seq 1 30); do
         echo $$ $i
-    done`
+    done
+    `
 }
 
 

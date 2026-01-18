@@ -31,6 +31,10 @@ bumpalo = { version = "3.19.0", features = ["collections"] }
 memchr = "2.7.6"
 sendfd = "0.4.4"
 jsony_value.path = "../../tests/jsony_value"
+toml-span = { path = "/home/user/git/toml-span/toml-span", features = [
+    "reporting",
+] }
+codespan-reporting = { version = "0.13.1", features = ["termcolor"] }
 
 [dev-dependencies]
 #proptest = "1.9.0"

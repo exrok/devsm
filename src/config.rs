@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use anyhow::bail;
 use bumpalo::Bump;
 use jsony::{
     FromJson, Jsony,
@@ -12,6 +13,7 @@ use jsony_value::{Value, ValueMap, ValueRef};
 
 use crate::config::template_string::{TemplatePart, munch_template_literal};
 mod template_string;
+pub mod toml_handler;
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct Alias<'a>(&'a str);
@@ -137,7 +139,7 @@ fn next_const(parser: &mut Parser<'static>) -> Option<&'static str> {
 pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
     let mut pwd = path.to_path_buf();
     loop {
-        pwd.push("devsm.js");
+        pwd.push("devsm.toml");
         if pwd.exists() {
             return Some(pwd);
         }
@@ -154,7 +156,7 @@ pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
 pub fn load_from_env() -> anyhow::Result<WorkspaceConfig<'static>> {
     let mut pwd = std::env::current_dir()?;
     loop {
-        pwd.push("devsm.js");
+        pwd.push("devsm.toml");
         if pwd.exists() {
             let content = std::fs::read_to_string(&pwd)?.leak();
             pwd.pop();
@@ -177,36 +179,40 @@ pub fn load_workspace_config_leaking(
     let bump = Box::leak(Box::new(Bump::new()));
     // todo put in the bump allocator
     let base_path = Box::leak(Box::new(base_path.to_path_buf()));
-    let parser = &mut jsony::json::Parser::new(
-        content,
-        jsony::JsonParserConfig {
-            recursion_limit: 100,
-            allow_trailing_commas: true,
-            allow_comments: true,
-            allow_unquoted_field_keys: true,
-            allow_trailing_data: true,
-        },
-    );
-    let mut tasks = bumpalo::collections::Vec::new_in(bump);
-    let mut groups = bumpalo::collections::Vec::new_in(bump);
-    while let Some(key) = next_const(parser) {
-        if parser.peek().ok() == Some(Peek::Array) {
-            match <&[TaskCall]>::decode(parser, bump) {
-                Ok(task) => groups.push((key, task)),
-                Err(err) => {
-                    println!("{} while parsing: const {}", jsony::JsonError::extract(err, parser), key);
-                }
-            }
-        } else {
-            match TaskConfigExpr::decode(parser, bump) {
-                Ok(task) => tasks.push((key, task)),
-                Err(err) => {
-                    println!("{} while parsing: const {}", jsony::JsonError::extract(err, parser), key);
-                }
-            }
-        }
+    match toml_handler::parse(bump, content, &mut |_| ()) {
+        Ok(value) => Ok(value),
+        Err(_) => bail!("Failed to parse config"),
     }
-    Ok(WorkspaceConfig { base_path, tasks: tasks.into_bump_slice(), groups: groups.into_bump_slice() })
+    // let parser = &mut jsony::json::Parser::new(
+    //     content,
+    //     jsony::JsonParserConfig {
+    //         recursion_limit: 100,
+    //         allow_trailing_commas: true,
+    //         allow_comments: true,
+    //         allow_unquoted_field_keys: true,
+    //         allow_trailing_data: true,
+    //     },
+    // );
+    // let mut tasks = bumpalo::collections::Vec::new_in(bump);
+    // let mut groups = bumpalo::collections::Vec::new_in(bump);
+    // while let Some(key) = next_const(parser) {
+    //     if parser.peek().ok() == Some(Peek::Array) {
+    //         match <&[TaskCall]>::decode(parser, bump) {
+    //             Ok(task) => groups.push((key, task)),
+    //             Err(err) => {
+    //                 println!("{} while parsing: const {}", jsony::JsonError::extract(err, parser), key);
+    //             }
+    //         }
+    //     } else {
+    //         match TaskConfigExpr::decode(parser, bump) {
+    //             Ok(task) => tasks.push((key, task)),
+    //             Err(err) => {
+    //                 println!("{} while parsing: const {}", jsony::JsonError::extract(err, parser), key);
+    //             }
+    //         }
+    //     }
+    // }
+    // Ok(WorkspaceConfig { base_path, tasks: tasks.into_bump_slice(), groups: groups.into_bump_slice() })
 }
 
 #[derive(Debug)]
