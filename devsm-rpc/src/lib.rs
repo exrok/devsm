@@ -583,6 +583,44 @@ impl Default for ClientProtocol {
     }
 }
 
+/// Encodes an AttachRpc request message in jsony binary format.
+///
+/// The format matches the daemon's RequestMessage struct:
+/// - cwd: length-prefixed byte string (path)
+/// - request: enum discriminant (4 for AttachRpc) + variant fields
+///   - config: length-prefixed byte string (path)
+///   - subscribe: bool as u8
+///
+/// # Examples
+///
+/// ```ignore
+/// let msg = encode_attach_rpc(&cwd, &config_path, true);
+/// socket.write_all(&msg)?;
+/// ```
+pub fn encode_attach_rpc(cwd: &std::path::Path, config: &std::path::Path, subscribe: bool) -> Vec<u8> {
+    use jsony::ToBinary;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut out = jsony::BytesWriter::new();
+
+    // Encode cwd path (length-prefixed bytes)
+    let cwd_bytes = cwd.as_os_str().as_bytes();
+    cwd_bytes.encode_binary(&mut out);
+
+    // Encode Request enum discriminant (AttachRpc = variant index 4)
+    out.push(4);
+
+    // Encode AttachRpc fields:
+    // - config path (length-prefixed bytes)
+    let config_bytes = config.as_os_str().as_bytes();
+    config_bytes.encode_binary(&mut out);
+
+    // - subscribe bool
+    subscribe.encode_binary(&mut out);
+
+    out.into_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

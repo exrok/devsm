@@ -13,40 +13,11 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use devsm_rpc::{ClientProtocol, DecodeResult, JobExitedEvent, JobStatusEvent, RpcMessageKind};
-use jsony::ToBinary;
+use devsm_rpc::{
+    encode_attach_rpc, ClientProtocol, DecodeResult, JobExitedEvent, JobStatusEvent, RpcMessageKind,
+};
 
 const SOCKET_PATH: &str = "/tmp/.devsm.socket";
-
-/// Encodes an AttachRpc request message in jsony binary format.
-///
-/// The format matches the daemon's RequestMessage struct:
-/// - cwd: length-prefixed byte string (path)
-/// - request: enum discriminant (4 for AttachRpc) + variant fields
-///   - config: length-prefixed byte string (path)
-///   - subscribe: bool as u8
-fn encode_attach_rpc(cwd: &Path, config: &Path, subscribe: bool) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut out = jsony::BytesWriter::new();
-
-    // Encode cwd path (length-prefixed bytes)
-    let cwd_bytes = cwd.as_os_str().as_bytes();
-    cwd_bytes.encode_binary(&mut out);
-
-    // Encode Request enum discriminant (AttachRpc = variant index 4)
-    out.push(4);
-
-    // Encode AttachRpc fields:
-    // - config path (length-prefixed bytes)
-    let config_bytes = config.as_os_str().as_bytes();
-    config_bytes.encode_binary(&mut out);
-
-    // - subscribe bool
-    subscribe.encode_binary(&mut out);
-
-    out.into_vec()
-}
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();

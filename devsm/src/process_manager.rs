@@ -729,6 +729,11 @@ impl ProcessManager {
                     }
                     let ws_idx = process.workspace_index;
                     let job_idx = process.job_index;
+                    let exit_code = if libc::WIFEXITED(status as i32) {
+                        libc::WEXITSTATUS(status as i32) as u32
+                    } else {
+                        u32::MAX
+                    };
                     if let Some(workspace) = self.workspaces.get(ws_idx as usize) {
                         let mut ws = workspace.handle.state.write().unwrap();
                         ws.update_job_status(
@@ -737,17 +742,12 @@ impl ProcessManager {
                                 finished_at: std::time::Instant::now(),
                                 log_end: workspace.line_writer.tail(),
                                 cause: ExitCause::Unknown,
-                                status,
+                                status: exit_code,
                             },
                         );
                     }
                     self.processes.remove(index);
-                    let exit_code = if libc::WIFEXITED(status as i32) {
-                        libc::WEXITSTATUS(status as i32)
-                    } else {
-                        -1
-                    };
-                    self.broadcast_job_exited(ws_idx, job_idx, exit_code, devsm_rpc::ExitCause::Unknown);
+                    self.broadcast_job_exited(ws_idx, job_idx, exit_code as i32, devsm_rpc::ExitCause::Unknown);
                     return false;
                 }
                 kvlog::info!("Didn't Find ProcessExited");

@@ -8,6 +8,7 @@ use std::{
         },
     },
     path::Path,
+    sync::OnceLock,
 };
 
 use anyhow::{Context, bail};
@@ -17,7 +18,17 @@ use sendfd::RecvWithFd;
 
 use crate::process_manager::ProcessManagerHandle;
 
-pub const GLOBAL_SOCKET: &str = "/tmp/.devsm.socket";
+static SOCKET_PATH: OnceLock<String> = OnceLock::new();
+
+/// Returns the path to the Unix domain socket for daemon communication.
+///
+/// Uses `DEVSM_SOCKET` environment variable if set, otherwise defaults to
+/// `/tmp/.devsm.socket`.
+pub fn socket_path() -> &'static str {
+    SOCKET_PATH.get_or_init(|| {
+        std::env::var("DEVSM_SOCKET").unwrap_or_else(|_| "/tmp/.devsm.socket".to_string())
+    })
+}
 
 mod unix_path {
     use jsony::{BytesWriter, FromBinary, ToBinary};
@@ -193,12 +204,11 @@ fn handle_request(
 
 pub fn worker() -> anyhow::Result<()> {
     kvlog::info!("Daemon Starting");
-    // Setup signal handlers for graceful termination
 
-    // Ensure the socket from a previous run is removed
-    let _ = std::fs::remove_file(GLOBAL_SOCKET);
-    let listener = UnixListener::bind(GLOBAL_SOCKET).context("Failed to bind daemon socket")?;
-    kvlog::info!("RPC Socket bound", path = GLOBAL_SOCKET);
+    let socket = socket_path();
+    let _ = std::fs::remove_file(socket);
+    let listener = UnixListener::bind(socket).context("Failed to bind daemon socket")?;
+    kvlog::info!("RPC Socket bound", path = socket);
     let listener_fd = listener.as_raw_fd();
 
     let mut buffer = [0u8; 4096 * 16];

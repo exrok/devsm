@@ -2,13 +2,13 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::unix::{net::UnixStream, process::CommandExt},
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::bail;
 use sendfd::SendWithFd;
 
-use crate::daemon::{GLOBAL_SOCKET, WorkspaceCommand};
+use crate::daemon::{socket_path, WorkspaceCommand};
 use devsm_rpc::{
     ClientProtocol, DecodeResult, JobExitedEvent, JobStatusEvent, JobStatusKind, ResizeNotification, RpcMessageKind,
 };
@@ -41,7 +41,11 @@ fn main() {
             return;
         }
         cli::Command::Server => {
-            let _log_guard = kvlog::collector::init_file_logger("/tmp/.devsm.log");
+            let _log_guard = if std::env::var("DEVSM_LOG_STDOUT").as_deref() == Ok("1") {
+                None
+            } else {
+                Some(kvlog::collector::init_file_logger("/tmp/.devsm.log"))
+            };
             if let Err(err) = daemon::worker() {
                 kvlog::error!("Daemon terminated with error", ?err);
             }
@@ -187,10 +191,45 @@ fn setup_signal_handler(sig: i32, handler: unsafe extern "C" fn(i32)) -> anyhow:
     Ok(())
 }
 
-fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
-    if let Ok(socket) = UnixStream::connect(GLOBAL_SOCKET) {
-        return Ok(socket);
+fn default_connect_timeout_ms() -> u64 {
+    std::env::var("DEVSM_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000)
+}
+
+fn connect_with_retry(timeout_ms: u64) -> std::io::Result<UnixStream> {
+    let socket = socket_path();
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+
+    loop {
+        match UnixStream::connect(socket) {
+            Ok(stream) => return Ok(stream),
+            Err(e) if e.kind() == ErrorKind::ConnectionRefused || e.kind() == ErrorKind::NotFound => {
+                if start.elapsed() >= timeout {
+                    return Err(std::io::Error::new(ErrorKind::TimedOut, "Connection timed out"));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
     }
+}
+
+fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
+    let socket = socket_path();
+    if let Ok(stream) = UnixStream::connect(socket) {
+        return Ok(stream);
+    }
+
+    if std::env::var("DEVSM_NO_AUTO_SPAWN").as_deref() == Ok("1") {
+        return Err(std::io::Error::new(
+            ErrorKind::ConnectionRefused,
+            "Daemon not running and auto-spawn disabled",
+        ));
+    }
+
     let current_exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(current_exe);
     command.arg("server");
@@ -199,10 +238,6 @@ fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
     command.stderr(std::process::Stdio::null());
     unsafe {
         command.pre_exec(|| {
-            // setsid() creates a new session and detaches the process from
-            // the controlling terminal of the parent (the client).
-            // This prevents SIGTTOU when the daemon tries to configure the
-            // client's TTY later.
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -211,13 +246,7 @@ fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
     }
 
     command.spawn()?;
-    for _ in 0..1000 {
-        std::thread::sleep(Duration::from_millis(1));
-        if let Ok(socket) = UnixStream::connect(GLOBAL_SOCKET) {
-            return Ok(socket);
-        }
-    }
-    Err(std::io::Error::new(ErrorKind::TimedOut, "Failed to connect to daemon"))
+    connect_with_retry(default_connect_timeout_ms())
 }
 
 fn workspace_command(command: WorkspaceCommand) -> anyhow::Result<()> {

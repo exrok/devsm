@@ -697,8 +697,6 @@ mod test {
 
     use super::*;
     use codespan_reporting::diagnostic::Diagnostic;
-    use codespan_reporting::files::SimpleFiles;
-    use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 
     #[test]
     fn test_parse_string_expr() {
