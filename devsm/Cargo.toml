@@ -16,15 +16,13 @@ mio = { version = "1.0.4", features = [
 slab = "0.4.11"
 unicode-segmentation = "1.12.0"
 unicode-width = { version = "0.2.2", default-features = false }
-vtui.path = "../../../vtui"
+extui = "0.1"
 jsony = "0.1.8"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 memchr = "2.7.6"
 sendfd = "0.4.4"
-jsony_value.path = "../../../tests/jsony_value"
-toml-span = { path = "/home/user/git/toml-span/toml-span", features = [
-    "reporting",
-] }
+jsony_value = "0.0.1"
+toml-spanner = { version = "0.1", features = ["reporting"] }
 codespan-reporting = { version = "0.13.1", features = ["termcolor"] }
 hashbrown = { version = "0.16.1", default-features = false, features = [
     "default-hasher",

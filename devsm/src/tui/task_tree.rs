@@ -1,4 +1,4 @@
-use vtui::{Color, DoubleBuffer, HAlign, Rect};
+use extui::{Color, DoubleBuffer, HAlign, Rect};
 
 use crate::{
     config::{Command, TaskKind},
@@ -292,7 +292,7 @@ impl TaskTreeState {
             }
             PrimaryEntry::MetaGroup(kind) => {
                 let jobs = ws.jobs_by_kind(kind.task_kind());
-                let job = self.normalize_secondary(&jobs);
+                let job = self.normalize_secondary(jobs);
                 let base_task = job.map(|ji| ws[ji].log_group.base_task_index());
                 Some(SelectionState { base_task, job, meta_group: Some(kind) })
             }

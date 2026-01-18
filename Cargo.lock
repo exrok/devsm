@@ -45,21 +45,21 @@ dependencies = [
  "bumpalo",
  "codespan-reporting",
  "devsm-rpc",
+ "extui",
  "foldhash",
  "hashbrown",
  "jsony",
- "jsony_value",
+ "jsony_value 0.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "kvlog",
  "libc",
  "memchr",
  "mio",
  "sendfd",
  "slab",
- "toml-span",
+ "toml-spanner",
  "unicode-segmentation",
  "unicode-width",
  "vt100",
- "vtui",
 ]
 
 [[package]]
@@ -68,7 +68,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "jsony",
- "jsony_value",
+ "jsony_value 0.0.1",
 ]
 
 [[package]]
@@ -79,6 +79,20 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "extui"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f97843776706df69854f0a0e714de3944ca196771656b07e77441953f0acc03"
+dependencies = [
+ "bitflags",
+ "itoap",
+ "libc",
+ "signal-hook-registry",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]
@@ -127,7 +141,17 @@ checksum = "c18667b5fc4ed9586b42797ecfeb32f8d235ff7aec32e12f79797e3b79c316f4"
 
 [[package]]
 name = "jsony_value"
-version = "0.15.1"
+version = "0.0.1"
+dependencies = [
+ "foldhash",
+ "jsony",
+]
+
+[[package]]
+name = "jsony_value"
+version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e8b4557deb416471eaccaf33bfa3eaf392a2a28107f598e1ae8f03bdf157027"
 dependencies = [
  "foldhash",
  "jsony",
@@ -279,8 +303,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml-span"
-version = "0.6.0"
+name = "toml-spanner"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "324adb53286bfd3237d6a23bccd2d67fd0c3b827f151eb96c462bfaf6eba90f0"
 dependencies = [
  "codespan-reporting",
  "smallvec",
@@ -329,19 +355,6 @@ checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
 dependencies = [
  "arrayvec",
  "memchr",
-]
-
-[[package]]
-name = "vtui"
-version = "0.1.0"
-dependencies = [
- "bitflags",
- "itoap",
- "kvlog",
- "libc",
- "signal-hook-registry",
- "unicode-segmentation",
- "unicode-width",
 ]
 
 [[package]]

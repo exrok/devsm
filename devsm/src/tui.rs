@@ -1,10 +1,10 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
+use extui::event::{Event, KeyEvent};
+use extui::vt::BufferWrite;
+use extui::{Color, DoubleBuffer, Rect, Style, TerminalFlags, vt};
 use jsony_value::ValueMap;
-use vtui::event::{Event, KeyEvent};
-use vtui::vt::BufferWrite;
-use vtui::{Color, DoubleBuffer, Rect, Style, TerminalFlags, vt};
 
 use crate::config::TaskKind;
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
@@ -393,13 +393,12 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
             }
         }
         Command::TerminateTask => {
-            if let Some(sel) = tui.task_tree.selection_state(&workspace.state())
-                && let Some(bti) = sel.base_task
-            {
+            let ws = workspace.state();
+            let bti = tui.task_tree.selection_state(&ws).and_then(|sel| sel.base_task);
+            drop(ws);
+            if let Some(bti) = bti {
                 workspace.terminate_tasks(bti);
             }
-            // For meta-groups without a specific job, we could terminate all tasks of that kind
-            // but that seems too destructive - for now we require a specific task to be selected
         }
         Command::LaunchTask => {
             let ws = workspace.state();
@@ -649,7 +648,7 @@ pub fn run(
     stdin: OwnedFd,
     stdout: OwnedFd,
     workspace: &Workspace,
-    vtui_channel: Arc<ClientChannel>,
+    extui_channel: Arc<ClientChannel>,
     keybinds: &Keybinds,
     output_mode: OutputMode,
 ) -> anyhow::Result<()> {
@@ -659,16 +658,13 @@ pub fn run(
         | TerminalFlags::MOUSE_CAPTURE
         | TerminalFlags::EXTENDED_KEYBOARD_INPUTS;
     let mut terminal = match output_mode {
-        OutputMode::Terminal => Some(vtui::Terminal::new(stdout.as_raw_fd(), mode)?),
+        OutputMode::Terminal => Some(extui::Terminal::new(stdout.as_raw_fd(), mode)?),
         OutputMode::JsonStateStream => None,
     };
-    let mut events = vtui::event::parse::Events::default();
+    let mut events = extui::event::Events::default();
     use std::io::Write;
     if let Some(terminal) = &mut terminal {
-        let mut buf = Vec::new();
-        vt::move_cursor_to_origin(&mut buf);
-        buf.extend_from_slice(vt::CLEAR_BELOW);
-        terminal.write_all(&buf)?;
+        terminal.write_all(&[vt::MOVE_CURSOR_TO_ORIGIN, vt::CLEAR_BELOW].concat())?;
     }
     let (mut w, mut h) = if let Some(terminal) = &terminal { terminal.size()? } else { (160, 90) };
     let bh = 10;
@@ -704,23 +700,23 @@ pub fn run(
                 // Update the channel's selected atomic so RestartSelected command works
                 // For meta-groups, we use the base_task from the selected job if available
                 if let Some(bti) = sel.base_task {
-                    vtui_channel.selected.store(bti.idx() as u64, std::sync::atomic::Ordering::Relaxed);
+                    extui_channel.selected.store(bti.idx() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
 
-        match vtui::event::poll_with_custom_waker(&stdin, Some(&vtui_channel.waker), None)? {
-            vtui::event::Polled::ReadReady => events.read_from(&stdin)?,
-            vtui::event::Polled::Woken => {}
-            vtui::event::Polled::TimedOut => {}
+        match extui::event::poll_with_custom_waker(&stdin, Some(&extui_channel.waker), None)? {
+            extui::event::Polled::ReadReady => events.read_from(&stdin)?,
+            extui::event::Polled::Woken => {}
+            extui::event::Polled::TimedOut => {}
         }
-        match vtui_channel.actions(&mut previous) {
+        match extui_channel.actions(&mut previous) {
             Some(Action::Resized) => delta |= Has::RESIZED,
             Some(Action::Terminated) => return Ok(()),
             None => (),
         }
 
-        if vtui::event::polling::termination_requested() {
+        if extui::event::polling::termination_requested() {
             return Ok(());
         }
 
@@ -738,14 +734,14 @@ pub fn run(
                     let target = scroll_target(w, h, x, y);
                     println!("{} {} -> {:?}", x, y, target);
                     match mouse.kind {
-                        vtui::event::MouseEventKind::ScrollDown => match target {
+                        extui::event::MouseEventKind::ScrollDown => match target {
                             ScrollTarget::TopLog => tui.logs.pending_top_scroll -= 5,
                             ScrollTarget::BottomLog => tui.logs.pending_bottom_scroll -= 5,
                             ScrollTarget::TaskList => tui.task_tree.move_cursor_down(&workspace.state()),
                             ScrollTarget::JobList => tui.task_tree.move_cursor_down(&workspace.state()),
                             ScrollTarget::None => (),
                         },
-                        vtui::event::MouseEventKind::ScrollUp => match target {
+                        extui::event::MouseEventKind::ScrollUp => match target {
                             ScrollTarget::TopLog => tui.logs.pending_top_scroll += 5,
                             ScrollTarget::BottomLog => tui.logs.pending_bottom_scroll += 5,
                             ScrollTarget::TaskList => tui.task_tree.move_cursor_up(&workspace.state()),

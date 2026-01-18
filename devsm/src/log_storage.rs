@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use vtui::Style;
+use extui::Style;
 
 use crate::workspace::BaseTaskIndex;
 

@@ -1,5 +1,5 @@
 use unicode_width::UnicodeWidthStr;
-use vtui::{
+use extui::{
     Color, DoubleBuffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
@@ -120,7 +120,7 @@ impl SelectSearch {
         out: &mut DoubleBuffer,
         rect: Rect,
         label: &str,
-        render: impl Fn(&mut vtui::DoubleBuffer, Rect, Id, bool),
+        render: impl Fn(&mut extui::DoubleBuffer, Rect, Id, bool),
     ) {
         self.render_internal(out, rect, label, &move |out, r, id, sel| render(out, r, Id::unpack_u64(id), sel));
     }
@@ -129,7 +129,7 @@ impl SelectSearch {
         out: &mut DoubleBuffer,
         mut rect: Rect,
         label: &str,
-        func: &dyn Fn(&mut vtui::DoubleBuffer, Rect, u64, bool),
+        func: &dyn Fn(&mut extui::DoubleBuffer, Rect, u64, bool),
     ) {
         // tood need to scroll text but is probably better to put this in a sperate input boxk
         let input_rect = rect.take_top(1);

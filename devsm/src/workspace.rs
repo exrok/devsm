@@ -191,19 +191,19 @@ impl LatestConfig {
     fn update_base_tasks(
         &self,
         base_tasks: &mut Vec<BaseTask>,
-        name_map: &mut std::collections::HashMap<&'static str, BaseTaskIndex>,
+        name_map: &mut hashbrown::HashMap<&'static str, BaseTaskIndex>,
     ) {
         for base_task in base_tasks.iter_mut() {
             base_task.removed = true;
         }
         for (name, config) in self.current.tasks {
             match name_map.entry(name) {
-                std::collections::hash_map::Entry::Occupied(occupied_entry) => {
+                hashbrown::hash_map::Entry::Occupied(occupied_entry) => {
                     let base_task = &mut base_tasks[occupied_entry.get().idx()];
                     base_task.removed = false;
                     base_task.config = config;
                 }
-                std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                hashbrown::hash_map::Entry::Vacant(vacant_entry) => {
                     if base_tasks.len() > u32::MAX as usize {
                         panic!("Too many base tasks");
                     }
@@ -231,13 +231,13 @@ impl LatestConfig {
                 let test_info = Some(TestInfo { base_name, variant_index: variant_index as u32 });
 
                 match name_map.entry(task_name) {
-                    std::collections::hash_map::Entry::Occupied(occupied_entry) => {
+                    hashbrown::hash_map::Entry::Occupied(occupied_entry) => {
                         let base_task = &mut base_tasks[occupied_entry.get().idx()];
                         base_task.removed = false;
                         base_task.config = task_config;
                         base_task.test_info = test_info;
                     }
-                    std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                    hashbrown::hash_map::Entry::Vacant(vacant_entry) => {
                         vacant_entry.insert(BaseTaskIndex::new_or_panic(base_tasks.len()));
                         base_tasks.push(BaseTask {
                             name: task_name,
@@ -333,9 +333,11 @@ pub struct WorkspaceState {
     pub config: LatestConfig,
     pub base_tasks: Vec<BaseTask>,
     pub change_number: u32,
-    pub name_map: std::collections::HashMap<&'static str, BaseTaskIndex>,
+    pub name_map: hashbrown::HashMap<&'static str, BaseTaskIndex>,
     pub jobs: Vec<Job>,
     pub active_test_run: Option<TestRun>,
+    pub action_jobs: JobIndexList,
+    pub test_jobs: JobIndexList,
 }
 
 impl WorkspaceState {
@@ -581,10 +583,24 @@ impl WorkspaceState {
         let job_id = LogGroup::new(base_task, pc);
 
         let spawn = pred.is_empty();
+        let task_kind = bt.config.kind;
         if spawn {
             bt.jobs.push_active(job_index);
         } else {
             bt.jobs.push_scheduled(job_index);
+        }
+
+        let global_list = match task_kind {
+            TaskKind::Action => Some(&mut self.action_jobs),
+            TaskKind::Test => Some(&mut self.test_jobs),
+            TaskKind::Service => None,
+        };
+        if let Some(list) = global_list {
+            if spawn {
+                list.push_active(job_index);
+            } else {
+                list.push_scheduled(job_index);
+            }
         }
 
         self.jobs.push(Job {
@@ -613,12 +629,12 @@ impl std::ops::Index<JobIndex> for WorkspaceState {
 
 impl WorkspaceState {
     /// Returns all job indices for tasks of the given kind.
-    pub fn jobs_by_kind(&self, kind: TaskKind) -> Vec<JobIndex> {
-        self.base_tasks
-            .iter()
-            .filter(|bt| !bt.removed && bt.config.kind == kind)
-            .flat_map(|bt| bt.jobs.all().iter().copied())
-            .collect()
+    pub fn jobs_by_kind(&self, kind: TaskKind) -> &[JobIndex] {
+        match kind {
+            TaskKind::Action => self.action_jobs.all(),
+            TaskKind::Test => self.test_jobs.all(),
+            TaskKind::Service => &[],
+        }
     }
 }
 impl std::ops::IndexMut<JobIndex> for WorkspaceState {
@@ -638,7 +654,9 @@ impl WorkspaceState {
     pub fn update_job_status(&mut self, job_index: JobIndex, status: JobStatus) {
         let job = &mut self.jobs[job_index.idx()];
         let job_id = job.log_group;
-        let jobs_list = &mut self.base_tasks[job_id.base_task_index().idx()].jobs;
+        let base_task = &mut self.base_tasks[job_id.base_task_index().idx()];
+        let task_kind = base_task.config.kind;
+        let jobs_list = &mut base_task.jobs;
 
         use JobStatus as S;
         match (&job.process_status, &status) {
@@ -669,14 +687,44 @@ impl WorkspaceState {
                 );
             }
         }
+
+        let global_list = match task_kind {
+            TaskKind::Action => Some(&mut self.action_jobs),
+            TaskKind::Test => Some(&mut self.test_jobs),
+            TaskKind::Service => None,
+        };
+        if let Some(list) = global_list {
+            match (&job.process_status, &status) {
+                (S::Scheduled { .. }, S::Cancelled)
+                | (S::Starting, S::Cancelled)
+                | (S::Running { .. }, S::Cancelled)
+                | (S::Running { .. }, S::Exited { .. }) => {
+                    list.set_terminal(job_index);
+                }
+                (S::Scheduled { .. }, S::Starting) => {
+                    list.set_active(job_index);
+                }
+                _ => {}
+            }
+        }
+
         job.process_status = status;
     }
     pub fn new(config_path: PathBuf) -> anyhow::Result<WorkspaceState> {
         let config = LatestConfig::new(config_path)?;
         let mut base_tasks = Vec::new();
-        let mut name_map = std::collections::HashMap::new();
+        let mut name_map = hashbrown::HashMap::new();
         config.update_base_tasks(&mut base_tasks, &mut name_map);
-        Ok(WorkspaceState { change_number: 0, config, name_map, base_tasks, jobs: Vec::new(), active_test_run: None })
+        Ok(WorkspaceState {
+            change_number: 0,
+            config,
+            name_map,
+            base_tasks,
+            jobs: Vec::new(),
+            active_test_run: None,
+            action_jobs: JobIndexList::default(),
+            test_jobs: JobIndexList::default(),
+        })
     }
 
     /// Brute force scheduling useful testing will provided an optimized alternative later
@@ -900,8 +948,10 @@ impl Workspace {
             let spawn = pred.is_empty();
             if spawn {
                 base_task.jobs.push_active(job_index);
+                state.test_jobs.push_active(job_index);
             } else {
                 base_task.jobs.push_scheduled(job_index);
+                state.test_jobs.push_scheduled(job_index);
             }
 
             state.jobs.push(Job {
@@ -951,10 +1001,9 @@ fn matches_test_filters(name: &str, tags: &[&str], filters: &[TestFilter]) -> bo
 
     for filter in filters {
         if let TestFilter::ExcludeTag(exclude_tag) = filter
-            && tags.contains(exclude_tag)
-        {
-            return false;
-        }
+            && tags.contains(exclude_tag) {
+                return false;
+            }
     }
 
     for filter in filters {

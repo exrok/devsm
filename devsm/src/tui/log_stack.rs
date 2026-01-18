@@ -1,4 +1,4 @@
-use vtui::{Color, Rect, vt::BufferWrite};
+use extui::{Color, Rect, vt::BufferWrite};
 
 use crate::{
     config::TaskKind,
@@ -242,13 +242,11 @@ impl LogStack {
             self.pending_bottom_scroll = 0;
 
             let br = dest.take_bottom(1);
-            let Mode::Hybrid(selection_state) = &self.mode else {
-                unreachable!()
-            };
+            let Mode::Hybrid(selection_state) = &self.mode else { unreachable!() };
             let current_sep = SeparatorState { selection: *selection_state, y: br.y };
 
             if self.last_separator.as_ref() != Some(&current_sep) {
-                vtui::vt::move_cursor(buf, br.x, br.y);
+                extui::vt::MoveCursor(br.x, br.y).write_to_buffer(buf);
                 Color::Grey[6].with_fg(Color::Grey[25]).write_to_buffer(buf);
                 if selection_state.job.is_none() {
                     if let Some(bti) = selection_state.base_task {
@@ -265,8 +263,8 @@ impl LogStack {
                         buf.extend_from_slice(label.as_bytes());
                     }
                 }
-                vtui::vt::CLEAR_LINE_TO_RIGHT.write_to_buffer(buf);
-                vtui::vt::clear_style(buf);
+                extui::vt::CLEAR_LINE_TO_RIGHT.write_to_buffer(buf);
+                extui::vt::CLEAR_STYLE.write_to_buffer(buf);
                 self.last_separator = Some(current_sep);
             }
         } else {

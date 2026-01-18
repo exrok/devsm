@@ -1,6 +1,6 @@
+use extui::{Color, Style, vt::Modifier};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
-use vtui::{Color, Style, vt::Modifier};
 
 /// A segment of a string, classified for width calculation.
 #[derive(Debug, PartialEq, Eq)]
@@ -148,15 +148,15 @@ pub fn apply_raw_display_mode_vt_to_style(style: &mut Style, escape: &str) {
             27 => style.without_modifier(Modifier::REVERSED),
             28 => style.without_modifier(Modifier::HIDDEN),
             29 => style.without_modifier(Modifier::CROSSED_OUT),
-            fg @ 30..=37 => style.with_fg(vtui::Color(fg - 30)),
+            fg @ 30..=37 => style.with_fg(extui::Color(fg - 30)),
             38 => match next!() {
                 5 => style.with_fg(Color(next!())),
                 _ => return,
             },
             39 => style.without_fg(),
-            fg @ 90..=97 => style.with_fg(vtui::Color(fg - 90 + 8)),
-            bg @ 40..=47 => style.with_fg(vtui::Color(bg - 30)),
-            bg @ 100..=107 => style.with_bg(vtui::Color(bg - 100 + 8)),
+            fg @ 90..=97 => style.with_fg(extui::Color(fg - 90 + 8)),
+            bg @ 40..=47 => style.with_fg(extui::Color(bg - 30)),
+            bg @ 100..=107 => style.with_bg(extui::Color(bg - 100 + 8)),
             49 => style.without_bg(),
             48 => match next!() {
                 5 => style.with_bg(Color(next!())),

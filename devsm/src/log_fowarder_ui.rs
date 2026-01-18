@@ -114,8 +114,8 @@ pub fn run(
             break;
         }
 
-        match vtui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), None) {
-            Ok(vtui::event::Polled::ReadReady) => {
+        match extui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), None) {
+            Ok(extui::event::Polled::ReadReady) => {
                 let mut buf = [0u8; 64];
                 let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n == 0 {
@@ -134,7 +134,7 @@ pub fn run(
                     break;
                 }
             }
-            Ok(vtui::event::Polled::Woken) | Ok(vtui::event::Polled::TimedOut) | Err(_) => {}
+            Ok(extui::event::Polled::Woken) | Ok(extui::event::Polled::TimedOut) | Err(_) => {}
         }
     }
 

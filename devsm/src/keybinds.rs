@@ -4,9 +4,9 @@ use std::{
     str::FromStr,
 };
 
+use extui::event::{KeyCode, KeyEvent, KeyModifiers};
 use foldhash::quality::RandomState;
 use hashbrown::HashTable;
-use vtui::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Compact representation of a key input event.
 /// Lower 32 bits: key code (char value or special key)
@@ -390,9 +390,10 @@ impl Keybinds {
     /// Falls back to global bindings if no mode-specific binding exists.
     pub fn lookup(&self, mode: Mode, input: InputEvent) -> Option<Command> {
         if mode != Mode::Global
-            && let Some(cmd) = self.table_lookup(self.table_for_mode(mode), input) {
-                return Some(cmd);
-            }
+            && let Some(cmd) = self.table_lookup(self.table_for_mode(mode), input)
+        {
+            return Some(cmd);
+        }
         self.table_lookup(&self.global, input)
     }
 

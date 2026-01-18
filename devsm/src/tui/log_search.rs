@@ -1,5 +1,5 @@
 use unicode_width::UnicodeWidthStr;
-use vtui::{
+use extui::{
     Color, DoubleBuffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
@@ -348,7 +348,7 @@ fn filter_contains(filter: &LogFilter, entry: &LogEntry) -> bool {
 
 /// Renders text with ANSI codes stripped and optional substring highlighting.
 ///
-/// Uses vtui's chaining API to render each segment with appropriate styling.
+/// Uses extui's chaining API to render each segment with appropriate styling.
 fn render_stripped_with_highlight(
     rect: Rect,
     out: &mut DoubleBuffer,
@@ -357,7 +357,7 @@ fn render_stripped_with_highlight(
     highlight_style: Style,
     highlight: MatchHighlight,
 ) {
-    use vtui::DisplayRect;
+    use extui::DisplayRect;
 
     let match_start = highlight.start as usize;
     let match_end = match_start + highlight.len as usize;

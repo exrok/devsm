@@ -1,4 +1,4 @@
-use vtui::{
+use extui::{
     Rect,
     vt::{self, BufferWrite},
 };
@@ -32,7 +32,7 @@ fn render_single_entry(
     max_lines: u16,
     style: &LogStyle,
 ) -> u16 {
-    use vtui::Color;
+    use extui::Color;
 
     if max_lines == 0 {
         return 0;
@@ -65,7 +65,8 @@ fn render_single_entry(
             buf.extend_from_slice(text.as_bytes());
         }
 
-        vt::clear_style(buf);
+        buf.extend_from_slice(vt::CLEAR_STYLE);
+
         if !style.assume_blank {
             buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
         }
@@ -104,7 +105,7 @@ fn render_single_entry(
 
                 lines_rendered += 1;
                 if lines_rendered == max_lines {
-                    vt::clear_style(buf);
+                    vt::CLEAR_STYLE.write_to_buffer(buf);
                     return lines_rendered;
                 }
             } else {
@@ -115,7 +116,7 @@ fn render_single_entry(
         if !prefix_bytes.is_empty() {
             buf.extend_from_slice(prefix_bytes);
         }
-        vt::clear_style(buf);
+        vt::CLEAR_STYLE.write_to_buffer(buf);
         if !style.assume_blank {
             buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
         }
@@ -169,7 +170,8 @@ fn render_single_entry(
         }
     }
 
-    vt::clear_style(buf);
+    buf.extend_from_slice(vt::CLEAR_STYLE);
+
     lines_rendered
 }
 
@@ -194,9 +196,9 @@ fn calculate_stripped_len(text: &str) -> usize {
 fn render_text_with_highlight(
     buf: &mut Vec<u8>,
     text: &str,
-    base_style: vtui::Style,
+    base_style: extui::Style,
     highlight: MatchHighlight,
-    highlight_style: vtui::Style,
+    highlight_style: extui::Style,
 ) {
     let match_start = highlight.start as usize;
     let match_end = match_start + highlight.len as usize;
@@ -219,10 +221,14 @@ fn render_text_with_highlight(
                     if hl_start_in_seg > 0 {
                         buf.extend_from_slice(s[..hl_start_in_seg].as_bytes());
                     }
-                    highlight_style.write_to_buffer(buf);
-                    buf.extend_from_slice(s[hl_start_in_seg..hl_end_in_seg].as_bytes());
-                    vt::clear_style(buf);
-                    current_style.write_to_buffer(buf);
+                    extui::splat!(
+                        buf,
+                        highlight_style,
+                        s[hl_start_in_seg..hl_end_in_seg],
+                        vt::CLEAR_STYLE,
+                        current_style,
+                    );
+
                     if hl_end_in_seg < s.len() {
                         buf.extend_from_slice(s[hl_end_in_seg..].as_bytes());
                     }
@@ -242,12 +248,14 @@ fn render_text_with_highlight(
                     let in_highlight = has_highlight && ch_start < match_end && ch_end > match_start;
 
                     if in_highlight {
-                        highlight_style.write_to_buffer(buf);
                         let mut char_buf = [0u8; 4];
-                        let encoded = ch.encode_utf8(&mut char_buf);
-                        buf.extend_from_slice(encoded.as_bytes());
-                        vt::clear_style(buf);
-                        current_style.write_to_buffer(buf);
+                        extui::splat!(
+                            buf,
+                            highlight_style,
+                            ch.encode_utf8(&mut char_buf),
+                            vt::CLEAR_STYLE,
+                            current_style,
+                        )
                     } else {
                         let mut char_buf = [0u8; 4];
                         let encoded = ch.encode_utf8(&mut char_buf);
@@ -357,7 +365,9 @@ impl LogWidget {
     pub fn scroll_state(&self, view: &LogView, style: &LogStyle) -> ScrollState {
         match self {
             LogWidget::Scroll(_) => ScrollState { is_scrolled: true, can_scroll_up: true },
-            LogWidget::Tail(tail) => ScrollState { is_scrolled: false, can_scroll_up: self.can_scroll(view, style, tail.previous) },
+            LogWidget::Tail(tail) => {
+                ScrollState { is_scrolled: false, can_scroll_up: self.can_scroll(view, style, tail.previous) }
+            }
         }
     }
 
@@ -713,18 +723,15 @@ fn handle_scroll_render(
 ) {
     let scrolled_lines = scrolled_lines as u16;
     if scrolled_lines < rect.h && scroll_view.previous == rect {
-        let scroll_region = vt::ScrollRegion(rect.y + 1, rect.y + rect.h);
-        scroll_region.write_to_buffer(buf);
+        vt::ScrollRegion(rect.y + 1, rect.y + rect.h).write_to_buffer(buf);
 
         match direction {
             ScrollDirection::Up => {
-                vt::scroll_buffer_down(buf, scrolled_lines);
-                vt::ScrollRegion::RESET.write_to_buffer(buf);
+                extui::splat!(buf, vt::ScrollBufferDown(scrolled_lines), vt::ScrollRegion::RESET);
                 scroll_view.render_top_lines(buf, rect, view, scrolled_lines, style);
             }
             ScrollDirection::Down => {
-                vt::scroll_buffer_up(buf, scrolled_lines);
-                vt::ScrollRegion::RESET.write_to_buffer(buf);
+                extui::splat!(buf, vt::ScrollBufferUp(scrolled_lines), vt::ScrollRegion::RESET);
                 scroll_view.render_bottom_lines(buf, rect, view, scrolled_lines, style);
             }
         }
@@ -799,11 +806,11 @@ impl LogScrollWidget {
         let use_batch_clear = rect.y == 0 && !style.assume_blank;
 
         if use_batch_clear {
-            vt::move_cursor(buf, rect.x, rect.y + rect.h - 1);
+            vt::MoveCursor(rect.x, rect.y + rect.h - 1).write_to_buffer(buf);
             buf.extend_from_slice(vt::CLEAR_ABOVE);
         }
 
-        vt::move_cursor(buf, rect.x, rect.y);
+        vt::MoveCursor(rect.x, rect.y).write_to_buffer(buf);
         let remaining_height = self.render_content(buf, rect, view, rect.h, style);
 
         if !use_batch_clear && !style.assume_blank {
@@ -815,7 +822,7 @@ impl LogScrollWidget {
     }
 
     fn render_top_lines(&self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, line_count: u16, style: &LogStyle) {
-        vt::move_cursor(buf, rect.x, rect.y);
+        vt::MoveCursor(rect.x, rect.y).write_to_buffer(buf);
         self.render_content(buf, rect, view, line_count, style);
     }
 
@@ -859,7 +866,7 @@ impl LogScrollWidget {
             }
         }
 
-        vt::move_cursor(buf, rect.x, rect.y + rect.h - scrolled_lines);
+        vt::MoveCursor(rect.x, rect.y + rect.h - scrolled_lines).write_to_buffer(buf);
         let mut remaining_height = scrolled_lines;
 
         if let Some((log_id, entry)) = start_entry {
@@ -899,10 +906,10 @@ impl LogTailWidget {
 
         let mut first = false;
         if rect.y + self.next_screen_offset == 0 {
-            vt::move_cursor(buf, rect.x, 0);
+            vt::MoveCursor(rect.x, 0).write_to_buffer(buf);
             first = true;
         } else {
-            vt::move_cursor(buf, rect.x, rect.y + self.next_screen_offset - 1);
+            vt::MoveCursor(rect.x, rect.y + self.next_screen_offset - 1).write_to_buffer(buf);
         }
         let mut offset = self.next_screen_offset as u32;
         for entry in a.iter().chain(b.iter()) {
@@ -928,7 +935,7 @@ impl LogTailWidget {
                 }
                 entry.style.write_to_buffer(buf);
                 buf.extend_from_slice(text.as_bytes());
-                vt::clear_style(buf);
+                vt::CLEAR_STYLE.write_to_buffer(buf);
                 if !style.assume_blank {
                     buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
                 }
@@ -959,7 +966,7 @@ impl LogTailWidget {
                         }
                     }
                 }
-                vt::clear_style(buf);
+                vt::CLEAR_STYLE.write_to_buffer(buf);
             }
         }
 
@@ -999,11 +1006,11 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
     let use_batch_clear = rect.y == 0 && !style.assume_blank;
 
     if use_batch_clear {
-        vt::move_cursor(buf, rect.x, rect.y + rect.h - 1);
+        vt::MoveCursor(rect.x, rect.y + rect.h - 1).write_to_buffer(buf);
         buf.extend_from_slice(vt::CLEAR_ABOVE);
     }
 
-    vt::move_cursor(buf, rect.x, rect.y);
+    vt::MoveCursor(rect.x, rect.y).write_to_buffer(buf);
 
     let mut screen_lines_left = rect.h;
     let mut entries_to_render = displayed.iter().rev();
@@ -1037,7 +1044,7 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
 #[cfg(test)]
 mod test {
 
-    use vtui::{Rect, vt};
+    use extui::{Rect, vt, vt::BufferWrite};
 
     use crate::{
         log_storage::LogWriter,
@@ -1074,7 +1081,7 @@ mod test {
             };
         }
 
-        vt::move_cursor(&mut buf, 0, 0);
+        vt::MoveCursor(0, 0).write_to_buffer(&mut buf);
         for _ in 0..6 {
             buf.extend_from_slice(b"12345678");
         }
@@ -1314,7 +1321,7 @@ mod test {
         let mut parser = vt100::Parser::new(12, 20, 0);
         let mut buf = Vec::new();
 
-        vt::move_cursor(&mut buf, 0, 0);
+        vt::MoveCursor(0, 0).write_to_buffer(&mut buf);
         buf.extend_from_slice(b"HEADER LINE         ");
         parser.process(&buf);
         buf.clear();

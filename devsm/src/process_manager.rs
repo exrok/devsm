@@ -7,12 +7,13 @@ use crate::{
 };
 use anyhow::{Context, bail};
 use devsm_rpc::{DecodeResult, DecodingState, RpcMessageKind};
+use extui::Style;
 use jsony_value::ValueMap;
 use mio::{Events, Interest, Poll, Token, Waker, unix::SourceFd};
 use slab::Slab;
 use std::io::Write;
+use hashbrown::HashMap;
 use std::{
-    collections::HashMap,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{net::UnixStream, process::CommandExt},
@@ -25,7 +26,6 @@ use std::{
     },
 };
 use unicode_width::UnicodeWidthStr;
-use vtui::Style;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Pipe {
@@ -433,7 +433,7 @@ pub(crate) enum ProcessRequest {
 /// For TUI clients, all fields are used. For forwarder clients, only `waker`
 /// and `state` are used; `selected` and `events` are ignored.
 pub struct ClientChannel {
-    pub waker: vtui::event::polling::Waker,
+    pub waker: extui::event::polling::Waker,
     /// Encodes termination flag (high bits > u32::MAX) and resize counter (low bits).
     pub state: AtomicU64,
     /// Tracks selected base task index. Only used by TUI clients.
@@ -796,7 +796,7 @@ impl ProcessManager {
         let ws = &mut self.workspaces[ws_index as usize];
         let ws_handle = ws.handle.clone();
         let channel = Arc::new(ClientChannel {
-            waker: vtui::event::polling::Waker::new().unwrap(),
+            waker: extui::event::polling::Waker::new().unwrap(),
             events: Mutex::new(Vec::new()),
             selected: AtomicU64::new(0),
             state: AtomicU64::new(0),
@@ -873,7 +873,7 @@ impl ProcessManager {
         };
 
         let channel = Arc::new(ClientChannel {
-            waker: vtui::event::polling::Waker::new().unwrap(),
+            waker: extui::event::polling::Waker::new().unwrap(),
             events: Mutex::new(Vec::new()),
             selected: AtomicU64::new(0),
             state: AtomicU64::new(0),
@@ -949,7 +949,7 @@ impl ProcessManager {
         }
 
         let channel = Arc::new(ClientChannel {
-            waker: vtui::event::polling::Waker::new().unwrap(),
+            waker: extui::event::polling::Waker::new().unwrap(),
             events: Mutex::new(Vec::new()),
             selected: AtomicU64::new(0),
             state: AtomicU64::new(0),
@@ -993,7 +993,7 @@ impl ProcessManager {
         let subscriptions = RpcSubscriptions { job_status: subscribe, job_exits: subscribe };
 
         let channel = Arc::new(ClientChannel {
-            waker: vtui::event::polling::Waker::new().unwrap(),
+            waker: extui::event::polling::Waker::new().unwrap(),
             events: Mutex::new(Vec::new()),
             selected: AtomicU64::new(0),
             state: AtomicU64::new(0),

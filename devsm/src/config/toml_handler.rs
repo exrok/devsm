@@ -1,7 +1,7 @@
 use bumpalo::Bump;
 use codespan_reporting::diagnostic::{Diagnostic, Label};
 use std::borrow::Cow;
-use toml_span::{
+use toml_spanner::{
     Value as TomlValue,
     value::{Table, ValueInner},
 };
@@ -551,7 +551,7 @@ pub fn parse<'a>(
     data: &'a str,
     re: &mut dyn FnMut(Diagnostic<usize>),
 ) -> Result<WorkspaceConfig<'a>, ()> {
-    let value = match toml_span::parse(data) {
+    let value = match toml_spanner::parse(data) {
         Ok(value) => value,
         Err(err) => {
             re(err.to_diagnostic(0));
@@ -650,7 +650,7 @@ mod test {
     #[test]
     fn test_parse_string_expr() {
         let text = r#"hello = "world""#;
-        let value = toml_span::parse(text).unwrap();
+        let value = toml_spanner::parse(text).unwrap();
         let table = value.as_table().unwrap();
         let bump = Bump::new();
         let mut errors = Vec::new();
@@ -670,7 +670,7 @@ mod test {
     #[test]
     fn test_parse_var_expr() {
         let text = r#"path = { var = "dir" }"#;
-        let value = toml_span::parse(text).unwrap();
+        let value = toml_spanner::parse(text).unwrap();
         let table = value.as_table().unwrap();
         let bump = Bump::new();
         let mut errors = Vec::new();
@@ -690,7 +690,7 @@ mod test {
     #[test]
     fn test_parse_if_expr() {
         let text = r#"arg = { if.profile = "verbose", then = "-al" }"#;
-        let value = toml_span::parse(text).unwrap();
+        let value = toml_spanner::parse(text).unwrap();
         let table = value.as_table().unwrap();
         let bump = Bump::new();
         let mut errors = Vec::new();

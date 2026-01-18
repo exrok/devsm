@@ -58,7 +58,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
  "vt100",
- "vtui",
+ "extui",
 ]
 
 [[package]]
@@ -322,7 +322,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vtui"
+name = "extui"
 version = "0.1.0"
 dependencies = [
  "bitflags",

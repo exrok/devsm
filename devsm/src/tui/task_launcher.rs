@@ -6,7 +6,7 @@
 
 use jsony_value::ValueMap;
 use unicode_width::UnicodeWidthStr;
-use vtui::{
+use extui::{
     Color, DoubleBuffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };

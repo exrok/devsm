@@ -8,7 +8,6 @@ pub struct UserConfig {
     pub keybinds: Keybinds,
 }
 
-
 /// Returns the path to the user config file.
 pub fn user_config_path() -> Option<PathBuf> {
     dirs_path().map(|p| p.join("devsm.user.toml"))
@@ -54,7 +53,7 @@ impl UserConfig {
 
 /// Parses user config from TOML content.
 fn parse_user_config(content: &str) -> Result<UserConfig, String> {
-    let toml = toml_span::parse(content).map_err(|e| format!("TOML parse error: {e}"))?;
+    let toml = toml_spanner::parse(content).map_err(|e| format!("TOML parse error: {e}"))?;
 
     let mut keybinds = Keybinds::default();
 
