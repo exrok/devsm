@@ -168,6 +168,7 @@ pub enum Command {
     // Task operations
     RestartTask,
     TerminateTask,
+    LaunchTask,
 
     // Overlays
     StartGroup,
@@ -208,6 +209,7 @@ impl FromStr for Command {
             "FocusSecondary" => Command::FocusSecondary,
             "RestartTask" => Command::RestartTask,
             "TerminateTask" => Command::TerminateTask,
+            "LaunchTask" => Command::LaunchTask,
             "StartGroup" => Command::StartGroup,
             "SelectProfile" => Command::SelectProfile,
             "SearchLogs" => Command::SearchLogs,
@@ -234,6 +236,7 @@ pub enum Mode {
     JobList,
     SelectSearch,
     LogSearch,
+    TaskLauncher,
 }
 
 impl FromStr for Mode {
@@ -245,6 +248,7 @@ impl FromStr for Mode {
             "joblist" => Mode::JobList,
             "select_search" | "selectsearch" => Mode::SelectSearch,
             "log_search" | "logsearch" => Mode::LogSearch,
+            "task_launcher" | "tasklauncher" => Mode::TaskLauncher,
             _ => return Err(format!("Unknown mode: `{s}`")),
         })
     }
@@ -259,6 +263,7 @@ pub struct Keybinds {
     joblist: BindingTable,
     select_search: BindingTable,
     log_search: BindingTable,
+    task_launcher: BindingTable,
 }
 
 impl Keybinds {
@@ -284,6 +289,7 @@ impl Keybinds {
             joblist: HashTable::new(),
             select_search: HashTable::new(),
             log_search: HashTable::new(),
+            task_launcher: HashTable::new(),
         }
     }
 
@@ -293,6 +299,7 @@ impl Keybinds {
             Mode::JobList => &self.joblist,
             Mode::SelectSearch => &self.select_search,
             Mode::LogSearch => &self.log_search,
+            Mode::TaskLauncher => &self.task_launcher,
         }
     }
 
@@ -304,6 +311,7 @@ impl Keybinds {
         self.bind(Mode::Global, "g", Command::StartGroup);
         self.bind(Mode::Global, "r", Command::RestartTask);
         self.bind(Mode::Global, "d", Command::TerminateTask);
+        self.bind(Mode::Global, " ", Command::LaunchTask);
         self.bind(Mode::Global, "1", Command::LogModeAll);
         self.bind(Mode::Global, "2", Command::LogModeSelected);
         self.bind(Mode::Global, "3", Command::LogModeHybrid);
@@ -337,6 +345,15 @@ impl Keybinds {
         self.bind(Mode::LogSearch, "C-g", Command::OverlayCancel);
         self.bind(Mode::LogSearch, "ESC", Command::OverlayCancel);
         self.bind(Mode::LogSearch, "ENTER", Command::OverlayConfirm);
+
+        // TaskLauncher overlay keybindings
+        self.bind(Mode::TaskLauncher, "C-k", Command::SelectPrev);
+        self.bind(Mode::TaskLauncher, "UP", Command::SelectPrev);
+        self.bind(Mode::TaskLauncher, "C-j", Command::SelectNext);
+        self.bind(Mode::TaskLauncher, "DOWN", Command::SelectNext);
+        self.bind(Mode::TaskLauncher, "C-g", Command::OverlayCancel);
+        self.bind(Mode::TaskLauncher, "ESC", Command::OverlayCancel);
+        self.bind(Mode::TaskLauncher, "ENTER", Command::OverlayConfirm);
     }
 
     /// Binds a key to a command in a specific mode.
@@ -349,6 +366,7 @@ impl Keybinds {
             Mode::JobList => &mut self.joblist,
             Mode::SelectSearch => &mut self.select_search,
             Mode::LogSearch => &mut self.log_search,
+            Mode::TaskLauncher => &mut self.task_launcher,
         };
         match table.find_mut(hash, |(k, _)| *k == input) {
             Some(entry) => entry.1 = command,
@@ -367,6 +385,7 @@ impl Keybinds {
             Mode::JobList => &mut self.joblist,
             Mode::SelectSearch => &mut self.select_search,
             Mode::LogSearch => &mut self.log_search,
+            Mode::TaskLauncher => &mut self.task_launcher,
         };
         match command {
             Some(cmd) => match table.find_mut(hash, |(k, _)| *k == input) {
@@ -423,6 +442,7 @@ impl Command {
             Command::FocusSecondary => "Focus Right",
             Command::RestartTask => "Restart",
             Command::TerminateTask => "Terminate",
+            Command::LaunchTask => "Launch",
             Command::StartGroup => "Start Group",
             Command::SelectProfile => "Profile",
             Command::SearchLogs => "Search",

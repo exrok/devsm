@@ -410,3 +410,173 @@ pub trait BumpEval<'a> {
     type Object: Sized;
     fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<Self::Object, EvalError>;
 }
+
+fn collect_string_expr_vars(expr: &StringExpr<'static>, out: &mut Vec<&'static str>) {
+    match expr {
+        StringExpr::Literal(_) => {}
+        StringExpr::Var(name) => {
+            if !out.contains(name) {
+                out.push(name);
+            }
+        }
+        StringExpr::If(if_expr) => {
+            collect_string_expr_vars(&if_expr.then, out);
+            if let Some(or_else) = &if_expr.or_else {
+                collect_string_expr_vars(or_else, out);
+            }
+        }
+    }
+}
+
+fn collect_string_list_expr_vars(expr: &StringListExpr<'static>, out: &mut Vec<&'static str>) {
+    match expr {
+        StringListExpr::Literal(_) => {}
+        StringListExpr::Var(name) => {
+            if !out.contains(name) {
+                out.push(name);
+            }
+        }
+        StringListExpr::List(items) => {
+            for item in *items {
+                collect_string_list_expr_vars(item, out);
+            }
+        }
+        StringListExpr::If(if_expr) => {
+            collect_string_list_expr_vars(&if_expr.then, out);
+            if let Some(or_else) = &if_expr.or_else {
+                collect_string_list_expr_vars(or_else, out);
+            }
+        }
+    }
+}
+
+impl TaskConfigExpr<'static> {
+    /// Collects all variable names referenced in this task configuration.
+    ///
+    /// Traverses the `pwd`, `command`, and `envvar` expressions to find all
+    /// `Var(name)` references, including those inside `If` branches.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let vars = CARGO_AUTO_EXPR.collect_variables();
+    /// assert!(vars.contains(&"pwd"));
+    /// assert!(vars.contains(&"args"));
+    /// ```
+    pub fn collect_variables(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        collect_string_expr_vars(&self.pwd, &mut out);
+        match &self.command {
+            CommandExpr::Cmd(list_expr) => collect_string_list_expr_vars(list_expr, &mut out),
+            CommandExpr::Sh(str_expr) => collect_string_expr_vars(str_expr, &mut out),
+        }
+        for (_key, value_expr) in self.envvar {
+            collect_string_expr_vars(value_expr, &mut out);
+        }
+        out
+    }
+
+    /// Returns a short preview of the command for display purposes.
+    ///
+    /// For `cmd` style commands, returns the first literal argument (usually the binary name).
+    /// For `sh` style commands, returns a truncated prefix of the shell script.
+    pub fn command_preview(&self) -> &'static str {
+        match &self.command {
+            CommandExpr::Cmd(list_expr) => first_literal_from_list(list_expr).unwrap_or(""),
+            CommandExpr::Sh(str_expr) => first_literal_from_string(str_expr).unwrap_or(""),
+        }
+    }
+}
+
+fn first_literal_from_list(expr: &StringListExpr<'static>) -> Option<&'static str> {
+    match expr {
+        StringListExpr::Literal(s) => Some(s),
+        StringListExpr::List(items) => {
+            for item in *items {
+                if let Some(lit) = first_literal_from_list(item) {
+                    return Some(lit);
+                }
+            }
+            None
+        }
+        StringListExpr::Var(_) => None,
+        StringListExpr::If(if_expr) => {
+            first_literal_from_list(&if_expr.then).or_else(|| if_expr.or_else.as_ref().and_then(first_literal_from_list))
+        }
+    }
+}
+
+fn first_literal_from_string(expr: &StringExpr<'static>) -> Option<&'static str> {
+    match expr {
+        StringExpr::Literal(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        }
+        StringExpr::Var(_) => None,
+        StringExpr::If(if_expr) => {
+            first_literal_from_string(&if_expr.then)
+                .or_else(|| if_expr.or_else.as_ref().and_then(first_literal_from_string))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cargo_auto_expr_collects_pwd_and_args() {
+        let vars = CARGO_AUTO_EXPR.collect_variables();
+        assert!(vars.contains(&"pwd"), "should find pwd variable: {:?}", vars);
+        assert!(vars.contains(&"args"), "should find args variable: {:?}", vars);
+        assert_eq!(vars.len(), 2, "should have exactly 2 variables: {:?}", vars);
+    }
+
+    #[test]
+    fn collect_variables_deduplicates() {
+        static TEST_EXPR: TaskConfigExpr<'static> = TaskConfigExpr {
+            kind: TaskKind::Action,
+            info: "",
+            pwd: StringExpr::Var("dup"),
+            command: CommandExpr::Cmd(StringListExpr::List(&[
+                StringListExpr::Var("dup"),
+                StringListExpr::Var("other"),
+            ])),
+            profiles: &[],
+            envvar: &[],
+            require: EMPTY_TASK_CALLS,
+            cache: None,
+            tags: &[],
+        };
+        let vars = TEST_EXPR.collect_variables();
+        assert_eq!(vars.iter().filter(|&&v| v == "dup").count(), 1, "dup should appear once");
+        assert!(vars.contains(&"other"), "should contain other");
+    }
+
+    #[test]
+    fn collect_variables_traverses_if_branches() {
+        static IF_BRANCH: If<'static, StringListExpr<'static>> = If {
+            cond: Predicate::Profile("prod"),
+            then: StringListExpr::Var("then_var"),
+            or_else: Some(StringListExpr::Var("else_var")),
+        };
+        static TEST_EXPR: TaskConfigExpr<'static> = TaskConfigExpr {
+            kind: TaskKind::Action,
+            info: "",
+            pwd: StringExpr::Literal("./"),
+            command: CommandExpr::Cmd(StringListExpr::If(&IF_BRANCH)),
+            profiles: &[],
+            envvar: &[],
+            require: EMPTY_TASK_CALLS,
+            cache: None,
+            tags: &[],
+        };
+        let vars = TEST_EXPR.collect_variables();
+        assert!(vars.contains(&"then_var"), "should find then_var: {:?}", vars);
+        assert!(vars.contains(&"else_var"), "should find else_var: {:?}", vars);
+    }
+}

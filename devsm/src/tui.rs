@@ -13,6 +13,8 @@ use crate::process_manager::{Action, ClientChannel};
 use crate::tui::log_search::{LogSearchState, SearchAction};
 use crate::tui::log_stack::LogStack;
 use crate::tui::select_search::SelectSearch;
+use crate::tui::task_launcher::{LauncherAction, TaskLauncherState};
+use crate::tui::task_launcher::LauncherMode;
 use crate::tui::task_tree::{MetaGroupKind, SelectionState, TaskTreeState};
 use crate::workspace::{BaseTaskIndex, Workspace, WorkspaceState};
 
@@ -92,12 +94,13 @@ fn selection_to_filter(sel: &SelectionState, ws: &WorkspaceState) -> LogFilter {
 mod log_search;
 mod log_stack;
 mod select_search;
+mod task_launcher;
 mod task_tree;
 
 enum FocusOverlap {
     Group { selection: SelectSearch },
-    SpawnProfile { selection: SelectSearch, bti: BaseTaskIndex, profiles: &'static [&'static str] },
     LogSearch { state: LogSearchState },
+    TaskLauncher { state: TaskLauncherState },
     None,
 }
 
@@ -178,22 +181,12 @@ fn render<'a>(
                     x.text(out, ws.config.current.groups[bti].0);
                 });
             }
-            FocusOverlap::SpawnProfile { selection, profiles, .. } => {
-                let (p, mut s) = task_tree_rect.h_split(0.5);
-                s.take_left(1);
-                let ws = workspace.state();
-                tui.task_tree.render_primary(&mut tui.frame, p, &ws);
-                selection.render(&mut tui.frame, s, "profile> ", |out, rect, prof: usize, selected| {
-                    let mut x = rect.with(Style::default());
-                    if selected {
-                        x = x.with(Color::LightSkyBlue1.with_fg(Color::Black)).fill(out)
-                    }
-                    x.text(out, &profiles[prof]);
-                });
-            }
             FocusOverlap::LogSearch { state } => {
                 let logs = workspace.logs.read().unwrap();
                 state.render(&mut tui.frame, task_tree_rect, &logs);
+            }
+            FocusOverlap::TaskLauncher { state } => {
+                state.render(&mut tui.frame, task_tree_rect);
             }
             FocusOverlap::None => {
                 let (p, mut s) = task_tree_rect.h_split(0.5);
@@ -207,8 +200,9 @@ fn render<'a>(
         // Render help menu
         if let Some(help_rect) = help_rect {
             let current_mode = match &tui.overlay {
-                FocusOverlap::Group { .. } | FocusOverlap::SpawnProfile { .. } => Mode::SelectSearch,
+                FocusOverlap::Group { .. } => Mode::SelectSearch,
                 FocusOverlap::LogSearch { .. } => Mode::LogSearch,
+                FocusOverlap::TaskLauncher { .. } => Mode::TaskLauncher,
                 FocusOverlap::None => Mode::Global,
             };
             render_help_menu(&mut tui.frame, help_rect, keybinds, &mut tui.help, current_mode);
@@ -321,22 +315,6 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
             }
             return false;
         }
-        FocusOverlap::SpawnProfile { selection, bti, profiles } => {
-            match selection.process_input(key_event, keybinds) {
-                select_search::Action::Cancel => {
-                    tui.overlay = FocusOverlap::None;
-                }
-                select_search::Action::Enter => {
-                    if let Some(pi) = selection.selected::<usize>() {
-                        workspace.restart_task(*bti, ValueMap::new(), profiles[pi]);
-                    }
-
-                    tui.overlay = FocusOverlap::None;
-                }
-                select_search::Action::None => selection.flush(),
-            }
-            return false;
-        }
         FocusOverlap::LogSearch { state } => {
             match state.process_input(key_event, keybinds) {
                 SearchAction::Cancel => {
@@ -358,6 +336,21 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
                         tui.logs.scroll_to_log_id(log_id, workspace);
                     }
                 }
+            }
+            return false;
+        }
+        FocusOverlap::TaskLauncher { state } => {
+            let ws = workspace.state();
+            match state.process_input(key_event, keybinds, &ws) {
+                LauncherAction::Cancel => {
+                    tui.overlay = FocusOverlap::None;
+                }
+                LauncherAction::Start { base_task, profile, params } => {
+                    drop(ws);
+                    workspace.restart_task(base_task, params, &profile);
+                    tui.overlay = FocusOverlap::None;
+                }
+                LauncherAction::None => {}
             }
             return false;
         }
@@ -426,6 +419,11 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
                 // but that seems too destructive - for now we require a specific task to be selected
             }
         }
+        Command::LaunchTask => {
+            let ws = workspace.state();
+            let state = TaskLauncherState::new(&ws);
+            tui.overlay = FocusOverlap::TaskLauncher { state };
+        }
         Command::ToggleViewMode => {
             tui.task_tree.toggle_collapsed();
         }
@@ -445,7 +443,6 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
         Command::SelectProfile => {
             let ws = workspace.state();
             if let Some(sel) = tui.task_tree.selection_state(&ws) {
-                // SelectProfile only works when a specific base task is selected
                 let Some(bti) = sel.base_task else {
                     return false;
                 };
@@ -453,11 +450,9 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
                 if profiles.is_empty() {
                     return false;
                 }
-                tui.overlay = FocusOverlap::SpawnProfile {
-                    bti,
-                    profiles,
-                    selection: profiles.into_iter().enumerate().collect(),
-                }
+                tui.overlay = FocusOverlap::TaskLauncher {
+                    state: TaskLauncherState::with_task(&ws, bti),
+                };
             }
         }
         Command::SelectPrev => {
@@ -585,12 +580,6 @@ fn output_json_state(ws: &WorkspaceState, tui: &mut TuiState, out: &OwnedFd) {
                 selection: selection.selected::<usize>(),
                 groups: [for (name, _) in ws.config.current.groups; name]
             },
-            FocusOverlap::SpawnProfile { selection, bti, profiles } => {
-                kind: "SpawnProfile",
-                base_task: bti.idx(),
-                selection: selection.selected::<usize>(),
-                profiles: [for prof in *profiles; prof]
-            },
             FocusOverlap::LogSearch { state } => {
                 kind: "LogSearch",
                 pattern: state.pattern,
@@ -603,6 +592,22 @@ fn output_json_state(ws: &WorkspaceState, tui: &mut TuiState, out: &OwnedFd) {
                     None => None,
                 },
                 total_matches: state.matches.len()
+            },
+            FocusOverlap::TaskLauncher { state } => {
+                kind: "TaskLauncher",
+                input: state.input(),
+                mode: match state.mode() {
+                    LauncherMode::TaskName => "TaskName",
+                    LauncherMode::Profile => "Profile",
+                    LauncherMode::Variable => "Variable",
+                    LauncherMode::Value => "Value",
+                },
+                confirmed_task: match state.confirmed_task() {
+                    Some((bti, name)) => { index: bti.idx(), name: name },
+                    None => None,
+                },
+                confirmed_profile: state.confirmed_profile(),
+                completed_vars: [for (name, value) in state.completed_vars(); { name: name, value: value }]
             },
             FocusOverlap::None => None,
         },

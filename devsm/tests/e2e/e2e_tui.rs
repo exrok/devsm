@@ -16,6 +16,8 @@ struct TuiState {
     collapsed: bool,
     #[allow(dead_code)]
     selection: Option<TuiSelection>,
+    #[allow(dead_code)]
+    overlay: Option<TuiOverlay>,
     base_tasks: Vec<TuiBaseTask>,
     #[allow(dead_code)]
     meta_groups: Option<TuiMetaGroups>,
@@ -40,6 +42,14 @@ struct TuiMetaGroups {
 #[allow(dead_code)]
 struct TuiMetaGroup {
     job_count: usize,
+}
+
+#[derive(Debug, Clone, Jsony, Default)]
+#[allow(dead_code)]
+struct TuiOverlay {
+    kind: Option<String>,
+    input: Option<String>,
+    mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Jsony, Default)]
@@ -234,4 +244,114 @@ sh = "while true; do sleep 1; done"
     assert!(state.find_task_by_name("task_one").is_some(), "Should find task_one: {:?}", state.base_tasks);
     assert!(state.find_task_by_name("task_two").is_some(), "Should find task_two: {:?}", state.base_tasks);
     assert!(state.find_task_by_name("my_service").is_some(), "Should find my_service: {:?}", state.base_tasks);
+}
+
+#[test]
+fn tui_task_launcher_overlay_opens_on_space() {
+    use std::io::Write;
+
+    let mut harness = TestHarness::new("tui_task_launcher");
+
+    harness.write_config(
+        r#"
+[action.my_action]
+profiles = ["default", "release"]
+sh = "echo hello"
+"#,
+    );
+
+    // Spawn server with JSON state stream mode
+    let log_file = fs::File::create(&harness.server_log_path).expect("Failed to create server log");
+    let log_file_err = log_file.try_clone().expect("Failed to clone log file");
+
+    let server = Command::new(cargo_bin_path())
+        .arg("server")
+        .env("DEVSM_SOCKET", &harness.socket_path)
+        .env("DEVSM_LOG_STDOUT", "1")
+        .env("DEVSM_JSON_STATE_STREAM", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
+        .spawn()
+        .expect("Failed to spawn server");
+
+    harness.server = Some(server);
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    // Spawn TUI client with piped stdin/stdout
+    let temp_dir = harness.temp_dir.clone();
+    let socket_path = harness.socket_path.clone();
+    let mut tui_child = Command::new(cargo_bin_path())
+        .current_dir(&temp_dir)
+        .env("DEVSM_SOCKET", &socket_path)
+        .env("DEVSM_NO_AUTO_SPAWN", "1")
+        .env("DEVSM_CONNECT_TIMEOUT_MS", "5000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn TUI client");
+
+    let mut stdin = tui_child.stdin.take().expect("No stdin");
+    let stdout = tui_child.stdout.take().expect("No stdout");
+
+    // Read JSON states in background
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            if let Ok(line) = line {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Wait for initial state
+    let initial_state = rx.recv_timeout(Duration::from_secs(3)).ok().and_then(|line| TuiState::from_json(&line));
+    assert!(initial_state.is_some(), "Should receive initial state, server_log: {}", harness.server_log());
+
+    // Send Space to open task launcher
+    stdin.write_all(b" ").expect("Failed to send space");
+    stdin.flush().expect("Failed to flush");
+
+    // Wait for launcher overlay to appear
+    let mut launcher_opened = false;
+    for _ in 0..20 {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            if let Some(state) = TuiState::from_json(&line) {
+                if let Some(ref overlay) = state.overlay {
+                    if overlay.kind.as_deref() == Some("TaskLauncher") {
+                        launcher_opened = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    assert!(launcher_opened, "TaskLauncher overlay should open, server_log: {}", harness.server_log());
+
+    // Send Escape to close launcher
+    stdin.write_all(b"\x1b").expect("Failed to send escape");
+    stdin.flush().expect("Failed to flush");
+
+    // Wait for overlay to close
+    let mut launcher_closed = false;
+    for _ in 0..20 {
+        if let Ok(line) = rx.recv_timeout(Duration::from_millis(200)) {
+            if let Some(state) = TuiState::from_json(&line) {
+                if state.overlay.is_none() {
+                    launcher_closed = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(launcher_closed, "TaskLauncher overlay should close on Escape, server_log: {}", harness.server_log());
+
+    // Kill TUI client
+    let _ = tui_child.kill();
+    let _ = tui_child.wait();
 }
