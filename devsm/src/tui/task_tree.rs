@@ -314,11 +314,7 @@ impl TaskTreeState {
                 Command::Cmd(args) => args.join(" "),
                 Command::Sh(script) => {
                     // Show "sh: " followed by a prefix of the script
-                    let prefix = if script.len() > 50 {
-                        format!("{}...", &script[..50])
-                    } else {
-                        script.to_string()
-                    };
+                    let prefix = if script.len() > 50 { format!("{}...", &script[..50]) } else { script.to_string() };
                     format!("sh: {}", prefix)
                 }
             };

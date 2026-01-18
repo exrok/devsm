@@ -13,9 +13,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use devsm_rpc::{
-    encode_attach_rpc, ClientProtocol, DecodeResult, JobExitedEvent, JobStatusEvent, RpcMessageKind,
-};
+use devsm_rpc::{ClientProtocol, DecodeResult, JobExitedEvent, JobStatusEvent, RpcMessageKind, encode_attach_rpc};
 
 const SOCKET_PATH: &str = "/tmp/.devsm.socket";
 
@@ -77,8 +75,7 @@ fn main() -> anyhow::Result<()> {
 fn handle_message(kind: RpcMessageKind, correlation: u16, payload: &[u8]) {
     match kind {
         RpcMessageKind::OpenWorkspaceAck => {
-            let response: devsm_rpc::OpenWorkspaceResponse =
-                jsony::from_binary(payload).expect("invalid payload");
+            let response: devsm_rpc::OpenWorkspaceResponse = jsony::from_binary(payload).expect("invalid payload");
             if response.success {
                 println!("[ACK] Workspace opened successfully");
             } else {
@@ -88,10 +85,7 @@ fn handle_message(kind: RpcMessageKind, correlation: u16, payload: &[u8]) {
         }
         RpcMessageKind::JobStatus => {
             let event: JobStatusEvent = jsony::from_binary(payload).expect("invalid payload");
-            println!(
-                "[EVENT] JobStatus: job_index={}, status={:?}",
-                event.job_index, event.status
-            );
+            println!("[EVENT] JobStatus: job_index={}, status={:?}", event.job_index, event.status);
         }
         RpcMessageKind::JobExited => {
             let event: JobExitedEvent = jsony::from_binary(payload).expect("invalid payload");
@@ -104,12 +98,7 @@ fn handle_message(kind: RpcMessageKind, correlation: u16, payload: &[u8]) {
             println!("[EVENT] Disconnect received");
         }
         _ => {
-            println!(
-                "[MSG] kind={:?}, correlation={}, payload_len={}",
-                kind,
-                correlation,
-                payload.len()
-            );
+            println!("[MSG] kind={:?}, correlation={}, payload_len={}", kind, correlation, payload.len());
         }
     }
 }

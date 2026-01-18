@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
 use jsony_value::ValueMap;
@@ -13,7 +13,7 @@ use crate::tui::log_search::{LogSearchState, SearchAction};
 use crate::tui::log_stack::LogStack;
 use crate::tui::select_search::SelectSearch;
 use crate::tui::task_tree::TaskTreeState;
-use crate::workspace::{BaseTaskIndex, Workspace};
+use crate::workspace::{BaseTaskIndex, Workspace, WorkspaceState};
 
 pub fn constrain_scroll_offset(visible_height: usize, item_index: usize, scroll_offset: usize) -> usize {
     if item_index < scroll_offset {
@@ -465,28 +465,100 @@ fn scroll_target(w: u16, h: u16, x: u16, y: u16) -> ScrollTarget {
     }
 }
 
+fn job_status_str(status: &crate::workspace::JobStatus) -> &'static str {
+    match status {
+        crate::workspace::JobStatus::Scheduled { .. } => "Scheduled",
+        crate::workspace::JobStatus::Starting => "Starting",
+        crate::workspace::JobStatus::Running { .. } => "Running",
+        crate::workspace::JobStatus::Exited { .. } => "Exited",
+        crate::workspace::JobStatus::Cancelled => "Cancelled",
+    }
+}
+
+fn output_json_state(ws: &WorkspaceState, tui: &mut TuiState, out: &OwnedFd) {
+    let mut file = unsafe { std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(out.as_raw_fd())) };
+    let mut message = jsony::object! {
+        overlay: match &tui.overlay {
+            FocusOverlap::Group { selection } => {
+                kind: "Group",
+                selection: selection.selected::<usize>(),
+                groups: [for (name, _) in ws.config.current.groups; name]
+            },
+            FocusOverlap::SpawnProfile { selection, bti, profiles } => {
+                kind: "SpawnProfile",
+                base_task: bti.idx(),
+                selection: selection.selected::<usize>(),
+                profiles: [for prof in *profiles; prof]
+            },
+            FocusOverlap::LogSearch { state } => {
+                kind: "LogSearch",
+                pattern: state.pattern,
+                selected_match: match state.selected_match() {
+                    Some(m) => {
+                        log_id: m.log_id.0,
+                        match_start: m.match_start,
+                        match_len: state.pattern_len() as u32
+                    },
+                    None => None,
+                },
+                total_matches: state.matches.len()
+            },
+            FocusOverlap::None => None,
+        },
+        @[if let Some(selection) = tui.task_tree.selection_state(ws)]
+        selection: {
+            base_task: selection.base_task.idx(),
+            @[if let Some(job) = selection.job]
+            job: job.idx()
+        },
+        base_tasks: [for (i, bt) in ws.base_tasks.iter().enumerate(); {
+            index: i,
+            name: bt.name,
+            jobs: [for ji in bt.jobs.all(); {
+                index: ji.idx(),
+                status: job_status_str(&ws[*ji].process_status),
+                @[if let crate::workspace::JobStatus::Exited { status, .. } = &ws[*ji].process_status]
+                exit_code: *status
+            }]
+        }]
+    };
+    message.push('\n');
+    use std::io::Write;
+    let _ = file.write_all(message.as_bytes());
+}
+
+pub enum OutputMode {
+    /// The normal tui interface
+    Terminal,
+    /// A line seperated JSON stream used for testing
+    JsonStateStream,
+}
 pub fn run(
     stdin: OwnedFd,
     stdout: OwnedFd,
     workspace: &Workspace,
     vtui_channel: Arc<ClientChannel>,
     keybinds: &Keybinds,
+    output_mode: OutputMode,
 ) -> anyhow::Result<()> {
     let mode = TerminalFlags::RAW_MODE
         | TerminalFlags::ALT_SCREEN
         | TerminalFlags::HIDE_CURSOR
         | TerminalFlags::MOUSE_CAPTURE
         | TerminalFlags::EXTENDED_KEYBOARD_INPUTS;
-    let mut terminal = vtui::Terminal::new(stdout.as_raw_fd(), mode)?;
+    let mut terminal = match output_mode {
+        OutputMode::Terminal => Some(vtui::Terminal::new(stdout.as_raw_fd(), mode)?),
+        OutputMode::JsonStateStream => None,
+    };
     let mut events = vtui::event::parse::Events::default();
     use std::io::Write;
-    {
+    if let Some(terminal) = &mut terminal {
         let mut buf = Vec::new();
         vt::move_cursor_to_origin(&mut buf);
         buf.extend_from_slice(vt::CLEAR_BELOW);
         terminal.write_all(&buf)?;
     }
-    let (mut w, mut h) = terminal.size()?;
+    let (mut w, mut h) = if let Some(terminal) = &terminal { terminal.size()? } else { (120, 60) };
     let bh = 10;
 
     let mut previous = 0;
@@ -501,15 +573,23 @@ pub fn run(
     let mut delta = Has(0);
     loop {
         if delta.any(Has::RESIZED) {
-            (w, h) = terminal.size()?;
+            (w, h) = if let Some(terminal) = &terminal { terminal.size()? } else { (90, 70) };
         }
-        terminal.write_all(render(w, h, &mut tui, workspace, keybinds, delta))?;
+        let data = render(w, h, &mut tui, workspace, keybinds, delta);
+        if let Some(terminal) = &mut terminal {
+            terminal.write_all(data)?;
+        } else {
+            let ws = workspace.state();
+            output_json_state(&ws, &mut tui, &stdout);
+        }
         delta = Has(0);
 
         {
             let ws = workspace.state();
             if let Some(sel) = tui.task_tree.selection_state(&ws) {
                 tui.logs.update_selection(sel);
+                // Update the channel's selected atomic so RestartSelected command works
+                vtui_channel.selected.store(sel.base_task.idx() as u64, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -528,7 +608,7 @@ pub fn run(
             return Ok(());
         }
 
-        while let Some(event) = events.next(terminal.is_raw()) {
+        while let Some(event) = events.next(true) {
             match event {
                 Event::Key(key_event) => {
                     if process_key(&mut tui, workspace, key_event, keybinds) {

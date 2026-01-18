@@ -403,8 +403,17 @@ pub(crate) enum AttachKind {
 }
 
 pub(crate) enum ProcessRequest {
-    WorkspaceCommand { workspace_config: PathBuf, socket: UnixStream, command: Vec<u8> },
-    Spawn { task: TaskConfigRc, workspace_id: WorkspaceIndex, job_id: LogGroup, job_index: JobIndex },
+    WorkspaceCommand {
+        workspace_config: PathBuf,
+        socket: UnixStream,
+        command: Vec<u8>,
+    },
+    Spawn {
+        task: TaskConfigRc,
+        workspace_id: WorkspaceIndex,
+        job_id: LogGroup,
+        job_index: JobIndex,
+    },
     AttachClient {
         stdin: Option<OwnedFd>,
         stdout: Option<OwnedFd>,
@@ -412,9 +421,18 @@ pub(crate) enum ProcessRequest {
         workspace_config: PathBuf,
         kind: AttachKind,
     },
-    TerminateJob { job_id: LogGroup, process_index: usize, exit_cause: ExitCause },
-    ClientExited { index: usize },
-    ProcessExited { pid: u32, status: u32 },
+    TerminateJob {
+        job_id: LogGroup,
+        process_index: usize,
+        exit_cause: ExitCause,
+    },
+    ClientExited {
+        index: usize,
+    },
+    ProcessExited {
+        pid: u32,
+        status: u32,
+    },
     GlobalTermination,
 }
 
@@ -734,11 +752,8 @@ impl ProcessManager {
                     let ws_idx = process.workspace_index;
                     let job_idx = process.job_index;
                     let cause = process.pending_exit_cause.unwrap_or(ExitCause::Unknown);
-                    let exit_code = if libc::WIFEXITED(status as i32) {
-                        libc::WEXITSTATUS(status as i32) as u32
-                    } else {
-                        u32::MAX
-                    };
+                    let exit_code =
+                        if libc::WIFEXITED(status as i32) { libc::WEXITSTATUS(status as i32) as u32 } else { u32::MAX };
                     let rpc_cause = match cause {
                         ExitCause::Unknown => devsm_rpc::ExitCause::Unknown,
                         ExitCause::Killed => devsm_rpc::ExitCause::Killed,
@@ -799,9 +814,14 @@ impl ProcessManager {
         kvlog::info!("Client Attached");
         let keybinds = global_keybinds();
         let channel_clone = channel.clone();
+        let output_mode = if std::env::var("DEVSM_JSON_STATE_STREAM").is_ok() {
+            crate::tui::OutputMode::JsonStateStream
+        } else {
+            crate::tui::OutputMode::Terminal
+        };
         std::thread::spawn(move || {
             let _ = std::panic::catch_unwind(|| {
-                if let Err(err) = crate::tui::run(stdin, stdout, &ws_handle, channel_clone, keybinds) {
+                if let Err(err) = crate::tui::run(stdin, stdout, &ws_handle, channel_clone, keybinds, output_mode) {
                     kvlog::error!("TUI exited with error", %err);
                 }
             });
@@ -1087,10 +1107,7 @@ impl ProcessManager {
                     encoder.encode_response(
                         RpcMessageKind::ErrorResponse,
                         correlation,
-                        &devsm_rpc::ErrorResponsePayload {
-                            code: 1,
-                            message: "Invalid subscription filter".into(),
-                        },
+                        &devsm_rpc::ErrorResponsePayload { code: 1, message: "Invalid subscription filter".into() },
                     );
                     return;
                 };
@@ -1098,7 +1115,11 @@ impl ProcessManager {
                 let ClientKind::Rpc { subscriptions } = &mut client.kind else { return };
                 subscriptions.job_status = filter.job_status;
                 subscriptions.job_exits = filter.job_exits;
-                encoder.encode_response(RpcMessageKind::SubscribeAck, correlation, &devsm_rpc::SubscribeAck { success: true });
+                encoder.encode_response(
+                    RpcMessageKind::SubscribeAck,
+                    correlation,
+                    &devsm_rpc::SubscribeAck { success: true },
+                );
             }
             RpcMessageKind::RunTask => {
                 let Ok(req) = jsony::from_binary::<devsm_rpc::RunTaskRequest>(payload) else {
@@ -1397,7 +1418,12 @@ impl ProcessManager {
         }
     }
 
-    fn broadcast_job_status(&mut self, ws_index: WorkspaceIndex, job_index: JobIndex, status: devsm_rpc::JobStatusKind) {
+    fn broadcast_job_status(
+        &mut self,
+        ws_index: WorkspaceIndex,
+        job_index: JobIndex,
+        status: devsm_rpc::JobStatusKind,
+    ) {
         let event = devsm_rpc::JobStatusEvent { job_index: job_index.as_u32(), status };
         let mut encoder = devsm_rpc::Encoder::new();
         encoder.encode_push(RpcMessageKind::JobStatus, &event);

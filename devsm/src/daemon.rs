@@ -25,9 +25,7 @@ static SOCKET_PATH: OnceLock<String> = OnceLock::new();
 /// Uses `DEVSM_SOCKET` environment variable if set, otherwise defaults to
 /// `/tmp/.devsm.socket`.
 pub fn socket_path() -> &'static str {
-    SOCKET_PATH.get_or_init(|| {
-        std::env::var("DEVSM_SOCKET").unwrap_or_else(|_| "/tmp/.devsm.socket".to_string())
-    })
+    SOCKET_PATH.get_or_init(|| std::env::var("DEVSM_SOCKET").unwrap_or_else(|_| "/tmp/.devsm.socket".to_string()))
 }
 
 mod unix_path {
@@ -167,10 +165,7 @@ fn handle_request(
                 stdout: Some(fds.pop_front().unwrap()),
                 socket,
                 workspace_config: config.into(),
-                kind: crate::process_manager::AttachKind::Run {
-                    task_name: name,
-                    params: jsony::to_binary(&params),
-                },
+                kind: crate::process_manager::AttachKind::Run { task_name: name, params: jsony::to_binary(&params) },
             });
         }
         Request::AttachTests { config, filters } => {
@@ -183,9 +178,7 @@ fn handle_request(
                 stdout: Some(fds.pop_front().unwrap()),
                 socket,
                 workspace_config: config.into(),
-                kind: crate::process_manager::AttachKind::TestRun {
-                    filters: jsony::to_binary(&filters),
-                },
+                kind: crate::process_manager::AttachKind::TestRun { filters: jsony::to_binary(&filters) },
             });
         }
         Request::AttachRpc { config, subscribe } => {

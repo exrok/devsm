@@ -8,7 +8,7 @@ use std::{
 use anyhow::bail;
 use sendfd::SendWithFd;
 
-use crate::daemon::{socket_path, WorkspaceCommand};
+use crate::daemon::{WorkspaceCommand, socket_path};
 use devsm_rpc::{
     ClientProtocol, DecodeResult, JobExitedEvent, JobStatusEvent, JobStatusKind, ResizeNotification, RpcMessageKind,
 };
@@ -192,10 +192,7 @@ fn setup_signal_handler(sig: i32, handler: unsafe extern "C" fn(i32)) -> anyhow:
 }
 
 fn default_connect_timeout_ms() -> u64 {
-    std::env::var("DEVSM_CONNECT_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1000)
+    std::env::var("DEVSM_CONNECT_TIMEOUT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(1000)
 }
 
 fn connect_with_retry(timeout_ms: u64) -> std::io::Result<UnixStream> {
@@ -224,10 +221,7 @@ fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
     }
 
     if std::env::var("DEVSM_NO_AUTO_SPAWN").as_deref() == Ok("1") {
-        return Err(std::io::Error::new(
-            ErrorKind::ConnectionRefused,
-            "Daemon not running and auto-spawn disabled",
-        ));
+        return Err(std::io::Error::new(ErrorKind::ConnectionRefused, "Daemon not running and auto-spawn disabled"));
     }
 
     let current_exe = std::env::current_exe()?;

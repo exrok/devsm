@@ -118,7 +118,7 @@ pub enum SearchAction {
 /// Main state for interactive log search mode.
 pub struct LogSearchState {
     /// Current search pattern.
-    pattern: String,
+    pub pattern: String,
     /// Length of pattern in lowercased form (for highlighting).
     pattern_lower_len: usize,
     /// Cursor position within pattern.
@@ -128,7 +128,7 @@ pub struct LogSearchState {
     /// Search index containing stripped log text.
     index: LogSearchIndex,
     /// List of matches found.
-    matches: Vec<LogMatch>,
+    pub matches: Vec<LogMatch>,
     /// Currently selected match index.
     selected: usize,
     /// Scroll offset for match list display.

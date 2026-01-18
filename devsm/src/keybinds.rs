@@ -364,14 +364,12 @@ impl Keybinds {
             Mode::LogSearch => &mut self.log_search,
         };
         match command {
-            Some(cmd) => {
-                match table.find_mut(hash, |(k, _)| *k == input) {
-                    Some(entry) => entry.1 = cmd,
-                    None => {
-                        table.insert_unique(hash, (input, cmd), |(k, _)| hash_input(hasher, *k));
-                    }
+            Some(cmd) => match table.find_mut(hash, |(k, _)| *k == input) {
+                Some(entry) => entry.1 = cmd,
+                None => {
+                    table.insert_unique(hash, (input, cmd), |(k, _)| hash_input(hasher, *k));
                 }
-            }
+            },
             None => {
                 if let Ok(entry) = table.find_entry(hash, |(k, _)| *k == input) {
                     entry.remove();
