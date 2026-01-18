@@ -1,5 +1,5 @@
 // fn main() -> anyhow::Result<()> {
-//     let _log_guard = kvlog::collector::init_file_logger("/tmp/.dfj.log");
+//     let _log_guard = kvlog::collector::init_file_logger("/tmp/.devsm.log");
 //     let resp = Arc::new(CrosstermChannel {
 //         waker: vtui::event::polling::resize_waker().unwrap(),
 //         events: Mutex::new(Vec::new()),

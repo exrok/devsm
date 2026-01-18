@@ -1,21 +1,14 @@
 use std::{
     io::{ErrorKind, Read, Write},
-    os::{
-        fd::RawFd,
-        unix::{net::UnixStream, process::CommandExt},
-    },
+    os::unix::{net::UnixStream, process::CommandExt},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
 use anyhow::bail;
-use libc::sigwait;
 use sendfd::SendWithFd;
 
-use crate::{
-    config::{BumpEval, TaskConfig, WorkspaceConfig, load_from_env},
-    daemon::GLOBAL_SOCKET,
-};
+use crate::daemon::{GLOBAL_SOCKET, WorkspaceCommand};
 
 mod config;
 mod daemon;
@@ -23,46 +16,42 @@ mod line_width;
 mod log_storage;
 mod process_manager;
 mod scroll_view;
+mod searcher;
 mod tui;
 mod workspace;
-
-fn unmanaged_exec(ws: &WorkspaceConfig, task: &TaskConfig) {
-    let [cmd, args @ ..] = task.cmd else {
-        panic!("Expected atleast one command")
-    };
-    let path = ws.base_path.join(task.pwd);
-    println!("in {:?}", path);
-    let _ = std::process::Command::new(cmd)
-        .args(args)
-        .current_dir(path)
-        .envs(task.envvar.iter().copied())
-        .exec();
-    panic!()
-}
-
-fn main_simple_run() {
-    let config = load_from_env().unwrap();
-    let mut args = std::env::args();
-    args.next();
-    let arg = args.next().expect("Arg");
-    let (task, profile) = arg.rsplit_once(":").unwrap_or((&arg, ""));
-    let task = config.task_by_name(task).expect("Unknown task");
-    let bump = bumpalo::Bump::new();
-    let task = task
-        .bump_eval(&config::Enviroment { profile }, &bump)
-        .unwrap();
-    unmanaged_exec(&config, &task);
-}
 
 fn main() {
     let mut args = std::env::args();
     args.next();
-    let mode = args.next().expect("Arg");
-    if mode == "client" {
+    let Some(mode) = args.next() else {
+        let _log_guard = kvlog::collector::init_file_logger("/tmp/.client.devsm.log");
         client().unwrap();
+        return;
+    };
+    if mode == "get-last-rust-panic" {
+        workspace_command(WorkspaceCommand::GetPanicLocation).unwrap();
     }
+    if mode == "restart-selected" {
+        workspace_command(WorkspaceCommand::RestartSelected).unwrap();
+    }
+    if mode == "run" {
+        let name = args.next().unwrap();
+        let arg2: String;
+        let params = if let Some(arg) = args.next() {
+            arg2 = arg;
+            jsony::from_json(&arg2).unwrap()
+        } else {
+            jsony_value::ValueMap::new()
+        };
+        workspace_command(WorkspaceCommand::Run {
+            name: name.into(),
+            params,
+        })
+        .unwrap();
+    }
+
     if mode == "server" {
-        let _log_guard = kvlog::collector::init_file_logger("/tmp/.dfj.log");
+        let _log_guard = kvlog::collector::init_file_logger("/tmp/.devsm.log");
         if let Err(err) = daemon::worker() {
             kvlog::error!("Daemon terminated with error", ?err);
         }
@@ -145,10 +134,27 @@ fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
     ))
 }
 
+fn workspace_command(command: WorkspaceCommand) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.js in current or parent directories"))?;
+
+    let mut socket = connect_or_spawn_daemon()?;
+    socket.write_all(&jsony::to_binary(&daemon::RequestMessage {
+        cwd: &cwd,
+        request: daemon::Request::WorkspaceCommand {
+            config: &config,
+            command,
+        },
+    }))?;
+    std::io::copy(&mut socket, &mut std::io::stdout())?;
+    Ok(())
+}
+
 fn client() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let config = config::find_config_path_from(&cwd)
-        .ok_or_else(|| anyhow::anyhow!("Cannot find dfj.js in current or parent directories"))?;
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.js in current or parent directories"))?;
 
     // Register the signal handlers using libc directly
     setup_signal_handler(libc::SIGTERM, term_handler)?;
@@ -180,7 +186,10 @@ fn client() -> anyhow::Result<()> {
             socket.write_all(&RESIZE_CODE.to_ne_bytes())?;
         }
         match socket.read(&mut buf) {
-            Ok(_) => {
+            Ok(amount) => {
+                if amount == 0 {
+                    break;
+                }
                 let received_code = u32::from_ne_bytes(buf);
                 if received_code == TERMINATION_CODE {
                     break;
@@ -197,55 +206,3 @@ fn client() -> anyhow::Result<()> {
 
     Ok(())
 }
-
-// fn server() -> anyhow::Result<()> {
-//     let _ = std::fs::remove_file("/tmp/.dfj");
-//     let listener = std::os::unix::net::UnixListener::bind("/tmp/.dfj")?;
-//     loop {
-//         let (mut socket, _) = listener.accept()?;
-//         std::thread::spawn(move || {
-//             handler(socket).unwrap();
-//         });
-//     }
-
-//     Ok(())
-// }
-
-// fn handler(mut stream: UnixStream) -> anyhow::Result<()> {
-//     let stdin_fd = stream.recv_fd()?;
-//     let stdout_fd = stream.recv_fd()?;
-
-//     use std::process::Command;
-
-//     use vtui::event::polling::GlobalWakerConfig;
-//     use vtui::event::{Event, KeyCode, KeyModifiers};
-//     use vtui::vt::BufferWrite;
-//     use vtui::{Color, Rect, Style, TerminalFlags, vt};
-
-//     let mode = TerminalFlags::RAW_MODE
-//         | TerminalFlags::HIDE_CURSOR
-//         | TerminalFlags::EXTENDED_KEYBOARD_INPUTS;
-//     let mut terminal = vtui::Terminal::new(stdout_fd, mode).expect("Valid TTY");
-//     let (w, h) = terminal.size().unwrap();
-//     let mut events = vtui::event::parse::Events::default();
-//     let mut render_frame = vtui::DoubleBuffer::new(w, h);
-//     loop {
-//         match vtui::event::poll_with_custom_waker(&stdin_fd, None, None)? {
-//             vtui::event::Polled::ReadReady => {
-//                 events.read_from(&stdin_fd)?;
-//             }
-//             vtui::event::Polled::Woken => {}
-//             vtui::event::Polled::TimedOut => {}
-//         }
-//         let (w, h) = terminal.size().unwrap();
-//         render_frame.resize(w, h);
-//         let rect = render_frame.rect();
-//         while let Some(event) = events.next(terminal.is_raw()) {
-//             rect.with(Color(2).as_fg())
-//                 .text(&mut render_frame, &format!("{:?}", event));
-//         }
-
-//         render_frame.render(&mut terminal);
-//     }
-//     Ok(())
-// }

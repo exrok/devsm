@@ -287,21 +287,6 @@ pub fn naive_line_splitting(
 mod tests {
     use super::*;
     #[test]
-    fn splitter() {
-        // let values: Vec<_> = naive_line_splitting("abcd1234value", 4).collect();
-        // assert_eq!(values, vec!["abcd", "1234", "value", "e"]);
-
-        // let values: Vec<_> = naive_line_splitting("ab\x1b[31mcd1234value", 4).collect();
-        // assert_eq!(values, vec!["ab\x1b[31mcd", "1234", "value", "e"]);
-
-        // let values: Vec<_> = naive_line_splitting("ab\x1b[31mcd123👍value", 4).collect();
-        // assert_eq!(values, vec!["ab\x1b[31mcd", "123", "👍va", "lue"]);
-
-        // let values: Vec<_> = naive_line_splitting("ab\x1b[31mcd123👍👍👍value", 4).collect();
-        // assert_eq!(values, vec!["ab\x1b[31mcd", "123", "👍👍", "👍va", "lue"]);
-    }
-
-    #[test]
     fn test_segment_iterator() {
         let text = "hello \x1b[31mworld\x1b[0m! これはASCIIではありません\x1b[0mりません";
         let segments: Vec<_> = Segment::iterator(text).collect();

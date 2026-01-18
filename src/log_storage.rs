@@ -1,6 +1,5 @@
 use std::{
     marker::PhantomData,
-    ops::ControlFlow,
     ptr::NonNull,
     sync::{
         Arc, RwLock,
@@ -8,20 +7,27 @@ use std::{
     },
 };
 
-use unicode_width::UnicodeWidthStr;
 use vtui::Style;
+
+use crate::workspace::BaseTaskIndex;
 
 #[derive(Clone, Copy)]
 pub enum LogFilter {
     All,
-    Job(JobId),
+    IsJob(JobLogCorrelation),
+    NotJob(JobLogCorrelation),
+    IsBaseTask(BaseTaskIndex),
+    NotBaseTask(BaseTaskIndex),
 }
 
 impl<'a> LogView<'a> {
     pub fn contains(&self, line: &LogEntry) -> bool {
         match self.filter {
             LogFilter::All => true,
-            LogFilter::Job(job_id) => line.job_id == job_id,
+            LogFilter::IsJob(job_id) => line.job_id == job_id,
+            LogFilter::NotJob(job_id) => line.job_id != job_id,
+            LogFilter::IsBaseTask(base_task) => line.job_id.base_task_index() == base_task.0,
+            LogFilter::NotBaseTask(base_task) => line.job_id.base_task_index() != base_task.0,
         }
     }
 }
@@ -33,14 +39,20 @@ pub struct LogView<'a> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct JobId(pub u32);
+pub struct JobLogCorrelation(pub u32);
+
+impl JobLogCorrelation {
+    pub fn base_task_index(self) -> u32 {
+        self.0 & 0xFFF
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, Default)]
 pub struct LogId(pub usize);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LogEntry {
-    pub job_id: JobId,
+    pub job_id: JobLogCorrelation,
     start: u32,
     len: u32,
     pub width: u32,
@@ -118,18 +130,11 @@ impl std::ops::Index<LogId> for LogIndexer<'_> {
 
 impl Logs {
     pub fn view(&self, filter: LogFilter) -> LogView<'_> {
-        LogView {
-            logs: self,
-            tail: self.tail(),
-            filter,
-        }
+        LogView { logs: self, tail: self.tail(), filter }
     }
+    #[cfg(test)]
     pub fn view_all(&self) -> LogView<'_> {
-        LogView {
-            logs: self,
-            tail: self.tail(),
-            filter: LogFilter::All,
-        }
+        LogView { logs: self, tail: self.tail(), filter: LogFilter::All }
     }
     pub fn indexer(&self) -> LogIndexer<'_> {
         let len = self.line_count.load(Ordering::Acquire);
@@ -196,75 +201,22 @@ impl Logs {
 
         if physical_start + count <= MAX_LINES {
             unsafe {
-                let slice = std::slice::from_raw_parts(
-                    self.line_entries.as_ptr().add(physical_start),
-                    count,
-                );
+                let slice = std::slice::from_raw_parts(self.line_entries.as_ptr().add(physical_start), count);
                 (slice, &[])
             }
         } else {
             let first_len = MAX_LINES - physical_start;
             let second_len = count - first_len;
             unsafe {
-                let a = std::slice::from_raw_parts(
-                    self.line_entries.as_ptr().add(physical_start),
-                    first_len,
-                );
+                let a = std::slice::from_raw_parts(self.line_entries.as_ptr().add(physical_start), first_len);
                 let b = std::slice::from_raw_parts(self.line_entries.as_ptr(), second_len);
                 (a, b)
             }
         }
     }
 
-    pub fn slices_from(&self, start_id: LogId) -> (&[LogEntry], &[LogEntry], LogId) {
-        let first_id = self.start_line_id;
-        let len = self.line_count.load(Ordering::Acquire);
-
-        let end_line_id = first_id + len;
-        if len == 0 {
-            return (&[], &[], LogId(end_line_id)); // Buffer is empty, try again from the same spot later.
-        }
-
-        let start_logical_offset = start_id.0.saturating_sub(first_id);
-
-        if start_logical_offset >= len {
-            // The requested start_id is past the end of our buffer.
-            // The next valid ID to request is the one after our last line.
-            return (&[], &[], LogId(end_line_id));
-        }
-
-        let physical_start_index = (first_id + start_logical_offset) & (MAX_LINES - 1);
-        let num_lines_to_iterate = len - start_logical_offset;
-
-        let (a, b) = if physical_start_index + num_lines_to_iterate <= MAX_LINES {
-            unsafe {
-                (
-                    std::slice::from_raw_parts(
-                        self.line_entries.as_ptr().add(physical_start_index),
-                        num_lines_to_iterate,
-                    ),
-                    &[][..],
-                )
-            }
-        } else {
-            let first_slice_len = MAX_LINES - physical_start_index;
-            unsafe {
-                (
-                    std::slice::from_raw_parts(
-                        self.line_entries.as_ptr().add(physical_start_index),
-                        first_slice_len,
-                    ),
-                    std::slice::from_raw_parts(
-                        self.line_entries.as_ptr(),
-                        num_lines_to_iterate - first_slice_len,
-                    ),
-                )
-            }
-        };
-        (a, b, LogId(end_line_id))
-    }
-
-    pub fn for_each(&self, mut func: impl FnMut(LogId, JobId, &str, u32) -> ControlFlow<(), ()>) {
+    #[cfg(test)]
+    pub fn for_each(&self, mut func: impl FnMut(LogId, JobLogCorrelation, &str, u32) -> std::ops::ControlFlow<(), ()>) {
         let (a, b) = self.slices();
         let first_id = self.start_line_id;
         let mut logical_index = 0;
@@ -276,24 +228,20 @@ impl Logs {
                         entry.len as usize,
                     ))
                 };
-                match func(
-                    LogId(first_id + logical_index),
-                    entry.job_id,
-                    data,
-                    entry.width,
-                ) {
-                    ControlFlow::Continue(_) => (),
-                    ControlFlow::Break(_) => return,
+                match func(LogId(first_id + logical_index), entry.job_id, data, entry.width) {
+                    std::ops::ControlFlow::Continue(_) => (),
+                    std::ops::ControlFlow::Break(_) => return,
                 }
                 logical_index += 1;
             }
         }
     }
 
+    #[cfg(test)]
     pub fn for_each_from(
         &self,
         start_id: LogId,
-        mut func: impl FnMut(LogId, JobId, &str, u32) -> ControlFlow<(), ()>,
+        mut func: impl FnMut(LogId, JobLogCorrelation, &str, u32) -> std::ops::ControlFlow<(), ()>,
     ) -> LogId {
         let first_id = self.start_line_id;
         let len = self.line_count.load(Ordering::Acquire);
@@ -328,14 +276,8 @@ impl Logs {
             let first_slice_len = MAX_LINES - physical_start_index;
             unsafe {
                 (
-                    std::slice::from_raw_parts(
-                        self.line_entries.as_ptr().add(physical_start_index),
-                        first_slice_len,
-                    ),
-                    std::slice::from_raw_parts(
-                        self.line_entries.as_ptr(),
-                        num_lines_to_iterate - first_slice_len,
-                    ),
+                    std::slice::from_raw_parts(self.line_entries.as_ptr().add(physical_start_index), first_slice_len),
+                    std::slice::from_raw_parts(self.line_entries.as_ptr(), num_lines_to_iterate - first_slice_len),
                 )
             }
         };
@@ -351,8 +293,8 @@ impl Logs {
                 };
                 let current_line_id = LogId(first_id + current_logical_offset);
                 match func(current_line_id, entry.job_id, data, entry.width) {
-                    ControlFlow::Continue(_) => (),
-                    ControlFlow::Break(_) => {
+                    std::ops::ControlFlow::Continue(_) => (),
+                    std::ops::ControlFlow::Break(_) => {
                         // Iteration was stopped early. The next ID to start from
                         // is the one after the line we just processed.
                         return LogId(current_line_id.0 + 1);
@@ -374,10 +316,7 @@ impl Logs {
 
         if amount == 0 {
             if curr == 0 {
-                return WrappingBufferRange {
-                    start: 0,
-                    len: MAX_CAPACITY as u32,
-                };
+                return WrappingBufferRange { start: 0, len: MAX_CAPACITY as u32 };
             }
             let last_line_idx = (index_start + curr - 1) & (MAX_LINES - 1);
             let end_of_used_buffer = unsafe {
@@ -385,10 +324,7 @@ impl Logs {
                 value.start + value.len
             };
             if curr == MAX_LINES {
-                return WrappingBufferRange {
-                    start: end_of_used_buffer,
-                    len: 0,
-                };
+                return WrappingBufferRange { start: end_of_used_buffer, len: 0 };
             }
             let start_of_used_buffer = unsafe {
                 let value = self.line_entries.add(index_start).read();
@@ -396,8 +332,7 @@ impl Logs {
             };
             return WrappingBufferRange {
                 start: end_of_used_buffer,
-                len: (start_of_used_buffer + MAX_CAPACITY as u32 - end_of_used_buffer)
-                    % MAX_CAPACITY as u32,
+                len: (start_of_used_buffer + MAX_CAPACITY as u32 - end_of_used_buffer) % MAX_CAPACITY as u32,
             };
         }
 
@@ -413,18 +348,13 @@ impl Logs {
         let new_line_count = curr - amount;
         if new_line_count > 0 {
             let new_index_start = self.index_start();
-            let start_of_used_buffer =
-                unsafe { self.line_entries.add(new_index_start).read().start };
+            let start_of_used_buffer = unsafe { self.line_entries.add(new_index_start).read().start };
             WrappingBufferRange {
                 start: end_of_used_buffer,
-                len: (start_of_used_buffer + MAX_CAPACITY as u32 - end_of_used_buffer)
-                    % MAX_CAPACITY as u32,
+                len: (start_of_used_buffer + MAX_CAPACITY as u32 - end_of_used_buffer) % MAX_CAPACITY as u32,
             }
         } else {
-            WrappingBufferRange {
-                start: 0,
-                len: MAX_CAPACITY as u32,
-            }
+            WrappingBufferRange { start: 0, len: MAX_CAPACITY as u32 }
         }
     }
 }
@@ -461,35 +391,23 @@ pub struct LogWriter {
     remaining: usize,
 }
 
-fn write_line_unchecked(
-    buf: &Logs,
-    start: u32,
-    line: &str,
-    width: u32,
-    job_id: JobId,
-    style: Style,
-) {
+fn write_line_unchecked(buf: &Logs, start: u32, line: &str, width: u32, job_id: JobLogCorrelation, style: Style) {
     let index_start = buf.index_start();
     let line_count = buf.line_count.load(Ordering::Acquire);
     let next = (line_count + index_start) & (MAX_LINES - 1);
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            line.as_ptr(),
-            buf.buffer.add(start as usize).as_ptr(),
-            line.len(),
-        );
-        buf.line_entries.add(next).write(LogEntry {
-            job_id,
-            start,
-            len: line.len() as u32,
-            width,
-            style,
-        });
+        std::ptr::copy_nonoverlapping(line.as_ptr(), buf.buffer.add(start as usize).as_ptr(), line.len());
+        buf.line_entries.add(next).write(LogEntry { job_id, start, len: line.len() as u32, width, style });
         buf.line_count.fetch_add(1, Ordering::Release);
     }
 }
 
 impl LogWriter {
+    pub fn tail(&self) -> LogId {
+        let buf = self.buffer.read().unwrap();
+        let len = buf.line_count.load(Ordering::Acquire);
+        LogId(buf.start_line_id + len)
+    }
     pub fn new() -> LogWriter {
         let buffer = {
             let layout = std::alloc::Layout::from_size_align(MAX_CAPACITY, 1).unwrap();
@@ -507,19 +425,12 @@ impl LogWriter {
             }
             NonNull::new(ptr as *mut LogEntry).unwrap()
         };
-        let line_buffer = Logs {
-            buffer,
-            line_entries: line_entries,
-            line_count: AtomicUsize::new(0),
-            start_line_id: 0,
-        };
+        let line_buffer =
+            Logs { buffer, line_entries: line_entries, line_count: AtomicUsize::new(0), start_line_id: 0 };
         LogWriter {
             buffer: Arc::new(RwLock::new(line_buffer)),
             remaining: MAX_LINES,
-            range: WrappingBufferRange {
-                start: 0,
-                len: MAX_CAPACITY as u32,
-            },
+            range: WrappingBufferRange { start: 0, len: MAX_CAPACITY as u32 },
         }
     }
 
@@ -527,10 +438,13 @@ impl LogWriter {
         self.buffer.clone()
     }
 
+    #[cfg(test)]
     pub fn push(&mut self, line: &str) {
-        self.push_line(line, line.width() as u32, JobId(1), Style::DEFAULT);
+        use unicode_width::UnicodeWidthStr;
+        self.push_line(line, line.width() as u32, JobLogCorrelation(1), Style::DEFAULT);
     }
-    pub fn push_line(&mut self, line: &str, width: u32, job_id: JobId, style: Style) {
+
+    pub fn push_line(&mut self, line: &str, width: u32, job_id: JobLogCorrelation, style: Style) {
         let offset = if let Some(offset) = self.range.munch(line.len())
             && self.remaining > 0
         {
@@ -562,7 +476,7 @@ mod tests {
     use std::ops::ControlFlow;
 
     // Helper to collect all lines from the buffer for easy assertion.
-    fn collect_lines(reader: &Arc<RwLock<Logs>>) -> Vec<(LogId, JobId, String, u32)> {
+    fn collect_lines(reader: &Arc<RwLock<Logs>>) -> Vec<(LogId, JobLogCorrelation, String, u32)> {
         let mut lines = Vec::new();
         let buffer = reader.read().unwrap();
         buffer.for_each(|id, job, data, width| {
@@ -573,10 +487,7 @@ mod tests {
     }
 
     // Helper to collect lines from a specific starting ID.
-    fn collect_lines_from(
-        reader: &Arc<RwLock<Logs>>,
-        start_id: LogId,
-    ) -> Vec<(LogId, JobId, String, u32)> {
+    fn collect_lines_from(reader: &Arc<RwLock<Logs>>, start_id: LogId) -> Vec<(LogId, JobLogCorrelation, String, u32)> {
         let mut lines = Vec::new();
         let buffer = reader.read().unwrap();
         buffer.for_each_from(start_id, |id, job, data, width| {
@@ -592,14 +503,14 @@ mod tests {
         let reader = writer.reader();
 
         for i in 0..5 {
-            writer.push_line(&format!("Line {}", i), 10, JobId(1), Style::DEFAULT);
+            writer.push_line(&format!("Line {}", i), 10, JobLogCorrelation(1), Style::DEFAULT);
         }
 
         let lines = collect_lines(&reader);
         assert_eq!(lines.len(), 5);
         for i in 0..5 {
             assert_eq!(lines[i].0, LogId(i));
-            assert_eq!(lines[i].1, JobId(1));
+            assert_eq!(lines[i].1, JobLogCorrelation(1));
             assert_eq!(lines[i].2, format!("Line {}", i));
             assert_eq!(lines[i].3, 10);
         }
@@ -609,15 +520,9 @@ mod tests {
     fn test_rotation_on_max_lines() {
         let mut writer = LogWriter::new();
         let reader = writer.reader();
-
         // Push MAX_LINES + 1 lines to trigger a rotation.
         for i in 0..=MAX_LINES {
-            writer.push_line(
-                &format!("line_{}", i),
-                i as u32,
-                JobId(i as u32),
-                Style::DEFAULT,
-            );
+            writer.push_line(&format!("line_{}", i), i as u32, JobLogCorrelation(i as u32), Style::DEFAULT);
         }
 
         // On the (MAX_LINES+1)th push, a rotation is triggered.
@@ -647,13 +552,13 @@ mod tests {
         // MAX_CAPACITY is 256. Push 5 lines of 60 bytes each. 4 will fit, 5th triggers rotation.
         let line_data = "A".repeat(60);
         for i in 0..4 {
-            writer.push_line(&line_data, 60, JobId(i), Style::DEFAULT);
+            writer.push_line(&line_data, 60, JobLogCorrelation(i), Style::DEFAULT);
         }
         // Buffer used: 4 * 60 = 240 bytes. Remaining capacity: 16 bytes.
         assert_eq!(collect_lines(&reader).len(), 4);
 
         // This push will fail to find space and trigger a rotation.
-        writer.push_line(&line_data, 60, JobId(4), Style::DEFAULT);
+        writer.push_line(&line_data, 60, JobLogCorrelation(4), Style::DEFAULT);
 
         // Rotation frees (4+1)/2 = 2 lines. 2 * 60 = 120 bytes of space freed.
         // The buffer should now contain original lines 2, 3 and the new line 4.
@@ -679,15 +584,15 @@ mod tests {
 
         // 1. Push a line that fills most of the buffer. Capacity is 256.
         let line_a = "A".repeat(200);
-        writer.push_line(&line_a, 200, JobId(0), Style::DEFAULT); // Uses [0..200)
+        writer.push_line(&line_a, 200, JobLogCorrelation(0), Style::DEFAULT); // Uses [0..200)
 
         // 2. Push a second line that fits in the remaining space.
         let line_b = "B".repeat(50);
-        writer.push_line(&line_b, 50, JobId(1), Style::DEFAULT); // Uses [200..250)
+        writer.push_line(&line_b, 50, JobLogCorrelation(1), Style::DEFAULT); // Uses [200..250)
 
         // 3. Push a third line that is too big, triggering rotation.
         let line_c = "C".repeat(100);
-        writer.push_line(&line_c, 100, JobId(2), Style::DEFAULT);
+        writer.push_line(&line_c, 100, JobLogCorrelation(2), Style::DEFAULT);
 
         // Rotation frees (2+1)/2 = 1 line (line_a).
         // Line_b at [200..250) remains. start_line_id becomes 1.
@@ -699,11 +604,11 @@ mod tests {
         // Check that the remaining line (line_b) and the new line (line_c) are correct.
         assert_eq!(lines[0].0, LogId(1));
         assert_eq!(lines[0].2, line_b);
-        assert_eq!(lines[0].1, JobId(1));
+        assert_eq!(lines[0].1, JobLogCorrelation(1));
 
         assert_eq!(lines[1].0, LogId(2));
         assert_eq!(lines[1].2, line_c);
-        assert_eq!(lines[1].1, JobId(2));
+        assert_eq!(lines[1].1, JobLogCorrelation(2));
     }
 
     #[test]
@@ -713,7 +618,7 @@ mod tests {
 
         // Push 20 lines to trigger one rotation and populate the buffer.
         for i in 0..20 {
-            writer.push_line(&format!("line_{}", i), 10, JobId(i as u32), Style::DEFAULT);
+            writer.push_line(&format!("line_{}", i), 10, JobLogCorrelation(i as u32), Style::DEFAULT);
         }
 
         // After 16 lines, a rotation happens on the 17th. 8 lines are freed.
@@ -753,12 +658,12 @@ mod tests {
         // Fill both MAX_LINES and MAX_CAPACITY.
         // 16 lines * 16 bytes/line = 256 bytes.
         for i in 0..MAX_LINES {
-            writer.push_line(&"A".repeat(16), 16, JobId(i as u32), Style::DEFAULT);
+            writer.push_line(&"A".repeat(16), 16, JobLogCorrelation(i as u32), Style::DEFAULT);
         }
 
         // Now, try to push a line that is too large to fit even after rotation.
         // Rotation will free (16+1)/2 = 8 lines, freeing 8 * 16 = 128 bytes.
         // A 150-byte line will not fit in the 128 bytes of freed space.
-        writer.push_line(&"B".repeat(150), 150, JobId(99), Style::DEFAULT);
+        writer.push_line(&"B".repeat(150), 150, JobLogCorrelation(99), Style::DEFAULT);
     }
 }

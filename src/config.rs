@@ -1,13 +1,14 @@
 use std::{
-    collections::HashMap,
-    marker::PhantomData,
     path::{Path, PathBuf},
-    ptr::NonNull,
     sync::Arc,
 };
 
 use bumpalo::Bump;
-use jsony::json::{DecodeError, Parser, Peek};
+use jsony::{
+    FromJson, Jsony,
+    json::{DecodeError, Parser, Peek},
+};
+use jsony_value::{Value, ValueMap, ValueRef};
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct Alias<'a>(&'a str);
@@ -18,6 +19,69 @@ impl<'a> std::ops::Deref for Alias<'a> {
     }
 }
 
+#[derive(Debug)]
+pub struct TaskCall<'a> {
+    pub name: Alias<'a>,
+    pub profile: Option<&'a str>,
+    /// todo this leaks when bump allows because ValueMap allocates globally
+    pub vars: ValueMap<'a>,
+}
+
+impl<'a> BumpJsonDecode<'a> for TaskCall<'a> {
+    fn decode(parser: &mut Parser<'static>, bump: &'a Bump) -> Result<Self, &'static jsony::json::DecodeError> {
+        match parser.peek()? {
+            Peek::Array => {
+                let start = parser.at.enter_array()?;
+                let Some(first) = start else {
+                    return Err(&DecodeError { message: "Expected atleast the name" });
+                };
+                let name;
+                let mut profile = None::<&str>;
+                match first {
+                    Peek::String => {
+                        let sname = <&str>::decode(parser, bump)?;
+                        if let Some((sname, sprofile)) = sname.rsplit_once(':') {
+                            name = Alias(sname);
+                            profile = Some(sprofile);
+                        } else {
+                            name = Alias(sname);
+                        }
+                    }
+                    _ => name = Alias::decode(parser, bump)?,
+                }
+                let vars = if let Some(_) = parser.at.array_step()? {
+                    ValueMap::decode_json(parser)?
+                } else {
+                    ValueMap::new()
+                };
+                if parser.at.array_step()?.is_some() {
+                    return Err(&DecodeError { message: "Extra item found in task innovcation list" });
+                }
+                Ok(TaskCall { name, profile, vars })
+            }
+            Peek::String => {
+                let name = <&str>::decode(parser, bump)?;
+                if let Some((name, profile)) = name.rsplit_once(':') {
+                    Ok(TaskCall { name: Alias(name), profile: Some(profile), vars: ValueMap::new() })
+                } else {
+                    Ok(TaskCall { name: Alias(name), profile: None, vars: ValueMap::new() })
+                }
+            }
+            _ => {
+                let name = Alias::decode(parser, bump)?;
+                Ok(TaskCall { name, profile: None, vars: ValueMap::new() })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Jsony)]
+#[jsony(rename_all = "snake_case")]
+pub enum TaskKind {
+    Service,
+    Action,
+}
+#[derive(Clone)]
 pub struct TaskConfigRc(Arc<(TaskConfig<'static>, Bump)>);
 unsafe impl Send for TaskConfigRc {}
 unsafe impl Sync for TaskConfigRc {}
@@ -30,6 +94,7 @@ impl TaskConfigRc {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TaskConfig<'a> {
+    pub kind: TaskKind,
     pub pwd: &'a str,
     pub cmd: &'a [&'a str],
     pub profiles: &'a [&'a str],
@@ -63,7 +128,7 @@ fn next_const(parser: &mut Parser<'static>) -> Option<&'static str> {
 pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
     let mut pwd = path.to_path_buf();
     loop {
-        pwd.push("dfj.js");
+        pwd.push("devsm.js");
         if pwd.exists() {
             return Some(pwd);
         }
@@ -80,7 +145,7 @@ pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
 pub fn load_from_env() -> anyhow::Result<WorkspaceConfig<'static>> {
     let mut pwd = std::env::current_dir()?;
     loop {
-        pwd.push("dfj.js");
+        pwd.push("devsm.js");
         if pwd.exists() {
             let content = std::fs::read_to_string(&pwd)?.leak();
             pwd.pop();
@@ -93,9 +158,7 @@ pub fn load_from_env() -> anyhow::Result<WorkspaceConfig<'static>> {
             break;
         }
     }
-    Err(anyhow::anyhow!(
-        "Cannot find dfj.js in current or parent directories"
-    ))
+    Err(anyhow::anyhow!("Cannot find devsm.js in current or parent directories"))
 }
 
 pub fn load_workspace_config_leaking(
@@ -116,62 +179,62 @@ pub fn load_workspace_config_leaking(
         },
     );
     let mut tasks = bumpalo::collections::Vec::new_in(bump);
-    let mut map: HashMap<&'static str, usize> = HashMap::new();
+    let mut groups = bumpalo::collections::Vec::new_in(bump);
     while let Some(key) = next_const(parser) {
-        match TaskConfigExpr::decode(parser, bump) {
-            Ok(task) => {
-                map.insert(key, tasks.len());
-                tasks.push(task)
+        if parser.peek().ok() == Some(Peek::Array) {
+            match <&[TaskCall]>::decode(parser, bump) {
+                Ok(task) => groups.push((key, task)),
+                Err(err) => {
+                    println!("{} while parsing: const {}", jsony::JsonError::extract(err, parser), key);
+                }
             }
-            Err(err) => {
-                println!(
-                    "{} while parsing: const {}",
-                    jsony::JsonError::extract(err, parser),
-                    key
-                );
+        } else {
+            match TaskConfigExpr::decode(parser, bump) {
+                Ok(task) => tasks.push((key, task)),
+                Err(err) => {
+                    println!("{} while parsing: const {}", jsony::JsonError::extract(err, parser), key);
+                }
             }
         }
     }
-    Ok(WorkspaceConfig {
-        base_path,
-        map,
-        tasks: tasks.into_bump_slice(),
-    })
+    Ok(WorkspaceConfig { base_path, tasks: tasks.into_bump_slice(), groups: groups.into_bump_slice() })
 }
 
 #[derive(Debug)]
 pub struct WorkspaceConfig<'a> {
     pub base_path: &'a Path,
-    pub map: HashMap<&'a str, usize>,
-    pub tasks: &'a [TaskConfigExpr<'a>],
-}
-impl<'a> WorkspaceConfig<'a> {
-    pub fn task_by_name(&self, name: &str) -> Option<&'a TaskConfigExpr<'a>> {
-        let index = self.map.get(name)?;
-        Some(&self.tasks[*index])
-    }
-}
-
-enum Value<'a> {
-    Int(i64),
-    Float(f64),
-    Str(&'a str),
-    Bool(bool),
+    pub tasks: &'a [(&'a str, TaskConfigExpr<'a>)],
+    pub groups: &'a [(&'a str, &'a [TaskCall<'a>])],
 }
 
 #[derive(Debug)]
 pub struct TaskConfigExpr<'a> {
+    pub kind: TaskKind,
     info: &'a str,
     pwd: StringExpr<'a>,
     cmd: StringListExpr<'a>,
-    profiles: &'a [&'a str],
+    pub profiles: &'a [&'a str],
     envvar: &'a [(&'a str, StringExpr<'a>)],
     before: AliasListExpr<'a>,
     before_once: AliasListExpr<'a>,
 }
 
+pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
+    TaskConfigExpr {
+        kind: TaskKind::Action,
+        info: "Default Expression for Cargo Innvocations",
+        pwd: StringExpr::Var("pwd"),
+        cmd: StringListExpr::List(&[StringListExpr::Literal("cargo"), StringListExpr::Var("args")]),
+        profiles: &["default"],
+        envvar: &[],
+        before: AliasListExpr::List(&[]),
+        before_once: AliasListExpr::List(&[]),
+    }
+};
+
 pub struct Enviroment<'a> {
     pub profile: &'a str,
+    pub param: jsony_value::ValueMap<'a>,
 }
 
 #[derive(Debug)]
@@ -184,6 +247,7 @@ impl TaskConfigExpr<'static> {
     pub fn eval(&self, env: &Enviroment) -> Result<TaskConfigRc, EvalError> {
         let mut new = Arc::new((
             TaskConfig {
+                kind: TaskKind::Action,
                 pwd: "",
                 cmd: &[],
                 before: &[],
@@ -209,6 +273,7 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
     type Object = TaskConfig<'a>;
     fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<TaskConfig<'a>, EvalError> {
         Ok(TaskConfig {
+            kind: self.kind,
             pwd: self.pwd.bump_eval(env, bump)?,
             cmd: self.cmd.bump_eval(env, bump)?,
             before: self.before.bump_eval(env, bump)?,
@@ -233,6 +298,10 @@ impl<'a> BumpEval<'a> for StringExpr<'static> {
     fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a str, EvalError> {
         match self {
             StringExpr::Literal(s) => Ok(*s),
+            StringExpr::Var(var_name) => match env.param[*var_name].as_ref() {
+                ValueRef::String(value_string) | ValueRef::Other(value_string) => Ok(bump.alloc_str(&value_string)),
+                _ => Err(EvalError::Todo),
+            },
             StringExpr::If(if_expr) => Ok(if_expr.bump_eval(env, bump)?),
         }
     }
@@ -288,6 +357,37 @@ fn eval_append_alias<'a>(
         }
     }
 }
+
+fn append_value<'a>(
+    value: &Value<'_>,
+    bump: &'a Bump,
+    target: &mut bumpalo::collections::Vec<&'a str>,
+) -> Result<(), EvalError> {
+    match value.as_ref() {
+        ValueRef::Null(_) => (),
+        ValueRef::Number(value_number) => {
+            target.push(bump.alloc_str(&value_number.to_string()));
+        }
+        ValueRef::String(value_string) | ValueRef::Other(value_string) => {
+            target.push(bump.alloc_str(&value_string));
+        }
+        ValueRef::Map(_) => return Err(EvalError::Todo),
+        ValueRef::List(list) => {
+            for item in list {
+                append_value(item, bump, target)?;
+            }
+        }
+        ValueRef::Boolean(value_boolean) => {
+            if *value_boolean == true {
+                target.push("true");
+            } else {
+                target.push("false");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn eval_append_str<'a>(
     expr: &StringListExpr<'static>,
     env: &Enviroment,
@@ -302,6 +402,7 @@ fn eval_append_str<'a>(
                 eval_append_str(item, env, bump, target);
             }
         }
+        Expr::Var(key) => append_value(&env.param[key], bump, target).unwrap(),
         Expr::If(branch) => {
             if branch.cond.eval(env) {
                 eval_append_str(&branch.then, env, bump, target);
@@ -324,11 +425,13 @@ impl<'a> BumpJsonDecode<'a> for TaskConfigExpr<'a> {
         let mut before = AliasListExpr::List(&[]);
         let mut before_once = AliasListExpr::List(&[]);
         let mut next_key = parser.enter_object()?;
+        let mut kind = TaskKind::Action;
         let mut info = "";
         while let Some(key) = next_key {
             match key {
                 "pwd" => pwd = StringExpr::decode(parser, bump)?,
                 "info" => info = take_string(parser, bump)?,
+                "kind" | "type" => kind = TaskKind::decode_json(parser)?,
                 "cmd" => cmd = Some(StringListExpr::decode(parser, bump)?),
                 "profiles" => profiles = <&[&str]>::decode(parser, bump)?,
                 "before" => before = AliasListExpr::decode(parser, bump)?,
@@ -337,11 +440,8 @@ impl<'a> BumpJsonDecode<'a> for TaskConfigExpr<'a> {
                     let mut vars = bumpalo::collections::Vec::new_in(bump);
                     let mut next_env_key = parser.at.enter_object(&mut parser.scratch)?;
                     while let Some(env_key) = next_env_key {
-                        let env_key = if let Some(key) = parser.at.try_zerocopy(env_key) {
-                            key
-                        } else {
-                            bump.alloc_str(env_key)
-                        };
+                        let env_key =
+                            if let Some(key) = parser.at.try_zerocopy(env_key) { key } else { bump.alloc_str(env_key) };
                         let value_expr = StringExpr::decode(parser, bump)?;
                         vars.push((env_key, value_expr));
                         next_env_key = parser.at.object_step(&mut parser.scratch)?;
@@ -351,9 +451,7 @@ impl<'a> BumpJsonDecode<'a> for TaskConfigExpr<'a> {
                 _ => {
                     let error = format!("Unexpected key `{}` in TaskConfig", key);
                     parser.report_error(error);
-                    return Err(&DecodeError {
-                        message: "Unexpected key in TaskConfig",
-                    });
+                    return Err(&DecodeError { message: "Unexpected key in TaskConfig" });
                 }
             }
             next_key = parser.object_step()?;
@@ -361,6 +459,7 @@ impl<'a> BumpJsonDecode<'a> for TaskConfigExpr<'a> {
 
         Ok(TaskConfigExpr {
             info,
+            kind,
             pwd,
             envvar,
             before,
@@ -368,9 +467,7 @@ impl<'a> BumpJsonDecode<'a> for TaskConfigExpr<'a> {
             cmd: if let Some(cmd) = cmd {
                 cmd
             } else {
-                return Err(&DecodeError {
-                    message: "`cmd` field is required in TaskConfig",
-                });
+                return Err(&DecodeError { message: "`cmd` field is required in TaskConfig" });
             },
             profiles,
         })
@@ -386,17 +483,11 @@ impl<'a> BumpJsonDecode<'a> for Alias<'a> {
         let _ = parser.peek()?;
         let bytes = parser.at.ctx.as_bytes();
         let index = parser.at.index;
-        let prefix = bytes.get(index..).ok_or(&DecodeError {
-            message: "Unexpected EOF",
-        })?;
-        let start = prefix.first().ok_or(&DecodeError {
-            message: "Unexpected EOF",
-        })?;
+        let prefix = bytes.get(index..).ok_or(&DecodeError { message: "Unexpected EOF" })?;
+        let start = prefix.first().ok_or(&DecodeError { message: "Unexpected EOF" })?;
         if !start.is_ascii_alphabetic() {
             parser.report_error(format!("Found `{}`", *start as char));
-            return Err(&DecodeError {
-                message: "Identifier must start with an letter.",
-            });
+            return Err(&DecodeError { message: "Identifier must start with an letter." });
         }
         let len = 'len: {
             for ch in prefix[1..].iter().enumerate() {
@@ -433,6 +524,7 @@ struct If<'a, T> {
 #[derive(PartialEq, Eq, Debug)]
 enum StringExpr<'a> {
     Literal(&'a str),
+    Var(&'a str),
     If(&'a If<'a, StringExpr<'a>>),
 }
 impl<'a, T: BumpEval<'a>> BumpEval<'a> for If<'a, T> {
@@ -467,15 +559,9 @@ impl<'a, T: BumpJsonDecode<'a>> If<'a, T> {
             }
         }
         if let Some(then) = then {
-            return Ok(If {
-                cond,
-                then,
-                or_else,
-            });
+            return Ok(If { cond, then, or_else });
         } else {
-            return Err(&DecodeError {
-                message: "`then` branch is required in if expression",
-            });
+            return Err(&DecodeError { message: "`then` branch is required in if expression" });
         }
     }
 }
@@ -484,6 +570,7 @@ impl<'a, T: BumpJsonDecode<'a>> If<'a, T> {
 enum StringListExpr<'a> {
     Literal(&'a str),
     List(&'a [StringListExpr<'a>]),
+    Var(&'a str),
     If(&'a If<'a, StringListExpr<'a>>),
 }
 
@@ -495,19 +582,13 @@ enum AliasListExpr<'a> {
 }
 
 impl<'a> BumpJsonDecode<'a> for &'a str {
-    fn decode(
-        parser: &mut Parser<'static>,
-        bump: &'a Bump,
-    ) -> Result<Self, &'static jsony::json::DecodeError> {
+    fn decode(parser: &mut Parser<'static>, bump: &'a Bump) -> Result<Self, &'static jsony::json::DecodeError> {
         take_string(parser, bump)
     }
 }
 
 impl<'a, T: BumpJsonDecode<'a>> BumpJsonDecode<'a> for &'a [T] {
-    fn decode(
-        parser: &mut Parser<'static>,
-        bump: &'a Bump,
-    ) -> Result<Self, &'static jsony::json::DecodeError> {
+    fn decode(parser: &mut Parser<'static>, bump: &'a Bump) -> Result<Self, &'static jsony::json::DecodeError> {
         if parser.at.enter_array()?.is_none() {
             return Ok(&[]);
         }
@@ -527,11 +608,7 @@ fn take_string<'a>(
     alloc: &'a Bump,
 ) -> Result<&'a str, &'static jsony::json::DecodeError> {
     let text = parser.at.take_string(&mut parser.scratch)?;
-    if let Some(text) = parser.at.try_zerocopy(text) {
-        Ok(text)
-    } else {
-        Ok(alloc.alloc_str(text))
-    }
+    if let Some(text) = parser.at.try_zerocopy(text) { Ok(text) } else { Ok(alloc.alloc_str(text)) }
 }
 
 pub trait BumpEval<'a> {
@@ -540,114 +617,83 @@ pub trait BumpEval<'a> {
 }
 
 trait BumpJsonDecode<'a>: Sized {
-    fn decode(
-        parser: &mut Parser<'static>,
-        bump: &'a Bump,
-    ) -> Result<Self, &'static jsony::json::DecodeError>;
+    fn decode(parser: &mut Parser<'static>, bump: &'a Bump) -> Result<Self, &'static jsony::json::DecodeError>;
 }
 
 impl<'a> BumpJsonDecode<'a> for Predicate<'a> {
-    fn decode(
-        parser: &mut Parser<'static>,
-        bump: &'a Bump,
-    ) -> Result<Self, &'static jsony::json::DecodeError> {
+    fn decode(parser: &mut Parser<'static>, bump: &'a Bump) -> Result<Self, &'static jsony::json::DecodeError> {
         let Some(key) = parser.enter_object()? else {
-            return Err(&DecodeError {
-                message: "Expected object for Predicate",
-            });
+            return Err(&DecodeError { message: "Expected object for Predicate" });
         };
         match key {
             "profile_is" => {
                 let value = take_string(parser, bump)?;
-                if let Some(key) = parser.object_step()? {
-                    return Err(&DecodeError {
-                        message: "Unexpected extra key in profile_is predicate",
-                    });
+                if let Some(_key) = parser.object_step()? {
+                    return Err(&DecodeError { message: "Unexpected extra key in profile_is predicate" });
                 }
                 Ok(Predicate::ProfileIs(value))
             }
-            _ => Err(&DecodeError {
-                message: "Unknown predicate key",
-            }),
+            _ => Err(&DecodeError { message: "Unknown predicate key" }),
         }
     }
 }
 impl<'a> BumpJsonDecode<'a> for StringExpr<'a> {
-    fn decode(
-        parser: &mut Parser<'static>,
-        bump: &'a Bump,
-    ) -> Result<Self, &'static jsony::json::DecodeError> {
+    fn decode(parser: &mut Parser<'static>, bump: &'a Bump) -> Result<Self, &'static jsony::json::DecodeError> {
+        const DOLLAR: Peek = Peek::new(b'$');
         match parser.peek()? {
             Peek::String => Ok(StringExpr::Literal(take_string(parser, bump)?)),
             Peek::Object => {
-                let Some(key) = parser.enter_seen_object()? else {
-                    panic!()
-                };
+                let Some(key) = parser.enter_seen_object()? else { panic!() };
                 if key == "if" {
-                    return Ok(StringExpr::If(
-                        bump.alloc(If::decode_from_seen_key(parser, bump)?),
-                    ));
+                    return Ok(StringExpr::If(bump.alloc(If::decode_from_seen_key(parser, bump)?)));
                 }
-                Err(&DecodeError {
-                    message: "Unexpected string operator",
-                })
+                Err(&DecodeError { message: "Unexpected string operator" })
             }
-            _ => Err(&DecodeError {
-                message: "Expected String or Object for String Expression",
-            }),
+            DOLLAR => {
+                parser.at.index += 1;
+                let alias = Alias::decode(parser, bump)?;
+                Ok(StringExpr::Var(&alias.0))
+            }
+            _ => Err(&DecodeError { message: "Expected String or Object for String Expression" }),
         }
     }
 }
 
 impl<'a> BumpJsonDecode<'a> for StringListExpr<'a> {
-    fn decode(
-        parser: &mut Parser<'static>,
-        bump: &'a Bump,
-    ) -> Result<Self, &'static jsony::json::DecodeError> {
+    fn decode(parser: &mut Parser<'static>, bump: &'a Bump) -> Result<Self, &'static jsony::json::DecodeError> {
         use StringListExpr as Expr;
+        const DOLLAR: Peek = Peek::new(b'$');
         match parser.peek()? {
             Peek::String => Ok(Expr::Literal(BumpJsonDecode::decode(parser, bump)?)),
             Peek::Array => Ok(Expr::List(BumpJsonDecode::decode(parser, bump)?)),
             Peek::Object => {
-                let Some(key) = parser.enter_seen_object()? else {
-                    panic!()
-                };
+                let Some(key) = parser.enter_seen_object()? else { panic!() };
                 if key == "if" {
-                    return Ok(Expr::If(
-                        bump.alloc(If::decode_from_seen_key(parser, bump)?),
-                    ));
+                    return Ok(Expr::If(bump.alloc(If::decode_from_seen_key(parser, bump)?)));
                 }
-                Err(&DecodeError {
-                    message: "Unexpected string operator",
-                })
+                Err(&DecodeError { message: "Unexpected string operator" })
             }
-            _ => Err(&DecodeError {
-                message: "Expected String or Object for String Expression",
-            }),
+            DOLLAR => {
+                parser.at.index += 1;
+                let alias = Alias::decode(parser, bump)?;
+                Ok(StringListExpr::Var(&alias.0))
+            }
+            _ => Err(&DecodeError { message: "Expected String or Object for String Expression" }),
         }
     }
 }
 impl<'a> BumpJsonDecode<'a> for AliasListExpr<'a> {
-    fn decode(
-        parser: &mut Parser<'static>,
-        bump: &'a Bump,
-    ) -> Result<Self, &'static jsony::json::DecodeError> {
+    fn decode(parser: &mut Parser<'static>, bump: &'a Bump) -> Result<Self, &'static jsony::json::DecodeError> {
         use AliasListExpr as Expr;
         match parser.peek()? {
             Peek::String => Ok(Expr::Literal(BumpJsonDecode::decode(parser, bump)?)),
             Peek::Array => Ok(Expr::List(BumpJsonDecode::decode(parser, bump)?)),
             Peek::Object => {
-                let Some(key) = parser.enter_seen_object()? else {
-                    panic!()
-                };
+                let Some(key) = parser.enter_seen_object()? else { panic!() };
                 if key == "if" {
-                    return Ok(Expr::If(
-                        bump.alloc(If::decode_from_seen_key(parser, bump)?),
-                    ));
+                    return Ok(Expr::If(bump.alloc(If::decode_from_seen_key(parser, bump)?)));
                 }
-                Err(&DecodeError {
-                    message: "Unexpected string operator",
-                })
+                Err(&DecodeError { message: "Unexpected string operator" })
             }
             _ => Ok(Expr::Literal(BumpJsonDecode::decode(parser, bump)?)),
         }
@@ -678,6 +724,7 @@ impl<'a> BumpJsonDecode<'a> for AliasListExpr<'a> {
 mod test {
 
     use jsony::JsonError;
+    use jsony_value::ValueMap;
 
     use super::*;
     #[test]
@@ -704,26 +751,22 @@ mod test {
             allow_trailing_data: true,
         };
         let mut parser = jsony::json::Parser::new(complex, config);
-        let mut bump = Bump::new();
+        let bump = Bump::new();
         let config_expr = match TaskConfigExpr::decode(&mut parser, &bump) {
             Ok(config) => config,
             Err(err) => {
                 panic!("{}", JsonError::extract(err, &mut parser));
             }
         };
-        let asdf = unsafe {
-            std::mem::transmute::<TaskConfigExpr<'_>, TaskConfigExpr<'static>>(config_expr)
-        };
-        let mut bump2 = Bump::new();
-        let res = asdf
-            .bump_eval(&Enviroment { profile: "default" }, &bump2)
-            .unwrap();
+        let asdf = unsafe { std::mem::transmute::<TaskConfigExpr<'_>, TaskConfigExpr<'static>>(config_expr) };
+        let bump2 = Bump::new();
+        let res = asdf.bump_eval(&Enviroment { profile: "default", param: ValueMap::new() }, &bump2).unwrap();
         println!("{:#?}", res);
     }
 
     // #[test]
     // fn parseit() {
-    //     let path = "/home/user/am/libra/dfj.js";
+    //     let path = "/home/user/am/libra/devsm.js";
     //     let input = stringify!({
     //         hello: what
     //     });
