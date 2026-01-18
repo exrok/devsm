@@ -458,7 +458,7 @@ fn test_require_waits_for_success() {
     harness.write_config(&format!(
         r#"
 [action.dep]
-sh = "sleep 0.1 && echo dep_done > {}"
+sh = "sleep 0.01 && echo dep_done > {}"
 
 [action.main]
 sh = "cat {}"
@@ -720,7 +720,7 @@ require = ["gen"]
     assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "gen should be cached");
 
     // Modify trigger file (sleep to ensure mtime changes)
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(1));
     fs::write(&trigger, "modified").unwrap();
 
     // Third run - cache should be invalidated
@@ -959,4 +959,185 @@ sh = "sleep 0.01 && echo done"
         "Should see Running status, got: {:?}",
         statuses
     );
+}
+
+#[test]
+fn test_require_with_profile() {
+    let mut harness = TestHarness::new("require_profile");
+    let output_file = harness.temp_dir.join("output.txt");
+    harness.write_config(&format!(
+        r#"
+[action.dep]
+sh = '''
+if [ "$PROFILE_VAL" = "release" ]; then
+    echo "dep_release" >> {output}
+else
+    echo "dep_default" >> {output}
+fi
+'''
+profiles = ["default", "release"]
+env.PROFILE_VAL = {{ if.profile = "release", then = "release", or_else = "default" }}
+
+[action.main]
+sh = "echo main >> {output}"
+require = ["dep:release"]
+"#,
+        output = output_file.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "main"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+
+    let content = fs::read_to_string(&output_file).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines, vec!["dep_release", "main"], "dep should run with release profile, got: {:?}", lines);
+}
+
+#[test]
+fn test_require_with_params() {
+    let mut harness = TestHarness::new("require_params");
+    let output_file = harness.temp_dir.join("output.txt");
+    // Use { var = "name" } syntax to reference params in env
+    harness.write_config(&format!(
+        r#"
+[action.dep]
+sh = "echo $MSG >> {output}"
+env.MSG = {{ var = "msg" }}
+
+[action.main]
+sh = "echo main >> {output}"
+require = [["dep", {{ msg = "hello_from_params" }}]]
+"#,
+        output = output_file.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "main"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+
+    let content = fs::read_to_string(&output_file).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines, vec!["hello_from_params", "main"], "dep should receive params, got: {:?}", lines);
+}
+
+#[test]
+fn test_require_cache_per_profile() {
+    let mut harness = TestHarness::new("cache_per_profile");
+    let counter = harness.temp_dir.join("counter.txt");
+    let output = harness.temp_dir.join("output.txt");
+
+    fs::write(&counter, "0").unwrap();
+
+    harness.write_config(&format!(
+        r#"
+[action.dep]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+if [ "$PROFILE_VAL" = "release" ]; then
+    echo "release_$count" >> {output}
+else
+    echo "default_$count" >> {output}
+fi
+'''
+profiles = ["default", "release"]
+env.PROFILE_VAL = {{ if.profile = "release", then = "release", or_else = "default" }}
+cache = {{}}
+
+[action.main_default]
+sh = "echo main_default >> {output}"
+require = ["dep"]
+
+[action.main_release]
+sh = "echo main_release >> {output}"
+require = ["dep:release"]
+"#,
+        counter = counter.display(),
+        output = output.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    // Run with default profile
+    let result = harness.run_client(&["run", "main_default"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "dep should run first time");
+
+    // Run with release profile - should run dep again despite cache
+    let result = harness.run_client(&["run", "main_release"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "dep:release should run (different profile)");
+
+    // Run with default profile again - should be cached
+    let result = harness.run_client(&["run", "main_default"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "dep:default should be cached");
+
+    // Run with release profile again - should be cached
+    let result = harness.run_client(&["run", "main_release"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "dep:release should be cached");
+}
+
+#[test]
+fn test_require_cache_per_params() {
+    let mut harness = TestHarness::new("cache_per_params");
+    let counter = harness.temp_dir.join("counter.txt");
+    let output = harness.temp_dir.join("output.txt");
+
+    fs::write(&counter, "0").unwrap();
+
+    harness.write_config(&format!(
+        r#"
+[action.dep]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+echo "${{VALUE}}_$count" >> {output}
+'''
+cache = {{}}
+env.VALUE = {{ var = "value" }}
+
+[action.main_a]
+sh = "echo main_a >> {output}"
+require = [["dep", {{ value = "aaa" }}]]
+
+[action.main_b]
+sh = "echo main_b >> {output}"
+require = [["dep", {{ value = "bbb" }}]]
+"#,
+        counter = counter.display(),
+        output = output.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    // Run with value=aaa
+    let result = harness.run_client(&["run", "main_a"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "dep should run first time");
+
+    // Run with value=bbb - should run dep again (different params)
+    let result = harness.run_client(&["run", "main_b"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "dep with different params should run");
+
+    // Run with value=aaa again - should be cached
+    let result = harness.run_client(&["run", "main_a"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "dep with aaa should be cached");
+
+    // Run with value=bbb again - should be cached
+    let result = harness.run_client(&["run", "main_b"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "dep with bbb should be cached");
+
+    let content = fs::read_to_string(&output).unwrap_or_default();
+    assert!(content.contains("aaa_"), "should have aaa output: {}", content);
+    assert!(content.contains("bbb_"), "should have bbb output: {}", content);
 }

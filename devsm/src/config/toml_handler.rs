@@ -7,7 +7,7 @@ use toml_span::{
 };
 
 use crate::config::{
-    Alias, AliasListExpr, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, StringExpr, StringListExpr, TaskCall,
+    Alias, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, StringExpr, StringListExpr, TaskCall,
     TaskConfigExpr, TaskKind, TestConfigExpr, WorkspaceConfig,
 };
 
@@ -151,57 +151,6 @@ fn parse_string_list_expr<'a>(
     }
 }
 
-fn parse_alias_list_expr<'a>(
-    alloc: &'a Bump,
-    value: &TomlValue<'a>,
-    re: &mut dyn FnMut(Diagnostic<usize>),
-) -> Result<AliasListExpr<'a>, ()> {
-    match &value.value {
-        ValueInner::String(s) => Ok(AliasListExpr::Literal(Alias(alloc.alloc_str(as_str(s))))),
-        ValueInner::Array(arr) => {
-            // Manually allocate each expression in the array
-            let mut items_vec = bumpalo::collections::Vec::new_in(alloc);
-            for item in arr {
-                items_vec.push(parse_alias_list_expr(alloc, item, re)?);
-            }
-            Ok(AliasListExpr::List(items_vec.into_bump_slice()))
-        }
-        ValueInner::Table(table) => {
-            // Check for { if.profile = "...", then = ..., or_else = ... }
-            if let Some(if_val) = table.get("if") {
-                let if_table = if_val.as_table().ok_or(())?;
-                let profile_val = if_table.get("profile").ok_or(())?;
-                let Some(profile) = profile_val.as_str() else {
-                    mismatched_in_object(re, "string", profile_val, "profile");
-                    return Err(());
-                };
-
-                let then_val = table.get("then").ok_or(())?;
-                let then_expr = parse_alias_list_expr(alloc, then_val, re)?;
-
-                let mut or_else = None;
-                if let Some(else_val) = table.get("or_else") {
-                    or_else = Some(parse_alias_list_expr(alloc, else_val, re)?);
-                }
-
-                return Ok(AliasListExpr::If(alloc.alloc(If {
-                    cond: Predicate::Profile(alloc.alloc_str(profile)),
-                    then: then_expr,
-                    or_else,
-                })));
-            }
-            re(Diagnostic::error()
-                .with_message("invalid alias list expression")
-                .with_label(Label::primary(0, value.span)));
-            Err(())
-        }
-        _ => {
-            mismatched_in_object(re, "string, array, or table", value, "expression");
-            Err(())
-        }
-    }
-}
-
 fn parse_task<'a>(
     alloc: &'a Bump,
     task_table: &Table<'a>,
@@ -212,7 +161,7 @@ fn parse_task<'a>(
     let mut profiles_vec = bumpalo::collections::Vec::new_in(alloc);
     profiles_vec.push("default");
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
-    let mut require = AliasListExpr::List(&[]);
+    let mut require: &[TaskCall<'a>] = &[];
     let mut cache: Option<CacheConfig<'a>> = None;
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
@@ -257,7 +206,15 @@ fn parse_task<'a>(
                 }
             }
             "require" => {
-                require = parse_alias_list_expr(alloc, value, re)?;
+                let Some(arr) = value.as_array() else {
+                    mismatched_in_object(re, "array", value, "require");
+                    return Err(());
+                };
+                let mut calls = bumpalo::collections::Vec::new_in(alloc);
+                for item in arr {
+                    calls.push(parse_task_call(alloc, item, re)?);
+                }
+                require = calls.into_bump_slice();
             }
             "cache" => {
                 if kind != TaskKind::Action {
@@ -412,7 +369,7 @@ fn parse_test<'a>(
 ) -> Result<TestConfigExpr<'a>, ()> {
     let mut pwd = StringExpr::Literal("./");
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
-    let mut require = AliasListExpr::List(&[]);
+    let mut require: &[TaskCall<'a>] = &[];
     let mut tags_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut cache: Option<CacheConfig<'a>> = None;
     let mut info = "";
@@ -444,7 +401,15 @@ fn parse_test<'a>(
                 }
             }
             "require" => {
-                require = parse_alias_list_expr(alloc, value, re)?;
+                let Some(arr) = value.as_array() else {
+                    mismatched_in_object(re, "array", value, "require");
+                    return Err(());
+                };
+                let mut calls = bumpalo::collections::Vec::new_in(alloc);
+                for item in arr {
+                    calls.push(parse_task_call(alloc, item, re)?);
+                }
+                require = calls.into_bump_slice();
             }
             "tag" => {
                 // Tag can be a single string or an array of strings

@@ -27,6 +27,9 @@ pub struct TaskCall<'a> {
     pub vars: ValueMap<'a>,
 }
 
+/// Empty slice of task calls, used as default for require field.
+pub static EMPTY_TASK_CALLS: &[TaskCall<'static>] = &[];
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Jsony)]
 #[jsony(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -70,25 +73,12 @@ pub enum Command<'a> {
     Sh(&'a str),
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Debug)]
 pub struct TaskConfig<'a> {
-    pub kind: TaskKind,
-    pub pwd: &'a str,
-    pub command: Command<'a>,
-    pub profiles: &'a [&'a str],
-    pub envvar: &'a [(&'a str, &'a str)],
-    pub require: &'a [Alias<'a>],
-    pub cache: Option<CacheConfig<'a>>,
-}
-
-/// Evaluated test configuration (runtime form).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct TestConfig<'a> {
     pub pwd: &'a str,
     pub command: Command<'a>,
     pub envvar: &'a [(&'a str, &'a str)],
-    pub require: &'a [Alias<'a>],
-    pub tags: &'a [&'a str],
+    pub require: &'a [TaskCall<'a>],
     pub cache: Option<CacheConfig<'a>>,
 }
 
@@ -168,7 +158,7 @@ pub struct TaskConfigExpr<'a> {
     command: CommandExpr<'a>,
     pub profiles: &'a [&'a str],
     envvar: &'a [(&'a str, StringExpr<'a>)],
-    require: AliasListExpr<'a>,
+    require: &'a [TaskCall<'a>],
     pub cache: Option<CacheConfig<'a>>,
     /// Tags for test filtering. Empty for non-test tasks.
     pub tags: &'a [&'a str],
@@ -181,13 +171,14 @@ pub struct TestConfigExpr<'a> {
     pwd: StringExpr<'a>,
     command: CommandExpr<'a>,
     envvar: &'a [(&'a str, StringExpr<'a>)],
-    require: AliasListExpr<'a>,
+    require: &'a [TaskCall<'a>],
     pub tags: &'a [&'a str],
     pub cache: Option<CacheConfig<'a>>,
 }
 
 impl TestConfigExpr<'static> {
-    /// Converts this test config to a TaskConfigExpr with kind=Test.
+    /// Converts this test config to a [`TaskConfigExpr`] with kind=Test.
+    ///
     /// The result is leaked and valid for 'static lifetime.
     pub fn to_task_config_expr(&self) -> &'static TaskConfigExpr<'static> {
         Box::leak(Box::new(TaskConfigExpr {
@@ -197,7 +188,7 @@ impl TestConfigExpr<'static> {
             command: self.command.clone(),
             profiles: &[],
             envvar: self.envvar,
-            require: self.require.clone(),
+            require: self.require,
             cache: self.cache.clone(),
             tags: self.tags,
         }))
@@ -215,7 +206,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         ])),
         profiles: &["default"],
         envvar: &[],
-        require: AliasListExpr::List(&[]),
+        require: EMPTY_TASK_CALLS,
         cache: None,
         tags: &[],
     }
@@ -235,15 +226,7 @@ pub enum EvalError {
 impl TaskConfigExpr<'static> {
     pub fn eval(&self, env: &Enviroment) -> Result<TaskConfigRc, EvalError> {
         let mut new = Arc::new((
-            TaskConfig {
-                kind: TaskKind::Action,
-                pwd: "",
-                command: Command::Cmd(&[]),
-                require: &[],
-                cache: None,
-                profiles: &[],
-                envvar: &[],
-            },
+            TaskConfig { pwd: "", command: Command::Cmd(&[]), require: &[], cache: None, envvar: &[] },
             Bump::new(),
         ));
         let alloc = Arc::get_mut(&mut new).unwrap();
@@ -272,34 +255,9 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
     type Object = TaskConfig<'a>;
     fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<TaskConfig<'a>, EvalError> {
         Ok(TaskConfig {
-            kind: self.kind,
             pwd: self.pwd.bump_eval(env, bump)?,
             command: self.command.bump_eval(env, bump)?,
-            require: self.require.bump_eval(env, bump)?,
-            cache: self.cache.clone(),
-            profiles: self.profiles,
-            envvar: if self.envvar.is_empty() {
-                &[]
-            } else {
-                let mut result = bumpalo::collections::Vec::new_in(bump);
-                for (key, value_expr) in self.envvar.iter() {
-                    let value = value_expr.bump_eval(env, bump)?;
-                    result.push((*key, value));
-                }
-                result.into_bump_slice()
-            },
-        })
-    }
-}
-
-impl<'a> BumpEval<'a> for TestConfigExpr<'static> {
-    type Object = TestConfig<'a>;
-    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<TestConfig<'a>, EvalError> {
-        Ok(TestConfig {
-            pwd: self.pwd.bump_eval(env, bump)?,
-            command: self.command.bump_eval(env, bump)?,
-            require: self.require.bump_eval(env, bump)?,
-            tags: self.tags,
+            require: self.require,
             cache: self.cache.clone(),
             envvar: if self.envvar.is_empty() {
                 &[]
@@ -329,19 +287,6 @@ impl<'a> BumpEval<'a> for StringExpr<'static> {
     }
 }
 
-impl<'a> BumpEval<'a> for AliasListExpr<'static> {
-    type Object = &'a [Alias<'a>];
-    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a [Alias<'a>], EvalError> {
-        match self {
-            AliasListExpr::List([AliasListExpr::Literal(s)]) => Ok(std::slice::from_ref(s)),
-            _ => {
-                let mut result = bumpalo::collections::Vec::new_in(bump);
-                eval_append_alias(self, env, bump, &mut result);
-                Ok(result.into_bump_slice())
-            }
-        }
-    }
-}
 impl<'a> BumpEval<'a> for StringListExpr<'static> {
     type Object = &'a [&'a str];
     fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a [&'a str], EvalError> {
@@ -351,30 +296,6 @@ impl<'a> BumpEval<'a> for StringListExpr<'static> {
                 let mut result = bumpalo::collections::Vec::new_in(bump);
                 eval_append_str(self, env, bump, &mut result);
                 Ok(result.into_bump_slice())
-            }
-        }
-    }
-}
-
-fn eval_append_alias<'a>(
-    expr: &AliasListExpr<'static>,
-    env: &Enviroment,
-    bump: &'a Bump,
-    target: &mut bumpalo::collections::Vec<Alias<'a>>,
-) {
-    use AliasListExpr as Expr;
-    match expr {
-        Expr::Literal(value) => target.push(*value),
-        Expr::List(string_list_exprs) => {
-            for item in string_list_exprs.iter() {
-                eval_append_alias(item, env, bump, target);
-            }
-        }
-        Expr::If(branch) => {
-            if branch.cond.eval(env) {
-                eval_append_alias(&branch.then, env, bump, target);
-            } else if let Some(or_else) = &branch.or_else {
-                eval_append_alias(or_else, env, bump, target);
             }
         }
     }
@@ -483,13 +404,6 @@ enum StringListExpr<'a> {
     List(&'a [StringListExpr<'a>]),
     Var(&'a str),
     If(&'a If<'a, StringListExpr<'a>>),
-}
-
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
-enum AliasListExpr<'a> {
-    Literal(Alias<'a>),
-    List(&'a [AliasListExpr<'a>]),
-    If(&'a If<'a, AliasListExpr<'a>>),
 }
 
 pub trait BumpEval<'a> {

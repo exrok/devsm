@@ -65,6 +65,10 @@ pub struct Job {
     pub log_start: LogId,
     /// Computed cache key for cache invalidation. Empty string means no key-based caching.
     pub cache_key: String,
+    /// Profile used when spawning this job.
+    pub spawn_profile: String,
+    /// Parameters used when spawning this job.
+    pub spawn_params: ValueMap<'static>,
 }
 
 #[derive(Debug)]
@@ -318,6 +322,14 @@ pub struct TestRun {
     pub test_jobs: Vec<TestJob>,
 }
 
+/// Checks if a running service job matches the required profile and parameters.
+fn service_matches_require(job: &Job, require_profile: &str, require_params: &ValueMap) -> bool {
+    if !require_profile.is_empty() && job.spawn_profile != require_profile {
+        return false;
+    }
+    require_params == &job.spawn_params
+}
+
 /// Stores that state of the current workspace including:
 /// - Past running tasks
 /// - Current running tasks
@@ -370,6 +382,36 @@ impl WorkspaceState {
                     key.push(';');
                 }
             }
+        }
+        key
+    }
+
+    /// Computes a cache key that includes profile and parameters from require.
+    ///
+    /// Extends [`compute_cache_key`] by appending the profile and parameters
+    /// used to spawn this dependency, ensuring different profile/param
+    /// combinations result in different cache keys.
+    fn compute_cache_key_with_require(
+        &self,
+        cache_key_inputs: &[CacheKeyInput],
+        profile: &str,
+        params: &ValueMap,
+    ) -> String {
+        let mut key = self.compute_cache_key(cache_key_inputs);
+        if !profile.is_empty() {
+            key.push_str("require_profile:");
+            key.push_str(profile);
+            key.push(';');
+        }
+        if !params.entries().is_empty() {
+            key.push_str("require_params:");
+            for (k, v) in params.entries() {
+                key.push_str(&**k);
+                key.push('=');
+                key.push_str(&v.to_string());
+                key.push(',');
+            }
+            key.push(';');
         }
         key
     }
@@ -434,11 +476,15 @@ impl WorkspaceState {
                 _ => (),
             }
         }
-        let task = bt.config.eval(&Enviroment { profile, param: params }).unwrap();
+        let task = bt.config.eval(&Enviroment { profile, param: params.clone() }).unwrap();
 
-        'outer: for dep_alias in task.config().require {
-            let Some(&dep_base_task) = self.name_map.get(&**dep_alias) else {
-                kvlog::error!("unknown alias", dep_alias);
+        'outer: for dep_call in task.config().require {
+            let dep_name = &*dep_call.name;
+            let dep_profile = dep_call.profile.unwrap_or("");
+            let dep_params = dep_call.vars.clone();
+
+            let Some(&dep_base_task) = self.name_map.get(dep_name) else {
+                kvlog::error!("unknown alias", dep_name);
                 continue;
             };
             let dep_config = &self.base_tasks[dep_base_task.idx()].config;
@@ -446,8 +492,14 @@ impl WorkspaceState {
             match dep_config.kind {
                 TaskKind::Action => {
                     let Some(cache_config) = dep_config.cache.as_ref() else {
-                        let new_job =
-                            self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
+                        let new_job = self.spawn_task(
+                            workspace_id,
+                            channel,
+                            dep_base_task,
+                            log_start,
+                            dep_params.clone(),
+                            dep_profile,
+                        );
                         pred.push(ScheduleRequirement {
                             job: new_job,
                             predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
@@ -455,9 +507,14 @@ impl WorkspaceState {
                         continue;
                     };
 
-                    let expected_cache_key = self.compute_cache_key(cache_config.key);
+                    let expected_cache_key =
+                        self.compute_cache_key_with_require(cache_config.key, dep_profile, &dep_params);
                     let spawner = &self.base_tasks[dep_base_task.idx()];
 
+                    // When require specifies profile/params, we need to find a job with matching
+                    // cache key. Don't break early on non-matching keys since different param
+                    // combinations create different "cache buckets".
+                    let mut found_pending = None;
                     for ji in spawner.jobs.all().iter().rev() {
                         let job = &self[*ji];
                         if matches!(job.process_status, JobStatus::Cancelled) {
@@ -467,21 +524,25 @@ impl WorkspaceState {
                             if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
                                 continue 'outer;
                             }
-                            break;
+                            continue;
                         }
                         if job.process_status.is_pending_completion() {
                             if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
-                                pred.push(ScheduleRequirement {
-                                    job: *ji,
-                                    predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
-                                });
-                                continue 'outer;
+                                found_pending = Some(*ji);
+                                break;
                             }
-                            break;
+                            continue;
                         }
-                        break;
                     }
-                    let new_job = self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
+                    if let Some(pending_job) = found_pending {
+                        pred.push(ScheduleRequirement {
+                            job: pending_job,
+                            predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                        });
+                        continue 'outer;
+                    }
+                    let new_job =
+                        self.spawn_task(workspace_id, channel, dep_base_task, log_start, dep_params, dep_profile);
                     pred.push(ScheduleRequirement {
                         job: new_job,
                         predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
@@ -490,10 +551,14 @@ impl WorkspaceState {
                 TaskKind::Service => {
                     let spawner = &self.base_tasks[dep_base_task.idx()];
                     for &ji in spawner.jobs.running() {
-                        pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
-                        continue 'outer;
+                        let job = &self[ji];
+                        if service_matches_require(job, dep_profile, &dep_params) {
+                            pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
+                            continue 'outer;
+                        }
                     }
-                    let new_job = self.spawn_task(workspace_id, channel, dep_base_task, log_start, ValueMap::new(), "");
+                    let new_job =
+                        self.spawn_task(workspace_id, channel, dep_base_task, log_start, dep_params, dep_profile);
                     pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
                 }
                 TaskKind::Test => {
@@ -502,7 +567,11 @@ impl WorkspaceState {
             }
         }
 
-        let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
+        let cache_key = task
+            .config()
+            .cache
+            .as_ref()
+            .map_or(String::new(), |c| self.compute_cache_key_with_require(c.key, profile, &params));
 
         let job_index = JobIndex(self.jobs.len() as u32);
         let bt = &mut self.base_tasks[base_task.idx()];
@@ -523,6 +592,8 @@ impl WorkspaceState {
             started_at: Instant::now(),
             log_start,
             cache_key,
+            spawn_profile: profile.to_string(),
+            spawn_params: params.to_owned(),
         });
         if spawn {
             channel.send(crate::process_manager::ProcessRequest::Spawn { task, job_index, workspace_id, job_id });
@@ -716,73 +787,92 @@ impl Workspace {
         for matched in matched_tests {
             let task_config = matched.task_config;
 
-            // Get require list as owned strings to avoid borrow issues
-            let requires: Vec<String> = task_config.config().require.iter().map(|a| (**a).to_string()).collect();
+            // Collect require calls to avoid borrow issues
+            struct RequireInfo {
+                name: String,
+                profile: String,
+                params: ValueMap<'static>,
+            }
+            let requires: Vec<RequireInfo> = task_config
+                .config()
+                .require
+                .iter()
+                .map(|tc| RequireInfo {
+                    name: (*tc.name).to_string(),
+                    profile: tc.profile.unwrap_or("").to_string(),
+                    params: tc.vars.clone().to_owned(),
+                })
+                .collect();
 
             // Build requirements from test dependencies
             let mut pred = Vec::new();
-            for dep_alias in &requires {
-                if let Some(&dep_base_task) = state.name_map.get(dep_alias.as_str()) {
-                    let dep_config = &state.base_tasks[dep_base_task.idx()].config;
-                    match dep_config.kind {
-                        TaskKind::Action => {
-                            if let Some(cache_config) = dep_config.cache.as_ref() {
-                                let expected_cache_key = state.compute_cache_key(cache_config.key);
-                                let spawner = &state.base_tasks[dep_base_task.idx()];
-                                let mut found_cached = false;
-                                for ji in spawner.jobs.all().iter().rev() {
-                                    let job = &state.jobs[ji.idx()];
-                                    if matches!(job.process_status, JobStatus::Cancelled) {
-                                        continue;
-                                    }
-                                    if job.process_status.is_successful_completion() {
-                                        if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
-                                            found_cached = true;
-                                            break;
-                                        }
-                                    }
-                                    break;
+            for req in &requires {
+                let Some(&dep_base_task) = state.name_map.get(req.name.as_str()) else {
+                    continue;
+                };
+                let dep_config = &state.base_tasks[dep_base_task.idx()].config;
+                match dep_config.kind {
+                    TaskKind::Action => {
+                        if let Some(cache_config) = dep_config.cache.as_ref() {
+                            let expected_cache_key =
+                                state.compute_cache_key_with_require(cache_config.key, &req.profile, &req.params);
+                            let spawner = &state.base_tasks[dep_base_task.idx()];
+                            let mut found_cached = false;
+                            for ji in spawner.jobs.all().iter().rev() {
+                                let job = &state.jobs[ji.idx()];
+                                if matches!(job.process_status, JobStatus::Cancelled) {
+                                    continue;
                                 }
-                                if found_cached {
+                                if job.process_status.is_successful_completion() {
+                                    if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
+                                        found_cached = true;
+                                        break;
+                                    }
                                     continue;
                                 }
                             }
+                            if found_cached {
+                                continue;
+                            }
+                        }
+                        let new_job = state.spawn_task(
+                            self.workspace_id,
+                            &self.process_channel,
+                            dep_base_task,
+                            log_start,
+                            req.params.clone(),
+                            &req.profile,
+                        );
+                        pred.push(ScheduleRequirement {
+                            job: new_job,
+                            predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                        });
+                    }
+                    TaskKind::Service => {
+                        let spawner = &state.base_tasks[dep_base_task.idx()];
+                        let mut found_running = false;
+                        for &ji in spawner.jobs.running() {
+                            let job = &state.jobs[ji.idx()];
+                            if service_matches_require(job, &req.profile, &req.params) {
+                                pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
+                                found_running = true;
+                                break;
+                            }
+                        }
+                        if !found_running {
                             let new_job = state.spawn_task(
                                 self.workspace_id,
                                 &self.process_channel,
                                 dep_base_task,
                                 log_start,
-                                ValueMap::new(),
-                                "",
+                                req.params.clone(),
+                                &req.profile,
                             );
-                            pred.push(ScheduleRequirement {
-                                job: new_job,
-                                predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
-                            });
+                            pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
                         }
-                        TaskKind::Service => {
-                            let spawner = &state.base_tasks[dep_base_task.idx()];
-                            let mut found_running = false;
-                            for &ji in spawner.jobs.running() {
-                                pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
-                                found_running = true;
-                                break;
-                            }
-                            if !found_running {
-                                let new_job = state.spawn_task(
-                                    self.workspace_id,
-                                    &self.process_channel,
-                                    dep_base_task,
-                                    log_start,
-                                    ValueMap::new(),
-                                    "",
-                                );
-                                pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
-                            }
-                        }
-                        TaskKind::Test => {
-                            // Tests cannot be dependencies of other tests
-                        }
+                    }
+                    TaskKind::Test => {
+                        // Tests cannot be dependencies of other tests
                     }
                 }
             }
@@ -811,6 +901,8 @@ impl Workspace {
                 started_at: Instant::now(),
                 log_start,
                 cache_key,
+                spawn_profile: String::new(),
+                spawn_params: ValueMap::new(),
             });
 
             test_jobs.push(TestJob {
