@@ -18,12 +18,28 @@ pub struct TuiState {
     #[allow(dead_code)]
     collapsed: bool,
     #[allow(dead_code)]
+    pub scroll: Option<TuiScrollState>,
+    #[allow(dead_code)]
     selection: Option<TuiSelection>,
     #[allow(dead_code)]
     pub overlay: Option<TuiOverlay>,
     pub base_tasks: Vec<TuiBaseTask>,
     #[allow(dead_code)]
     meta_groups: Option<TuiMetaGroups>,
+}
+
+#[derive(Debug, Clone, Jsony, Default)]
+#[allow(dead_code)]
+pub struct TuiScrollState {
+    pub top: TuiScrollInfo,
+    pub bottom: Option<TuiScrollInfo>,
+}
+
+#[derive(Debug, Clone, Jsony, Default)]
+#[allow(dead_code)]
+pub struct TuiScrollInfo {
+    pub is_scrolled: bool,
+    pub can_scroll_up: bool,
 }
 
 #[derive(Debug, Clone, Jsony, Default)]
@@ -388,4 +404,86 @@ sh = "echo hello"
 
     let state = tui.wait_until(|s| s.overlay.is_none(), timeout);
     assert!(state.is_some(), "TaskLauncher overlay should close on Escape, server_log: {}", harness.server_log());
+}
+
+#[test]
+fn tui_scroll_state_prevents_scroll_when_logs_fit() {
+    let mut harness = TestHarness::new("tui_scroll_state");
+
+    harness.write_config(
+        r#"
+[action.many_logs]
+sh = "for i in $(seq 1 200); do echo \"log line $i\"; done"
+"#,
+    );
+
+    let log_file = fs::File::create(&harness.server_log_path).expect("Failed to create server log");
+    let log_file_err = log_file.try_clone().expect("Failed to clone log file");
+
+    let server = Command::new(cargo_bin_path())
+        .arg("server")
+        .env("DEVSM_SOCKET", &harness.socket_path)
+        .env("DEVSM_LOG_STDOUT", "1")
+        .env("DEVSM_JSON_STATE_STREAM", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
+        .spawn()
+        .expect("Failed to spawn server");
+
+    harness.server = Some(server);
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut tui = TuiTestClient::spawn(&harness);
+    let timeout = Duration::from_secs(5);
+
+    let state = tui.wait_until(|s| s.scroll.is_some(), timeout);
+    assert!(state.is_some(), "Should receive initial state with scroll info, server_log: {}", harness.server_log());
+
+    let state = state.unwrap();
+    let scroll = state.scroll.as_ref().unwrap();
+    assert!(!scroll.top.is_scrolled, "Should not be scrolled initially");
+    assert!(!scroll.top.can_scroll_up, "Should not be able to scroll with no logs");
+
+    tui.send_ctrl_key('k');
+
+    tui.send_key(b" ");
+    let state = tui.wait_until(
+        |s| s.overlay.as_ref().map(|o| o.kind.as_deref() == Some("TaskLauncher")).unwrap_or(false),
+        timeout,
+    );
+    assert!(state.is_some(), "TaskLauncher should open");
+    let scroll = state.unwrap().scroll.unwrap();
+    assert!(!scroll.top.is_scrolled, "Should NOT have entered scroll mode when logs fit on screen");
+
+    tui.send_key(b"\x1b");
+    let _ = tui.wait_until(|s| s.overlay.is_none(), timeout);
+
+    tui.send_key(b" ");
+    let _ = tui.wait_until(
+        |s| s.overlay.as_ref().map(|o| o.kind.as_deref() == Some("TaskLauncher")).unwrap_or(false),
+        timeout,
+    );
+    tui.send_key(b"\r");
+
+    let state = tui.wait_until(
+        |s| {
+            let task_exited = s
+                .find_task_by_name("many_logs")
+                .map(|t| t.jobs.iter().any(|j| j.status == "Exited" && j.exit_code == Some(0)))
+                .unwrap_or(false);
+            let can_scroll = s.scroll.as_ref().map(|sc| sc.top.can_scroll_up).unwrap_or(false);
+            task_exited && can_scroll
+        },
+        timeout,
+    );
+    assert!(state.is_some(), "many_logs should complete and can_scroll_up should be true, server_log: {}", harness.server_log());
+
+    tui.send_ctrl_key('k');
+
+    let state = tui.wait_until(
+        |s| s.scroll.as_ref().map(|sc| sc.top.is_scrolled).unwrap_or(false),
+        Duration::from_secs(2),
+    );
+    assert!(state.is_some(), "Should enter scroll mode when there are enough logs");
 }

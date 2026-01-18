@@ -17,16 +17,16 @@ use std::time::Duration;
 const PLAIN_LOG_GEN: &str =
     r#"for i in $(seq 1 500); do echo "Line $i: plain text output for baseline benchmarking"; done"#;
 
-const LONG_LOG_GEN: &str = r#"for i in $(seq 1 200); do printf "Line %04d: %s\n" "$i" "ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJ"; done"#;
+// const LONG_LOG_GEN: &str = r#"for i in $(seq 1 200); do printf "Line %04d: %s\n" "$i" "ABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJABCDEFGHIJ"; done"#;
 
-const COLORED_LOG_GEN: &str = r#"for i in $(seq 1 300); do
-  case $((i % 4)) in
-    0) printf "\033[31m[ERROR]\033[0m Line %04d: Error message content here\n" $i;;
-    1) printf "\033[32m[INFO]\033[0m Line %04d: Info message content here\n" $i;;
-    2) printf "\033[33m[WARN]\033[0m Line %04d: Warning message content here\n" $i;;
-    3) printf "\033[34m[DEBUG]\033[0m Line %04d: Debug message content here\n" $i;;
-  esac
-done"#;
+// const COLORED_LOG_GEN: &str = r#"for i in $(seq 1 300); do
+//   case $((i % 4)) in
+//     0) printf "\033[31m[ERROR]\033[0m Line %04d: Error message content here\n" $i;;
+//     1) printf "\033[32m[INFO]\033[0m Line %04d: Info message content here\n" $i;;
+//     2) printf "\033[33m[WARN]\033[0m Line %04d: Warning message content here\n" $i;;
+//     3) printf "\033[34m[DEBUG]\033[0m Line %04d: Debug message content here\n" $i;;
+//   esac
+// done"#;
 
 const TIMEOUT_MS: u64 = 500;
 

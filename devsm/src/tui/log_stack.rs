@@ -3,10 +3,16 @@ use vtui::{Color, Rect, vt::BufferWrite};
 use crate::{
     config::TaskKind,
     log_storage::{BaseTaskSet, LogFilter, LogId},
-    scroll_view::{LogHighlight, LogStyle, LogWidget},
+    scroll_view::{LogHighlight, LogStyle, LogWidget, ScrollState},
     tui::task_tree::{MetaGroupKind, SelectionState},
     workspace::{BaseTaskIndex, Workspace, WorkspaceState},
 };
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LogStackScrollState {
+    pub top: ScrollState,
+    pub bottom: Option<ScrollState>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -93,6 +99,28 @@ impl LogStack {
     /// Returns the current display mode.
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Returns the scroll state for both top and bottom panes.
+    pub fn scroll_state(&self, ws: &Workspace) -> LogStackScrollState {
+        let ws_state = ws.state();
+        let logs = ws.logs.read().unwrap();
+
+        let (top_filter, bot_filter) = (self.mode.top_filter(&ws_state), self.mode.bottom_filter(&ws_state));
+
+        let top_view = logs.view(top_filter);
+        let top_style = match &self.mode {
+            Mode::All | Mode::Hybrid(..) => &self.base_task_log_style,
+            Mode::OnlySelected(..) => &LogStyle::default(),
+        };
+        let top = self.top.scroll_state(&top_view, top_style);
+
+        let bottom = bot_filter.map(|filter| {
+            let view = logs.view(filter);
+            self.bottom.scroll_state(&view, &LogStyle::default())
+        });
+
+        LogStackScrollState { top, bottom }
     }
 
     /// Forces the appropriate log view into scroll mode at the current position.
@@ -182,7 +210,7 @@ impl LogStack {
             }
         }
     }
-    pub fn render(&mut self, buf: &mut Vec<u8>, mut dest: Rect, ws: &Workspace) {
+    pub fn render(&mut self, buf: &mut Vec<u8>, mut dest: Rect, ws: &Workspace, resized: bool) {
         // self.base_task_log_style.assume_blank = true;
         // todo move this logic else where to avoid taking the log
         let (top_filter, bot_filter) = {
@@ -206,7 +234,11 @@ impl LogStack {
         let logs = ws.logs.read().unwrap();
         if let Some(bot_filter) = bot_filter {
             let view = logs.view(bot_filter);
-            self.bottom.scrollable_render(self.pending_bottom_scroll, buf, dest.take_bottom(0.5), &view, &def);
+            let bot_rect = dest.take_bottom(0.5);
+            if resized {
+                self.bottom.check_resize_revert_to_tail(&view, &def, bot_rect);
+            }
+            self.bottom.scrollable_render(self.pending_bottom_scroll, buf, bot_rect, &view, &def);
             self.pending_bottom_scroll = 0;
 
             let br = dest.take_bottom(1);
@@ -243,17 +275,15 @@ impl LogStack {
         }
 
         let view = logs.view(top_filter);
-        self.top.scrollable_render(
-            self.pending_top_scroll,
-            buf,
-            dest,
-            &view,
-            match &self.mode {
-                Mode::All => &self.base_task_log_style,
-                Mode::OnlySelected(..) => &def,
-                Mode::Hybrid(..) => &self.base_task_log_style,
-            },
-        );
+        let top_style = match &self.mode {
+            Mode::All => &self.base_task_log_style,
+            Mode::OnlySelected(..) => &def,
+            Mode::Hybrid(..) => &self.base_task_log_style,
+        };
+        if resized {
+            self.top.check_resize_revert_to_tail(&view, top_style, dest);
+        }
+        self.top.scrollable_render(self.pending_top_scroll, buf, dest, &view, top_style);
         self.pending_top_scroll = 0;
     }
 }

@@ -153,7 +153,7 @@ fn render<'a>(
     };
 
     let dest = Rect { x: 0, y: 0, w, h: h - menu_height };
-    tui.logs.render(&mut tui.frame.buf, dest, workspace);
+    tui.logs.render(&mut tui.frame.buf, dest, workspace, delta.any(Has::RESIZED));
 
     let mut bot = Rect { x: 0, y: 0, w, h: menu_height };
 
@@ -554,12 +554,25 @@ fn meta_group_kind_str(kind: MetaGroupKind) -> &'static str {
     }
 }
 
-fn output_json_state(ws: &WorkspaceState, tui: &mut TuiState, tty_render_byte_count: usize, out: &OwnedFd) {
+fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_count: usize, out: &OwnedFd) {
     let mut file = unsafe { std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(out.as_raw_fd())) };
-    let selection = tui.task_tree.selection_state(ws);
+    let ws = workspace.state();
+    let selection = tui.task_tree.selection_state(&ws);
+    let scroll_state = tui.logs.scroll_state(workspace);
     let mut message = jsony::object! {
         tty_render_byte_count,
         collapsed: tui.task_tree.is_collapsed(),
+        scroll: {
+            top: {
+                is_scrolled: scroll_state.top.is_scrolled,
+                can_scroll_up: scroll_state.top.can_scroll_up
+            },
+            @[if let Some(bottom) = scroll_state.bottom]
+            bottom: {
+                is_scrolled: bottom.is_scrolled,
+                can_scroll_up: bottom.can_scroll_up
+            }
+        },
         overlay: match &tui.overlay {
             FocusOverlap::Group { selection } => {
                 kind: "Group",
@@ -679,9 +692,8 @@ pub fn run(
         if let Some(terminal) = &mut terminal {
             terminal.write_all(data)?;
         } else {
-            let ws = workspace.state();
             let byte_count = data.len();
-            output_json_state(&ws, &mut tui, byte_count, &stdout);
+            output_json_state(workspace, &mut tui, byte_count, &stdout);
         }
         delta = Has(0);
 

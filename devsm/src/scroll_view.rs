@@ -331,6 +331,12 @@ impl Default for LogTailWidget {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScrollState {
+    pub is_scrolled: bool,
+    pub can_scroll_up: bool,
+}
+
 pub enum LogWidget {
     Scroll(LogScrollWidget),
     Tail(LogTailWidget),
@@ -346,6 +352,45 @@ impl LogWidget {
     pub fn reset(&mut self) {
         // todo optimize
         *self = LogWidget::default();
+    }
+
+    pub fn scroll_state(&self, view: &LogView, style: &LogStyle) -> ScrollState {
+        match self {
+            LogWidget::Scroll(_) => ScrollState { is_scrolled: true, can_scroll_up: true },
+            LogWidget::Tail(tail) => ScrollState { is_scrolled: false, can_scroll_up: self.can_scroll(view, style, tail.previous) },
+        }
+    }
+
+    fn can_scroll(&self, view: &LogView, style: &LogStyle, rect: Rect) -> bool {
+        if rect.h == 0 || rect.w == 0 {
+            return false;
+        }
+        let (a, b) = view.logs.slices();
+        let mut total_height = 0u32;
+        let limit = rect.h as u32;
+
+        for slice in [a, b] {
+            for entry in slice {
+                if !view.contains(entry) {
+                    continue;
+                }
+                total_height += get_entry_height(entry, style, rect.w as u32);
+                if total_height > limit {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn check_resize_revert_to_tail(&mut self, view: &LogView, style: &LogStyle, rect: Rect) -> bool {
+        if let LogWidget::Scroll(_) = self {
+            if !self.can_scroll(view, style, rect) {
+                *self = LogWidget::Tail(LogTailWidget::default());
+                return true;
+            }
+        }
+        false
     }
     /// Transitions the view from `Tail` mode to `Scroll` mode if it isn't already.
     pub fn scrollify(&mut self, view: &LogView, style: &LogStyle) -> &mut LogScrollWidget {
@@ -554,6 +599,12 @@ impl LogWidget {
     }
 
     pub fn scroll_up(&mut self, amount: u32, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
+        if let LogWidget::Tail(_) = self {
+            if !self.can_scroll(view, style, rect) {
+                self.render(buf, rect, view, style);
+                return;
+            }
+        }
         let scroll_view = self.scrollify(view, style);
         let logs = view.logs.indexer();
         let mut scrolled_lines = 0;

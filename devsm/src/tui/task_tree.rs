@@ -309,10 +309,7 @@ impl TaskTreeState {
             Some(entry) => entry,
             None => return,
         };
-        let jobs: Vec<JobIndex> = match entry {
-            PrimaryEntry::Task(bti) => ws.base_tasks[bti.idx()].jobs.all().to_vec(),
-            PrimaryEntry::MetaGroup(kind) => ws.jobs_by_kind(kind.task_kind()),
-        };
+        let jobs = self.get_job_list(ws, entry);
         let Some(last) = jobs.last() else {
             return;
         };
@@ -320,9 +317,9 @@ impl TaskTreeState {
         self.job_index = Some(*last);
     }
 
-    fn get_job_list(&self, ws: &WorkspaceState, entry: PrimaryEntry) -> Vec<JobIndex> {
+    fn get_job_list<'a>(&self, ws: &'a WorkspaceState, entry: PrimaryEntry) -> &'a [JobIndex] {
         match entry {
-            PrimaryEntry::Task(bti) => ws.base_tasks[bti.idx()].jobs.all().to_vec(),
+            PrimaryEntry::Task(bti) => ws.base_tasks[bti.idx()].jobs.all(),
             PrimaryEntry::MetaGroup(kind) => ws.jobs_by_kind(kind.task_kind()),
         }
     }
@@ -496,8 +493,8 @@ impl TaskTreeState {
             None => return,
         };
 
-        let (jobs, show_task_name) = match (sel.base_task, sel.meta_group) {
-            (Some(bti), None) => (ws.base_tasks[bti.idx()].jobs.all().to_vec(), false),
+        let (jobs, show_task_name): (&[JobIndex], bool) = match (sel.base_task, sel.meta_group) {
+            (Some(bti), None) => (ws.base_tasks[bti.idx()].jobs.all(), false),
             (_, Some(kind)) => (ws.jobs_by_kind(kind.task_kind()), true),
             (None, None) => return,
         };

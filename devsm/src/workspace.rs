@@ -951,9 +951,10 @@ fn matches_test_filters(name: &str, tags: &[&str], filters: &[TestFilter]) -> bo
 
     for filter in filters {
         if let TestFilter::ExcludeTag(exclude_tag) = filter
-            && tags.contains(exclude_tag) {
-                return false;
-            }
+            && tags.contains(exclude_tag)
+        {
+            return false;
+        }
     }
 
     for filter in filters {
