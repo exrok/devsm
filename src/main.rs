@@ -122,7 +122,7 @@ fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
 fn workspace_command(command: WorkspaceCommand) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let config = config::find_config_path_from(&cwd)
-        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.js in current or parent directories"))?;
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
     let mut socket = connect_or_spawn_daemon()?;
     socket.write_all(&jsony::to_binary(&daemon::RequestMessage {
@@ -136,7 +136,7 @@ fn workspace_command(command: WorkspaceCommand) -> anyhow::Result<()> {
 fn client() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let config = config::find_config_path_from(&cwd)
-        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.js in current or parent directories"))?;
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
     // Register the signal handlers using libc directly
     setup_signal_handler(libc::SIGTERM, term_handler)?;

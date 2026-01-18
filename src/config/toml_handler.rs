@@ -1,0 +1,550 @@
+use bumpalo::Bump;
+use codespan_reporting::{
+    diagnostic::{self, Diagnostic, Label},
+    term::{self, termcolor::ColorChoice},
+};
+use std::borrow::Cow;
+use toml_span::{
+    Value as TomlValue,
+    value::{Array as TomlArray, Key, Table, ValueInner},
+};
+
+use crate::config::{
+    Alias, AliasListExpr, CommandExpr, If, Predicate, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind,
+    WorkspaceConfig,
+};
+
+fn mismatched_in_object(report_error: &mut dyn FnMut(Diagnostic<usize>), expected: &str, found: &TomlValue, key: &str) {
+    report_error(
+        Diagnostic::error()
+            .with_message("mismatched types")
+            .with_label(
+                Label::primary(0, found.span)
+                    .with_message(format_args!("expected `{expected}`, found `{}`", found.value.type_str())),
+            )
+            .with_note(format_args!("The {key:?} property should be a `{expected}`")),
+    );
+}
+
+fn table<'a, 'b>(
+    table: &'b Table<'a>,
+    key: &str,
+    re: &mut dyn FnMut(Diagnostic<usize>),
+) -> Result<Option<&'b Table<'a>>, ()> {
+    if let Some(action) = table.get(key) {
+        let Some(t) = action.as_table() else {
+            mismatched_in_object(re, "table", action, key);
+            return Err(());
+        };
+        Ok(Some(t))
+    } else {
+        Ok(None)
+    }
+}
+
+fn as_str<'a>(cow: &'a Cow<'a, str>) -> &'a str {
+    cow.as_ref()
+}
+
+fn parse_string_expr<'a>(
+    alloc: &'a Bump,
+    value: &TomlValue<'a>,
+    re: &mut dyn FnMut(Diagnostic<usize>),
+) -> Result<StringExpr<'a>, ()> {
+    match &value.value {
+        ValueInner::String(s) => Ok(StringExpr::Literal(alloc.alloc_str(as_str(s)))),
+        ValueInner::Table(table) => {
+            // Check for { var = "name" }
+            if let Some(var_val) = table.get("var") {
+                let Some(var_name) = var_val.as_str() else {
+                    mismatched_in_object(re, "string", var_val, "var");
+                    return Err(());
+                };
+                return Ok(StringExpr::Var(alloc.alloc_str(var_name)));
+            }
+            // Check for { if.profile = "...", then = ..., or_else = ... }
+            if let Some(if_val) = table.get("if") {
+                let if_table = if_val.as_table().ok_or(())?;
+                let profile_val = if_table.get("profile").ok_or(())?;
+                let Some(profile) = profile_val.as_str() else {
+                    mismatched_in_object(re, "string", profile_val, "profile");
+                    return Err(());
+                };
+
+                let then_val = table.get("then").ok_or(())?;
+                let then_expr = parse_string_expr(alloc, then_val, re)?;
+
+                let mut or_else = None;
+                if let Some(else_val) = table.get("or_else") {
+                    or_else = Some(parse_string_expr(alloc, else_val, re)?);
+                }
+
+                return Ok(StringExpr::If(alloc.alloc(If {
+                    cond: Predicate::Profile(alloc.alloc_str(profile)),
+                    then: then_expr,
+                    or_else,
+                })));
+            }
+            re(Diagnostic::error().with_message("invalid string expression").with_label(Label::primary(0, value.span)));
+            Err(())
+        }
+        _ => {
+            mismatched_in_object(re, "string or table", value, "expression");
+            Err(())
+        }
+    }
+}
+
+fn parse_string_list_expr<'a>(
+    alloc: &'a Bump,
+    value: &TomlValue<'a>,
+    re: &mut dyn FnMut(Diagnostic<usize>),
+) -> Result<StringListExpr<'a>, ()> {
+    match &value.value {
+        ValueInner::String(s) => Ok(StringListExpr::Literal(alloc.alloc_str(as_str(s)))),
+        ValueInner::Array(arr) => {
+            // Manually allocate each expression in the array
+            let mut items_vec = bumpalo::collections::Vec::new_in(alloc);
+            for item in arr {
+                items_vec.push(parse_string_list_expr(alloc, item, re)?);
+            }
+            Ok(StringListExpr::List(items_vec.into_bump_slice()))
+        }
+        ValueInner::Table(table) => {
+            // Check for { var = "name" }
+            if let Some(var_val) = table.get("var") {
+                let Some(var_name) = var_val.as_str() else {
+                    mismatched_in_object(re, "string", var_val, "var");
+                    return Err(());
+                };
+                return Ok(StringListExpr::Var(alloc.alloc_str(var_name)));
+            }
+            // Check for { if.profile = "...", then = ..., or_else = ... }
+            if let Some(if_val) = table.get("if") {
+                let if_table = if_val.as_table().ok_or(())?;
+                let profile_val = if_table.get("profile").ok_or(())?;
+                let Some(profile) = profile_val.as_str() else {
+                    mismatched_in_object(re, "string", profile_val, "profile");
+                    return Err(());
+                };
+
+                let then_val = table.get("then").ok_or(())?;
+                let then_expr = parse_string_list_expr(alloc, then_val, re)?;
+
+                let mut or_else = None;
+                if let Some(else_val) = table.get("or_else") {
+                    or_else = Some(parse_string_list_expr(alloc, else_val, re)?);
+                }
+
+                return Ok(StringListExpr::If(alloc.alloc(If {
+                    cond: Predicate::Profile(alloc.alloc_str(profile)),
+                    then: then_expr,
+                    or_else,
+                })));
+            }
+            re(Diagnostic::error()
+                .with_message("invalid string list expression")
+                .with_label(Label::primary(0, value.span)));
+            Err(())
+        }
+        _ => {
+            mismatched_in_object(re, "string, array, or table", value, "expression");
+            Err(())
+        }
+    }
+}
+
+fn parse_alias_list_expr<'a>(
+    alloc: &'a Bump,
+    value: &TomlValue<'a>,
+    re: &mut dyn FnMut(Diagnostic<usize>),
+) -> Result<AliasListExpr<'a>, ()> {
+    match &value.value {
+        ValueInner::String(s) => Ok(AliasListExpr::Literal(Alias(alloc.alloc_str(as_str(s))))),
+        ValueInner::Array(arr) => {
+            // Manually allocate each expression in the array
+            let mut items_vec = bumpalo::collections::Vec::new_in(alloc);
+            for item in arr {
+                items_vec.push(parse_alias_list_expr(alloc, item, re)?);
+            }
+            Ok(AliasListExpr::List(items_vec.into_bump_slice()))
+        }
+        ValueInner::Table(table) => {
+            // Check for { if.profile = "...", then = ..., or_else = ... }
+            if let Some(if_val) = table.get("if") {
+                let if_table = if_val.as_table().ok_or(())?;
+                let profile_val = if_table.get("profile").ok_or(())?;
+                let Some(profile) = profile_val.as_str() else {
+                    mismatched_in_object(re, "string", profile_val, "profile");
+                    return Err(());
+                };
+
+                let then_val = table.get("then").ok_or(())?;
+                let then_expr = parse_alias_list_expr(alloc, then_val, re)?;
+
+                let mut or_else = None;
+                if let Some(else_val) = table.get("or_else") {
+                    or_else = Some(parse_alias_list_expr(alloc, else_val, re)?);
+                }
+
+                return Ok(AliasListExpr::If(alloc.alloc(If {
+                    cond: Predicate::Profile(alloc.alloc_str(profile)),
+                    then: then_expr,
+                    or_else,
+                })));
+            }
+            re(Diagnostic::error()
+                .with_message("invalid alias list expression")
+                .with_label(Label::primary(0, value.span)));
+            Err(())
+        }
+        _ => {
+            mismatched_in_object(re, "string, array, or table", value, "expression");
+            Err(())
+        }
+    }
+}
+
+fn parse_task<'a>(
+    alloc: &'a Bump,
+    name: &'a str,
+    task_table: &Table<'a>,
+    kind: TaskKind,
+    re: &mut dyn FnMut(Diagnostic<usize>),
+) -> Result<TaskConfigExpr<'a>, ()> {
+    let mut pwd = StringExpr::Literal("./");
+    let mut profiles_vec = bumpalo::collections::Vec::new_in(alloc);
+    profiles_vec.push("default");
+    let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
+    let mut before = AliasListExpr::List(&[]);
+    let mut before_once = AliasListExpr::List(&[]);
+    let mut info = "";
+    let mut cmd: Option<StringListExpr> = None;
+    let mut sh: Option<StringExpr> = None;
+
+    for (key, value) in task_table.iter() {
+        let key_str = key.name.as_ref();
+        match key_str {
+            "pwd" => {
+                pwd = parse_string_expr(alloc, value, re)?;
+            }
+            "profiles" => {
+                let Some(arr) = value.as_array() else {
+                    mismatched_in_object(re, "array", value, "profiles");
+                    return Err(());
+                };
+                profiles_vec.clear();
+                for item in arr {
+                    let Some(s) = item.as_str() else {
+                        mismatched_in_object(re, "string", item, "profile");
+                        return Err(());
+                    };
+                    profiles_vec.push(alloc.alloc_str(s) as &str);
+                }
+            }
+            "cmd" => {
+                cmd = Some(parse_string_list_expr(alloc, value, re)?);
+            }
+            "sh" => {
+                sh = Some(parse_string_expr(alloc, value, re)?);
+            }
+            "env" => {
+                let Some(env_table) = value.as_table() else {
+                    mismatched_in_object(re, "table", value, "env");
+                    return Err(());
+                };
+                envvar_vec.clear();
+                for (env_key, env_value) in env_table.iter() {
+                    let key_str = alloc.alloc_str(env_key.name.as_ref()) as &str;
+                    let val_expr = parse_string_expr(alloc, env_value, re)?;
+                    envvar_vec.push((key_str, val_expr));
+                }
+            }
+            "before" => {
+                before = parse_alias_list_expr(alloc, value, re)?;
+            }
+            "before_once" => {
+                before_once = parse_alias_list_expr(alloc, value, re)?;
+            }
+            "info" => {
+                let Some(s) = value.as_str() else {
+                    mismatched_in_object(re, "string", value, "info");
+                    return Err(());
+                };
+                info = alloc.alloc_str(s);
+            }
+            _ => {
+                re(Diagnostic::error()
+                    .with_message(format_args!("unknown key `{}` in task definition", key_str))
+                    .with_label(Label::primary(0, value.span)));
+                return Err(());
+            }
+        }
+    }
+
+    // Validate that exactly one of cmd or sh is specified
+    let command = match (cmd, sh) {
+        (Some(cmd), None) => CommandExpr::Cmd(cmd),
+        (None, Some(sh)) => CommandExpr::Sh(sh),
+        (Some(_), Some(_)) => {
+            re(Diagnostic::error()
+                .with_message("fields `cmd` and `sh` are mutually exclusive")
+                .with_label(Label::primary(0, 0..0)));
+            return Err(());
+        }
+        (None, None) => {
+            re(Diagnostic::error()
+                .with_message("either `cmd` or `sh` field is required")
+                .with_label(Label::primary(0, 0..0)));
+            return Err(());
+        }
+    };
+
+    Ok(TaskConfigExpr {
+        kind,
+        info,
+        pwd,
+        command,
+        profiles: profiles_vec.into_bump_slice(),
+        envvar: envvar_vec.into_bump_slice(),
+        before,
+        before_once,
+    })
+}
+
+fn parse_task_call<'a>(
+    alloc: &'a Bump,
+    value: &TomlValue<'a>,
+    re: &mut dyn FnMut(Diagnostic<usize>),
+) -> Result<TaskCall<'a>, ()> {
+    match &value.value {
+        ValueInner::String(s) => {
+            let s_str = as_str(s);
+            let (name_str, profile_str) =
+                if let Some((n, p)) = s_str.rsplit_once(':') { (n, Some(p)) } else { (s_str, None) };
+            let name = alloc.alloc_str(name_str) as &str;
+            let profile = profile_str.map(|p| alloc.alloc_str(p) as &str);
+            Ok(TaskCall { name: Alias(name), profile, vars: jsony_value::ValueMap::new() })
+        }
+        ValueInner::Array(arr) => {
+            if arr.is_empty() {
+                re(Diagnostic::error()
+                    .with_message("task call array cannot be empty")
+                    .with_label(Label::primary(0, value.span)));
+                return Err(());
+            }
+            if arr.len() > 2 {
+                re(Diagnostic::error()
+                    .with_message("task call array can have at most 2 elements")
+                    .with_label(Label::primary(0, value.span)));
+                return Err(());
+            }
+
+            let first = &arr[0];
+            let (name, profile) = match &first.value {
+                ValueInner::String(s) => {
+                    let s_str = as_str(s);
+                    let (name_str, profile_str) =
+                        if let Some((n, p)) = s_str.rsplit_once(':') { (n, Some(p)) } else { (s_str, None) };
+                    let name = alloc.alloc_str(name_str) as &str;
+                    let profile = profile_str.map(|p| alloc.alloc_str(p) as &str);
+                    (name, profile)
+                }
+                _ => {
+                    mismatched_in_object(re, "string", first, "task name");
+                    return Err(());
+                }
+            };
+
+            let mut vars = jsony_value::ValueMap::new();
+            if arr.len() == 2 {
+                let second = &arr[1];
+                let Some(vars_table) = second.as_table() else {
+                    mismatched_in_object(re, "table", second, "variables");
+                    return Err(());
+                };
+                for (key, val) in vars_table.iter() {
+                    let val_str = match &val.value {
+                        ValueInner::String(s) => as_str(s).to_string(),
+                        ValueInner::Integer(i) => i.to_string(),
+                        ValueInner::Boolean(b) => b.to_string(),
+                        _ => continue,
+                    };
+                    vars.insert(key.name.as_ref().to_string().into(), val_str.into());
+                }
+            }
+
+            Ok(TaskCall { name: Alias(name), profile, vars })
+        }
+        _ => {
+            mismatched_in_object(re, "string or array", value, "task call");
+            Err(())
+        }
+    }
+}
+
+pub fn parse<'a>(
+    alloc: &'a Bump,
+    data: &'a str,
+    re: &mut dyn FnMut(Diagnostic<usize>),
+) -> Result<WorkspaceConfig<'a>, ()> {
+    let mut value = match toml_span::parse(data) {
+        Ok(value) => value,
+        Err(err) => {
+            re(err.to_diagnostic(0));
+            return Err(());
+        }
+    };
+
+    let root = value.as_table().unwrap();
+
+    let mut tasks_vec = bumpalo::collections::Vec::new_in(alloc);
+    let mut groups_vec = bumpalo::collections::Vec::new_in(alloc);
+
+    // Parse [action.*] tables
+    if let Some(action_table) = table(root, "action", re)? {
+        for (name, task_value) in action_table.iter() {
+            let Some(task_table) = task_value.as_table() else {
+                mismatched_in_object(re, "table", task_value, name.name.as_ref());
+                return Err(());
+            };
+            let name_str = alloc.alloc_str(name.name.as_ref()) as &str;
+            let task = parse_task(alloc, name_str, task_table, TaskKind::Action, re)?;
+            tasks_vec.push((name_str, task));
+        }
+    }
+
+    // Parse [service.*] tables
+    if let Some(service_table) = table(root, "service", re)? {
+        for (name, task_value) in service_table.iter() {
+            let Some(task_table) = task_value.as_table() else {
+                mismatched_in_object(re, "table", task_value, name.name.as_ref());
+                return Err(());
+            };
+            let name_str = alloc.alloc_str(name.name.as_ref()) as &str;
+            let task = parse_task(alloc, name_str, task_table, TaskKind::Service, re)?;
+            tasks_vec.push((name_str, task));
+        }
+    }
+
+    // Parse [group] tables
+    if let Some(group_table) = table(root, "group", re)? {
+        for (name, group_value) in group_table.iter() {
+            let Some(group_array) = group_value.as_array() else {
+                mismatched_in_object(re, "array", group_value, name.name.as_ref());
+                return Err(());
+            };
+            let name_str = alloc.alloc_str(name.name.as_ref()) as &str;
+            let mut calls = bumpalo::collections::Vec::new_in(alloc);
+            for item in group_array {
+                calls.push(parse_task_call(alloc, item, re)?);
+            }
+            groups_vec.push((name_str, calls.into_bump_slice()));
+        }
+    }
+
+    Ok(WorkspaceConfig {
+        base_path: alloc.alloc(std::path::Path::new(".")) as &std::path::Path,
+        tasks: tasks_vec.into_bump_slice(),
+        groups: groups_vec.into_bump_slice(),
+    })
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use codespan_reporting::diagnostic::{Diagnostic, Label};
+    use codespan_reporting::files::SimpleFiles;
+    use codespan_reporting::term::termcolor::StandardStream;
+    use jsony_value::ValueMap;
+
+    #[test]
+    fn simple() {
+        let text = std::fs::read_to_string("./devsm.toml").unwrap();
+        let mut files = SimpleFiles::new();
+        let fid = files.add("devsm.toml", &text);
+        let mut writer = StandardStream::stderr(ColorChoice::Auto);
+        let mut config = codespan_reporting::term::Config::default();
+        let mut error = |diag: Diagnostic<usize>| {
+            codespan_reporting::term::emit_to_write_style(&mut writer, &config, &files, &diag).unwrap();
+        };
+        let bump = Bump::new();
+        match parse(&bump, &text, &mut error) {
+            Ok(config) => {
+                println!("Parsed {} tasks and {} groups", config.tasks.len(), config.groups.len());
+                for (name, task) in config.tasks {
+                    println!("  Task: {:?} - {:?}", name, task.kind);
+                }
+                for (name, group) in config.groups {
+                    println!("  Group: {:?} with {} calls", name, group.len());
+                }
+            }
+            Err(_) => {
+                panic!("Failed to parse");
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_string_expr() {
+        let text = r#"hello = "world""#;
+        let mut value = toml_span::parse(text).unwrap();
+        let table = value.as_table().unwrap();
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic<usize>| {
+            errors.push(diag);
+        };
+
+        let hello_val = table.get("hello").unwrap();
+        let result = parse_string_expr(&bump, hello_val, &mut error);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            StringExpr::Literal(s) => assert_eq!(s, "world"),
+            _ => panic!("Expected literal"),
+        }
+    }
+
+    #[test]
+    fn test_parse_var_expr() {
+        let text = r#"path = { var = "dir" }"#;
+        let mut value = toml_span::parse(text).unwrap();
+        let table = value.as_table().unwrap();
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic<usize>| {
+            errors.push(diag);
+        };
+
+        let path_val = table.get("path").unwrap();
+        let result = parse_string_expr(&bump, path_val, &mut error);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            StringExpr::Var(v) => assert_eq!(v, "dir"),
+            _ => panic!("Expected var"),
+        }
+    }
+
+    #[test]
+    fn test_parse_if_expr() {
+        let text = r#"arg = { if.profile = "verbose", then = "-al" }"#;
+        let mut value = toml_span::parse(text).unwrap();
+        let table = value.as_table().unwrap();
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic<usize>| {
+            errors.push(diag);
+        };
+
+        let arg_val = table.get("arg").unwrap();
+        let result = parse_string_expr(&bump, arg_val, &mut error);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            StringExpr::If(if_expr) => {
+                assert!(matches!(if_expr.cond, Predicate::Profile(_)));
+                assert!(matches!(if_expr.then, StringExpr::Literal(_)));
+            }
+            _ => panic!("Expected if expression"),
+        }
+    }
+}
