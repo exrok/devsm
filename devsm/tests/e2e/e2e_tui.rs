@@ -13,14 +13,15 @@ use jsony::Jsony;
 
 /// State parsed from TUI JSON output stream.
 #[derive(Debug, Clone, Jsony, Default)]
-struct TuiState {
+pub struct TuiState {
+    pub tty_render_byte_count: usize,
     #[allow(dead_code)]
     collapsed: bool,
     #[allow(dead_code)]
     selection: Option<TuiSelection>,
     #[allow(dead_code)]
-    overlay: Option<TuiOverlay>,
-    base_tasks: Vec<TuiBaseTask>,
+    pub overlay: Option<TuiOverlay>,
+    pub base_tasks: Vec<TuiBaseTask>,
     #[allow(dead_code)]
     meta_groups: Option<TuiMetaGroups>,
 }
@@ -48,26 +49,66 @@ struct TuiMetaGroup {
 
 #[derive(Debug, Clone, Jsony, Default)]
 #[allow(dead_code)]
-struct TuiOverlay {
-    kind: Option<String>,
-    input: Option<String>,
-    mode: Option<String>,
+pub struct TuiOverlay {
+    pub kind: Option<String>,
+    pub input: Option<String>,
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Jsony, Default)]
 #[allow(dead_code)]
-struct TuiBaseTask {
-    index: usize,
-    name: String,
-    jobs: Vec<TuiJob>,
+pub struct TuiBaseTask {
+    pub index: usize,
+    pub name: String,
+    pub jobs: Vec<TuiJob>,
 }
 
 #[derive(Debug, Clone, Jsony, Default)]
 #[allow(dead_code)]
-struct TuiJob {
-    index: usize,
-    status: String,
-    exit_code: Option<u32>,
+pub struct TuiJob {
+    pub index: usize,
+    pub status: String,
+    pub exit_code: Option<u32>,
+}
+
+pub struct BenchMetrics {
+    samples: Vec<usize>,
+}
+
+impl BenchMetrics {
+    pub fn new() -> Self {
+        Self { samples: Vec::new() }
+    }
+
+    pub fn push(&mut self, v: usize) {
+        self.samples.push(v);
+    }
+
+    pub fn total(&self) -> usize {
+        self.samples.iter().sum()
+    }
+
+    pub fn avg(&self) -> f64 {
+        self.total() as f64 / self.samples.len().max(1) as f64
+    }
+
+    pub fn max(&self) -> usize {
+        self.samples.iter().copied().max().unwrap_or(0)
+    }
+
+    pub fn median(&self) -> usize {
+        if self.samples.is_empty() {
+            return 0;
+        }
+        let mut sorted = self.samples.clone();
+        sorted.sort_unstable();
+        let mid = sorted.len() / 2;
+        if sorted.len() % 2 == 0 { (sorted[mid - 1] + sorted[mid]) / 2 } else { sorted[mid] }
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
 }
 
 impl TuiState {
@@ -75,19 +116,19 @@ impl TuiState {
         jsony::from_json(json).ok()
     }
 
-    fn find_task_by_name(&self, name: &str) -> Option<&TuiBaseTask> {
+    pub fn find_task_by_name(&self, name: &str) -> Option<&TuiBaseTask> {
         self.base_tasks.iter().find(|t| t.name == name)
     }
 }
 
-struct TuiTestClient {
+pub struct TuiTestClient {
     child: Child,
     stdin: ChildStdin,
-    state_rx: Receiver<TuiState>,
+    pub state_rx: Receiver<TuiState>,
 }
 
 impl TuiTestClient {
-    fn spawn(harness: &TestHarness) -> Self {
+    pub fn spawn(harness: &TestHarness) -> Self {
         let mut child = Command::new(cargo_bin_path())
             .current_dir(&harness.temp_dir)
             .env("DEVSM_SOCKET", &harness.socket_path)
@@ -118,7 +159,7 @@ impl TuiTestClient {
         Self { child, stdin, state_rx }
     }
 
-    fn wait_until<F>(&self, predicate: F, timeout: Duration) -> Option<TuiState>
+    pub fn wait_until<F>(&self, predicate: F, timeout: Duration) -> Option<TuiState>
     where
         F: Fn(&TuiState) -> bool,
     {
@@ -135,9 +176,13 @@ impl TuiTestClient {
         None
     }
 
-    fn send_key(&mut self, key: &[u8]) {
+    pub fn send_key(&mut self, key: &[u8]) {
         self.stdin.write_all(key).expect("Failed to send key");
         self.stdin.flush().expect("Failed to flush");
+    }
+
+    pub fn drain_states(&self, timeout: Duration) {
+        while self.state_rx.recv_timeout(timeout).is_ok() {}
     }
 }
 

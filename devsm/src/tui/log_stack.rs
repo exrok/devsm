@@ -70,6 +70,12 @@ impl Mode {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct SeparatorState {
+    selection: SelectionState,
+    y: u16,
+}
+
 #[derive(Default)]
 pub struct LogStack {
     mode: Mode,
@@ -80,6 +86,8 @@ pub struct LogStack {
     base_task_log_style: LogStyle,
     /// Highlight info for search result highlighting in the log view.
     pub highlight: Option<LogHighlight>,
+    /// Cached separator bar state to avoid redundant redraws.
+    last_separator: Option<SeparatorState>,
 }
 impl LogStack {
     /// Returns the current display mode.
@@ -142,6 +150,7 @@ impl LogStack {
             self.mode = mode;
             self.top.reset();
             self.bottom.reset();
+            self.last_separator = None;
         }
     }
 
@@ -199,33 +208,35 @@ impl LogStack {
             let view = logs.view(bot_filter);
             self.bottom.scrollable_render(self.pending_bottom_scroll, buf, dest.take_bottom(0.5), &view, &def);
             self.pending_bottom_scroll = 0;
-            // todo don't always render the value
+
             let br = dest.take_bottom(1);
-            vtui::vt::move_cursor(buf, br.x, br.y);
-            Color::Grey[6].with_fg(Color::Grey[25]).write_to_buffer(buf);
-            match &self.mode {
-                Mode::All => {}
-                Mode::OnlySelected(_selection_state) => {}
-                Mode::Hybrid(selection_state) => {
-                    let ws_state = ws.state();
-                    if selection_state.job.is_none() {
-                        if let Some(bti) = selection_state.base_task {
-                            let name = ws_state.base_tasks[bti.idx()].name;
-                            buf.extend_from_slice(b" NOT ");
-                            buf.extend_from_slice(name.as_bytes());
-                        } else if let Some(kind) = selection_state.meta_group {
-                            buf.extend_from_slice(b" NOT ");
-                            let label = match kind {
-                                MetaGroupKind::Tests => "@tests",
-                                MetaGroupKind::Actions => "@actions",
-                            };
-                            buf.extend_from_slice(label.as_bytes());
-                        }
+            let Mode::Hybrid(selection_state) = &self.mode else {
+                unreachable!()
+            };
+            let current_sep = SeparatorState { selection: *selection_state, y: br.y };
+
+            if self.last_separator.as_ref() != Some(&current_sep) {
+                vtui::vt::move_cursor(buf, br.x, br.y);
+                Color::Grey[6].with_fg(Color::Grey[25]).write_to_buffer(buf);
+                if selection_state.job.is_none() {
+                    if let Some(bti) = selection_state.base_task {
+                        let ws_state = ws.state();
+                        let name = ws_state.base_tasks[bti.idx()].name;
+                        buf.extend_from_slice(b" NOT ");
+                        buf.extend_from_slice(name.as_bytes());
+                    } else if let Some(kind) = selection_state.meta_group {
+                        buf.extend_from_slice(b" NOT ");
+                        let label = match kind {
+                            MetaGroupKind::Tests => "@tests",
+                            MetaGroupKind::Actions => "@actions",
+                        };
+                        buf.extend_from_slice(label.as_bytes());
                     }
                 }
+                vtui::vt::CLEAR_LINE_TO_RIGHT.write_to_buffer(buf);
+                vtui::vt::clear_style(buf);
+                self.last_separator = Some(current_sep);
             }
-            vtui::vt::CLEAR_LINE_TO_RIGHT.write_to_buffer(buf);
-            vtui::vt::clear_style(buf);
         } else {
             self.pending_top_scroll += self.pending_bottom_scroll;
             self.pending_bottom_scroll = 0;

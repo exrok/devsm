@@ -1,3 +1,5 @@
+#[path = "e2e/e2e_bench.rs"]
+mod e2e_bench;
 #[path = "e2e/e2e_cli.rs"]
 mod e2e_cli;
 #[path = "e2e/e2e_tui.rs"]

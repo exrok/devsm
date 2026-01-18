@@ -732,12 +732,21 @@ impl LogScrollWidget {
             }
         }
 
+        let use_batch_clear = rect.y == 0 && !style.assume_blank;
+
+        if use_batch_clear {
+            vt::move_cursor(buf, rect.x, rect.y + rect.h - 1);
+            buf.extend_from_slice(vt::CLEAR_ABOVE);
+        }
+
         vt::move_cursor(buf, rect.x, rect.y);
         let remaining_height = self.render_content(buf, rect, view, rect.h, style);
 
-        for _ in 0..remaining_height {
-            buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
-            buf.extend_from_slice(b"\r\n");
+        if !use_batch_clear && !style.assume_blank {
+            for _ in 0..remaining_height {
+                buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+                buf.extend_from_slice(b"\r\n");
+            }
         }
     }
 
@@ -906,9 +915,6 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
     let head = view.logs.head();
     let mut remaining_v_space = rect.h as i32;
 
-    // Iterate in reverse (newest first). Slice b comes after a in the logical order.
-    // Compute LogIds: entries in a have LogIds from head to head+a.len()-1
-    //                 entries in b have LogIds from head+a.len() to head+a.len()+b.len()-1
     let a_len = a.len();
 
     'outer: for (slice, base_offset) in [(b, a_len), (a, 0)] {
@@ -926,16 +932,25 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
         }
     }
 
+    let use_batch_clear = rect.y == 0 && !style.assume_blank;
+
+    if use_batch_clear {
+        vt::move_cursor(buf, rect.x, rect.y + rect.h - 1);
+        buf.extend_from_slice(vt::CLEAR_ABOVE);
+    }
+
     vt::move_cursor(buf, rect.x, rect.y);
+
     let mut screen_lines_left = rect.h;
     let mut entries_to_render = displayed.iter().rev();
 
     if remaining_v_space < 0
-        && let Some((log_id, entry)) = entries_to_render.next() {
-            let skip = (-remaining_v_space) as u16;
-            let rendered = render_single_entry(buf, view.logs, rect.w, entry, *log_id, skip, screen_lines_left, style);
-            screen_lines_left = screen_lines_left.saturating_sub(rendered);
-        }
+        && let Some((log_id, entry)) = entries_to_render.next()
+    {
+        let skip = (-remaining_v_space) as u16;
+        let rendered = render_single_entry(buf, view.logs, rect.w, entry, *log_id, skip, screen_lines_left, style);
+        screen_lines_left = screen_lines_left.saturating_sub(rendered);
+    }
 
     for (log_id, entry) in entries_to_render {
         if screen_lines_left == 0 {
@@ -945,7 +960,7 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
         screen_lines_left = screen_lines_left.saturating_sub(rendered);
     }
 
-    if !style.assume_blank {
+    if !use_batch_clear && !style.assume_blank {
         for _ in 0..screen_lines_left {
             buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
             buf.extend_from_slice(b"\r\n");
@@ -1192,5 +1207,121 @@ mod test {
         parser.process(&buf);
         buf.clear();
         expect(&parser, &["P: Short  ", "P: 1234567", "P: 1234567", "8         "]);
+    }
+
+    #[test]
+    fn batch_clear_optimization_at_y_zero() {
+        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut buf = Vec::new();
+        let rect = Rect { x: 0, y: 0, w: 20, h: 10 };
+
+        let mut writer = LogWriter::new();
+        let logs = writer.reader();
+        let mut view = LogWidget::default();
+        let style = LogStyle::default();
+
+        for i in 0..3 {
+            writer.push(&format!("Line {}", i));
+        }
+
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+        parser.process(&buf);
+
+        let byte_count_optimized = buf.len();
+        buf.clear();
+
+        assert!(
+            byte_count_optimized < 150,
+            "Byte count {} should be reduced with CLEAR_ABOVE optimization",
+            byte_count_optimized
+        );
+
+        for (i, row) in parser.screen().rows(0, 20).enumerate() {
+            if i < 3 {
+                assert!(row.starts_with("Line"), "Row {} should have content", i);
+            } else if i < 10 {
+                assert!(row.trim().is_empty(), "Row {} should be blank", i);
+            }
+        }
+    }
+
+    #[test]
+    fn no_batch_clear_when_y_nonzero() {
+        let mut parser = vt100::Parser::new(12, 20, 0);
+        let mut buf = Vec::new();
+
+        vt::move_cursor(&mut buf, 0, 0);
+        buf.extend_from_slice(b"HEADER LINE         ");
+        parser.process(&buf);
+        buf.clear();
+
+        let rect = Rect { x: 0, y: 1, w: 20, h: 10 };
+
+        let mut writer = LogWriter::new();
+        let logs = writer.reader();
+        let mut view = LogWidget::default();
+        let style = LogStyle::default();
+
+        for i in 0..3 {
+            writer.push(&format!("Line {}", i));
+        }
+
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+        parser.process(&buf);
+        buf.clear();
+
+        let first_row = parser.screen().rows(0, 20).next().unwrap();
+        assert_eq!(first_row.trim(), "HEADER LINE", "Header should be preserved when rect.y != 0");
+
+        for (i, row) in parser.screen().rows(0, 20).skip(1).enumerate() {
+            if i < 3 {
+                assert!(row.starts_with("Line"), "Row {} should have content", i + 1);
+            }
+        }
+    }
+
+    #[test]
+    fn reset_uses_batch_clear_at_y_zero() {
+        let mut parser = vt100::Parser::new(10, 20, 0);
+        let mut buf = Vec::new();
+        let rect = Rect { x: 0, y: 0, w: 20, h: 10 };
+
+        let mut writer = LogWriter::new();
+        let logs = writer.reader();
+        let mut view = LogWidget::default();
+        let style = LogStyle::default();
+
+        for i in 0..5 {
+            writer.push(&format!("Line {}", i));
+        }
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+        parser.process(&buf);
+        let initial_len = buf.len();
+        buf.clear();
+
+        view.scroll_up(2, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
+        parser.process(&buf);
+        buf.clear();
+
+        view = LogWidget::default();
+        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+        parser.process(&buf);
+        let reset_len = buf.len();
+        buf.clear();
+
+        assert!(
+            reset_len <= initial_len + 50,
+            "Reset render ({} bytes) should be similar to initial ({} bytes)",
+            reset_len,
+            initial_len
+        );
+
+        for (i, row) in parser.screen().rows(0, 20).enumerate() {
+            if i < 5 {
+                assert!(row.starts_with("Line"), "Row {} should have content", i);
+            } else if i < 10 {
+                assert!(row.trim().is_empty(), "Row {} should be blank", i);
+            }
+        }
     }
 }
