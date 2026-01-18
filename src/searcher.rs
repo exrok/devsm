@@ -102,10 +102,9 @@ impl FatSearch {
                     let Some(offset) = memchr::memmem::find(rest, r.as_bytes()) else {
                         continue 'cont;
                     };
-                    if offset != 0
-                        && rest[offset - 1] == b' ' {
-                            score += 1;
-                        }
+                    if offset != 0 && rest[offset - 1] == b' ' {
+                        score += 1;
+                    }
                     rest = &rest[offset + r.len()..];
                 }
             }

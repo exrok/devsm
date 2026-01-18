@@ -78,6 +78,7 @@ pub enum Command<'a> {
     Exec { job: &'a str, value_map: ValueMap<'a> },
     Run { job: &'a str, value_map: ValueMap<'a> },
     Test { filters: Vec<TestFilter<'a>> },
+    Validate { path: Option<&'a str>, skip_path_checks: bool },
 }
 
 /// Filter for test selection.
@@ -146,6 +147,37 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     Ok(Command::Run { job, value_map })
 }
 
+/// Parse validate command arguments.
+/// - Positional argument: config file path (optional)
+/// - `--skip-path-checks`: skip validation of pwd paths
+fn parse_validate<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let mut path = None;
+    let mut skip_path_checks = false;
+    for component in parser.by_ref() {
+        match component {
+            Component::Term(arg) => {
+                if path.is_some() {
+                    bail!("Unexpected argument: {:?}", arg);
+                }
+                path = Some(arg);
+            }
+            Component::Long(long) => match long {
+                "skip-path-checks" => skip_path_checks = true,
+                _ => bail!("Unknown flag --{} in validate command", long),
+            },
+            Component::Flags(flags) => {
+                if let Some(flag) = flags.chars().next() {
+                    bail!("Unknown flag -{}", flag);
+                }
+            }
+            Component::Value(val) => {
+                bail!("Unexpected value: {:?}", val);
+            }
+        }
+    }
+    Ok(Command::Validate { path, skip_path_checks })
+}
+
 /// Parse test filters from remaining arguments.
 /// - `+tag` includes tests with tag
 /// - `-tag` excludes tests with tag
@@ -197,16 +229,18 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                     bail!("Unknown flag, -{}", flag)
                 }
             }
-            Component::Long(long) => if long == "from" {
-                if let Some(Component::Long(value) | Component::Value(value)) = parser.next() {
-                    if global.from.is_some() {
-                        bail!("from already specified")
+            Component::Long(long) => {
+                if long == "from" {
+                    if let Some(Component::Long(value) | Component::Value(value)) = parser.next() {
+                        if global.from.is_some() {
+                            bail!("from already specified")
+                        }
+                        global.from = Some(value);
+                    } else {
+                        bail!("Expected value after from");
                     }
-                    global.from = Some(value);
-                } else {
-                    bail!("Expected value after from");
                 }
-            },
+            }
             Component::Value(value) => {
                 bail!("Dangling value found: {:?}", value)
             }
@@ -217,6 +251,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                 "exec" => break 'command parse_exec(&mut parser)?,
                 "run" => break 'command parse_run(&mut parser)?,
                 "test" => break 'command parse_test_filters(&mut parser)?,
+                "validate" => break 'command parse_validate(&mut parser)?,
                 unknown_command => bail!("Unknown Command: {:?}", unknown_command),
             },
         }

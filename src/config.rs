@@ -154,11 +154,11 @@ pub struct TaskConfigExpr<'a> {
     pub kind: TaskKind,
     #[expect(unused, reason = "TODO display in TUI and other output")]
     info: &'a str,
-    pwd: StringExpr<'a>,
+    pub pwd: StringExpr<'a>,
     command: CommandExpr<'a>,
     pub profiles: &'a [&'a str],
     envvar: &'a [(&'a str, StringExpr<'a>)],
-    require: &'a [TaskCall<'a>],
+    pub require: &'a [TaskCall<'a>],
     pub cache: Option<CacheConfig<'a>>,
     /// Tags for test filtering. Empty for non-test tasks.
     pub tags: &'a [&'a str],
@@ -168,10 +168,10 @@ pub struct TaskConfigExpr<'a> {
 #[derive(Debug)]
 pub struct TestConfigExpr<'a> {
     pub info: &'a str,
-    pwd: StringExpr<'a>,
+    pub pwd: StringExpr<'a>,
     command: CommandExpr<'a>,
     envvar: &'a [(&'a str, StringExpr<'a>)],
-    require: &'a [TaskCall<'a>],
+    pub require: &'a [TaskCall<'a>],
     pub tags: &'a [&'a str],
     pub cache: Option<CacheConfig<'a>>,
 }
@@ -370,14 +370,14 @@ impl<'a> Predicate<'a> {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
-struct If<'a, T> {
+pub struct If<'a, T> {
     cond: Predicate<'a>,
     then: T,
     or_else: Option<T>,
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
-enum StringExpr<'a> {
+pub enum StringExpr<'a> {
     Literal(&'a str),
     Var(&'a str),
     If(&'a If<'a, StringExpr<'a>>),

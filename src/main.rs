@@ -28,6 +28,7 @@ mod searcher;
 mod test_summary_ui;
 mod tui;
 mod user_config;
+mod validate;
 mod workspace;
 
 fn main() {
@@ -74,6 +75,30 @@ fn main() {
             if let Err(err) = test_client(filters) {
                 eprintln!("test failed: {}", err);
                 std::process::exit(1);
+            }
+        }
+        cli::Command::Validate { path, skip_path_checks } => {
+            let config_path = match path {
+                Some(p) => std::path::PathBuf::from(p),
+                None => {
+                    let cwd = std::env::current_dir().unwrap();
+                    match config::find_config_path_from(&cwd) {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("Cannot find devsm.toml in current or parent directories");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            };
+            let options = validate::ValidateOptions { skip_path_checks };
+            match validate::validate_config(&config_path, &options) {
+                Ok(true) => std::process::exit(0),
+                Ok(false) => std::process::exit(1),
+                Err(err) => {
+                    eprintln!("validation error: {}", err);
+                    std::process::exit(1);
+                }
             }
         }
     }

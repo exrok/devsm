@@ -1,8 +1,8 @@
-use unicode_width::UnicodeWidthStr;
 use extui::{
     Color, DoubleBuffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     keybinds::{Command, InputEvent, Keybinds, Mode},

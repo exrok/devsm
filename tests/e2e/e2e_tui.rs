@@ -477,13 +477,15 @@ sh = "for i in $(seq 1 200); do echo \"log line $i\"; done"
         },
         timeout,
     );
-    assert!(state.is_some(), "many_logs should complete and can_scroll_up should be true, server_log: {}", harness.server_log());
+    assert!(
+        state.is_some(),
+        "many_logs should complete and can_scroll_up should be true, server_log: {}",
+        harness.server_log()
+    );
 
     tui.send_ctrl_key('k');
 
-    let state = tui.wait_until(
-        |s| s.scroll.as_ref().map(|sc| sc.top.is_scrolled).unwrap_or(false),
-        Duration::from_secs(2),
-    );
+    let state =
+        tui.wait_until(|s| s.scroll.as_ref().map(|sc| sc.top.is_scrolled).unwrap_or(false), Duration::from_secs(2));
     assert!(state.is_some(), "Should enter scroll mode when there are enough logs");
 }

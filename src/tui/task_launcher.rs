@@ -4,12 +4,12 @@
 //! in the format `taskname:profile var1=value1 var2=value2` with context-aware
 //! autocomplete at each stage.
 
-use jsony_value::ValueMap;
-use unicode_width::UnicodeWidthStr;
 use extui::{
     Color, DoubleBuffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
+use jsony_value::ValueMap;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     config::TaskKind,
