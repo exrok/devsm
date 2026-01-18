@@ -10,6 +10,9 @@ use jsony::{
 };
 use jsony_value::{Value, ValueMap, ValueRef};
 
+use crate::config::template_string::{TemplatePart, munch_template_literal};
+mod template_string;
+
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct Alias<'a>(&'a str);
 impl<'a> std::ops::Deref for Alias<'a> {
@@ -236,7 +239,10 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         kind: TaskKind::Action,
         info: "Default Expression for Cargo Innvocations",
         pwd: StringExpr::Var("pwd"),
-        command: CommandExpr::Cmd(StringListExpr::List(&[StringListExpr::Literal("cargo"), StringListExpr::Var("args")])),
+        command: CommandExpr::Cmd(StringListExpr::List(&[
+            StringListExpr::Literal("cargo"),
+            StringListExpr::Var("args"),
+        ])),
         profiles: &["default"],
         envvar: &[],
         before: AliasListExpr::List(&[]),
@@ -325,6 +331,21 @@ impl<'a> BumpEval<'a> for StringExpr<'static> {
                 _ => Err(EvalError::Todo),
             },
             StringExpr::If(if_expr) => Ok(if_expr.bump_eval(env, bump)?),
+            StringExpr::TemplateLiteral(parts) => {
+                let mut result = bumpalo::collections::String::new_in(bump);
+                for part in *parts {
+                    match part {
+                        TemplatePart::Lit(s) => result.push_str(s),
+                        TemplatePart::Var(var_name) => match env.param[*var_name].as_ref() {
+                            ValueRef::String(value_string) | ValueRef::Other(value_string) => {
+                                result.push_str(&value_string);
+                            }
+                            _ => return Err(EvalError::Todo),
+                        },
+                    }
+                }
+                Ok(result.into_bump_str())
+            }
         }
     }
 }
@@ -440,16 +461,17 @@ impl<'a> BumpJsonDecode<'a> for TaskConfigExpr<'a> {
         parser: &mut jsony::json::Parser<'static>,
         bump: &'a Bump,
     ) -> Result<Self, &'static jsony::json::DecodeError> {
+        const BACKTICK: Peek = Peek::new(b'`');
         let mut pwd = StringExpr::Literal("./");
-        let mut cmd: Option<StringListExpr> = None;
-        let mut sh: Option<StringExpr> = None;
         let mut profiles: &[&str] = &[];
         let mut envvar: &[(&str, StringExpr)] = &[];
         let mut before = AliasListExpr::List(&[]);
-        let mut before_once = AliasListExpr::List(&[]);
-        let mut next_key = parser.enter_object()?;
         let mut kind = TaskKind::Action;
         let mut info = "";
+        let mut before_once = AliasListExpr::List(&[]);
+        let mut cmd: Option<StringListExpr> = None;
+        let mut sh: Option<StringExpr> = None;
+        let mut next_key = parser.enter_object()?;
         while let Some(key) = next_key {
             match key {
                 "pwd" => pwd = StringExpr::decode(parser, bump)?,
@@ -493,16 +515,7 @@ impl<'a> BumpJsonDecode<'a> for TaskConfigExpr<'a> {
             }
         };
 
-        Ok(TaskConfigExpr {
-            info,
-            kind,
-            pwd,
-            command,
-            envvar,
-            before,
-            before_once,
-            profiles,
-        })
+        Ok(TaskConfigExpr { info, kind, pwd, command, envvar, before, before_once, profiles })
     }
 }
 
@@ -558,6 +571,7 @@ enum StringExpr<'a> {
     Literal(&'a str),
     Var(&'a str),
     If(&'a If<'a, StringExpr<'a>>),
+    TemplateLiteral(&'a [TemplatePart<'a>]),
 }
 impl<'a, T: BumpEval<'a>> BumpEval<'a> for If<'a, T> {
     type Object = T::Object;
@@ -671,9 +685,24 @@ impl<'a> BumpJsonDecode<'a> for Predicate<'a> {
 }
 impl<'a> BumpJsonDecode<'a> for StringExpr<'a> {
     fn decode(parser: &mut Parser<'static>, bump: &'a Bump) -> Result<Self, &'static jsony::json::DecodeError> {
+        const BACKTICK: Peek = Peek::new(b'`');
         const DOLLAR: Peek = Peek::new(b'$');
         match parser.peek()? {
             Peek::String => Ok(StringExpr::Literal(take_string(parser, bump)?)),
+            BACKTICK => {
+                // Parse template literal (backtick-quoted string)
+                parser.at.index += 1; // Skip opening backtick
+                let bytes = parser.at.ctx.as_bytes();
+                let start = parser.at.index;
+                let content = unsafe { std::str::from_utf8_unchecked(&bytes[start..]) };
+                let (template, offset) = munch_template_literal(content, bump)?;
+                parser.at.index += offset;
+                match template {
+                    [TemplatePart::Lit(val)] => Ok(StringExpr::Literal(val)),
+                    [TemplatePart::Var(var)] => Ok(StringExpr::Var(var)),
+                    _ => Ok(StringExpr::TemplateLiteral(template)),
+                }
+            }
             Peek::Object => {
                 let Some(key) = parser.enter_seen_object()? else { panic!() };
                 if key == "if" {
@@ -794,6 +823,49 @@ mod test {
         let bump2 = Bump::new();
         let res = asdf.bump_eval(&Enviroment { profile: "default", param: ValueMap::new() }, &bump2).unwrap();
         println!("{:#?}", res);
+    }
+
+    #[test]
+    fn template_literal() {
+        use std::collections::HashMap;
+        let template = r#"{
+            pwd: "/tmp/",
+            sh: `echo "Hello ${$name}" $SHELL_ENV && echo "Value: ${$value}"`,
+            profiles: ["default"],
+        }"#;
+        let config = jsony::JsonParserConfig {
+            recursion_limit: 50,
+            allow_trailing_commas: true,
+            allow_comments: true,
+            allow_unquoted_field_keys: true,
+            allow_trailing_data: true,
+        };
+        let mut parser = jsony::json::Parser::new(template, config);
+        let bump = Bump::new();
+        let config_expr = match TaskConfigExpr::decode(&mut parser, &bump) {
+            Ok(config) => config,
+            Err(err) => {
+                panic!("{}", JsonError::extract(err, &mut parser));
+            }
+        };
+
+        let asdf = unsafe { std::mem::transmute::<TaskConfigExpr<'_>, TaskConfigExpr<'static>>(config_expr) };
+        let bump2 = Bump::new();
+
+        // Create test environment with variables
+        let mut param = jsony_value::ValueMap::new();
+        param.insert("name".into(), "World".into());
+        param.insert("value".into(), "42".into());
+
+        let res = asdf.bump_eval(&Enviroment { profile: "default", param }, &bump2).unwrap();
+
+        // Verify the template literal was evaluated correctly
+        match &res.command {
+            Command::Sh(script) => {
+                assert_eq!(*script, r#"echo "Hello World" $SHELL_ENV && echo "Value: 42""#);
+            }
+            _ => panic!("Expected Command::Sh"),
+        }
     }
 
     // #[test]
