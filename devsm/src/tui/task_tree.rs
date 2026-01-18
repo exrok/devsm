@@ -427,8 +427,12 @@ impl TaskTreeState {
             Some(sel) => sel,
             None => return,
         };
-        self.primary_scroll_offset =
-            constrain_scroll_offset(rect.h as usize, self.primary_index, self.primary_scroll_offset);
+        self.primary_scroll_offset = constrain_scroll_offset(
+            rect.h as usize,
+            self.primary_index,
+            self.primary_scroll_offset,
+            self.primary_list.len(),
+        );
         for &entry in &self.primary_list[self.primary_scroll_offset..] {
             let mut line = rect.take_top(1);
             if line.is_empty() {
@@ -509,6 +513,7 @@ impl TaskTreeState {
                 rect.h as usize,
                 (jobs.len() - self.job_list_index).saturating_sub(1),
                 self.job_list_scroll_offset,
+                jobs.len(),
             );
         } else {
             self.job_list_scroll_offset = 0;

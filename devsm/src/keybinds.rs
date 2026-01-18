@@ -453,50 +453,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_simple_key() {
+    fn input_event_parsing() {
         let key: InputEvent = "j".parse().unwrap();
         assert_eq!(key.as_char(), Some('j'));
-    }
 
-    #[test]
-    fn test_parse_ctrl_key() {
         let key: InputEvent = "C-c".parse().unwrap();
         assert_eq!(key.as_char(), Some('c'));
         assert!(key.modifiers().contains(KeyModifiers::CONTROL));
-    }
 
-    #[test]
-    fn test_parse_special_key() {
         let key: InputEvent = "ESC".parse().unwrap();
         assert!(key.named_key().is_some());
         assert_eq!(key.to_string(), "ESC");
-    }
 
-    #[test]
-    fn test_parse_ctrl_special_key() {
         let key: InputEvent = "C-ENTER".parse().unwrap();
         assert!(key.modifiers().contains(KeyModifiers::CONTROL));
         assert!(key.named_key().is_some());
     }
 
     #[test]
-    fn test_default_keybinds() {
+    fn default_keybinds_and_fallback() {
         let keybinds = Keybinds::default();
+
         let j: InputEvent = "j".parse().unwrap();
         assert_eq!(keybinds.lookup(Mode::Global, j), Some(Command::SelectNext));
-    }
 
-    #[test]
-    fn test_mode_fallback() {
-        let keybinds = Keybinds::default();
         let ctrl_c: InputEvent = "C-c".parse().unwrap();
-        // SelectSearch mode should fall back to global for C-c
         assert_eq!(keybinds.lookup(Mode::SelectSearch, ctrl_c), Some(Command::Quit));
-    }
 
-    #[test]
-    fn test_tail_log_bindings() {
-        let keybinds = Keybinds::default();
         let end: InputEvent = "END".parse().unwrap();
         let ctrl_end: InputEvent = "C-END".parse().unwrap();
         assert_eq!(keybinds.lookup(Mode::Global, end), Some(Command::TailTopLog));

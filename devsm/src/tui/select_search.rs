@@ -148,7 +148,8 @@ impl SelectSearch {
             return;
         }
         self.selected = (self.results.len() - 1).min(self.selected);
-        self.scroll_offset = constrain_scroll_offset(rect.h as usize, self.selected, self.scroll_offset);
+        self.scroll_offset =
+            constrain_scroll_offset(rect.h as usize, self.selected, self.scroll_offset, self.results.len());
         let selected = &self.results[self.selected];
         for entry in &self.results[self.scroll_offset..] {
             let entry_rect = rect.take_top(1);

@@ -309,7 +309,8 @@ impl LogSearchState {
 
         // Constrain selection and scroll
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
-        self.scroll_offset = constrain_scroll_offset(rect.h as usize, self.selected, self.scroll_offset);
+        self.scroll_offset =
+            constrain_scroll_offset(rect.h as usize, self.selected, self.scroll_offset, self.matches.len());
 
         let indexer = logs.indexer();
 

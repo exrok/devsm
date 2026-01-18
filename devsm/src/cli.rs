@@ -236,116 +236,56 @@ mod tests {
     use jsony_value::ValueRef;
 
     #[test]
-    fn parse_flag_value_integer() {
-        let value = parse_flag_value("500");
-        let ValueRef::Number(n) = value.as_ref() else {
-            panic!("Expected number, got {:?}", value);
-        };
+    fn parse_flag_value_json_types() {
+        let v = parse_flag_value("500");
+        let ValueRef::Number(n) = v.as_ref() else { panic!() };
         assert_eq!(n.as_u64(), Some(500));
-    }
 
-    #[test]
-    fn parse_flag_value_negative_integer() {
-        let value = parse_flag_value("-42");
-        let ValueRef::Number(n) = value.as_ref() else {
-            panic!("Expected number, got {:?}", value);
-        };
+        let v = parse_flag_value("-42");
+        let ValueRef::Number(n) = v.as_ref() else { panic!() };
         assert_eq!(n.as_i64(), Some(-42));
-    }
 
-    #[test]
-    fn parse_flag_value_float() {
-        let value = parse_flag_value("3.14");
-        let ValueRef::Number(n) = value.as_ref() else {
-            panic!("Expected number, got {:?}", value);
-        };
+        let v = parse_flag_value("3.14");
+        let ValueRef::Number(n) = v.as_ref() else { panic!() };
         assert_eq!(n.as_f64(), Some(3.14));
-    }
 
-    #[test]
-    fn parse_flag_value_boolean_true() {
-        let value = parse_flag_value("true");
-        let ValueRef::Boolean(b) = value.as_ref() else {
-            panic!("Expected boolean, got {:?}", value);
-        };
+        let v = parse_flag_value("true");
+        let ValueRef::Boolean(b) = v.as_ref() else { panic!() };
         assert!(*b == true);
-    }
 
-    #[test]
-    fn parse_flag_value_boolean_false() {
-        let value = parse_flag_value("false");
-        let ValueRef::Boolean(b) = value.as_ref() else {
-            panic!("Expected boolean, got {:?}", value);
-        };
+        let v = parse_flag_value("false");
+        let ValueRef::Boolean(b) = v.as_ref() else { panic!() };
         assert!(*b == false);
-    }
 
-    #[test]
-    fn parse_flag_value_null() {
-        let value = parse_flag_value("null");
-        assert!(matches!(value.as_ref(), ValueRef::Null(_)));
-    }
+        assert!(matches!(parse_flag_value("null").as_ref(), ValueRef::Null(_)));
 
-    #[test]
-    fn parse_flag_value_json_string() {
-        let value = parse_flag_value("\"quoted\"");
-        let ValueRef::String(s) = value.as_ref() else {
-            panic!("Expected string, got {:?}", value);
-        };
+        let v = parse_flag_value("\"quoted\"");
+        let ValueRef::String(s) = v.as_ref() else { panic!() };
         assert_eq!(&**s, "quoted");
-    }
 
-    #[test]
-    fn parse_flag_value_json_array() {
-        let value = parse_flag_value("[1,2,3]");
-        let ValueRef::List(list) = value.as_ref() else {
-            panic!("Expected list, got {:?}", value);
-        };
+        let v = parse_flag_value("[1,2,3]");
+        let ValueRef::List(list) = v.as_ref() else { panic!() };
         assert_eq!(list.as_slice().len(), 3);
-    }
 
-    #[test]
-    fn parse_flag_value_json_object() {
-        let value = parse_flag_value("{\"a\":1}");
-        let ValueRef::Map(map) = value.as_ref() else {
-            panic!("Expected map, got {:?}", value);
-        };
+        let v = parse_flag_value("{\"a\":1}");
+        let ValueRef::Map(map) = v.as_ref() else { panic!() };
         assert_eq!(map.entries().len(), 1);
     }
 
     #[test]
-    fn parse_flag_value_unquoted_string_fallback() {
-        let value = parse_flag_value("hello");
-        let ValueRef::String(s) = value.as_ref() else {
-            panic!("Expected string, got {:?}", value);
-        };
-        assert_eq!(&**s, "hello");
-    }
-
-    #[test]
-    fn parse_flag_value_path_fallback() {
-        let value = parse_flag_value("/usr/bin/bash");
-        let ValueRef::String(s) = value.as_ref() else {
-            panic!("Expected string, got {:?}", value);
-        };
-        assert_eq!(&**s, "/usr/bin/bash");
-    }
-
-    #[test]
-    fn parse_flag_value_url_fallback() {
-        let value = parse_flag_value("https://example.com");
-        let ValueRef::String(s) = value.as_ref() else {
-            panic!("Expected string, got {:?}", value);
-        };
-        assert_eq!(&**s, "https://example.com");
-    }
-
-    #[test]
-    fn parse_flag_value_empty_string_fallback() {
-        let value = parse_flag_value("");
-        let ValueRef::String(s) = value.as_ref() else {
-            panic!("Expected string, got {:?}", value);
-        };
-        assert_eq!(&**s, "");
+    fn parse_flag_value_string_fallbacks() {
+        let cases = [
+            ("hello", "hello"),
+            ("/usr/bin/bash", "/usr/bin/bash"),
+            ("https://example.com", "https://example.com"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            let v = parse_flag_value(input);
+            let ValueRef::String(s) = v.as_ref() else {
+                panic!("Expected string for input '{input}'");
+            };
+            assert_eq!(&**s, expected, "input: '{input}'");
+        }
     }
 }

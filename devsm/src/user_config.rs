@@ -105,14 +105,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_empty_config() {
+    fn parse_user_config_keybinds() {
         let config = parse_user_config("").unwrap();
         let j: InputEvent = "j".parse().unwrap();
-        assert_eq!(config.keybinds.lookup(Mode::Global, j), Some(Command::SelectNext));
-    }
+        assert_eq!(config.keybinds.lookup(Mode::Global, j), Some(Command::SelectNext), "empty config uses defaults");
 
-    #[test]
-    fn test_parse_custom_binding() {
         let config = parse_user_config(
             r#"
             [bind.global]
@@ -121,13 +118,9 @@ mod tests {
             "#,
         )
         .unwrap();
-
         let ctrl_j: InputEvent = "C-j".parse().unwrap();
-        assert_eq!(config.keybinds.lookup(Mode::Global, ctrl_j), Some(Command::SelectNext));
-    }
+        assert_eq!(config.keybinds.lookup(Mode::Global, ctrl_j), Some(Command::SelectNext), "custom binding");
 
-    #[test]
-    fn test_parse_unbind() {
         let config = parse_user_config(
             r#"
             [bind.global]
@@ -135,14 +128,9 @@ mod tests {
             "#,
         )
         .unwrap();
-
         let g: InputEvent = "g".parse().unwrap();
-        // g should be unbound now (was StartGroup by default)
-        assert_eq!(config.keybinds.lookup(Mode::Global, g), None);
-    }
+        assert_eq!(config.keybinds.lookup(Mode::Global, g), None, "unbind with nan");
 
-    #[test]
-    fn test_parse_mode_specific() {
         let config = parse_user_config(
             r#"
             [bind.joblist]
@@ -150,8 +138,7 @@ mod tests {
             "#,
         )
         .unwrap();
-
         let ctrl_g: InputEvent = "C-g".parse().unwrap();
-        assert_eq!(config.keybinds.lookup(Mode::JobList, ctrl_g), Some(Command::StartGroup));
+        assert_eq!(config.keybinds.lookup(Mode::JobList, ctrl_g), Some(Command::StartGroup), "mode-specific");
     }
 }

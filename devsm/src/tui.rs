@@ -16,14 +16,53 @@ use crate::tui::select_search::SelectSearch;
 use crate::tui::task_tree::{MetaGroupKind, SelectionState, TaskTreeState};
 use crate::workspace::{BaseTaskIndex, Workspace, WorkspaceState};
 
-pub fn constrain_scroll_offset(visible_height: usize, item_index: usize, scroll_offset: usize) -> usize {
-    if item_index < scroll_offset {
-        item_index
-    } else if item_index >= scroll_offset + visible_height {
-        item_index + 1 - visible_height
-    } else {
-        scroll_offset
+/// Constrains scroll offset to keep the selected item visible with padding.
+///
+/// Implements the "one before scrolling" policy: when scrolling is needed, ensures
+/// at least one item is visible above and below the selected item (unless the
+/// selected item is at the absolute start or end of the list).
+///
+/// # Examples
+///
+/// ```ignore
+/// // Middle item in a long list - ensure padding on both sides
+/// let offset = constrain_scroll_offset(5, 10, 0, 20);
+/// assert!(offset <= 9);  // At least 1 item visible above
+/// assert!(offset + 5 > 11);  // At least 1 item visible below
+/// ```
+pub fn constrain_scroll_offset(
+    visible_height: usize,
+    item_index: usize,
+    scroll_offset: usize,
+    list_length: usize,
+) -> usize {
+    if list_length == 0 || visible_height == 0 {
+        return 0;
     }
+
+    if list_length <= visible_height || visible_height <= 2 {
+        if item_index < scroll_offset {
+            return item_index;
+        }
+        if item_index >= scroll_offset + visible_height {
+            return item_index + 1 - visible_height;
+        }
+        return scroll_offset;
+    }
+
+    let last_index = list_length - 1;
+
+    if item_index == 0 {
+        return 0;
+    }
+    if item_index == last_index {
+        return list_length.saturating_sub(visible_height);
+    }
+
+    let min_offset = (item_index + 2).saturating_sub(visible_height);
+    let max_offset = item_index.saturating_sub(1);
+
+    scroll_offset.clamp(min_offset, max_offset)
 }
 
 /// Builds a `BaseTaskSet` containing all base tasks of the given kind.
@@ -716,5 +755,51 @@ pub fn run(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::constrain_scroll_offset;
+
+    #[test]
+    fn scroll_offset_edge_cases() {
+        assert_eq!(constrain_scroll_offset(5, 0, 0, 0), 0, "empty list");
+        assert_eq!(constrain_scroll_offset(5, 0, 0, 1), 0, "single item");
+        assert_eq!(constrain_scroll_offset(10, 3, 0, 5), 0, "list fits in view");
+        assert_eq!(constrain_scroll_offset(5, 2, 0, 5), 0, "list exactly fits");
+        assert_eq!(constrain_scroll_offset(2, 5, 0, 10), 4, "small height no padding");
+        assert_eq!(constrain_scroll_offset(1, 5, 0, 10), 5, "height=1 no padding");
+    }
+
+    #[test]
+    fn scroll_offset_boundary_items() {
+        assert_eq!(constrain_scroll_offset(5, 0, 0, 20), 0, "first item from 0");
+        assert_eq!(constrain_scroll_offset(5, 0, 3, 20), 0, "first item resets offset");
+        assert_eq!(constrain_scroll_offset(5, 19, 0, 20), 15, "last item from 0");
+        assert_eq!(constrain_scroll_offset(5, 19, 10, 20), 15, "last item from middle");
+
+        let offset = constrain_scroll_offset(5, 1, 0, 20);
+        assert_eq!(offset, 0, "near-top item keeps offset 0");
+
+        let offset = constrain_scroll_offset(5, 18, 0, 20);
+        assert!(offset <= 17 && offset + 5 > 19, "near-bottom has padding both sides");
+    }
+
+    #[test]
+    fn scroll_offset_middle_items_with_padding() {
+        for initial_offset in [0, 8, 15] {
+            let offset = constrain_scroll_offset(5, 10, initial_offset, 20);
+            assert!(offset <= 9, "item 10 needs 1 visible above: got {offset}");
+            assert!(offset + 5 > 11, "item 10 needs 1 visible below: got {offset}");
+        }
+
+        assert_eq!(constrain_scroll_offset(5, 10, 8, 20), 8, "valid offset preserved");
+
+        let offset = constrain_scroll_offset(5, 10, 12, 20);
+        assert!(offset <= 9, "offset too high corrected");
+
+        let offset = constrain_scroll_offset(5, 10, 3, 20);
+        assert!(offset + 5 > 11, "offset too low corrected");
     }
 }
