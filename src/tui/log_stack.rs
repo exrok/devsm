@@ -148,6 +148,17 @@ impl LogStack {
             self.bottom.reset();
         }
     }
+
+    /// Resets the top log view to tailing mode (following new logs).
+    pub fn tail_top(&mut self) {
+        self.top.reset();
+    }
+
+    /// Resets the bottom log view to tailing mode (following new logs).
+    /// Only effective in Hybrid mode.
+    pub fn tail_bottom(&mut self) {
+        self.bottom.reset();
+    }
     pub fn update_selection(&mut self, selection: SelectionState) {
         match &self.mode {
             Mode::All => {}

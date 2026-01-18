@@ -1,10 +1,11 @@
 use unicode_width::UnicodeWidthStr;
 use vtui::{
     Color, DoubleBuffer, Rect, Style,
-    event::{KeyEvent, KeyModifiers},
+    event::{KeyCode, KeyEvent},
 };
 
 use crate::{
+    keybinds::{Command, InputEvent, Keybinds, Mode},
     searcher::{Entry, FatSearch},
     tui::constrain_scroll_offset,
     workspace::BaseTaskIndex,
@@ -55,39 +56,49 @@ impl SelectSearch {
     pub fn selected<Id: PackU64>(&self) -> Option<Id> {
         Some(Id::unpack_u64(self.raw_selected()?))
     }
-    pub fn process_input(&mut self, key: KeyEvent) -> Action {
-        use vtui::event::KeyCode::*;
-        const CTRL: KeyModifiers = KeyModifiers::CONTROL;
-        match (key.modifiers, key.code) {
-            (CTRL, Char('k')) | (_, Up) => {
-                self.flush();
-                self.selected = self.selected.saturating_sub(1);
-            }
-            (CTRL, Char('j')) | (_, Down) => {
-                self.flush();
-                if self.selected + 1 < self.results.len() {
-                    self.selected += 1;
+    pub fn process_input(&mut self, key: KeyEvent, keybinds: &Keybinds) -> Action {
+        let input = InputEvent::from(key);
+
+        // Check keybindings first
+        if let Some(cmd) = keybinds.lookup_mode_only(Mode::SelectSearch, input) {
+            match cmd {
+                Command::SelectPrev => {
+                    self.flush();
+                    self.selected = self.selected.saturating_sub(1);
+                    return Action::None;
                 }
-            }
-            (CTRL, Char('g')) | (_, Esc) => {
-                return Action::Cancel;
-            }
-            (CTRL, Char('l')) | (_, Enter) => {
-                self.flush();
-                if self.results.is_empty() {
+                Command::SelectNext => {
+                    self.flush();
+                    if self.selected + 1 < self.results.len() {
+                        self.selected += 1;
+                    }
+                    return Action::None;
+                }
+                Command::OverlayCancel => {
                     return Action::Cancel;
-                } else {
-                    return Action::Enter;
                 }
+                Command::OverlayConfirm => {
+                    self.flush();
+                    if self.results.is_empty() {
+                        return Action::Cancel;
+                    } else {
+                        return Action::Enter;
+                    }
+                }
+                _ => {}
             }
-            (_, Backspace) => {
+        }
+
+        // Handle text input
+        match key.code {
+            KeyCode::Backspace => {
                 if self.cursor != 0 {
                     self.pattern.remove(self.cursor - 1);
                     self.cursor -= 1;
                 }
                 self.pattern_updated = true;
             }
-            (_, Char(ch)) => {
+            KeyCode::Char(ch) => {
                 let len = self.pattern.len();
                 self.pattern.insert(self.cursor, ch);
                 let len2 = self.pattern.len();

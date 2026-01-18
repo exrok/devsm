@@ -1,10 +1,11 @@
 use unicode_width::UnicodeWidthStr;
 use vtui::{
     Color, DoubleBuffer, Rect, Style,
-    event::{KeyEvent, KeyModifiers},
+    event::{KeyCode, KeyEvent},
 };
 
 use crate::{
+    keybinds::{Command, InputEvent, Keybinds, Mode},
     line_width::{strip_ansi_to_buffer, MatchHighlight, Segment},
     log_storage::{LogEntry, LogFilter, LogId, Logs},
     tui::constrain_scroll_offset,
@@ -237,40 +238,49 @@ impl LogSearchState {
     }
 
     /// Processes keyboard input.
-    pub fn process_input(&mut self, key: KeyEvent) -> SearchAction {
-        use vtui::event::KeyCode::*;
-        const CTRL: KeyModifiers = KeyModifiers::CONTROL;
+    pub fn process_input(&mut self, key: KeyEvent, keybinds: &Keybinds) -> SearchAction {
+        let input = InputEvent::from(key);
 
-        match (key.modifiers, key.code) {
-            (CTRL, Char('k')) | (_, Up) => {
-                self.flush();
-                self.selected = self.selected.saturating_sub(1);
-            }
-            (CTRL, Char('j')) | (_, Down) => {
-                self.flush();
-                if self.selected + 1 < self.matches.len() {
-                    self.selected += 1;
+        // Check keybindings first
+        if let Some(cmd) = keybinds.lookup_mode_only(Mode::LogSearch, input) {
+            match cmd {
+                Command::SelectPrev => {
+                    self.flush();
+                    self.selected = self.selected.saturating_sub(1);
+                    return SearchAction::None;
                 }
-            }
-            (CTRL, Char('g')) | (_, Esc) => {
-                return SearchAction::Cancel;
-            }
-            (_, Enter) => {
-                self.flush();
-                if let Some(log_id) = self.selected_log_id() {
-                    return SearchAction::Confirm(log_id);
-                } else {
+                Command::SelectNext => {
+                    self.flush();
+                    if self.selected + 1 < self.matches.len() {
+                        self.selected += 1;
+                    }
+                    return SearchAction::None;
+                }
+                Command::OverlayCancel => {
                     return SearchAction::Cancel;
                 }
+                Command::OverlayConfirm => {
+                    self.flush();
+                    if let Some(log_id) = self.selected_log_id() {
+                        return SearchAction::Confirm(log_id);
+                    } else {
+                        return SearchAction::Cancel;
+                    }
+                }
+                _ => {}
             }
-            (_, Backspace) => {
+        }
+
+        // Handle text input
+        match key.code {
+            KeyCode::Backspace => {
                 if self.cursor != 0 {
                     self.pattern.remove(self.cursor - 1);
                     self.cursor -= 1;
                 }
                 self.pattern_updated = true;
             }
-            (_, Char(ch)) => {
+            KeyCode::Char(ch) => {
                 let len = self.pattern.len();
                 self.pattern.insert(self.cursor, ch);
                 let len2 = self.pattern.len();

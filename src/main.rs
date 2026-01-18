@@ -12,14 +12,17 @@ use sendfd::SendWithFd;
 use crate::daemon::{GLOBAL_SOCKET, WorkspaceCommand};
 
 mod cli;
+mod collection;
 mod config;
 mod daemon;
+mod keybinds;
 mod line_width;
 mod log_storage;
 mod process_manager;
 mod scroll_view;
 mod searcher;
 mod tui;
+mod user_config;
 mod workspace;
 
 fn main() {

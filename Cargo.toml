@@ -35,6 +35,8 @@ toml-span = { path = "/home/user/git/toml-span/toml-span", features = [
     "reporting",
 ] }
 codespan-reporting = { version = "0.13.1", features = ["termcolor"] }
+hashbrown = "0.16.1"
+foldhash = "0.2.0"
 
 [dev-dependencies]
 #proptest = "1.9.0"

@@ -573,9 +573,10 @@ impl ProcessManager {
                 let client_entry = ClientEntry { channel: vtui_channel.clone(), workspace: ws_index, socket };
                 let index = self.clients.insert(client_entry);
                 kvlog::info!("Client Attached");
+                let keybinds = global_keybinds();
                 std::thread::spawn(move || {
                     let _ = std::panic::catch_unwind(|| {
-                        if let Err(err) = crate::tui::run(stdin, stdout, &ws_handle, vtui_channel) {
+                        if let Err(err) = crate::tui::run(stdin, stdout, &ws_handle, vtui_channel, keybinds) {
                             kvlog::error!("TUI exited with error", %err);
                         }
                     });
@@ -898,11 +899,19 @@ fn setup_signal_handler(sig: i32, handler: unsafe extern "C" fn(i32)) -> anyhow:
 }
 
 static GLOBAL_WAKER: std::sync::OnceLock<&'static Waker> = std::sync::OnceLock::new();
+static GLOBAL_KEYBINDS: std::sync::OnceLock<crate::keybinds::Keybinds> = std::sync::OnceLock::new();
+
+pub(crate) fn global_keybinds() -> &'static crate::keybinds::Keybinds {
+    GLOBAL_KEYBINDS.get_or_init(|| crate::user_config::UserConfig::load().keybinds)
+}
 
 impl ProcessManagerHandle {
     pub(crate) fn global_block_on(
         mut func: impl FnMut(ProcessManagerHandle) + Send + Sync + 'static,
     ) -> anyhow::Result<()> {
+        // Load user config (keybinds) at startup
+        let _ = global_keybinds();
+
         setup_signal_handler(libc::SIGTERM, term_handler)?;
         setup_signal_handler(libc::SIGINT, term_handler)?;
         let poll = Poll::new()?;

@@ -6,6 +6,7 @@ use vtui::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use vtui::vt::BufferWrite;
 use vtui::{Color, DoubleBuffer, Rect, Style, TerminalFlags, vt};
 
+use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 use crate::log_storage::LogFilter;
 use crate::process_manager::{Action, ClientChannel};
 use crate::tui::log_search::{LogSearchState, SearchAction};
@@ -36,15 +37,28 @@ enum FocusOverlap {
     None,
 }
 
+struct HelpMenu {
+    visible: bool,
+    scroll: usize,
+}
+
 struct TuiState {
     frame: DoubleBuffer,
 
     logs: LogStack,
     task_tree: TaskTreeState,
     overlay: FocusOverlap,
+    help: HelpMenu,
 }
 
-fn render<'a>(w: u16, h: u16, tui: &'a mut TuiState, workspace: &Workspace, delta: Has) -> &'a [u8] {
+fn render<'a>(
+    w: u16,
+    h: u16,
+    tui: &'a mut TuiState,
+    workspace: &Workspace,
+    keybinds: &Keybinds,
+    delta: Has,
+) -> &'a [u8] {
     if delta.any(Has::RESIZED) {
         tui.frame.resize(w, h);
     }
@@ -88,7 +102,16 @@ fn render<'a>(w: u16, h: u16, tui: &'a mut TuiState, workspace: &Workspace, delt
         .skip(1)
         .text(&mut tui.frame, "Placeholder");
     {
-        let task_tree_rect = bot.take_top(19);
+        let mut task_tree_rect = bot.take_top(19);
+
+        // Take 32 chars from the right for help menu if visible
+        let help_rect = if tui.help.visible {
+            let help_width = 32.min(task_tree_rect.w as i32);
+            Some(task_tree_rect.take_right(help_width))
+        } else {
+            None
+        };
+
         match &mut tui.overlay {
             FocusOverlap::Group { selection } => {
                 let ws = &*workspace.state();
@@ -125,6 +148,16 @@ fn render<'a>(w: u16, h: u16, tui: &'a mut TuiState, workspace: &Workspace, delt
                 tui.task_tree.render_secondary(&mut tui.frame, s, &ws);
             }
         }
+
+        // Render help menu
+        if let Some(help_rect) = help_rect {
+            let current_mode = match &tui.overlay {
+                FocusOverlap::Group { .. } | FocusOverlap::SpawnProfile { .. } => Mode::SelectSearch,
+                FocusOverlap::LogSearch { .. } => Mode::LogSearch,
+                FocusOverlap::None => Mode::Global,
+            };
+            render_help_menu(&mut tui.frame, help_rect, keybinds, &mut tui.help, current_mode);
+        }
     }
 
     tui.frame.render_internal();
@@ -132,16 +165,80 @@ fn render<'a>(w: u16, h: u16, tui: &'a mut TuiState, workspace: &Workspace, delt
     pre_truncate(&mut tui.frame.buf)
 }
 
-fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyEvent) -> bool {
-    use KeyCode::*;
-    const CTRL: KeyModifiers = KeyModifiers::CONTROL;
-    match (key_event.modifiers, key_event.code) {
-        (CTRL, Char('c')) => return true,
-        _ => (),
+fn render_help_menu(frame: &mut DoubleBuffer, mut rect: Rect, keybinds: &Keybinds, help: &mut HelpMenu, current_mode: Mode) {
+    // Collect bindings from current mode first, then add global bindings not overridden
+    let mut bindings: Vec<_> = keybinds.mode_bindings(current_mode).collect();
+    let mode_keys: std::collections::HashSet<_> = bindings.iter().map(|(k, _)| *k).collect();
+
+    // Add global bindings that aren't overridden by mode-specific ones
+    for (input, cmd) in keybinds.global_bindings() {
+        if !mode_keys.contains(&input) {
+            bindings.push((input, cmd));
+        }
     }
+
+    bindings.sort_by(|a, b| a.1.display_name().cmp(b.1.display_name()));
+
+    let total_items = bindings.len();
+    let visible_height = rect.h as usize;
+
+    // Constrain scroll
+    if total_items <= visible_height {
+        help.scroll = 0;
+    } else if help.scroll > total_items - visible_height {
+        help.scroll = total_items - visible_height;
+    }
+
+    // Header
+    let header = rect.take_top(1);
+    header
+        .with(Color::Grey[6].with_fg(Color::Grey[25]))
+        .fill(frame)
+        .skip(1)
+        .text(frame, "Keybindings (? to close)");
+
+    // Render bindings
+    for (input, cmd) in bindings.iter().skip(help.scroll) {
+        let line_rect = rect.take_top(1);
+        if line_rect.is_empty() {
+            break;
+        }
+
+        // Format: "key     command"
+        let key_str = input.to_string();
+        let cmd_str = cmd.display_name();
+
+        let mut styled = line_rect.with(Style::DEFAULT);
+        styled = styled.with(Color::Cyan1.as_fg()).text(frame, &key_str);
+
+        // Pad to align command names
+        let key_width = key_str.len();
+        let pad_width = 10usize.saturating_sub(key_width);
+        for _ in 0..pad_width {
+            styled = styled.text(frame, " ");
+        }
+
+        styled.with(Color::Grey[20].as_fg()).text(frame, cmd_str);
+    }
+}
+
+fn process_key<'a>(
+    tui: &'a mut TuiState,
+    workspace: &Workspace,
+    key_event: KeyEvent,
+    keybinds: &Keybinds,
+) -> bool {
+    let input = InputEvent::from(key_event);
+
+    // Check for quit command first (always active)
+    if keybinds.lookup(Mode::Global, input) == Some(Command::Quit) {
+        return true;
+    }
+
+    // Handle overlay-specific input
     match &mut tui.overlay {
         FocusOverlap::Group { selection } => {
-            match selection.process_input(key_event) {
+            match selection.process_input(key_event, keybinds) {
                 select_search::Action::Cancel => {
                     tui.overlay = FocusOverlap::None;
                 }
@@ -173,7 +270,7 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
             return false;
         }
         FocusOverlap::SpawnProfile { selection, bti, profiles } => {
-            match selection.process_input(key_event) {
+            match selection.process_input(key_event, keybinds) {
                 select_search::Action::Cancel => {
                     tui.overlay = FocusOverlap::None;
                 }
@@ -189,7 +286,7 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
             return false;
         }
         FocusOverlap::LogSearch { state } => {
-            match state.process_input(key_event) {
+            match state.process_input(key_event, keybinds) {
                 SearchAction::Cancel => {
                     tui.overlay = FocusOverlap::None;
                 }
@@ -214,10 +311,15 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
         }
         FocusOverlap::None => {}
     }
-    match (key_event.modifiers, key_event.code) {
-        (CTRL, Char('c')) => return true,
-        (_, Char('/')) => {
-            // Enter log search mode
+
+    // Handle global commands when no overlay is active
+    let Some(command) = keybinds.lookup(Mode::Global, input) else {
+        return false;
+    };
+
+    match command {
+        Command::Quit => return true,
+        Command::SearchLogs => {
             let ws_state = workspace.state();
             let filter = match tui.logs.mode() {
                 log_stack::Mode::All => LogFilter::All,
@@ -236,40 +338,39 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
             tui.logs.enter_scroll_mode(workspace);
             tui.overlay = FocusOverlap::LogSearch { state };
         }
-        (_, Char('g')) => {
+        Command::StartGroup => {
             let ws = workspace.state();
             let entries = ws.config.current.groups.iter().enumerate().map(|(index, (name, _))| (index, name));
             tui.overlay = FocusOverlap::Group { selection: entries.collect() }
         }
-        (_, Char('r')) => {
+        Command::RestartTask => {
             if let Some(sel) = { tui.task_tree.selection_state(&workspace.state()) } {
                 workspace.restart_task(sel.base_task, ValueMap::new(), "");
             }
         }
-        (_, Char('d')) => {
+        Command::TerminateTask => {
             if let Some(sel) = { tui.task_tree.selection_state(&workspace.state()) } {
                 workspace.terminate_tasks(sel.base_task);
             }
         }
-        (_, Char('1')) => {
+        Command::LogModeAll => {
             tui.logs.set_mode(log_stack::Mode::All);
         }
-        (_, Char('2')) => {
+        Command::LogModeSelected => {
             if let Some(sel) = tui.task_tree.selection_state(&workspace.state()) {
                 tui.logs.set_mode(log_stack::Mode::OnlySelected(sel));
             }
         }
-        (_, Char('3')) => {
+        Command::LogModeHybrid => {
             if let Some(sel) = tui.task_tree.selection_state(&workspace.state()) {
                 tui.logs.set_mode(log_stack::Mode::Hybrid(sel));
             }
         }
-        (_, Char('p')) => {
+        Command::SelectProfile => {
             let ws = workspace.state();
             if let Some(sel) = tui.task_tree.selection_state(&ws) {
                 let profiles = ws.base_tasks[sel.base_task.idx()].config.profiles;
                 if profiles.is_empty() {
-                    // todo add message
                     return false;
                 }
                 tui.overlay = FocusOverlap::SpawnProfile {
@@ -279,19 +380,35 @@ fn process_key<'a>(tui: &'a mut TuiState, workspace: &Workspace, key_event: KeyE
                 }
             }
         }
-        (_, Char('k')) => {
+        Command::SelectPrev => {
             tui.task_tree.move_cursor_up(&workspace.state());
         }
-        (_, Char('j')) => {
+        Command::SelectNext => {
             tui.task_tree.move_cursor_down(&workspace.state());
         }
-        (_, Char('h')) => {
+        Command::FocusPrimary => {
             tui.task_tree.exit_secondary();
         }
-        (_, Char('l')) => {
+        Command::FocusSecondary => {
             tui.task_tree.enter_secondary(&workspace.state());
         }
-        _ => (),
+        Command::TailTopLog => {
+            tui.logs.tail_top();
+        }
+        Command::TailBottomLog => {
+            tui.logs.tail_bottom();
+        }
+        Command::ToggleHelp => {
+            tui.help.visible = !tui.help.visible;
+        }
+        Command::HelpScrollUp => {
+            tui.help.scroll = tui.help.scroll.saturating_sub(5);
+        }
+        Command::HelpScrollDown => {
+            tui.help.scroll = tui.help.scroll.saturating_add(5);
+        }
+        // Overlay commands are handled in overlay sections above
+        Command::OverlayCancel | Command::OverlayConfirm => {}
     }
     false
 }
@@ -365,6 +482,7 @@ pub fn run(
     stdout: OwnedFd,
     workspace: &Workspace,
     vtui_channel: Arc<ClientChannel>,
+    keybinds: &Keybinds,
 ) -> anyhow::Result<()> {
     let mode = TerminalFlags::RAW_MODE
         | TerminalFlags::ALT_SCREEN
@@ -389,6 +507,7 @@ pub fn run(
         logs: LogStack::default(),
         task_tree: TaskTreeState::default(),
         overlay: FocusOverlap::None,
+        help: HelpMenu { visible: false, scroll: 0 },
     };
 
     let mut delta = Has(0);
@@ -396,7 +515,7 @@ pub fn run(
         if delta.any(Has::RESIZED) {
             (w, h) = terminal.size()?;
         }
-        terminal.write_all(render(w, h, &mut tui, workspace, delta))?;
+        terminal.write_all(render(w, h, &mut tui, workspace, keybinds, delta))?;
         delta = Has(0);
 
         {
@@ -424,7 +543,7 @@ pub fn run(
         while let Some(event) = events.next(terminal.is_raw()) {
             match event {
                 Event::Key(key_event) => {
-                    if process_key(&mut tui, workspace, key_event) {
+                    if process_key(&mut tui, workspace, key_event, keybinds) {
                         return Ok(());
                     }
                 }
