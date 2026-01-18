@@ -1,5 +1,4 @@
-#:schema ./devsm-schema.json
-
+#:schema ./schema/devsm.json
 
 [action.print_key]
 sh = 'cat /tmp/devsm.test.key'

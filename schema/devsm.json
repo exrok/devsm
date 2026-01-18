@@ -1,0 +1,405 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "devsm configuration",
+  "description": "Configuration schema for devsm - a TUI development service manager",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "type": "object",
+      "description": "Actions are one-time tasks that run to completion",
+      "additionalProperties": {
+        "$ref": "#/definitions/action"
+      }
+    },
+    "service": {
+      "type": "object",
+      "description": "Services are long-running processes",
+      "additionalProperties": {
+        "$ref": "#/definitions/service"
+      }
+    },
+    "test": {
+      "type": "object",
+      "description": "Tests are test suites that can be filtered by tags",
+      "additionalProperties": {
+        "$ref": "#/definitions/testEntry"
+      }
+    },
+    "group": {
+      "type": "object",
+      "description": "Groups are collections of tasks to run together",
+      "additionalProperties": {
+        "type": "array",
+        "description": "Array of task references",
+        "items": {
+          "$ref": "#/definitions/taskCall"
+        }
+      }
+    }
+  },
+  "definitions": {
+    "stringExpr": {
+      "description": "A string expression: literal string, variable reference, or conditional",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/definitions/varExpr"
+        },
+        {
+          "$ref": "#/definitions/ifStringExpr"
+        }
+      ]
+    },
+    "varExpr": {
+      "type": "object",
+      "description": "Variable reference expression",
+      "additionalProperties": false,
+      "required": ["var"],
+      "properties": {
+        "var": {
+          "type": "string",
+          "description": "Name of the variable to substitute"
+        }
+      }
+    },
+    "ifStringExpr": {
+      "type": "object",
+      "description": "Conditional string expression",
+      "additionalProperties": false,
+      "required": ["if", "then"],
+      "properties": {
+        "if": {
+          "$ref": "#/definitions/predicate"
+        },
+        "then": {
+          "$ref": "#/definitions/stringExpr",
+          "description": "Value if condition is true"
+        },
+        "or_else": {
+          "$ref": "#/definitions/stringExpr",
+          "description": "Value if condition is false (optional)"
+        }
+      }
+    },
+    "stringListExpr": {
+      "description": "A string list expression: literal string, array, variable reference, or conditional",
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/stringListExpr"
+          }
+        },
+        {
+          "$ref": "#/definitions/varExpr"
+        },
+        {
+          "$ref": "#/definitions/ifStringListExpr"
+        }
+      ]
+    },
+    "ifStringListExpr": {
+      "type": "object",
+      "description": "Conditional string list expression",
+      "additionalProperties": false,
+      "required": ["if", "then"],
+      "properties": {
+        "if": {
+          "$ref": "#/definitions/predicate"
+        },
+        "then": {
+          "$ref": "#/definitions/stringListExpr",
+          "description": "Value if condition is true"
+        },
+        "or_else": {
+          "$ref": "#/definitions/stringListExpr",
+          "description": "Value if condition is false (optional)"
+        }
+      }
+    },
+    "predicate": {
+      "type": "object",
+      "description": "Condition predicate",
+      "additionalProperties": false,
+      "required": ["profile"],
+      "properties": {
+        "profile": {
+          "type": "string",
+          "description": "Profile name to match against"
+        }
+      }
+    },
+    "taskCall": {
+      "description": "Reference to a task: simple name, name:profile, or [name, {vars}]",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Task name, optionally with profile (e.g., 'build' or 'build:release')"
+        },
+        {
+          "type": "array",
+          "description": "Task call with variables: [name:profile, {var1: value1, ...}]",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": [
+            {
+              "type": "string",
+              "description": "Task name, optionally with profile"
+            },
+            {
+              "type": "object",
+              "description": "Variables to pass to the task",
+              "additionalProperties": {
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "integer" },
+                  { "type": "boolean" }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "envTable": {
+      "type": "object",
+      "description": "Environment variables",
+      "additionalProperties": {
+        "$ref": "#/definitions/stringExpr"
+      }
+    },
+    "cacheKeyInput": {
+      "description": "Cache invalidation trigger",
+      "oneOf": [
+        {
+          "type": "object",
+          "description": "Invalidate when file modification time changes",
+          "additionalProperties": false,
+          "required": ["modified"],
+          "properties": {
+            "modified": {
+              "type": "string",
+              "description": "Path to file or directory to watch"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "description": "Invalidate when another task's profile changes",
+          "additionalProperties": false,
+          "required": ["profile_changed"],
+          "properties": {
+            "profile_changed": {
+              "type": "string",
+              "description": "Name of task whose profile changes trigger invalidation"
+            }
+          }
+        }
+      ]
+    },
+    "cacheConfig": {
+      "type": "object",
+      "description": "Cache configuration for actions",
+      "additionalProperties": false,
+      "properties": {
+        "key": {
+          "type": "array",
+          "description": "Cache key inputs that determine when cache should be invalidated",
+          "items": {
+            "$ref": "#/definitions/cacheKeyInput"
+          }
+        }
+      },
+      "x-taplo": {
+        "initKeys": ["key"]
+      }
+    },
+    "action": {
+      "type": "object",
+      "description": "Action configuration - a one-time task",
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["cmd"] },
+        { "required": ["sh"] }
+      ],
+      "properties": {
+        "cmd": {
+          "$ref": "#/definitions/stringListExpr",
+          "description": "Command as array of arguments (mutually exclusive with 'sh')"
+        },
+        "sh": {
+          "$ref": "#/definitions/stringExpr",
+          "description": "Shell command string (mutually exclusive with 'cmd')"
+        },
+        "pwd": {
+          "$ref": "#/definitions/stringExpr",
+          "description": "Working directory for the task",
+          "default": "./"
+        },
+        "profiles": {
+          "type": "array",
+          "description": "Available profiles for this task",
+          "items": {
+            "type": "string"
+          },
+          "default": ["default"]
+        },
+        "env": {
+          "$ref": "#/definitions/envTable",
+          "description": "Environment variables"
+        },
+        "require": {
+          "type": "array",
+          "description": "Task dependencies that must complete before this task runs",
+          "items": {
+            "$ref": "#/definitions/taskCall"
+          }
+        },
+        "cache": {
+          "$ref": "#/definitions/cacheConfig",
+          "description": "Cache configuration - caches successful runs within a session"
+        },
+        "info": {
+          "type": "string",
+          "description": "Description of the action"
+        }
+      },
+      "x-taplo": {
+        "initKeys": ["cmd"]
+      }
+    },
+    "service": {
+      "type": "object",
+      "description": "Service configuration - a long-running process",
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["cmd"] },
+        { "required": ["sh"] }
+      ],
+      "properties": {
+        "cmd": {
+          "$ref": "#/definitions/stringListExpr",
+          "description": "Command as array of arguments (mutually exclusive with 'sh')"
+        },
+        "sh": {
+          "$ref": "#/definitions/stringExpr",
+          "description": "Shell command string (mutually exclusive with 'cmd')"
+        },
+        "pwd": {
+          "$ref": "#/definitions/stringExpr",
+          "description": "Working directory for the service",
+          "default": "./"
+        },
+        "profiles": {
+          "type": "array",
+          "description": "Available profiles for this service",
+          "items": {
+            "type": "string"
+          },
+          "default": ["default"]
+        },
+        "env": {
+          "$ref": "#/definitions/envTable",
+          "description": "Environment variables"
+        },
+        "require": {
+          "type": "array",
+          "description": "Task dependencies that must be active/running",
+          "items": {
+            "$ref": "#/definitions/taskCall"
+          }
+        },
+        "info": {
+          "type": "string",
+          "description": "Description of the service"
+        }
+      },
+      "x-taplo": {
+        "initKeys": ["cmd"]
+      }
+    },
+    "test": {
+      "type": "object",
+      "description": "Test configuration",
+      "additionalProperties": false,
+      "oneOf": [
+        { "required": ["cmd"] },
+        { "required": ["sh"] }
+      ],
+      "properties": {
+        "cmd": {
+          "$ref": "#/definitions/stringListExpr",
+          "description": "Command as array of arguments (mutually exclusive with 'sh')"
+        },
+        "sh": {
+          "$ref": "#/definitions/stringExpr",
+          "description": "Shell command string (mutually exclusive with 'cmd')"
+        },
+        "pwd": {
+          "$ref": "#/definitions/stringExpr",
+          "description": "Working directory for the test",
+          "default": "./"
+        },
+        "env": {
+          "$ref": "#/definitions/envTable",
+          "description": "Environment variables"
+        },
+        "require": {
+          "type": "array",
+          "description": "Task dependencies that must complete before this test runs",
+          "items": {
+            "$ref": "#/definitions/taskCall"
+          }
+        },
+        "tag": {
+          "description": "Tags for filtering tests",
+          "oneOf": [
+            {
+              "type": "string",
+              "description": "Single tag"
+            },
+            {
+              "type": "array",
+              "description": "Multiple tags",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
+        },
+        "cache": {
+          "$ref": "#/definitions/cacheConfig",
+          "description": "Cache configuration - caches successful runs within a session"
+        },
+        "info": {
+          "type": "string",
+          "description": "Description of the test"
+        }
+      },
+      "x-taplo": {
+        "initKeys": ["cmd"]
+      }
+    },
+    "testEntry": {
+      "description": "Test entry - either a single test or an array of test variants",
+      "oneOf": [
+        {
+          "$ref": "#/definitions/test"
+        },
+        {
+          "type": "array",
+          "description": "Multiple test variants with the same name",
+          "items": {
+            "$ref": "#/definitions/test"
+          }
+        }
+      ]
+    }
+  }
+}

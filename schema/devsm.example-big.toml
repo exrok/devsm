@@ -1,0 +1,407 @@
+# The following config is used for validating the json schema.
+
+# Minimal action with cmd array
+[action.simple_cmd]
+cmd = ["echo", "hello"]
+
+# Minimal action with sh string
+[action.simple_sh]
+sh = "echo hello"
+
+# Action with multiline shell script
+[action.multiline_sh]
+sh = '''
+for i in 1 2 3; do
+    echo "Iteration $i"
+done
+'''
+
+# Action with all basic fields
+[action.full_basic]
+cmd = ["cargo", "build"]
+pwd = "./backend"
+profiles = ["default", "release", "debug"]
+info = "Builds the backend service"
+
+# Action using variable in cmd
+[action.with_var]
+cmd = ["ls", { var = "dir" }]
+
+# Action using conditional in cmd
+[action.with_conditional]
+cmd = ["cargo", "build", { if.profile = "release", then = "--release" }]
+profiles = ["default", "release"]
+
+# Action using conditional with or_else
+[action.with_conditional_else]
+cmd = [
+    "cargo",
+    "build",
+    { if.profile = "debug", then = "--debug", or_else = "--release" },
+]
+profiles = ["debug", "release"]
+
+# Action with nested expressions in cmd
+[action.complex_cmd]
+cmd = [
+    "cargo",
+    { if.profile = "verbose", then = "-v" },
+    "build",
+    { if.profile = "release", then = "--release", or_else = "--debug" },
+    { var = "extra_args" },
+]
+profiles = ["default", "verbose", "release"]
+
+# Action with environment variables - literal strings
+[action.with_env_literal]
+cmd = ["./my-script.sh"]
+env.MY_VAR = "value"
+env.ANOTHER_VAR = "another"
+
+# Action with environment variables - expressions
+[action.with_env_expr]
+cmd = ["./my-script.sh"]
+env.LOG_LEVEL = { if.profile = "debug", then = "DEBUG", or_else = "INFO" }
+env.OUTPUT_DIR = { var = "output" }
+env.STATIC_VAR = "static-value"
+profiles = ["default", "debug"]
+
+# Action with pwd as expression
+[action.with_pwd_var]
+cmd = ["ls"]
+pwd = { var = "workdir" }
+
+# Action with pwd as conditional
+[action.with_pwd_conditional]
+cmd = ["ls"]
+pwd = { if.profile = "backend", then = "./backend", or_else = "./frontend" }
+profiles = ["backend", "frontend"]
+
+# Action with simple require (task name only)
+[action.with_require_simple]
+cmd = ["cargo", "test"]
+require = ["simple_cmd"]
+
+# Action with require using profile
+[action.with_require_profile]
+cmd = ["./deploy.sh"]
+require = ["full_basic:release"]
+
+# Action with require using variables
+[action.with_require_vars]
+cmd = ["./run-tests.sh"]
+require = [["with_var", { dir = "/usr/local" }]]
+
+# Action with require using profile and variables
+[action.with_require_full]
+cmd = ["./integration-test.sh"]
+require = [
+    "simple_cmd",
+    "full_basic:debug",
+    [
+        "with_var:default",
+        { dir = "/tmp" },
+    ],
+]
+
+# Action with empty cache (simple success-based caching)
+[action.with_cache_empty]
+cmd = ["./expensive-setup.sh"]
+cache = {}
+
+# Action with cache key using modified
+[action.with_cache_modified]
+cmd = ["cargo", "build"]
+cache.key = [{ modified = "Cargo.toml" }]
+
+# Action with cache key using profile_changed
+[action.with_cache_profile_changed]
+cmd = ["./build-config.sh"]
+cache.key = [{ profile_changed = "full_basic" }]
+
+# Action with cache key using multiple inputs
+[action.with_cache_multiple]
+cmd = ["./compile.sh"]
+cache.key = [
+    { modified = "Cargo.toml" },
+    { modified = "Cargo.lock" },
+    { modified = "src/lib.rs" },
+    { profile_changed = "simple_cmd" },
+    { profile_changed = "full_basic" },
+]
+
+# Action combining all features (cmd version)
+[action.kitchen_sink_cmd]
+cmd = [
+    "cargo",
+    { if.profile = "verbose", then = "-v" },
+    "build",
+    { if.profile = "release", then = "--release", or_else = "--debug" },
+    { var = "target" },
+]
+pwd = { if.profile = "frontend", then = "./frontend", or_else = "./backend" }
+profiles = ["default", "verbose", "release", "frontend"]
+env.RUST_LOG = { if.profile = "verbose", then = "debug", or_else = "info" }
+env.BUILD_DIR = { var = "build_dir" }
+env.CI = "true"
+require = ["simple_cmd", "full_basic:release", ["with_var", { dir = "/opt" }]]
+cache.key = [
+    { modified = "Cargo.toml" },
+    { profile_changed = "with_cache_modified" },
+]
+info = "The ultimate test action with every possible field (cmd)"
+
+# Action combining all features (sh version)
+[action.kitchen_sink_sh]
+sh = '''
+echo "Building with profile: $PROFILE"
+if [ "$RELEASE" = "true" ]; then
+    cargo build --release
+else
+    cargo build
+fi
+'''
+pwd = { if.profile = "docker", then = "/app", or_else = "./" }
+profiles = ["default", "docker"]
+env.PROFILE = { if.profile = "docker", then = "docker", or_else = "local" }
+env.RELEASE = { var = "release_flag" }
+env.OUTPUT = "build/"
+require = ["simple_cmd"]
+cache.key = [{ modified = "src/" }]
+info = "The ultimate test action with every possible field (sh)"
+
+# =============================================================================
+# SERVICES - Long-running processes
+# =============================================================================
+
+# Minimal service with cmd
+[service.simple_service]
+cmd = ["./server"]
+
+# Minimal service with sh
+[service.simple_service_sh]
+sh = "python -m http.server 8000"
+
+# Service with multiline sh
+[service.multiline_service]
+sh = '''
+export PORT=8080
+export HOST=0.0.0.0
+./my-server --port=$PORT --host=$HOST
+'''
+
+# Service with all basic fields (no cache - services don't support cache)
+[service.full_service]
+cmd = ["./backend-server", "--port", "8080"]
+pwd = "./backend"
+profiles = ["dev", "staging", "production"]
+info = "Main backend HTTP server"
+
+# Service with environment variables
+[service.service_with_env]
+cmd = ["./server"]
+env.PORT = { if.profile = "production", then = "80", or_else = "8080" }
+env.HOST = "0.0.0.0"
+env.LOG_LEVEL = { var = "log_level" }
+profiles = ["dev", "production"]
+
+# Service with conditional command
+[service.service_conditional_cmd]
+cmd = ["node", { if.profile = "watch", then = "--watch" }, "server.js"]
+profiles = ["default", "watch"]
+
+# Service with require (dependencies must be active/running)
+[service.service_with_require]
+cmd = ["./api-server"]
+require = ["simple_service"]
+
+# Service with complex require
+[service.complex_service]
+cmd = ["./main-service"]
+pwd = { if.profile = "docker", then = "/app", or_else = "./" }
+profiles = ["default", "docker"]
+env.DATABASE_URL = { var = "db_url" }
+env.ENVIRONMENT = { if.profile = "docker", then = "container", or_else = "local" }
+require = [
+    "simple_service",
+    "full_service:staging",
+    [
+        "service_with_env:dev",
+        { log_level = "debug" },
+    ],
+]
+info = "Complex service with all supported fields"
+
+# =============================================================================
+# TESTS - Test suites
+# =============================================================================
+
+# Minimal test with cmd
+[test.simple_test]
+cmd = ["cargo", "test"]
+
+# Minimal test with sh
+[test.simple_test_sh]
+sh = "pytest"
+
+# Test with multiline sh
+[test.multiline_test]
+sh = '''
+echo "Running tests..."
+cargo test --lib
+cargo test --doc
+echo "Done!"
+'''
+
+# Test with single tag (string)
+[test.test_with_single_tag]
+cmd = ["cargo", "test", "--lib"]
+tag = "unit"
+
+# Test with multiple tags (array)
+[test.test_with_multiple_tags]
+cmd = ["cargo", "test", "--test", "integration"]
+tag = ["integration", "slow", "database"]
+
+# Test with all basic fields
+[test.full_test]
+cmd = ["cargo", "test", "--all-features"]
+pwd = "./core"
+tag = ["unit", "fast"]
+info = "Core library unit tests"
+
+# Test with environment variables
+[test.test_with_env]
+cmd = ["./run-tests.sh"]
+env.TEST_DATABASE = "postgres://localhost/test"
+env.CI = "true"
+env.LOG_LEVEL = { var = "log_level" }
+
+# Test with require
+[test.test_with_require]
+cmd = ["cargo", "test"]
+require = ["with_cache_empty"]
+
+# Test with complex require
+[test.test_with_complex_require]
+cmd = ["./e2e-tests.sh"]
+require = [
+    "simple_cmd",
+    "full_basic:debug",
+    [
+        "with_var",
+        { dir = "/test-data" },
+    ],
+]
+
+# Test with cache
+[test.test_with_cache]
+cmd = ["cargo", "test", "--lib"]
+cache = {}
+
+# Test with cache key
+[test.test_with_cache_key]
+cmd = ["cargo", "test"]
+cache.key = [{ modified = "src/" }, { profile_changed = "full_basic" }]
+
+# Test with all fields
+[test.comprehensive_test]
+cmd = ["cargo", "test", "--all-features", "--", "--test-threads=1"]
+pwd = "./tests"
+tag = ["comprehensive", "slow", "integration"]
+env.TEST_MODE = "full"
+env.DATABASE_URL = { var = "db_url" }
+require = ["simple_cmd", "with_cache_empty"]
+cache.key = [{ modified = "tests/" }, { modified = "src/" }]
+info = "Comprehensive test suite with all features"
+
+# Multiple test variants using array syntax
+[[test.variant_tests]]
+cmd = ["cargo", "test", "--lib"]
+tag = "lib"
+info = "Library tests"
+
+[[test.variant_tests]]
+cmd = ["cargo", "test", "--bins"]
+tag = "bin"
+info = "Binary tests"
+
+[[test.variant_tests]]
+cmd = ["cargo", "test", "--doc"]
+tag = "doc"
+info = "Documentation tests"
+
+# Complex array tests
+[[test.complex_variants]]
+cmd = ["./test-mysql.sh"]
+tag = ["database", "mysql"]
+env.DB_TYPE = "mysql"
+cache.key = [{ modified = "tests/mysql/" }]
+
+[[test.complex_variants]]
+cmd = ["./test-postgres.sh"]
+tag = ["database", "postgres"]
+env.DB_TYPE = "postgres"
+cache.key = [{ modified = "tests/postgres/" }]
+
+[[test.complex_variants]]
+cmd = ["./test-sqlite.sh"]
+tag = ["database", "sqlite", "fast"]
+env.DB_TYPE = "sqlite"
+cache.key = [{ modified = "tests/sqlite/" }]
+
+[group]
+# Simple group with task names
+simple = ["simple_cmd", "simple_sh"]
+
+# Group with tasks using profiles
+with_profiles = ["full_basic:release", "service_conditional_cmd:watch"]
+
+# Group with tasks using variables
+with_vars = [
+    [
+        "with_var",
+        { dir = "/home" },
+    ],
+    [
+        "with_require_vars",
+        { extra = "value" },
+    ],
+]
+
+# Group mixing all formats
+mixed = [
+    "simple_cmd",
+    "full_basic:debug",
+    [
+        "with_var",
+        { dir = "/usr" },
+    ],
+    "simple_service",
+    "full_service:production",
+    [
+        "service_with_env:production",
+        { log_level = "warn" },
+    ],
+]
+
+# CI-style group
+ci = ["with_cache_empty", "with_cache_modified", "simple_test", "full_test"]
+
+# Development group
+dev = [
+    "simple_cmd",
+    "full_basic:debug",
+    "simple_service",
+    "service_with_env:dev",
+]
+
+# Production deployment group
+deploy = [
+    "with_cache_multiple",
+    "full_basic:release",
+    [
+        "complex_service:docker",
+        { db_url = "postgres://prod/db" },
+    ],
+]
