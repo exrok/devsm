@@ -72,7 +72,7 @@ pub struct TuiJob {
 }
 
 pub struct BenchMetrics {
-    samples: Vec<usize>,
+    pub samples: Vec<usize>,
 }
 
 impl BenchMetrics {
@@ -127,6 +127,37 @@ pub struct TuiTestClient {
     pub state_rx: Receiver<TuiState>,
 }
 
+/// Kitty keyboard protocol helper functions.
+/// Encodes keys using CSI u format: ESC [ codepoint ; modifiers u
+mod kitty {
+    /// Modifier bits for Kitty keyboard protocol.
+    const SHIFT: u8 = 1;
+    const ALT: u8 = 2;
+    const CTRL: u8 = 4;
+
+    /// Encodes a key with modifiers using Kitty keyboard protocol.
+    /// Returns bytes in CSI u format: ESC [ codepoint ; (modifiers + 1) u
+    pub fn encode_key(key: char, ctrl: bool, alt: bool, shift: bool) -> Vec<u8> {
+        let codepoint = key as u32;
+        let mut modifier_mask: u8 = 0;
+        if shift {
+            modifier_mask |= SHIFT;
+        }
+        if alt {
+            modifier_mask |= ALT;
+        }
+        if ctrl {
+            modifier_mask |= CTRL;
+        }
+        format!("\x1b[{};{}u", codepoint, modifier_mask + 1).into_bytes()
+    }
+
+    /// Encodes Ctrl+key using Kitty keyboard protocol.
+    pub fn ctrl(key: char) -> Vec<u8> {
+        encode_key(key, true, false, false)
+    }
+}
+
 impl TuiTestClient {
     pub fn spawn(harness: &TestHarness) -> Self {
         let mut child = Command::new(cargo_bin_path())
@@ -168,6 +199,7 @@ impl TuiTestClient {
             let remaining = timeout.saturating_sub(start.elapsed());
             let recv_timeout = remaining.min(Duration::from_millis(100));
             if let Ok(state) = self.state_rx.recv_timeout(recv_timeout) {
+                println!("{:#?}", state);
                 if predicate(&state) {
                     return Some(state);
                 }
@@ -178,6 +210,13 @@ impl TuiTestClient {
 
     pub fn send_key(&mut self, key: &[u8]) {
         self.stdin.write_all(key).expect("Failed to send key");
+        self.stdin.flush().expect("Failed to flush");
+    }
+
+    /// Sends a Ctrl+key using Kitty keyboard protocol encoding.
+    pub fn send_ctrl_key(&mut self, key: char) {
+        let bytes = kitty::ctrl(key);
+        self.stdin.write_all(&bytes).expect("Failed to send key");
         self.stdin.flush().expect("Failed to flush");
     }
 

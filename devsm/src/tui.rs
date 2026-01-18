@@ -453,6 +453,12 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
         Command::TailBottomLog => {
             tui.logs.tail_bottom();
         }
+        Command::LogScrollUp => {
+            tui.logs.pending_top_scroll += 5;
+        }
+        Command::LogScrollDown => {
+            tui.logs.pending_top_scroll -= 5;
+        }
         Command::ToggleHelp => {
             tui.help.visible = !tui.help.visible;
         }
@@ -669,6 +675,7 @@ pub fn run(
             (w, h) = if let Some(terminal) = &terminal { terminal.size()? } else { (150, 80) };
         }
         let data = render(w, h, &mut tui, workspace, keybinds, delta);
+        kvlog::info!("Rendered TUI", tty_render_byte_count = data.len());
         if let Some(terminal) = &mut terminal {
             terminal.write_all(data)?;
         } else {

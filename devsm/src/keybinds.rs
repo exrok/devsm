@@ -172,6 +172,8 @@ pub enum Command {
     LogModeHybrid,
     TailTopLog,
     TailBottomLog,
+    LogScrollUp,
+    LogScrollDown,
     ToggleHelp,
     HelpScrollUp,
     HelpScrollDown,
@@ -201,6 +203,8 @@ impl FromStr for Command {
             "LogModeHybrid" => Command::LogModeHybrid,
             "TailTopLog" => Command::TailTopLog,
             "TailBottomLog" => Command::TailBottomLog,
+            "LogScrollUp" => Command::LogScrollUp,
+            "LogScrollDown" => Command::LogScrollDown,
             "ToggleHelp" => Command::ToggleHelp,
             "HelpScrollUp" => Command::HelpScrollUp,
             "HelpScrollDown" => Command::HelpScrollDown,
@@ -303,6 +307,8 @@ impl Keybinds {
         self.bind(Mode::Global, "l", Command::FocusSecondary);
         self.bind(Mode::Global, "END", Command::TailTopLog);
         self.bind(Mode::Global, "C-END", Command::TailBottomLog);
+        self.bind(Mode::Global, "C-k", Command::LogScrollUp);
+        self.bind(Mode::Global, "C-j", Command::LogScrollDown);
         self.bind(Mode::Global, "?", Command::ToggleHelp);
         self.bind(Mode::Global, "PGUP", Command::HelpScrollUp);
         self.bind(Mode::Global, "PGDN", Command::HelpScrollDown);
@@ -426,6 +432,8 @@ impl Command {
             Command::LogModeHybrid => "Log: Hybrid",
             Command::TailTopLog => "Tail Top",
             Command::TailBottomLog => "Tail Bottom",
+            Command::LogScrollUp => "Scroll Up",
+            Command::LogScrollDown => "Scroll Down",
             Command::ToggleHelp => "Help",
             Command::HelpScrollUp => "Help Up",
             Command::HelpScrollDown => "Help Down",

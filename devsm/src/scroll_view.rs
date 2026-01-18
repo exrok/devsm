@@ -274,7 +274,7 @@ pub struct Prefix {
 }
 
 /// Highlight information for a specific log entry.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LogHighlight {
     /// The LogId to highlight.
     pub log_id: LogId,
@@ -311,6 +311,8 @@ pub struct LogScrollWidget {
     previous: Rect,
     /// The last LineId that has been processed in ids.
     tail: LogId,
+    /// The last highlight state that was rendered.
+    last_highlight: Option<LogHighlight>,
 }
 
 #[derive(Debug)]
@@ -384,6 +386,7 @@ impl LogWidget {
                 scroll_shift_up: if remaining_height < 0 { (-remaining_height) as u16 } else { 0 },
                 tail: LogId(line_id.0),
                 previous: Rect { x: tail.previous.x, y: tail.previous.y, w: tail.previous.w, h: tail.previous.h },
+                last_highlight: None,
             };
 
             *self = LogWidget::Scroll(scroll_view)
@@ -414,7 +417,7 @@ impl LogWidget {
 
     pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         match self {
-            LogWidget::Scroll(scroll_view) => scroll_view.render_reset(buf, rect, view, style),
+            LogWidget::Scroll(scroll_view) => scroll_view.render(buf, rect, view, style),
             LogWidget::Tail(tail_view) => tail_view.render(buf, rect, view, style),
         }
     }
@@ -720,8 +723,18 @@ impl LogScrollWidget {
         remaining_height
     }
 
+    pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
+        if rect == self.previous && style.highlight == self.last_highlight {
+            return;
+        }
+        self.render_reset(buf, rect, view, style);
+    }
+
     pub fn render_reset(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         self.previous = rect;
+        self.last_highlight = style.highlight;
+        self.tail = view.tail;
+
         while let Some(id) = self.ids.get(self.top_index) {
             if *id < view.logs.head() {
                 self.top_index += 1;

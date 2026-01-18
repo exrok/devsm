@@ -105,7 +105,7 @@ pub fn strip_ansi_to_buffer(text: &str, buffer: &mut Vec<u8>) {
 }
 
 /// Match highlight information for rendering.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MatchHighlight {
     /// Byte offset in stripped (ANSI-free, lowercased) text where match starts.
     pub start: u32,
