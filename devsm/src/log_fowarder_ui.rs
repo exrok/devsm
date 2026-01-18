@@ -183,8 +183,7 @@ fn forward_new_logs(
                 JobStatus::Exited { status, cause, .. } => {
                     let (code, rpc_cause) = match cause {
                         ExitCause::Killed => (-1, RpcExitCause::Killed),
-                        ExitCause::Replaced => (-1, RpcExitCause::Replaced),
-                        ExitCause::Reloaded => (-1, RpcExitCause::Reloaded),
+                        ExitCause::Restarted => (-1, RpcExitCause::Restarted),
                         ExitCause::Unknown => (*status as i32, RpcExitCause::Unknown),
                     };
                     return Ok((true, Some(code), Some(rpc_cause)));
@@ -233,8 +232,7 @@ fn forward_new_logs(
             JobStatus::Exited { status, cause, .. } => {
                 let (code, rpc_cause) = match cause {
                     ExitCause::Killed => (-1, RpcExitCause::Killed),
-                    ExitCause::Replaced => (-1, RpcExitCause::Replaced),
-                    ExitCause::Reloaded => (-1, RpcExitCause::Reloaded),
+                    ExitCause::Restarted => (-1, RpcExitCause::Restarted),
                     ExitCause::Unknown => (*status as i32, RpcExitCause::Unknown),
                 };
                 return Ok((true, Some(code), Some(rpc_cause)));

@@ -419,8 +419,7 @@ pub struct JobStatusEvent {
 pub enum ExitCause {
     Unknown = 0,
     Killed = 1,
-    Replaced = 2,
-    Reloaded = 3,
+    Restarted = 2,
 }
 
 #[derive(Jsony, Debug)]

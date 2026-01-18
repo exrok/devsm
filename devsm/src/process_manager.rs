@@ -44,6 +44,7 @@ pub(crate) struct ActiveProcess {
     pub(crate) stderr_buffer: Option<Buffer>,
     pub(crate) style: Style,
     pub(crate) child: Child,
+    pub(crate) pending_exit_cause: Option<ExitCause>,
 }
 
 impl ActiveProcess {
@@ -383,6 +384,7 @@ impl ProcessManager {
             stderr_buffer: None,
             style: Style::default(),
             child,
+            pending_exit_cause: None,
         });
         {
             let mut ws = workspace.handle.state.write().unwrap();
@@ -410,7 +412,7 @@ pub(crate) enum ProcessRequest {
         workspace_config: PathBuf,
         kind: AttachKind,
     },
-    TerminateJob { job_id: LogGroup, process_index: usize },
+    TerminateJob { job_id: LogGroup, process_index: usize, exit_cause: ExitCause },
     ClientExited { index: usize },
     ProcessExited { pid: u32, status: u32 },
     GlobalTermination,
@@ -571,27 +573,29 @@ impl ProcessManager {
                 self.handle_workspace_command(ws_index, &command, socket);
                 false
             }
-            ProcessRequest::TerminateJob { job_id, process_index } => {
-                if let Some(process) = self.processes.get_mut(process_index) {
-                    if process.log_group != job_id {
-                        kvlog::error!(
-                            "Mismatched job id for termination",
-                            ?job_id,
-                            expected = ?process.log_group
-                        );
-                        return false;
-                    }
-                    let child_pid = process.child.id();
-                    let pgid_to_kill = -(child_pid as i32);
-
-                    unsafe {
-                        if libc::kill(pgid_to_kill, libc::SIGINT) == -1 {
-                            let err = std::io::Error::last_os_error();
-                            kvlog::error!("Failed to send SIGTERM", ?err, ?child_pid);
-                        }
-                    }
-                    process.alive = false;
+            ProcessRequest::TerminateJob { job_id, process_index, exit_cause } => {
+                let Some(process) = self.processes.get_mut(process_index) else {
+                    return false;
+                };
+                if process.log_group != job_id {
+                    kvlog::error!(
+                        "Mismatched job id for termination",
+                        ?job_id,
+                        expected = ?process.log_group
+                    );
+                    return false;
                 }
+                process.pending_exit_cause = Some(exit_cause);
+                let child_pid = process.child.id();
+                let pgid_to_kill = -(child_pid as i32);
+
+                unsafe {
+                    if libc::kill(pgid_to_kill, libc::SIGINT) == -1 {
+                        let err = std::io::Error::last_os_error();
+                        kvlog::error!("Failed to send SIGTERM", ?err, ?child_pid);
+                    }
+                }
+                process.alive = false;
                 // if let Some(workspace) = self.workspaces.get(workspace_id as usize) {
                 //     let mut ws = workspace.handle.state.write().unwrap();
                 //     // if let Some(task) = ws.get_job_mut(job_id) {
@@ -729,10 +733,16 @@ impl ProcessManager {
                     }
                     let ws_idx = process.workspace_index;
                     let job_idx = process.job_index;
+                    let cause = process.pending_exit_cause.unwrap_or(ExitCause::Unknown);
                     let exit_code = if libc::WIFEXITED(status as i32) {
                         libc::WEXITSTATUS(status as i32) as u32
                     } else {
                         u32::MAX
+                    };
+                    let rpc_cause = match cause {
+                        ExitCause::Unknown => devsm_rpc::ExitCause::Unknown,
+                        ExitCause::Killed => devsm_rpc::ExitCause::Killed,
+                        ExitCause::Restarted => devsm_rpc::ExitCause::Restarted,
                     };
                     if let Some(workspace) = self.workspaces.get(ws_idx as usize) {
                         let mut ws = workspace.handle.state.write().unwrap();
@@ -741,13 +751,13 @@ impl ProcessManager {
                             JobStatus::Exited {
                                 finished_at: std::time::Instant::now(),
                                 log_end: workspace.line_writer.tail(),
-                                cause: ExitCause::Unknown,
+                                cause,
                                 status: exit_code,
                             },
                         );
                     }
                     self.processes.remove(index);
-                    self.broadcast_job_exited(ws_idx, job_idx, exit_code as i32, devsm_rpc::ExitCause::Unknown);
+                    self.broadcast_job_exited(ws_idx, job_idx, exit_code as i32, rpc_cause);
                     return false;
                 }
                 kvlog::info!("Didn't Find ProcessExited");

@@ -47,13 +47,11 @@ impl JobIndex {
     }
 }
 
-#[derive(Debug)]
-#[allow(unused)]
+#[derive(Clone, Copy, Debug)]
 pub enum ExitCause {
     Unknown,
     Killed,
-    Replaced,
-    Reloaded,
+    Restarted,
 }
 
 pub struct Job {
@@ -177,7 +175,6 @@ impl LatestConfig {
         let current = crate::config::load_workspace_config_leaking(path.parent().unwrap(), content)?;
         Ok(Self { modified_time, path, current })
     }
-    #[expect(unused, reason = "Auto Config Updating not implemented")]
     fn refresh(&mut self) -> anyhow::Result<bool> {
         let metadata = self.path.metadata()?;
         let modified = metadata.modified()?;
@@ -440,6 +437,16 @@ impl WorkspaceState {
         }
         None
     }
+
+    fn refresh_config(&mut self) {
+        let Ok(changed) = self.config.refresh() else {
+            return;
+        };
+        if changed {
+            self.config.update_base_tasks(&mut self.base_tasks, &mut self.name_map);
+        }
+    }
+
     fn spawn_task(
         &mut self,
         workspace_id: u32,
@@ -465,16 +472,15 @@ impl WorkspaceState {
 
         for job_index in bt.jobs.running() {
             let job = &mut self.jobs[job_index.idx()];
-            match &job.process_status {
-                JobStatus::Running { process_index } => {
-                    pred.push(ScheduleRequirement { job: *job_index, predicate: JobPredicate::Terminated });
-                    channel.send(crate::process_manager::ProcessRequest::TerminateJob {
-                        job_id: job.log_group,
-                        process_index: *process_index,
-                    })
-                }
-                _ => (),
-            }
+            let JobStatus::Running { process_index } = &job.process_status else {
+                continue;
+            };
+            pred.push(ScheduleRequirement { job: *job_index, predicate: JobPredicate::Terminated });
+            channel.send(crate::process_manager::ProcessRequest::TerminateJob {
+                job_id: job.log_group,
+                process_index: *process_index,
+                exit_cause: ExitCause::Restarted,
+            });
         }
         let task = bt.config.eval(&Enviroment { profile, param: params.clone() }).unwrap();
 
@@ -723,6 +729,7 @@ impl Workspace {
     pub fn restart_task(&self, base_task: BaseTaskIndex, params: ValueMap, profile: &str) {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
+        state.refresh_config();
         state.spawn_task(
             self.workspace_id,
             &self.process_channel,
@@ -739,12 +746,14 @@ impl Workspace {
         let bt = &mut state.base_tasks[base_task.idx()];
         for job_index in bt.jobs.non_terminal() {
             let job = &state.jobs[job_index.idx()];
-            if let JobStatus::Running { process_index } = &job.process_status {
-                self.process_channel.send(crate::process_manager::ProcessRequest::TerminateJob {
-                    job_id: job.log_group,
-                    process_index: *process_index,
-                })
-            }
+            let JobStatus::Running { process_index } = &job.process_status else {
+                continue;
+            };
+            self.process_channel.send(crate::process_manager::ProcessRequest::TerminateJob {
+                job_id: job.log_group,
+                process_index: *process_index,
+                exit_cause: ExitCause::Killed,
+            });
         }
     }
 
@@ -753,6 +762,7 @@ impl Workspace {
     pub fn start_test_run(&self, filters: &[TestFilter]) -> TestRun {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
+        state.refresh_config();
         let log_start = self.logs.read().unwrap().tail();
 
         let run_id = state.active_test_run.as_ref().map_or(0, |r| r.run_id + 1);

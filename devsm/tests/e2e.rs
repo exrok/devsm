@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use devsm_rpc::{
-    ClientProtocol, DecodeResult, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind, encode_attach_rpc,
+    ClientProtocol, DecodeResult, ExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind,
+    encode_attach_rpc,
 };
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -72,6 +73,26 @@ impl TestHarness {
 
         let server = Command::new(cargo_bin_path())
             .arg("server")
+            .env("DEVSM_SOCKET", &self.socket_path)
+            .env("DEVSM_LOG_STDOUT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err))
+            .spawn()
+            .expect("Failed to spawn server");
+
+        self.server = Some(server);
+        self
+    }
+
+    /// Spawns the server from a specific directory (not the config directory).
+    fn spawn_server_from(&mut self, cwd: &PathBuf) -> &mut Self {
+        let log_file = fs::File::create(&self.server_log_path).expect("Failed to create server log");
+        let log_file_err = log_file.try_clone().expect("Failed to clone log file");
+
+        let server = Command::new(cargo_bin_path())
+            .arg("server")
+            .current_dir(cwd)
             .env("DEVSM_SOCKET", &self.socket_path)
             .env("DEVSM_LOG_STDOUT", "1")
             .stdin(Stdio::null())
@@ -164,7 +185,7 @@ impl Drop for TestHarness {
 #[allow(dead_code)]
 enum RpcEvent {
     JobStatus { job_index: u32, status: JobStatusKind },
-    JobExited { job_index: u32, exit_code: i32 },
+    JobExited { job_index: u32, exit_code: i32, cause: ExitCause },
     WorkspaceOpened,
     Disconnect,
     Other { kind: RpcMessageKind },
@@ -229,7 +250,7 @@ impl RpcSubscriber {
                             }
                             RpcMessageKind::JobExited => {
                                 let e: JobExitedEvent = jsony::from_binary(payload).expect("invalid JobExitedEvent");
-                                RpcEvent::JobExited { job_index: e.job_index, exit_code: e.exit_code }
+                                RpcEvent::JobExited { job_index: e.job_index, exit_code: e.exit_code, cause: e.cause }
                             }
                             RpcMessageKind::Disconnect => RpcEvent::Disconnect,
                             _ => RpcEvent::Other { kind },
@@ -257,7 +278,7 @@ impl RpcSubscriber {
             timeout,
         );
         events.into_iter().find_map(|e| match e {
-            RpcEvent::JobExited { job_index: j, exit_code } if j == job_index => Some(exit_code),
+            RpcEvent::JobExited { job_index: j, exit_code, .. } if j == job_index => Some(exit_code),
             _ => None,
         })
     }
@@ -1337,4 +1358,251 @@ require = ["db"]
 
     assert_eq!(dev_starts, 1, "db:dev should start once, log: {}", log);
     assert_eq!(prod_starts, 1, "db:prod should start once, log: {}", log);
+}
+
+#[test]
+fn config_reload_on_task_run() {
+    let mut harness = TestHarness::new("config_reload");
+    let output = harness.temp_dir.join("output.txt");
+
+    harness.write_config(&format!(
+        r#"
+[action.task]
+sh = "echo 'v1' > {output}"
+"#,
+        output = output.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "task"]);
+    assert!(result.success(), "Expected success on first run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&output).unwrap().trim(), "v1", "should output v1");
+
+    std::thread::sleep(Duration::from_millis(10));
+    harness.write_config(&format!(
+        r#"
+[action.task]
+sh = "echo 'v2' > {output}"
+"#,
+        output = output.display()
+    ));
+
+    let result = harness.run_client(&["run", "task"]);
+    assert!(result.success(), "Expected success on second run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&output).unwrap().trim(), "v2", "should output v2 after config reload");
+}
+
+#[test]
+fn pwd_default_resolves_to_config_dir() {
+    let mut harness = TestHarness::new("pwd_default");
+    let output = harness.temp_dir.join("cwd_output.txt");
+
+    harness.write_config(&format!(
+        r#"
+[action.print_cwd]
+sh = "pwd > {output}"
+"#,
+        output = output.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "print_cwd"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+
+    let cwd = fs::read_to_string(&output).unwrap();
+    let cwd = cwd.trim();
+    let expected = harness.temp_dir.canonicalize().unwrap();
+    assert_eq!(cwd, expected.to_str().unwrap(), "default pwd should be config directory");
+}
+
+#[test]
+fn pwd_explicit_resolves_correctly() {
+    let mut harness = TestHarness::new("pwd_explicit");
+    let subdir = harness.temp_dir.join("subdir");
+    fs::create_dir_all(&subdir).unwrap();
+    let output = harness.temp_dir.join("cwd_output.txt");
+
+    harness.write_config(&format!(
+        r#"
+[action.print_cwd]
+sh = "pwd > {output}"
+pwd = "subdir"
+"#,
+        output = output.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "print_cwd"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+
+    let cwd = fs::read_to_string(&output).unwrap();
+    let cwd = cwd.trim();
+    let expected = subdir.canonicalize().unwrap();
+    assert_eq!(cwd, expected.to_str().unwrap(), "pwd should resolve to specified subdir");
+}
+
+#[test]
+fn pwd_resolves_from_config_dir_not_server_cwd() {
+    let mut harness = TestHarness::new("pwd_server_cwd");
+    let subdir = harness.temp_dir.join("subdir");
+    let server_cwd = harness.temp_dir.join("server_start_dir");
+    fs::create_dir_all(&subdir).unwrap();
+    fs::create_dir_all(&server_cwd).unwrap();
+    let output = harness.temp_dir.join("cwd_output.txt");
+
+    harness.write_config(&format!(
+        r#"
+[action.print_cwd_default]
+sh = "pwd > {output}"
+
+[action.print_cwd_subdir]
+sh = "pwd > {output}"
+pwd = "subdir"
+"#,
+        output = output.display()
+    ));
+
+    harness.spawn_server_from(&server_cwd);
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "print_cwd_default"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+
+    let cwd = fs::read_to_string(&output).unwrap();
+    let cwd = cwd.trim();
+    let config_dir = harness.temp_dir.canonicalize().unwrap();
+    assert_eq!(
+        cwd,
+        config_dir.to_str().unwrap(),
+        "default pwd should resolve to config dir, not server cwd"
+    );
+
+    let result = harness.run_client(&["run", "print_cwd_subdir"]);
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+
+    let cwd = fs::read_to_string(&output).unwrap();
+    let cwd = cwd.trim();
+    let expected = subdir.canonicalize().unwrap();
+    assert_eq!(
+        cwd,
+        expected.to_str().unwrap(),
+        "explicit pwd should resolve relative to config dir, not server cwd"
+    );
+}
+
+#[test]
+fn exit_cause_unknown_on_natural_exit() {
+    let mut harness = TestHarness::new("exit_cause_unknown");
+    harness.write_config(
+        r#"
+[action.natural_exit]
+sh = "exit 0"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut subscriber = RpcSubscriber::connect(&harness);
+    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(2));
+
+    let client_handle = std::thread::spawn({
+        let temp_dir = harness.temp_dir.clone();
+        let socket_path = harness.socket_path.clone();
+        move || {
+            Command::new(cargo_bin_path())
+                .args(["run", "natural_exit"])
+                .current_dir(&temp_dir)
+                .env("DEVSM_SOCKET", &socket_path)
+                .env("DEVSM_NO_AUTO_SPAWN", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Failed to spawn client")
+                .wait()
+        }
+    });
+
+    let events =
+        subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::JobExited { .. })), Duration::from_secs(5));
+
+    client_handle.join().ok();
+
+    let exit_event = events.iter().find(|e| matches!(e, RpcEvent::JobExited { .. }));
+    assert!(exit_event.is_some(), "Should see job exit, events: {:?}", events);
+    let RpcEvent::JobExited { cause, .. } = exit_event.unwrap() else { panic!() };
+    assert!(
+        matches!(cause, ExitCause::Unknown),
+        "Natural exit should have Unknown cause, got: {:?}",
+        cause
+    );
+}
+
+#[test]
+fn exit_cause_restarted_on_service_restart() {
+    let mut harness = TestHarness::new("exit_cause_restarted");
+    let service_log = harness.temp_dir.join("service.log");
+    harness.write_config(&format!(
+        r#"
+[service.backend]
+sh = '''
+echo "started" >> {service_log}
+while true; do sleep 1; done
+'''
+"#,
+        service_log = service_log.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut subscriber = RpcSubscriber::connect(&harness);
+    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(2));
+
+    let temp_dir = harness.temp_dir.clone();
+    let socket_path = harness.socket_path.clone();
+    let first_run = Command::new(cargo_bin_path())
+        .args(["run", "backend"])
+        .current_dir(&temp_dir)
+        .env("DEVSM_SOCKET", &socket_path)
+        .env("DEVSM_NO_AUTO_SPAWN", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn client");
+
+    subscriber.collect_until(
+        |evs| evs.iter().any(|e| matches!(e, RpcEvent::JobStatus { status: JobStatusKind::Running, .. })),
+        Duration::from_secs(3),
+    );
+
+    drop(first_run);
+
+    let temp_dir = harness.temp_dir.clone();
+    let socket_path = harness.socket_path.clone();
+    let _second_run = Command::new(cargo_bin_path())
+        .args(["run", "backend"])
+        .current_dir(&temp_dir)
+        .env("DEVSM_SOCKET", &socket_path)
+        .env("DEVSM_NO_AUTO_SPAWN", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn client");
+
+    let events =
+        subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::JobExited { .. })), Duration::from_secs(5));
+
+    let exit_event = events.iter().find(|e| matches!(e, RpcEvent::JobExited { job_index: 0, .. }));
+    assert!(exit_event.is_some(), "Should see first service exit, events: {:?}", events);
+    let RpcEvent::JobExited { cause, .. } = exit_event.unwrap() else { panic!() };
+    assert!(
+        matches!(cause, ExitCause::Restarted),
+        "Restarted service should have Restarted cause, got: {:?}",
+        cause
+    );
 }
