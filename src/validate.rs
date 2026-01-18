@@ -3,16 +3,13 @@ use std::ops::Range;
 use std::path::Path;
 
 use bumpalo::Bump;
-use codespan_reporting::diagnostic::{Diagnostic, Label};
-use codespan_reporting::files::SimpleFiles;
-use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
-use codespan_reporting::term::{self, Config};
 use toml_spanner::Value as TomlValue;
 use toml_spanner::span::Span;
 use toml_spanner::value::{Table, ValueInner};
 
 use crate::config::toml_handler;
 use crate::config::{StringExpr, WorkspaceConfig};
+use crate::diagnostic::{Diagnostic, DiagnosticLabel, emit_diagnostic, toml_error_to_diagnostic};
 
 fn span_to_range(span: Span) -> Range<usize> {
     (span.start as usize)..(span.end as usize)
@@ -34,25 +31,21 @@ pub fn validate_config(path: &Path, options: &ValidateOptions) -> anyhow::Result
 }
 
 fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
-    let mut files = SimpleFiles::new();
-    let file_id = files.add(path.display().to_string(), content);
-
-    let writer = StandardStream::stderr(ColorChoice::Auto);
-    let config = Config::default();
+    let file_name = path.display().to_string();
 
     let toml = match toml_spanner::parse(content) {
         Ok(value) => value,
         Err(err) => {
-            let diagnostic = err.to_diagnostic(file_id);
-            term::emit_to_io_write(&mut writer.lock(), &config, &files, &diagnostic)?;
+            let diagnostic = toml_error_to_diagnostic(&err);
+            emit_diagnostic(&file_name, content, &diagnostic);
             return Ok(false);
         }
     };
 
     let mut has_errors = false;
-    let mut emit = |diag: Diagnostic<usize>| {
+    let mut emit = |diag: Diagnostic| {
         has_errors = true;
-        let _ = term::emit_to_io_write(&mut writer.lock(), &config, &files, &diag);
+        emit_diagnostic(&file_name, content, &diag);
     };
 
     let root = toml.as_table().unwrap();
@@ -62,7 +55,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
             emit(
                 Diagnostic::error()
                     .with_message("'bind' must be a table")
-                    .with_labels(vec![Label::primary(file_id, span_to_range(bind_value.span))]),
+                    .with_labels(vec![DiagnosticLabel::primary(span_to_range(bind_value.span))]),
             );
             return Ok(false);
         };
@@ -74,7 +67,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
                 emit(
                     Diagnostic::error()
                         .with_message(format!("unknown mode '{}'", mode_name))
-                        .with_labels(vec![Label::primary(file_id, span_to_range(mode_key.span))])
+                        .with_labels(vec![DiagnosticLabel::primary(span_to_range(mode_key.span))])
                         .with_notes(vec![format!("valid modes are: {}", valid_modes.join(", "))]),
                 );
                 continue;
@@ -84,7 +77,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
                 emit(
                     Diagnostic::error()
                         .with_message(format!("'bind.{}' must be a table", mode_name))
-                        .with_labels(vec![Label::primary(file_id, span_to_range(mode_value.span))]),
+                        .with_labels(vec![DiagnosticLabel::primary(span_to_range(mode_value.span))]),
                 );
                 continue;
             };
@@ -96,7 +89,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
                             Diagnostic::error()
                                 .with_message("invalid binding value")
                                 .with_labels(vec![
-                                    Label::primary(file_id, span_to_range(cmd_value.span))
+                                    DiagnosticLabel::primary(span_to_range(cmd_value.span))
                                         .with_message("expected command string or nan"),
                                 ])
                                 .with_notes(vec!["use nan to unbind a key".to_string()]),
@@ -107,7 +100,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
                         Diagnostic::error()
                             .with_message("invalid binding value")
                             .with_labels(vec![
-                                Label::primary(file_id, span_to_range(cmd_value.span))
+                                DiagnosticLabel::primary(span_to_range(cmd_value.span))
                                     .with_message("expected command string or nan"),
                             ])
                             .with_notes(vec![format!("binding for key '{}'", key_str.name)]),
@@ -123,7 +116,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
             emit(
                 Diagnostic::warning()
                     .with_message(format!("unknown top-level key '{}'", key_name))
-                    .with_labels(vec![Label::primary(file_id, span_to_range(key.span))])
+                    .with_labels(vec![DiagnosticLabel::primary(span_to_range(key.span))])
                     .with_notes(vec!["user config only supports the 'bind' section".to_string()]),
             );
         }
@@ -138,19 +131,15 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
 }
 
 fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptions) -> anyhow::Result<bool> {
-    let mut files = SimpleFiles::new();
-    let file_id = files.add(path.display().to_string(), content);
-
-    let writer = StandardStream::stderr(ColorChoice::Auto);
-    let config = Config::default();
+    let file_name = path.display().to_string();
 
     let bump = Bump::new();
     let base_path = path.parent().unwrap_or(Path::new("."));
 
     let mut has_errors = false;
-    let mut emit = |diag: Diagnostic<usize>| {
+    let mut emit = |diag: Diagnostic| {
         has_errors = true;
-        let _ = term::emit_to_io_write(&mut writer.lock(), &config, &files, &diag);
+        emit_diagnostic(&file_name, content, &diag);
     };
 
     let workspace_config = match toml_handler::parse(base_path, &bump, content, &mut emit) {
@@ -164,10 +153,10 @@ fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptio
     };
     let root = toml.as_table().unwrap();
 
-    validate_cross_references(&workspace_config, root, file_id, &mut emit);
+    validate_cross_references(&workspace_config, root, &mut emit);
 
     if !options.skip_path_checks {
-        validate_pwd_paths(&workspace_config, base_path, root, file_id, &mut emit);
+        validate_pwd_paths(&workspace_config, base_path, root, &mut emit);
     }
 
     if has_errors {
@@ -178,12 +167,7 @@ fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptio
     }
 }
 
-fn validate_cross_references(
-    config: &WorkspaceConfig,
-    root: &Table,
-    file_id: usize,
-    emit: &mut dyn FnMut(Diagnostic<usize>),
-) {
+fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut dyn FnMut(Diagnostic)) {
     let mut task_profiles: HashSet<(&str, &str)> = HashSet::new();
     let mut task_names: HashSet<&str> = HashSet::new();
 
@@ -209,7 +193,7 @@ fn validate_cross_references(
                     emit(
                         Diagnostic::error()
                             .with_message(format!("task '{}' does not exist", task_name))
-                            .with_labels(vec![Label::primary(file_id, span).with_message("referenced here")])
+                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
                             .with_notes(vec![format!("in group '{}'", group_name)]),
                     );
                 }
@@ -220,7 +204,7 @@ fn validate_cross_references(
                     emit(
                         Diagnostic::error()
                             .with_message(format!("task '{}' does not have profile '{}'", task_name, profile))
-                            .with_labels(vec![Label::primary(file_id, span).with_message("referenced here")])
+                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
                             .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
                     );
                 }
@@ -238,7 +222,7 @@ fn validate_cross_references(
                     emit(
                         Diagnostic::error()
                             .with_message(format!("required task '{}' does not exist", required_name))
-                            .with_labels(vec![Label::primary(file_id, span).with_message("referenced here")])
+                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
                             .with_notes(vec![format!("in task '{}'", task_name)]),
                     );
                 }
@@ -252,7 +236,7 @@ fn validate_cross_references(
                                 "required task '{}' does not have profile '{}'",
                                 required_name, profile
                             ))
-                            .with_labels(vec![Label::primary(file_id, span).with_message("referenced here")])
+                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
                             .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
                     );
                 }
@@ -270,7 +254,7 @@ fn validate_cross_references(
                                         "profile_changed references task '{}' which does not exist",
                                         ref_task
                                     ))
-                                    .with_labels(vec![Label::primary(file_id, span).with_message("referenced here")]),
+                                    .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")]),
                             );
                         }
                     }
@@ -290,7 +274,7 @@ fn validate_cross_references(
                         emit(
                             Diagnostic::error()
                                 .with_message(format!("required task '{}' does not exist", required_name))
-                                .with_labels(vec![Label::primary(file_id, span).with_message("referenced here")])
+                                .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
                                 .with_notes(vec![format!("in test '{}'", test_name)]),
                         );
                     }
@@ -304,7 +288,7 @@ fn validate_cross_references(
                                     "required task '{}' does not have profile '{}'",
                                     required_name, profile
                                 ))
-                                .with_labels(vec![Label::primary(file_id, span).with_message("referenced here")])
+                                .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
                                 .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
                         );
                     }
@@ -314,13 +298,7 @@ fn validate_cross_references(
     }
 }
 
-fn validate_pwd_paths(
-    config: &WorkspaceConfig,
-    base_path: &Path,
-    root: &Table,
-    file_id: usize,
-    emit: &mut dyn FnMut(Diagnostic<usize>),
-) {
+fn validate_pwd_paths(config: &WorkspaceConfig, base_path: &Path, root: &Table, emit: &mut dyn FnMut(Diagnostic)) {
     for (task_name, task_expr) in config.tasks.iter() {
         if let StringExpr::Literal(pwd_literal) = task_expr.pwd {
             let full_path = base_path.join(pwd_literal);
@@ -329,7 +307,7 @@ fn validate_pwd_paths(
                     emit(
                         Diagnostic::error()
                             .with_message(format!("pwd path '{}' does not exist", pwd_literal))
-                            .with_labels(vec![Label::primary(file_id, span).with_message("path not found")])
+                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("path not found")])
                             .with_notes(vec![format!("resolved to: {}", full_path.display())]),
                     );
                 }
@@ -346,7 +324,7 @@ fn validate_pwd_paths(
                         emit(
                             Diagnostic::error()
                                 .with_message(format!("pwd path '{}' does not exist", pwd_literal))
-                                .with_labels(vec![Label::primary(file_id, span).with_message("path not found")])
+                                .with_labels(vec![DiagnosticLabel::primary(span).with_message("path not found")])
                                 .with_notes(vec![format!("resolved to: {}", full_path.display())]),
                         );
                     }

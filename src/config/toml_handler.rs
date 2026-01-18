@@ -1,5 +1,4 @@
 use bumpalo::Bump;
-use codespan_reporting::diagnostic::{Diagnostic, Label};
 use std::borrow::Cow;
 use toml_spanner::{
     Value as TomlValue,
@@ -10,24 +9,21 @@ use crate::config::{
     Alias, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, StringExpr, StringListExpr, TaskCall,
     TaskConfigExpr, TaskKind, TestConfigExpr, WorkspaceConfig,
 };
+use crate::diagnostic::{Diagnostic, DiagnosticLabel, toml_error_to_diagnostic};
 
-fn mismatched_in_object(report_error: &mut dyn FnMut(Diagnostic<usize>), expected: &str, found: &TomlValue, key: &str) {
+fn mismatched_in_object(report_error: &mut dyn FnMut(Diagnostic), expected: &str, found: &TomlValue, key: &str) {
     report_error(
         Diagnostic::error()
             .with_message("mismatched types")
             .with_label(
-                Label::primary(0, found.span)
-                    .with_message(format_args!("expected `{expected}`, found `{}`", found.value.type_str())),
+                DiagnosticLabel::primary(found.span.into())
+                    .with_message(format!("expected `{expected}`, found `{}`", found.value.type_str())),
             )
-            .with_note(format_args!("The {key:?} property should be a `{expected}`")),
+            .with_note(format!("The {key:?} property should be a `{expected}`")),
     );
 }
 
-fn table<'a, 'b>(
-    table: &'b Table<'a>,
-    key: &str,
-    re: &mut dyn FnMut(Diagnostic<usize>),
-) -> Result<Option<&'b Table<'a>>, ()> {
+fn table<'a, 'b>(table: &'b Table<'a>, key: &str, re: &mut dyn FnMut(Diagnostic)) -> Result<Option<&'b Table<'a>>, ()> {
     if let Some(action) = table.get(key) {
         let Some(t) = action.as_table() else {
             mismatched_in_object(re, "table", action, key);
@@ -46,7 +42,7 @@ fn as_str<'a>(cow: &'a Cow<'a, str>) -> &'a str {
 fn parse_string_expr<'a>(
     alloc: &'a Bump,
     value: &TomlValue<'a>,
-    re: &mut dyn FnMut(Diagnostic<usize>),
+    re: &mut dyn FnMut(Diagnostic),
 ) -> Result<StringExpr<'a>, ()> {
     match &value.value {
         ValueInner::String(s) => Ok(StringExpr::Literal(alloc.alloc_str(as_str(s)))),
@@ -80,7 +76,9 @@ fn parse_string_expr<'a>(
                     or_else,
                 })));
             }
-            re(Diagnostic::error().with_message("invalid string expression").with_label(Label::primary(0, value.span)));
+            re(Diagnostic::error()
+                .with_message("invalid string expression")
+                .with_label(DiagnosticLabel::primary(value.span.into())));
             Err(())
         }
         _ => {
@@ -93,7 +91,7 @@ fn parse_string_expr<'a>(
 fn parse_string_list_expr<'a>(
     alloc: &'a Bump,
     value: &TomlValue<'a>,
-    re: &mut dyn FnMut(Diagnostic<usize>),
+    re: &mut dyn FnMut(Diagnostic),
 ) -> Result<StringListExpr<'a>, ()> {
     match &value.value {
         ValueInner::String(s) => Ok(StringListExpr::Literal(alloc.alloc_str(as_str(s)))),
@@ -136,7 +134,7 @@ fn parse_string_list_expr<'a>(
             }
             re(Diagnostic::error()
                 .with_message("invalid string list expression")
-                .with_label(Label::primary(0, value.span)));
+                .with_label(DiagnosticLabel::primary(value.span.into())));
             Err(())
         }
         _ => {
@@ -150,7 +148,7 @@ fn parse_task<'a>(
     alloc: &'a Bump,
     task_table: &Table<'a>,
     kind: TaskKind,
-    re: &mut dyn FnMut(Diagnostic<usize>),
+    re: &mut dyn FnMut(Diagnostic),
 ) -> Result<TaskConfigExpr<'a>, ()> {
     let mut pwd = StringExpr::Literal("./");
     let mut profiles_vec = bumpalo::collections::Vec::new_in(alloc);
@@ -215,7 +213,7 @@ fn parse_task<'a>(
                 if kind != TaskKind::Action {
                     re(Diagnostic::error()
                         .with_message("`cache` is only valid for actions")
-                        .with_label(Label::primary(0, value.span)));
+                        .with_label(DiagnosticLabel::primary(value.span.into())));
                     return Err(());
                 }
                 let Some(cache_table) = value.as_table() else {
@@ -248,7 +246,7 @@ fn parse_task<'a>(
                         } else {
                             re(Diagnostic::error()
                                 .with_message("cache key input must have either `modified` or `profile_changed`")
-                                .with_label(Label::primary(0, item.span)));
+                                .with_label(DiagnosticLabel::primary(item.span.into())));
                             return Err(());
                         }
                     }
@@ -258,13 +256,13 @@ fn parse_task<'a>(
             "before" => {
                 re(Diagnostic::error()
                     .with_message("`before` is deprecated, use `require` instead")
-                    .with_label(Label::primary(0, value.span)));
+                    .with_label(DiagnosticLabel::primary(value.span.into())));
                 return Err(());
             }
             "before_once" => {
                 re(Diagnostic::error()
                     .with_message("`before_once` is deprecated, use `require` with `cache = {}` instead")
-                    .with_label(Label::primary(0, value.span)));
+                    .with_label(DiagnosticLabel::primary(value.span.into())));
                 return Err(());
             }
             "info" => {
@@ -276,8 +274,8 @@ fn parse_task<'a>(
             }
             _ => {
                 re(Diagnostic::error()
-                    .with_message(format_args!("unknown key `{}` in task definition", key_str))
-                    .with_label(Label::primary(0, value.span)));
+                    .with_message(format!("unknown key `{}` in task definition", key_str))
+                    .with_label(DiagnosticLabel::primary(value.span.into())));
                 return Err(());
             }
         }
@@ -289,13 +287,13 @@ fn parse_task<'a>(
         (Some(_), Some(_)) => {
             re(Diagnostic::error()
                 .with_message("fields `cmd` and `sh` are mutually exclusive")
-                .with_label(Label::primary(0, 0..0)));
+                .with_label(DiagnosticLabel::primary(0..0)));
             return Err(());
         }
         (None, None) => {
             re(Diagnostic::error()
                 .with_message("either `cmd` or `sh` field is required")
-                .with_label(Label::primary(0, 0..0)));
+                .with_label(DiagnosticLabel::primary(0..0)));
             return Err(());
         }
     };
@@ -317,7 +315,7 @@ fn parse_task<'a>(
 fn parse_cache_config<'a>(
     alloc: &'a Bump,
     cache_table: &Table<'a>,
-    re: &mut dyn FnMut(Diagnostic<usize>),
+    re: &mut dyn FnMut(Diagnostic),
 ) -> Result<CacheConfig<'a>, ()> {
     let mut key_inputs = bumpalo::collections::Vec::new_in(alloc);
     if let Some(key_value) = cache_table.get("key") {
@@ -345,7 +343,7 @@ fn parse_cache_config<'a>(
             } else {
                 re(Diagnostic::error()
                     .with_message("cache key input must have either `modified` or `profile_changed`")
-                    .with_label(Label::primary(0, item.span)));
+                    .with_label(DiagnosticLabel::primary(item.span.into())));
                 return Err(());
             }
         }
@@ -359,7 +357,7 @@ fn parse_test<'a>(
     alloc: &'a Bump,
     _name: &'a str,
     test_table: &Table<'a>,
-    re: &mut dyn FnMut(Diagnostic<usize>),
+    re: &mut dyn FnMut(Diagnostic),
 ) -> Result<TestConfigExpr<'a>, ()> {
     let mut pwd = StringExpr::Literal("./");
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
@@ -439,8 +437,8 @@ fn parse_test<'a>(
             }
             _ => {
                 re(Diagnostic::error()
-                    .with_message(format_args!("unknown key `{}` in test definition", key_str))
-                    .with_label(Label::primary(0, value.span)));
+                    .with_message(format!("unknown key `{}` in test definition", key_str))
+                    .with_label(DiagnosticLabel::primary(value.span.into())));
                 return Err(());
             }
         }
@@ -452,13 +450,13 @@ fn parse_test<'a>(
         (Some(_), Some(_)) => {
             re(Diagnostic::error()
                 .with_message("fields `cmd` and `sh` are mutually exclusive")
-                .with_label(Label::primary(0, 0..0)));
+                .with_label(DiagnosticLabel::primary(0..0)));
             return Err(());
         }
         (None, None) => {
             re(Diagnostic::error()
                 .with_message("either `cmd` or `sh` field is required")
-                .with_label(Label::primary(0, 0..0)));
+                .with_label(DiagnosticLabel::primary(0..0)));
             return Err(());
         }
     };
@@ -477,7 +475,7 @@ fn parse_test<'a>(
 fn parse_task_call<'a>(
     alloc: &'a Bump,
     value: &TomlValue<'a>,
-    re: &mut dyn FnMut(Diagnostic<usize>),
+    re: &mut dyn FnMut(Diagnostic),
 ) -> Result<TaskCall<'a>, ()> {
     match &value.value {
         ValueInner::String(s) => {
@@ -492,13 +490,13 @@ fn parse_task_call<'a>(
             if arr.is_empty() {
                 re(Diagnostic::error()
                     .with_message("task call array cannot be empty")
-                    .with_label(Label::primary(0, value.span)));
+                    .with_label(DiagnosticLabel::primary(value.span.into())));
                 return Err(());
             }
             if arr.len() > 2 {
                 re(Diagnostic::error()
                     .with_message("task call array can have at most 2 elements")
-                    .with_label(Label::primary(0, value.span)));
+                    .with_label(DiagnosticLabel::primary(value.span.into())));
                 return Err(());
             }
 
@@ -549,12 +547,12 @@ pub fn parse<'a>(
     base_path: &'a std::path::Path,
     alloc: &'a Bump,
     data: &'a str,
-    re: &mut dyn FnMut(Diagnostic<usize>),
+    re: &mut dyn FnMut(Diagnostic),
 ) -> Result<WorkspaceConfig<'a>, ()> {
     let value = match toml_spanner::parse(data) {
         Ok(value) => value,
         Err(err) => {
-            re(err.to_diagnostic(0));
+            re(toml_error_to_diagnostic(&err));
             return Err(());
         }
     };
@@ -645,7 +643,6 @@ mod test {
     use std::path::Path;
 
     use super::*;
-    use codespan_reporting::diagnostic::Diagnostic;
 
     #[test]
     fn test_parse_string_expr() {
@@ -654,7 +651,7 @@ mod test {
         let table = value.as_table().unwrap();
         let bump = Bump::new();
         let mut errors = Vec::new();
-        let mut error = |diag: Diagnostic<usize>| {
+        let mut error = |diag: Diagnostic| {
             errors.push(diag);
         };
 
@@ -674,7 +671,7 @@ mod test {
         let table = value.as_table().unwrap();
         let bump = Bump::new();
         let mut errors = Vec::new();
-        let mut error = |diag: Diagnostic<usize>| {
+        let mut error = |diag: Diagnostic| {
             errors.push(diag);
         };
 
@@ -694,7 +691,7 @@ mod test {
         let table = value.as_table().unwrap();
         let bump = Bump::new();
         let mut errors = Vec::new();
-        let mut error = |diag: Diagnostic<usize>| {
+        let mut error = |diag: Diagnostic| {
             errors.push(diag);
         };
 
@@ -719,7 +716,7 @@ require = ["build"]
 "#;
         let bump = Bump::new();
         let mut errors = Vec::new();
-        let mut error = |diag: Diagnostic<usize>| {
+        let mut error = |diag: Diagnostic| {
             errors.push(diag);
         };
 
@@ -741,7 +738,7 @@ cache = {}
 "#;
         let bump = Bump::new();
         let mut errors = Vec::new();
-        let mut error = |diag: Diagnostic<usize>| {
+        let mut error = |diag: Diagnostic| {
             errors.push(diag);
         };
 
@@ -763,7 +760,7 @@ cache = {}
 "#;
         let bump = Bump::new();
         let mut errors = Vec::new();
-        let mut error = |diag: Diagnostic<usize>| {
+        let mut error = |diag: Diagnostic| {
             errors.push(diag);
         };
 
@@ -782,7 +779,7 @@ before = ["build"]
 "#;
         let bump = Bump::new();
         let mut errors = Vec::new();
-        let mut error = |diag: Diagnostic<usize>| {
+        let mut error = |diag: Diagnostic| {
             errors.push(diag);
         };
 
@@ -801,7 +798,7 @@ before_once = ["setup"]
 "#;
         let bump = Bump::new();
         let mut errors = Vec::new();
-        let mut error = |diag: Diagnostic<usize>| {
+        let mut error = |diag: Diagnostic| {
             errors.push(diag);
         };
 
@@ -829,7 +826,7 @@ require = ["build"]
 "#;
         let bump = Bump::new();
         let mut errors = Vec::new();
-        let mut error = |diag: Diagnostic<usize>| {
+        let mut error = |diag: Diagnostic| {
             errors.push(diag);
         };
 
@@ -860,7 +857,7 @@ cache.key = [
 "#;
         let bump = Bump::new();
         let mut errors = Vec::new();
-        let mut error = |diag: Diagnostic<usize>| {
+        let mut error = |diag: Diagnostic| {
             errors.push(diag);
         };
 

@@ -21,12 +21,12 @@ bumpalo = { version = "3.19.0", features = ["collections"] }
 memchr = "2.7.6"
 sendfd = "0.4.4"
 jsony_value = "0.0.1"
-toml-spanner = { version = "0.1", features = ["reporting"] }
-codespan-reporting = { version = "0.13.1", features = ["termcolor"] }
+toml-spanner = "0.1"
 hashbrown = { version = "0.16.1", default-features = false, features = [
     "default-hasher",
 ] }
 foldhash = "0.2.0"
+annotate-snippets = "0.12.10"
 
 [dev-dependencies]
 vt100 = "*"

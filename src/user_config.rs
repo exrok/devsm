@@ -61,9 +61,7 @@ fn parse_user_config_for_daemon(content: &str) -> Result<UserConfig, String> {
 
         for (mode_name, mode_value) in bind_table.iter() {
             let mode: Mode = mode_name.name.parse().map_err(|e: String| e)?;
-            let bindings = mode_value
-                .as_table()
-                .ok_or_else(|| format!("'bind.{}' must be a table", mode_name.name))?;
+            let bindings = mode_value.as_table().ok_or_else(|| format!("'bind.{}' must be a table", mode_name.name))?;
 
             for (key_str, cmd_value) in bindings.iter() {
                 let input: InputEvent = key_str.name.parse().map_err(|e: String| e)?;

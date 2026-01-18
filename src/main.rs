@@ -17,6 +17,7 @@ mod cli;
 mod collection;
 mod config;
 pub mod daemon;
+mod diagnostic;
 mod keybinds;
 mod line_width;
 mod log_fowarder_ui;

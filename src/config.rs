@@ -5,59 +5,19 @@ use std::{
 
 use anyhow::bail;
 use bumpalo::Bump;
-use codespan_reporting::diagnostic::Diagnostic;
-use codespan_reporting::files::SimpleFiles;
-use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
-use codespan_reporting::term::{self, Config};
 use jsony::Jsony;
 use jsony_value::{Value, ValueMap, ValueRef};
 
+use crate::diagnostic::{Diagnostic, emit_diagnostic, render_diagnostic};
+
 pub mod toml_handler;
 
-fn remap_diagnostic_with_file_id(file_id: usize, diagnostic: &Diagnostic<usize>) -> Diagnostic<usize> {
-    use codespan_reporting::diagnostic::Label;
-
-    let remap_label = |l: &Label<usize>| -> Label<usize> {
-        let mut new_label = match l.style {
-            codespan_reporting::diagnostic::LabelStyle::Primary => Label::primary(file_id, l.range.clone()),
-            codespan_reporting::diagnostic::LabelStyle::Secondary => Label::secondary(file_id, l.range.clone()),
-        };
-        new_label.message = l.message.clone();
-        new_label
-    };
-
-    Diagnostic {
-        severity: diagnostic.severity,
-        code: diagnostic.code.clone(),
-        message: diagnostic.message.clone(),
-        labels: diagnostic.labels.iter().map(remap_label).collect(),
-        notes: diagnostic.notes.clone(),
-    }
+pub fn emit_config_error(file_name: &str, content: &str, diagnostic: &Diagnostic) {
+    emit_diagnostic(file_name, content, diagnostic);
 }
 
-#[allow(deprecated)]
-pub fn emit_config_error(file_name: &str, content: &str, diagnostic: &Diagnostic<usize>) {
-    let mut files = SimpleFiles::new();
-    let file_id = files.add(file_name.to_string(), content);
-    let remapped = remap_diagnostic_with_file_id(file_id, diagnostic);
-
-    let mut writer = StandardStream::stderr(ColorChoice::Auto);
-    let config = Config::default();
-    let _ = term::emit(&mut writer, &config, &files, &remapped);
-}
-
-#[allow(deprecated)]
-pub fn format_config_error(file_name: &str, content: &str, diagnostic: &Diagnostic<usize>) -> String {
-    use codespan_reporting::term::termcolor::Buffer;
-
-    let mut files = SimpleFiles::new();
-    let file_id = files.add(file_name.to_string(), content);
-    let remapped = remap_diagnostic_with_file_id(file_id, diagnostic);
-
-    let config = Config::default();
-    let mut buffer = Buffer::ansi();
-    let _ = term::emit(&mut buffer, &config, &files, &remapped);
-    String::from_utf8_lossy(buffer.as_slice()).into_owned()
+pub fn format_config_error(file_name: &str, content: &str, diagnostic: &Diagnostic) -> String {
+    render_diagnostic(file_name, content, diagnostic)
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
