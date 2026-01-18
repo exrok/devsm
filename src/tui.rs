@@ -58,8 +58,11 @@ fn render<'a>(w: u16, h: u16, tui: &'a mut TuiState, workspace: &Workspace, delt
     tui.frame.buf.clear();
 
     Style::DEFAULT.delta().write_to_buffer(&mut tui.frame.buf);
+
+    // Check if we're in search mode
     let dest = Rect { x: 0, y: 0, w, h: h - menu_height };
     tui.logs.render(&mut tui.frame.buf, dest, &workspace);
+
     let mut bot = Rect { x: 0, y: 0, w, h: menu_height };
 
     bot.take_top(1)
@@ -270,7 +273,7 @@ pub enum ScrollTarget {
     None,
 }
 
-pub fn scroll_target(w: u16, h: u16, tui: &TuiState, x: u16, y: u16) -> ScrollTarget {
+fn scroll_target(w: u16, h: u16, tui: &TuiState, x: u16, y: u16) -> ScrollTarget {
     let menu_height = 10;
     let mut dest = Rect { x: 0, y: 0, w, h: h };
     let mut bot = dest.take_bottom(menu_height);

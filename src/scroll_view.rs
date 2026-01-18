@@ -152,7 +152,7 @@ pub struct LogStyle {
 }
 
 impl LogStyle {
-    fn prefix(&self, job: JobLogCorrelation) -> Option<&Prefix> {
+    pub fn prefix(&self, job: JobLogCorrelation) -> Option<&Prefix> {
         let index = job.0 & 0x3ff;
         self.prefixes.get(index as usize)
     }

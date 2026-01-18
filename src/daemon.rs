@@ -42,10 +42,7 @@ pub struct RequestMessage<'a> {
 pub enum WorkspaceCommand<'a> {
     RestartSelected,
     GetPanicLocation,
-    Run {
-        name: Box<str>,
-        params: ValueMap<'a>,
-    },
+    Run { name: Box<str>, params: ValueMap<'a> },
 }
 
 #[derive(Jsony, Debug)]
@@ -104,26 +101,24 @@ fn handle_request(
     match message.request {
         Request::WorkspaceCommand { config, command } => {
             kvlog::info!("Restarting selected processes");
-            pm.request
-                .send(crate::process_manager::ProcessRequest::WorkspaceCommand {
-                    socket,
-                    // hack for now.
-                    command: jsony::to_binary(&command),
-                    workspace_config: config.into(),
-                });
+            pm.request.send(crate::process_manager::ProcessRequest::WorkspaceCommand {
+                socket,
+                // hack for now.
+                command: jsony::to_binary(&command),
+                workspace_config: config.into(),
+            });
         }
         Request::AttachTui { config } => {
             kvlog::info!("Receiving FD");
             if fds.len() != 2 {
                 bail!("Expected 2 FD's found only one");
             }
-            pm.request
-                .send(crate::process_manager::ProcessRequest::AttachClient {
-                    stdin: fds.pop_front().unwrap(),
-                    stdout: fds.pop_front().unwrap(),
-                    socket,
-                    workspace_config: config.into(),
-                });
+            pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
+                stdin: fds.pop_front().unwrap(),
+                stdout: fds.pop_front().unwrap(),
+                socket,
+                workspace_config: config.into(),
+            });
         }
     }
     Ok(())
@@ -147,12 +142,7 @@ pub fn worker() -> anyhow::Result<()> {
             let new_fd = {
                 unsafe {
                     // Directly call the raw libc::accept function
-                    libc::accept4(
-                        listener_fd,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        libc::SOCK_CLOEXEC,
-                    )
+                    libc::accept4(listener_fd, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_CLOEXEC)
                 }
             };
 

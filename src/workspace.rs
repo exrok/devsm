@@ -33,6 +33,7 @@ impl JobIndex {
 }
 
 #[derive(Debug)]
+#[allow(unused)]
 pub enum ExitCause {
     Unknown,
     Killed,

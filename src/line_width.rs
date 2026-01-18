@@ -67,31 +67,18 @@ impl<'a> Iterator for SegmentIterator<'a> {
         let first_byte = bytes[0];
 
         if first_byte == b'\x1b' && bytes.get(1) == Some(&b'[') {
-            let segment_len = bytes
-                .iter()
-                .skip(2)
-                .position(|&b| b == b'm')
-                .map(|pos| pos + 3)
-                .unwrap_or(bytes.len());
+            let segment_len = bytes.iter().skip(2).position(|&b| b == b'm').map(|pos| pos + 3).unwrap_or(bytes.len());
             self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
 
-            Some(Segment::AnsiEscapes(unsafe {
-                std::str::from_utf8_unchecked(&bytes[2..segment_len - 1])
-            }))
+            Some(Segment::AnsiEscapes(unsafe { std::str::from_utf8_unchecked(&bytes[2..segment_len - 1]) }))
         } else if first_byte.is_ascii() {
-            let segment_len = bytes
-                .iter()
-                .position(|&b| !b.is_ascii() || b == b'\x1b')
-                .unwrap_or(bytes.len());
+            let segment_len = bytes.iter().position(|&b| !b.is_ascii() || b == b'\x1b').unwrap_or(bytes.len());
             let (segment_str, next_remaining) = self.remaining.split_at(segment_len);
             self.remaining = next_remaining;
 
             Some(Segment::Ascii(segment_str))
         } else {
-            let segment_len = bytes
-                .iter()
-                .position(|&b| b.is_ascii() || b == b'\x1b')
-                .unwrap_or(bytes.len());
+            let segment_len = bytes.iter().position(|&b| b.is_ascii() || b == b'\x1b').unwrap_or(bytes.len());
             let (segment_str, next_remaining) = self.remaining.split_at(segment_len);
             self.remaining = next_remaining;
 
@@ -359,9 +346,6 @@ mod tests {
     fn test_utf8_then_ascii() {
         let text = "日本語abc";
         let segments: Vec<_> = Segment::iterator(text).collect();
-        assert_eq!(
-            segments,
-            vec![Segment::Utf8("日本語"), Segment::Ascii("abc"),]
-        );
+        assert_eq!(segments, vec![Segment::Utf8("日本語"), Segment::Ascii("abc"),]);
     }
 }

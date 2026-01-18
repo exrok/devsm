@@ -1,3 +1,4 @@
+#![allow(unused, dead_code)]
 use std::{
     io::{ErrorKind, Read, Write},
     os::unix::{net::UnixStream, process::CommandExt},
@@ -10,6 +11,7 @@ use sendfd::SendWithFd;
 
 use crate::daemon::{GLOBAL_SOCKET, WorkspaceCommand};
 
+mod cli;
 mod config;
 mod daemon;
 mod line_width;
@@ -23,37 +25,27 @@ mod workspace;
 fn main() {
     let mut args = std::env::args();
     args.next();
-    let Some(mode) = args.next() else {
-        let _log_guard = kvlog::collector::init_file_logger("/tmp/.client.devsm.log");
-        client().unwrap();
-        return;
-    };
-    if mode == "get-last-rust-panic" {
-        workspace_command(WorkspaceCommand::GetPanicLocation).unwrap();
-    }
-    if mode == "restart-selected" {
-        workspace_command(WorkspaceCommand::RestartSelected).unwrap();
-    }
-    if mode == "run" {
-        let name = args.next().unwrap();
-        let arg2: String;
-        let params = if let Some(arg) = args.next() {
-            arg2 = arg;
-            jsony::from_json(&arg2).unwrap()
-        } else {
-            jsony_value::ValueMap::new()
-        };
-        workspace_command(WorkspaceCommand::Run {
-            name: name.into(),
-            params,
-        })
-        .unwrap();
-    }
-
-    if mode == "server" {
-        let _log_guard = kvlog::collector::init_file_logger("/tmp/.devsm.log");
-        if let Err(err) = daemon::worker() {
-            kvlog::error!("Daemon terminated with error", ?err);
+    let args = args.collect::<Vec<_>>();
+    let (_config, command) = cli::parse(&args).unwrap();
+    match command {
+        cli::Command::Cli => {
+            let _log_guard = kvlog::collector::init_file_logger("/tmp/.client.devsm.log");
+            client().unwrap();
+            return;
+        }
+        cli::Command::Server => {
+            let _log_guard = kvlog::collector::init_file_logger("/tmp/.devsm.log");
+            if let Err(err) = daemon::worker() {
+                kvlog::error!("Daemon terminated with error", ?err);
+            }
+        }
+        cli::Command::RestartSelected => {
+            workspace_command(WorkspaceCommand::RestartSelected).unwrap();
+        }
+        cli::Command::TriggerPrimary => todo!(),
+        cli::Command::TriggerSecondary => todo!(),
+        cli::Command::Run { job, value_map } => {
+            workspace_command(WorkspaceCommand::Run { name: job.into(), params: value_map }).unwrap()
         }
     }
 }
@@ -88,11 +80,7 @@ fn setup_signal_handler(sig: i32, handler: unsafe extern "C" fn(i32)) -> anyhow:
         libc::sigfillset(&mut sa.sa_mask);
 
         if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
-            bail!(
-                "Failed to set signal handler for signal {}: {}",
-                sig,
-                std::io::Error::last_os_error()
-            );
+            bail!("Failed to set signal handler for signal {}: {}", sig, std::io::Error::last_os_error());
         }
     }
     Ok(())
@@ -128,10 +116,7 @@ fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
             return Ok(socket);
         }
     }
-    Err(std::io::Error::new(
-        ErrorKind::TimedOut,
-        "Failed to connect to daemon",
-    ))
+    Err(std::io::Error::new(ErrorKind::TimedOut, "Failed to connect to daemon"))
 }
 
 fn workspace_command(command: WorkspaceCommand) -> anyhow::Result<()> {
@@ -142,10 +127,7 @@ fn workspace_command(command: WorkspaceCommand) -> anyhow::Result<()> {
     let mut socket = connect_or_spawn_daemon()?;
     socket.write_all(&jsony::to_binary(&daemon::RequestMessage {
         cwd: &cwd,
-        request: daemon::Request::WorkspaceCommand {
-            config: &config,
-            command,
-        },
+        request: daemon::Request::WorkspaceCommand { config: &config, command },
     }))?;
     std::io::copy(&mut socket, &mut std::io::stdout())?;
     Ok(())

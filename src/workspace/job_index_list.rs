@@ -38,8 +38,7 @@ impl JobIndexList {
         self.terminal += 1;
     }
     pub fn push_active(&mut self, job: JobIndex) {
-        self.jobs
-            .insert((self.terminal + self.active) as usize, job);
+        self.jobs.insert((self.terminal + self.active) as usize, job);
         self.active += 1;
     }
     pub fn push_scheduled(&mut self, job: JobIndex) {
@@ -83,11 +82,7 @@ impl JobIndexList {
             self.active += 1;
             return;
         }
-        debug_assert!(
-            false,
-            "JobIndexList::run called on non-scheduled job: {:?}",
-            job.0
-        );
+        debug_assert!(false, "JobIndexList::run called on non-scheduled job: {:?}", job.0);
     }
     pub fn set_terminal(&mut self, job: JobIndex) {
         for (i, j) in self.non_terminal().iter().enumerate() {
@@ -106,11 +101,7 @@ impl JobIndexList {
             self.terminal += 1;
             return;
         }
-        debug_assert!(
-            false,
-            "JobIndexList::terminate called on non-running job: {:?}",
-            job.0
-        );
+        debug_assert!(false, "JobIndexList::terminate called on non-running job: {:?}", job.0);
     }
     pub fn terminal(&self) -> &[JobIndex] {
         &self.jobs[..self.terminal as usize]

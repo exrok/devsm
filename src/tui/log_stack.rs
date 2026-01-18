@@ -112,6 +112,7 @@ impl LogStack {
                 logs.view(bot_filter),
                 &def,
             );
+            self.pending_bottom_scroll = 0;
             // todo don't alaways render the value
             let br = dest.take_bottom(1);
             vtui::vt::move_cursor(buf, br.x, br.y);
