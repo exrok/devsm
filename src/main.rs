@@ -37,7 +37,7 @@ fn main() {
     let args = args.collect::<Vec<_>>();
     let (_config, command) = cli::parse(&args).unwrap();
     match command {
-        cli::Command::Cli => {
+        cli::Command::Tui => {
             let _log_guard = kvlog::collector::init_file_logger("/tmp/.client.devsm.log");
             client().unwrap();
         }

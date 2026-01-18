@@ -71,7 +71,7 @@ pub struct GlobalArguments<'a> {
 }
 
 pub enum Command<'a> {
-    Cli,
+    Tui,
     Server,
     RestartSelected,
     Restart { job: &'a str, value_map: ValueMap<'a> },
@@ -221,7 +221,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
 
     let command = 'command: loop {
         let Some(arg) = parser.next() else {
-            break 'command Command::Cli;
+            break 'command Command::Tui;
         };
         match arg {
             Component::Flags(flags) => {

@@ -5,10 +5,60 @@ use std::{
 
 use anyhow::bail;
 use bumpalo::Bump;
+use codespan_reporting::diagnostic::Diagnostic;
+use codespan_reporting::files::SimpleFiles;
+use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
+use codespan_reporting::term::{self, Config};
 use jsony::Jsony;
 use jsony_value::{Value, ValueMap, ValueRef};
 
 pub mod toml_handler;
+
+fn remap_diagnostic_with_file_id(file_id: usize, diagnostic: &Diagnostic<usize>) -> Diagnostic<usize> {
+    use codespan_reporting::diagnostic::Label;
+
+    let remap_label = |l: &Label<usize>| -> Label<usize> {
+        let mut new_label = match l.style {
+            codespan_reporting::diagnostic::LabelStyle::Primary => Label::primary(file_id, l.range.clone()),
+            codespan_reporting::diagnostic::LabelStyle::Secondary => Label::secondary(file_id, l.range.clone()),
+        };
+        new_label.message = l.message.clone();
+        new_label
+    };
+
+    Diagnostic {
+        severity: diagnostic.severity,
+        code: diagnostic.code.clone(),
+        message: diagnostic.message.clone(),
+        labels: diagnostic.labels.iter().map(remap_label).collect(),
+        notes: diagnostic.notes.clone(),
+    }
+}
+
+#[allow(deprecated)]
+pub fn emit_config_error(file_name: &str, content: &str, diagnostic: &Diagnostic<usize>) {
+    let mut files = SimpleFiles::new();
+    let file_id = files.add(file_name.to_string(), content);
+    let remapped = remap_diagnostic_with_file_id(file_id, diagnostic);
+
+    let mut writer = StandardStream::stderr(ColorChoice::Auto);
+    let config = Config::default();
+    let _ = term::emit(&mut writer, &config, &files, &remapped);
+}
+
+#[allow(deprecated)]
+pub fn format_config_error(file_name: &str, content: &str, diagnostic: &Diagnostic<usize>) -> String {
+    use codespan_reporting::term::termcolor::Buffer;
+
+    let mut files = SimpleFiles::new();
+    let file_id = files.add(file_name.to_string(), content);
+    let remapped = remap_diagnostic_with_file_id(file_id, diagnostic);
+
+    let config = Config::default();
+    let mut buffer = Buffer::ansi();
+    let _ = term::emit(&mut buffer, &config, &files, &remapped);
+    String::from_utf8_lossy(buffer.as_slice()).into_owned()
+}
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct Alias<'a>(&'a str);
@@ -104,9 +154,10 @@ pub fn load_from_env() -> anyhow::Result<WorkspaceConfig<'static>> {
     loop {
         pwd.push("devsm.toml");
         if pwd.exists() {
+            let config_path = pwd.clone();
             let content = std::fs::read_to_string(&pwd)?.leak();
             pwd.pop();
-            return load_workspace_config_leaking(&pwd, content);
+            return load_workspace_config_from_path(&pwd, &config_path, content);
         }
         if !pwd.pop() {
             break;
@@ -118,18 +169,61 @@ pub fn load_from_env() -> anyhow::Result<WorkspaceConfig<'static>> {
     Err(anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))
 }
 
-pub fn load_workspace_config_leaking(
+pub fn load_workspace_config_from_path(
     base_path: &Path,
+    config_path: &Path,
     content: &'static str,
 ) -> anyhow::Result<WorkspaceConfig<'static>> {
     let bump = Box::leak(Box::new(Bump::new()));
-    // todo put in the bump allocator
     let base_path = Box::leak(Box::new(base_path.to_path_buf()));
-    match toml_handler::parse(base_path, bump, content, &mut |err| {
-        println!("{:#?}", err);
+    let file_name = config_path.display().to_string();
+    let mut had_error = false;
+    match toml_handler::parse(base_path, bump, content, &mut |diagnostic| {
+        emit_config_error(&file_name, content, &diagnostic);
+        had_error = true;
     }) {
         Ok(value) => Ok(value),
-        Err(_) => bail!("Failed to parse config"),
+        Err(_) => {
+            if !had_error {
+                eprintln!("error: failed to parse {}", file_name);
+            }
+            bail!("Failed to parse config")
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ConfigError {
+    pub message: String,
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+pub fn load_workspace_config_capturing(
+    config_path: &Path,
+    content: &'static str,
+) -> Result<WorkspaceConfig<'static>, ConfigError> {
+    let bump = Box::leak(Box::new(Bump::new()));
+    let base_path = config_path.parent().unwrap_or(Path::new("."));
+    let base_path = Box::leak(Box::new(base_path.to_path_buf()));
+    let file_name = config_path.display().to_string();
+    let mut errors = String::new();
+    match toml_handler::parse(base_path, bump, content, &mut |diagnostic| {
+        errors.push_str(&format_config_error(&file_name, content, &diagnostic));
+    }) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            if errors.is_empty() {
+                errors = format!("error: failed to parse {}\n", file_name);
+            }
+            Err(ConfigError { message: errors })
+        }
     }
 }
 

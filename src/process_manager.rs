@@ -15,7 +15,7 @@ use slab::Slab;
 use std::io::Write;
 use std::{
     os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -585,11 +585,16 @@ impl ProcessManager {
     }
     fn handle_request(&mut self, req: ProcessRequest) -> bool {
         match req {
-            ProcessRequest::WorkspaceCommand { workspace_config, socket, command } => {
+            ProcessRequest::WorkspaceCommand { workspace_config, mut socket, command } => {
                 let ws_index = match self.workspace_index(workspace_config) {
                     Ok(ws) => ws,
                     Err(err) => {
                         kvlog::info!("Error spawning workspace", %err);
+                        if let Some(config_err) = err.downcast_ref::<crate::config::ConfigError>() {
+                            let _ = socket.write_all(config_err.message.as_bytes());
+                        } else {
+                            let _ = socket.write_all(format!("error: {}\n", err).as_bytes());
+                        }
                         return false;
                     }
                 };
@@ -632,6 +637,14 @@ impl ProcessManager {
                     Ok(ws) => ws,
                     Err(err) => {
                         kvlog::info!("Error spawning workspace", %err);
+                        if let Some(stdout) = stdout {
+                            let mut file = unsafe { std::fs::File::from_raw_fd(stdout.into_raw_fd()) };
+                            if let Some(config_err) = err.downcast_ref::<crate::config::ConfigError>() {
+                                let _ = file.write_all(config_err.message.as_bytes());
+                            } else {
+                                let _ = file.write_all(format!("error: {}\n", err).as_bytes());
+                            }
+                        }
                         return false;
                     }
                 };

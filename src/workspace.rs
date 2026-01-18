@@ -168,11 +168,19 @@ pub struct LatestConfig {
 }
 
 impl LatestConfig {
-    fn new(path: PathBuf) -> anyhow::Result<Self> {
-        let metadata = path.metadata()?;
-        let modified_time = metadata.modified()?;
-        let content = std::fs::read_to_string(&path)?.leak();
-        let current = crate::config::load_workspace_config_leaking(path.parent().unwrap(), content)?;
+    fn new(path: PathBuf) -> Result<Self, crate::config::ConfigError> {
+        let metadata = path.metadata().map_err(|e| crate::config::ConfigError {
+            message: format!("error: failed to read {}: {}\n", path.display(), e),
+        })?;
+        let modified_time = metadata.modified().map_err(|e| crate::config::ConfigError {
+            message: format!("error: failed to get modification time for {}: {}\n", path.display(), e),
+        })?;
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| crate::config::ConfigError {
+                message: format!("error: failed to read {}: {}\n", path.display(), e),
+            })?
+            .leak();
+        let current = crate::config::load_workspace_config_capturing(&path, content)?;
         Ok(Self { modified_time, path, current })
     }
     fn refresh(&mut self) -> anyhow::Result<bool> {
@@ -182,7 +190,9 @@ impl LatestConfig {
             return Ok(false);
         }
         let content = std::fs::read_to_string(&self.path)?.leak();
-        let new_config = crate::config::load_workspace_config_leaking(self.current.base_path, content)?;
+        let config_path = self.current.base_path.join("devsm.toml");
+        let new_config = crate::config::load_workspace_config_capturing(&config_path, content)
+            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
         self.current = new_config;
         self.modified_time = modified;
         Ok(true)
@@ -710,7 +720,7 @@ impl WorkspaceState {
 
         job.process_status = status;
     }
-    pub fn new(config_path: PathBuf) -> anyhow::Result<WorkspaceState> {
+    pub fn new(config_path: PathBuf) -> Result<WorkspaceState, crate::config::ConfigError> {
         let config = LatestConfig::new(config_path)?;
         let mut base_tasks = Vec::new();
         let mut name_map = hashbrown::HashMap::new();

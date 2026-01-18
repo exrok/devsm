@@ -29,13 +29,13 @@ impl UserConfig {
         };
 
         match std::fs::read_to_string(&path) {
-            Ok(content) => match parse_user_config(&content) {
+            Ok(content) => match parse_user_config_for_daemon(&content) {
                 Ok(config) => {
                     kvlog::info!("Loaded user config", path = %path.display());
                     config
                 }
                 Err(err) => {
-                    kvlog::error!("Failed to parse user config", path = %path.display(), ?err);
+                    kvlog::error!("Failed to parse user config", path = %path.display(), %err);
                     UserConfig::default()
                 }
             },
@@ -51,7 +51,51 @@ impl UserConfig {
     }
 }
 
-/// Parses user config from TOML content.
+fn parse_user_config_for_daemon(content: &str) -> Result<UserConfig, String> {
+    let toml = toml_spanner::parse(content).map_err(|e| format!("TOML parse error: {e}"))?;
+
+    let mut keybinds = Keybinds::default();
+
+    if let Some(bind_table) = toml.as_table().and_then(|t| t.get("bind")) {
+        let bind_table = bind_table.as_table().ok_or("'bind' must be a table")?;
+
+        for (mode_name, mode_value) in bind_table.iter() {
+            let mode: Mode = mode_name.name.parse().map_err(|e: String| e)?;
+            let bindings = mode_value
+                .as_table()
+                .ok_or_else(|| format!("'bind.{}' must be a table", mode_name.name))?;
+
+            for (key_str, cmd_value) in bindings.iter() {
+                let input: InputEvent = key_str.name.parse().map_err(|e: String| e)?;
+
+                let command = if let Some(f) = cmd_value.as_float() {
+                    if f.is_nan() {
+                        None
+                    } else {
+                        return Err(format!(
+                            "Invalid binding value for '{}': expected command string or nan",
+                            key_str.name
+                        ));
+                    }
+                } else if let Some(cmd_str) = cmd_value.as_str() {
+                    let cmd: Command = cmd_str.parse().map_err(|e: String| e)?;
+                    Some(cmd)
+                } else {
+                    return Err(format!(
+                        "Invalid binding value for '{}': expected command string or nan",
+                        key_str.name
+                    ));
+                };
+
+                keybinds.set_binding(mode, input, command);
+            }
+        }
+    }
+
+    Ok(UserConfig { keybinds })
+}
+
+#[cfg(test)]
 fn parse_user_config(content: &str) -> Result<UserConfig, String> {
     let toml = toml_spanner::parse(content).map_err(|e| format!("TOML parse error: {e}"))?;
 
