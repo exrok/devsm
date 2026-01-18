@@ -13,7 +13,7 @@ use std::io::Write;
 use std::{
     collections::HashMap,
     os::{
-        fd::{AsRawFd, OwnedFd, RawFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -101,6 +101,13 @@ struct ClientEntry {
     socket: UnixStream,
 }
 
+struct RunClientEntry {
+    workspace: WorkspaceIndex,
+    channel: Arc<ForwarderChannel>,
+    socket: UnixStream,
+    job_id: JobLogCorrelation,
+}
+
 pub struct WorkspaceEntry {
     line_writer: LogWriter,
     handle: Arc<Workspace>,
@@ -108,6 +115,7 @@ pub struct WorkspaceEntry {
 
 pub(crate) struct ProcessManager {
     clients: Slab<ClientEntry>,
+    run_clients: Slab<RunClientEntry>,
     workspaces: slab::Slab<WorkspaceEntry>,
     workspace_map: HashMap<Box<Path>, WorkspaceIndex>,
     processes: slab::Slab<ActiveProcess>,
@@ -382,8 +390,17 @@ pub(crate) enum ProcessRequest {
     WorkspaceCommand { workspace_config: PathBuf, socket: UnixStream, command: Vec<u8> },
     Spawn { task: TaskConfigRc, workspace_id: WorkspaceIndex, job_id: JobLogCorrelation, job_index: JobIndex },
     AttachClient { stdin: OwnedFd, stdout: OwnedFd, socket: UnixStream, workspace_config: PathBuf },
+    AttachRun {
+        stdin: OwnedFd,
+        stdout: OwnedFd,
+        socket: UnixStream,
+        workspace_config: PathBuf,
+        task_name: Box<str>,
+        params: Vec<u8>,
+    },
     TerminateJob { job_id: JobLogCorrelation, process_index: usize },
     ClientExited { index: usize },
+    RunClientExited { index: usize },
     ProcessExited { pid: u32, status: u32 },
     GlobalTermination,
 }
@@ -393,6 +410,32 @@ pub(crate) struct ClientChannel {
     pub(crate) state: AtomicU64,
     pub(crate) selected: AtomicU64,
     pub(crate) events: Mutex<Vec<()>>,
+}
+
+/// Channel for communicating with a log forwarder thread.
+///
+/// Allows the process manager to wake the forwarder when new logs arrive
+/// and signal termination when the client disconnects.
+pub struct ForwarderChannel {
+    pub waker: vtui::event::polling::Waker,
+    pub state: AtomicU64,
+}
+
+impl ForwarderChannel {
+    /// Wakes the forwarder thread to check for new logs.
+    pub fn wake(&self) -> std::io::Result<()> {
+        self.waker.wake()
+    }
+
+    /// Returns true if the forwarder should terminate.
+    pub fn is_terminated(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Relaxed) != 0
+    }
+
+    /// Signals the forwarder to terminate.
+    pub fn set_terminated(&self) {
+        self.state.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub enum Action {
@@ -699,6 +742,93 @@ impl ProcessManager {
                 }
                 return false;
             }
+            ProcessRequest::AttachRun {
+                stdin,
+                stdout,
+                socket,
+                workspace_config,
+                task_name,
+                params,
+            } => {
+                let ws_index = match self.workspace_index(workspace_config) {
+                    Ok(ws) => ws,
+                    Err(err) => {
+                        kvlog::info!("Error spawning workspace", %err);
+                        return false;
+                    }
+                };
+
+                let params: ValueMap = jsony::from_binary(&params).unwrap_or_else(|_| ValueMap::new());
+                let (name, profile) = task_name.rsplit_once(":").unwrap_or((&*task_name, ""));
+
+                let ws = &self.workspaces[ws_index as usize];
+                let job_id = {
+                    let mut state = ws.handle.state.write().unwrap();
+                    let Some(base_index) = state.base_index_by_name(name) else {
+                        drop(state);
+                        let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
+                        let _ = std::io::Write::write_all(&mut file, b"Task not found\n");
+                        std::mem::forget(file);
+                        return false;
+                    };
+                    drop(state);
+                    ws.handle.restart_task(workspace::BaseTaskIndex(base_index as u32), params, profile);
+
+                    let state = ws.handle.state.read().unwrap();
+                    let bt = &state.base_tasks[base_index];
+                    bt.jobs.all().last().map(|ji| state[*ji].job_id)
+                };
+
+                let Some(job_id) = job_id else {
+                    let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
+                    let _ = std::io::Write::write_all(&mut file, b"Failed to start task\n");
+                    std::mem::forget(file);
+                    return false;
+                };
+
+                let forwarder_channel = Arc::new(ForwarderChannel {
+                    waker: vtui::event::polling::Waker::new().unwrap(),
+                    state: AtomicU64::new(0),
+                });
+
+                let next = self.run_clients.vacant_key();
+                let _ = self.poll.registry().register(
+                    &mut SourceFd(&socket.as_raw_fd()),
+                    TokenHandle::RunClient(next as u32).into(),
+                    Interest::READABLE,
+                );
+                let _ = socket.set_nonblocking(true);
+
+                let forwarder_socket = socket.try_clone().ok();
+
+                let run_client_entry = RunClientEntry {
+                    channel: forwarder_channel.clone(),
+                    workspace: ws_index,
+                    socket,
+                    job_id,
+                };
+                let index = self.run_clients.insert(run_client_entry);
+
+                let ws_handle = ws.handle.clone();
+                let request_channel = self.request.clone();
+                std::thread::spawn(move || {
+                    let _ = std::panic::catch_unwind(|| {
+                        if let Err(err) =
+                            crate::forwarder::run(stdin, stdout, forwarder_socket, &ws_handle, job_id, forwarder_channel)
+                        {
+                            kvlog::error!("Forwarder exited with error", %err);
+                        }
+                    });
+                    kvlog::info!("Terminating run client");
+                    request_channel.send(ProcessRequest::RunClientExited { index });
+                });
+
+                false
+            }
+            ProcessRequest::RunClientExited { index } => {
+                self.terminate_run_client(index as u32);
+                false
+            }
         }
     }
     fn terminate_client(&mut self, client_index: ClientIndex) {
@@ -754,12 +884,63 @@ impl ProcessManager {
             let _ = client.channel.wake();
         }
     }
+    fn terminate_run_client(&mut self, client_index: u32) {
+        let Some(client) = self.run_clients.try_remove(client_index as usize) else {
+            return;
+        };
+        client.channel.set_terminated();
+        let _ = client.channel.wake();
+        let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
+    }
+    fn handle_run_client_read(&mut self, client_index: u32) {
+        let Some(client) = self.run_clients.get_mut(client_index as usize) else {
+            return;
+        };
+        let mut buffer = [0u8; 4];
+        let mut terminate = false;
+        let mut kill_task = false;
+        match std::io::Read::read(&mut &client.socket, &mut buffer) {
+            Ok(4) => {
+                let code = u32::from_le_bytes(buffer);
+                if code == TERMINATION_CODE {
+                    kill_task = true;
+                    terminate = true;
+                }
+            }
+            Ok(0) => {
+                terminate = true;
+            }
+            Err(_) => {
+                terminate = true;
+            }
+            _ => {}
+        }
+
+        if kill_task {
+            let job_id = client.job_id;
+            for (_, process) in &self.processes {
+                if process.job_id == job_id {
+                    let child_pid = process.child.id();
+                    let pgid = -(child_pid as i32);
+                    unsafe {
+                        libc::kill(pgid, libc::SIGINT);
+                    }
+                    break;
+                }
+            }
+        }
+
+        if terminate {
+            self.terminate_run_client(client_index);
+        }
+    }
 }
 
 pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread::JoinHandle<()>, poll: Poll) {
     let mut events = Events::with_capacity(128);
     let mut job_manager = ProcessManager {
         clients: Slab::new(),
+        run_clients: Slab::new(),
         request,
         workspace_map: HashMap::new(),
         workspaces: slab::Slab::new(),
@@ -797,10 +978,15 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
                 TokenHandle::Client(index) => {
                     job_manager.handle_client_read_ready(index);
                 }
+                TokenHandle::RunClient(index) => {
+                    job_manager.handle_run_client_read(index);
+                }
             }
         }
-        // todo optimize
         for (_, client) in &job_manager.clients {
+            let _ = client.channel.wake();
+        }
+        for (_, client) in &job_manager.run_clients {
             let _ = client.channel.wake();
         }
     }
@@ -827,6 +1013,7 @@ enum TokenHandle {
     RequestChannel,
     Task(TaskPipe),
     Client(ClientIndex),
+    RunClient(u32),
 }
 
 impl From<Token> for TokenHandle {
@@ -836,6 +1023,9 @@ impl From<Token> for TokenHandle {
         } else if token.0 & (1 << 29) != 0 {
             let index = token.0 & !(1 << 29);
             TokenHandle::Client(index as ClientIndex)
+        } else if token.0 & (1 << 28) != 0 {
+            let index = token.0 & !(1 << 28);
+            TokenHandle::RunClient(index as u32)
         } else {
             let pipe = TaskPipe(token.0 as u32);
             TokenHandle::Task(pipe)
@@ -848,6 +1038,7 @@ impl From<TokenHandle> for Token {
         match handle {
             TokenHandle::RequestChannel => CHANNEL_TOKEN,
             TokenHandle::Client(index) => Token((1 << 29) | (index as usize)),
+            TokenHandle::RunClient(index) => Token((1 << 28) | (index as usize)),
             TokenHandle::Task(pipe) => Token(pipe.0 as usize),
         }
     }

@@ -1,9 +1,30 @@
 use anyhow::{Context, bail};
-use jsony_value::ValueMap;
+use jsony_value::{Value, ValueMap};
 
 struct ArgParser<'a> {
     args: std::slice::Iter<'a, String>,
     value: Option<&'a str>,
+}
+
+/// Parses a flag value as a JSON literal, falling back to a string on failure.
+///
+/// # Examples
+///
+/// ```
+/// let value = parse_flag_value("500");
+/// assert!(matches!(value.as_ref(), jsony_value::ValueRef::Number(_)));
+///
+/// let value = parse_flag_value("true");
+/// assert!(matches!(value.as_ref(), jsony_value::ValueRef::Boolean(true)));
+///
+/// let value = parse_flag_value("hello");
+/// assert!(matches!(value.as_ref(), jsony_value::ValueRef::String(s) if s == "hello"));
+/// ```
+pub fn parse_flag_value(value: &str) -> Value<'_> {
+    let Ok(parsed) = jsony::from_json::<Value>(value) else {
+        return value.into();
+    };
+    parsed
 }
 
 #[derive(Debug)]
@@ -55,20 +76,63 @@ pub enum Command<'a> {
     RestartSelected,
     TriggerPrimary,
     TriggerSecondary,
-    Run { job: &'a str, value_map: jsony_value::ValueMap<'a> },
+    Restart { job: &'a str, value_map: ValueMap<'a> },
+    Exec { job: &'a str, value_map: ValueMap<'a> },
+    Run { job: &'a str, value_map: ValueMap<'a> },
 }
 
-fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+/// Parses a job name and parameters from remaining arguments.
+///
+/// Accepts either `--key=value` flags or a single JSON object literal.
+/// Flags are parsed as JSON literals, falling back to strings.
+fn parse_job_args<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<(&'a str, ValueMap<'a>)> {
     let job = match parser.next() {
         Some(Component::Term(name)) => name,
         Some(f) => bail!("Expected name of job, found {:?}", f),
         None => bail!("Missing name of job"),
     };
-    let value_map: ValueMap = match parser.next() {
-        Some(Component::Term(value)) => jsony::from_json(value).context("Parsing run value")?,
-        Some(f) => bail!("Expected optional job parameter json map, found {:?}", f),
-        None => ValueMap::new(),
-    };
+
+    let mut value_map = ValueMap::new();
+    while let Some(component) = parser.next() {
+        match component {
+            Component::Long(key) => {
+                let Some(Component::Value(val)) = parser.next() else {
+                    bail!("Flag --{} requires a value (use --{}=value)", key, key);
+                };
+                value_map.insert(key.into(), parse_flag_value(val));
+            }
+            Component::Term(json) => {
+                let parsed: ValueMap = jsony::from_json(json).context("Parsing job parameters")?;
+                for (k, v) in parsed.entries() {
+                    value_map.insert(k.clone(), v.clone());
+                }
+            }
+            Component::Flags(flags) => {
+                for flag in flags.chars() {
+                    bail!("Unknown flag -{}", flag);
+                }
+            }
+            Component::Value(val) => {
+                bail!("Unexpected value: {:?}", val);
+            }
+        }
+    }
+
+    Ok((job, value_map))
+}
+
+fn parse_restart<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let (job, value_map) = parse_job_args(parser)?;
+    Ok(Command::Restart { job, value_map })
+}
+
+fn parse_exec<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let (job, value_map) = parse_job_args(parser)?;
+    Ok(Command::Exec { job, value_map })
+}
+
+fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let (job, value_map) = parse_job_args(parser)?;
     Ok(Command::Run { job, value_map })
 }
 
@@ -105,6 +169,8 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
             Component::Term(command) => match command {
                 "server" => break 'command Command::Server,
                 "restart-selected" => break 'command Command::RestartSelected,
+                "restart" => break 'command parse_restart(&mut parser)?,
+                "exec" => break 'command parse_exec(&mut parser)?,
                 "run" => break 'command parse_run(&mut parser)?,
                 unknown_command => bail!("Unknown Command: {:?}", unknown_command),
             },
@@ -112,4 +178,124 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
     };
 
     Ok((global, command))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsony_value::ValueRef;
+
+    #[test]
+    fn parse_flag_value_integer() {
+        let value = parse_flag_value("500");
+        let ValueRef::Number(n) = value.as_ref() else {
+            panic!("Expected number, got {:?}", value);
+        };
+        assert_eq!(n.as_u64(), Some(500));
+    }
+
+    #[test]
+    fn parse_flag_value_negative_integer() {
+        let value = parse_flag_value("-42");
+        let ValueRef::Number(n) = value.as_ref() else {
+            panic!("Expected number, got {:?}", value);
+        };
+        assert_eq!(n.as_i64(), Some(-42));
+    }
+
+    #[test]
+    fn parse_flag_value_float() {
+        let value = parse_flag_value("3.14");
+        let ValueRef::Number(n) = value.as_ref() else {
+            panic!("Expected number, got {:?}", value);
+        };
+        assert_eq!(n.as_f64(), Some(3.14));
+    }
+
+    #[test]
+    fn parse_flag_value_boolean_true() {
+        let value = parse_flag_value("true");
+        let ValueRef::Boolean(b) = value.as_ref() else {
+            panic!("Expected boolean, got {:?}", value);
+        };
+        assert!(*b == true);
+    }
+
+    #[test]
+    fn parse_flag_value_boolean_false() {
+        let value = parse_flag_value("false");
+        let ValueRef::Boolean(b) = value.as_ref() else {
+            panic!("Expected boolean, got {:?}", value);
+        };
+        assert!(*b == false);
+    }
+
+    #[test]
+    fn parse_flag_value_null() {
+        let value = parse_flag_value("null");
+        assert!(matches!(value.as_ref(), ValueRef::Null(_)));
+    }
+
+    #[test]
+    fn parse_flag_value_json_string() {
+        let value = parse_flag_value("\"quoted\"");
+        let ValueRef::String(s) = value.as_ref() else {
+            panic!("Expected string, got {:?}", value);
+        };
+        assert_eq!(&**s, "quoted");
+    }
+
+    #[test]
+    fn parse_flag_value_json_array() {
+        let value = parse_flag_value("[1,2,3]");
+        let ValueRef::List(list) = value.as_ref() else {
+            panic!("Expected list, got {:?}", value);
+        };
+        assert_eq!(list.as_slice().len(), 3);
+    }
+
+    #[test]
+    fn parse_flag_value_json_object() {
+        let value = parse_flag_value("{\"a\":1}");
+        let ValueRef::Map(map) = value.as_ref() else {
+            panic!("Expected map, got {:?}", value);
+        };
+        assert_eq!(map.entries().len(), 1);
+    }
+
+    #[test]
+    fn parse_flag_value_unquoted_string_fallback() {
+        let value = parse_flag_value("hello");
+        let ValueRef::String(s) = value.as_ref() else {
+            panic!("Expected string, got {:?}", value);
+        };
+        assert_eq!(&**s, "hello");
+    }
+
+    #[test]
+    fn parse_flag_value_path_fallback() {
+        let value = parse_flag_value("/usr/bin/bash");
+        let ValueRef::String(s) = value.as_ref() else {
+            panic!("Expected string, got {:?}", value);
+        };
+        assert_eq!(&**s, "/usr/bin/bash");
+    }
+
+    #[test]
+    fn parse_flag_value_url_fallback() {
+        let value = parse_flag_value("https://example.com");
+        let ValueRef::String(s) = value.as_ref() else {
+            panic!("Expected string, got {:?}", value);
+        };
+        assert_eq!(&**s, "https://example.com");
+    }
+
+    #[test]
+    fn parse_flag_value_empty_string_fallback() {
+        let value = parse_flag_value("");
+        let ValueRef::String(s) = value.as_ref() else {
+            panic!("Expected string, got {:?}", value);
+        };
+        assert_eq!(&**s, "");
+    }
 }

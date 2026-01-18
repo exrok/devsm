@@ -57,6 +57,12 @@ pub enum Request<'a> {
         #[jsony(with = unix_path)]
         config: &'a Path,
     },
+    AttachRun {
+        #[jsony(with = unix_path)]
+        config: &'a Path,
+        name: Box<str>,
+        params: ValueMap<'a>,
+    },
 }
 
 struct FdSet<'a>(&'a [i32]);
@@ -118,6 +124,20 @@ fn handle_request(
                 stdout: fds.pop_front().unwrap(),
                 socket,
                 workspace_config: config.into(),
+            });
+        }
+        Request::AttachRun { config, name, params } => {
+            kvlog::info!("Receiving FD for run command");
+            if fds.len() != 2 {
+                bail!("Expected 2 FD's found only one");
+            }
+            pm.request.send(crate::process_manager::ProcessRequest::AttachRun {
+                stdin: fds.pop_front().unwrap(),
+                stdout: fds.pop_front().unwrap(),
+                socket,
+                workspace_config: config.into(),
+                task_name: name,
+                params: jsony::to_binary(&params),
             });
         }
     }
