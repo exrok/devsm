@@ -139,6 +139,7 @@ pub(crate) struct ProcessManager {
     wait_thread: std::thread::JoinHandle<()>,
     request: Arc<MioChannel>,
     poll: Poll,
+    timed_ready_count: u32,
 }
 
 pub(crate) enum ReadResult {
@@ -251,6 +252,9 @@ impl ProcessManager {
 
                 if let Some(ref checker) = process.ready_checker {
                     if crate::line_width::strip_ansi_and_contains(text, &checker.needle) {
+                        if checker.timeout_at.is_some() {
+                            self.timed_ready_count -= 1;
+                        }
                         ready_matched = true;
                         process.ready_checker = None;
                     }
@@ -297,9 +301,7 @@ impl ProcessManager {
                         ws_state.update_job_status(job_index, JobStatus::Cancelled);
                         continue 'outer;
                     }
-                    workspace::Scheduled::None => {
-                        kvlog::info!("no task is ready");
-                    }
+                    workspace::Scheduled::None => (),
                 }
             }
             break;
@@ -323,11 +325,11 @@ impl ProcessManager {
         for (_, process) in &mut self.processes {
             if let Some(ref checker) = process.ready_checker {
                 if checker.timeout_at.is_some_and(|t| now > t) {
+                    self.timed_ready_count -= 1;
                     process.ready_checker = None;
                 }
             }
         }
-        self.scheduled();
     }
 
     pub(crate) fn spawn(
@@ -424,6 +426,9 @@ impl ProcessManager {
                 timeout_at: rc.timeout.map(|secs| std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)),
             }
         });
+        if ready_checker.as_ref().is_some_and(|rc| rc.timeout_at.is_some()) {
+            self.timed_ready_count += 1;
+        }
         let ready_state = ready_checker.as_ref().map(|_| false);
         let process_index = self.processes.insert(ActiveProcess {
             workspace_index,
@@ -847,6 +852,9 @@ impl ProcessManager {
                                 status: exit_code,
                             },
                         );
+                    }
+                    if process.ready_checker.as_ref().is_some_and(|rc| rc.timeout_at.is_some()) {
+                        self.timed_ready_count -= 1;
                     }
                     self.processes.remove(index);
                     self.broadcast_job_exited(ws_idx, job_idx, exit_code as i32, rpc_cause);
@@ -1554,9 +1562,11 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
         buffer_pool: Vec::new(),
         wait_thread,
         poll,
+        timed_ready_count: 0,
     };
     loop {
-        let poll_timeout = Some(std::time::Duration::from_millis(500));
+        let poll_timeout =
+            if job_manager.timed_ready_count > 0 { Some(std::time::Duration::from_millis(500)) } else { None };
         job_manager.poll.poll(&mut events, poll_timeout).unwrap();
 
         for event in &events {
@@ -1573,13 +1583,11 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
                             return;
                         }
                     }
-                    job_manager.scheduled();
                 }
                 TokenHandle::Task(pipe) => {
                     if let Err(err) = job_manager.read(pipe.index(), pipe.pipe()) {
                         kvlog::error!("Failed to read from process", ?err, ?pipe);
                     }
-                    job_manager.scheduled();
                 }
                 TokenHandle::Client(index) => {
                     job_manager.handle_client_read(index);
@@ -1587,7 +1595,10 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
             }
         }
 
-        job_manager.check_ready_timeouts();
+        job_manager.scheduled();
+        if job_manager.timed_ready_count > 0 {
+            job_manager.check_ready_timeouts();
+        }
 
         for (_, client) in &job_manager.clients {
             let _ = client.channel.wake();

@@ -356,9 +356,28 @@ pub struct WorkspaceState {
     pub active_test_run: Option<TestRun>,
     pub action_jobs: JobIndexList,
     pub test_jobs: JobIndexList,
+    pub service_jobs: JobIndexList,
 }
 
 impl WorkspaceState {
+    /// Quickly determine if a scheduled task is pending
+    pub fn has_scheduled_task(&self) -> bool {
+        let mut non_scheduled = 0;
+        let mut total = 0;
+        non_scheduled += self.action_jobs.terminal_count();
+        non_scheduled += self.action_jobs.active_count();
+        total += self.action_jobs.len();
+
+        non_scheduled += self.test_jobs.terminal_count();
+        non_scheduled += self.test_jobs.active_count();
+        total += self.test_jobs.len();
+
+        non_scheduled += self.service_jobs.terminal_count();
+        non_scheduled += self.service_jobs.active_count();
+        total += self.service_jobs.len();
+
+        total != non_scheduled
+    }
     /// Computes a cache key from the cache configuration.
     ///
     /// The key is a concatenation of all key inputs, formatted as:
@@ -611,7 +630,7 @@ impl WorkspaceState {
         let global_list = match task_kind {
             TaskKind::Action => Some(&mut self.action_jobs),
             TaskKind::Test => Some(&mut self.test_jobs),
-            TaskKind::Service => None,
+            TaskKind::Service => Some(&mut self.service_jobs),
         };
         if let Some(list) = global_list {
             if spawn {
@@ -709,7 +728,7 @@ impl WorkspaceState {
         let global_list = match task_kind {
             TaskKind::Action => Some(&mut self.action_jobs),
             TaskKind::Test => Some(&mut self.test_jobs),
-            TaskKind::Service => None,
+            TaskKind::Service => Some(&mut self.service_jobs),
         };
         if let Some(list) = global_list {
             match (&job.process_status, &status) {
@@ -742,13 +761,17 @@ impl WorkspaceState {
             active_test_run: None,
             action_jobs: JobIndexList::default(),
             test_jobs: JobIndexList::default(),
+            service_jobs: JobIndexList::default(),
         })
     }
 
     /// Brute force scheduling useful testing will provided an optimized alternative later
     pub fn next_scheduled(&self) -> Scheduled {
-        for bs in &self.base_tasks {
-            'pending: for &job_index in bs.jobs.scheduled() {
+        if !self.has_scheduled_task() {
+            return Scheduled::None;
+        }
+        for job_set in [&self.action_jobs, &self.service_jobs, &self.test_jobs] {
+            'pending: for &job_index in job_set.scheduled() {
                 let JobStatus::Scheduled { after } = &self[job_index].process_status else {
                     kvlog::error!("Inconsistent JobStatus in WorkspaceState::next_ready_task",
                      status = ?&self[job_index].process_status, ?job_index);

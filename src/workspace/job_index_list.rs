@@ -25,6 +25,12 @@ impl<'a> IntoIterator for &'a JobIndexList {
 }
 
 impl JobIndexList {
+    pub fn terminal_count(&self) -> usize {
+        self.terminal as usize
+    }
+    pub fn active_count(&self) -> usize {
+        self.active as usize
+    }
     pub fn clear(&mut self) {
         self.jobs.clear();
         self.terminal = 0;
