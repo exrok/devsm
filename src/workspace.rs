@@ -117,7 +117,11 @@ impl ScheduleRequirement {
                 JobStatus::Scheduled { .. } => RequirementStatus::Pending,
                 JobStatus::Starting => RequirementStatus::Pending,
                 JobStatus::Cancelled => RequirementStatus::Never,
-                JobStatus::Running { .. } => RequirementStatus::Met,
+                JobStatus::Running { ready_state, .. } => match ready_state {
+                    None => RequirementStatus::Met,
+                    Some(true) => RequirementStatus::Met,
+                    Some(false) => RequirementStatus::Pending,
+                },
                 JobStatus::Exited { .. } => RequirementStatus::Never,
             },
         }
@@ -132,6 +136,10 @@ pub enum JobStatus {
     Starting,
     Running {
         process_index: usize,
+        /// None = no ready config (always ready)
+        /// Some(false) = waiting for ready condition
+        /// Some(true) = ready condition met
+        ready_state: Option<bool>,
     },
     Exited {
         finished_at: Instant,
@@ -482,7 +490,7 @@ impl WorkspaceState {
 
         for job_index in bt.jobs.running() {
             let job = &mut self.jobs[job_index.idx()];
-            let JobStatus::Running { process_index } = &job.process_status else {
+            let JobStatus::Running { process_index, .. } = &job.process_status else {
                 continue;
             };
             pred.push(ScheduleRequirement { job: *job_index, predicate: JobPredicate::Terminated });
@@ -811,7 +819,7 @@ impl Workspace {
         let bt = &mut state.base_tasks[base_task.idx()];
         for job_index in bt.jobs.non_terminal() {
             let job = &state.jobs[job_index.idx()];
-            let JobStatus::Running { process_index } = &job.process_status else {
+            let JobStatus::Running { process_index, .. } = &job.process_status else {
                 continue;
             };
             self.process_channel.send(crate::process_manager::ProcessRequest::TerminateJob {
@@ -1050,7 +1058,7 @@ mod scheduling_tests {
     fn test_job_status_is_pending_completion() {
         assert!(JobStatus::Scheduled { after: vec![] }.is_pending_completion());
         assert!(JobStatus::Starting.is_pending_completion());
-        assert!(JobStatus::Running { process_index: 0 }.is_pending_completion());
+        assert!(JobStatus::Running { process_index: 0, ready_state: None }.is_pending_completion());
         assert!(
             !JobStatus::Exited { finished_at: Instant::now(), log_end: LogId(0), cause: ExitCause::Unknown, status: 0 }
                 .is_pending_completion()
@@ -1062,7 +1070,7 @@ mod scheduling_tests {
     fn test_job_status_is_successful_completion() {
         assert!(!JobStatus::Scheduled { after: vec![] }.is_successful_completion());
         assert!(!JobStatus::Starting.is_successful_completion());
-        assert!(!JobStatus::Running { process_index: 0 }.is_successful_completion());
+        assert!(!JobStatus::Running { process_index: 0, ready_state: None }.is_successful_completion());
         assert!(!JobStatus::Cancelled.is_successful_completion());
 
         assert!(

@@ -82,6 +82,20 @@ impl<'a> Segment<'a> {
     }
 }
 
+/// Strips ANSI escape codes and checks if text contains needle (case-sensitive).
+///
+/// Used for checking ready conditions where ANSI codes should be ignored.
+pub fn strip_ansi_and_contains(text: &str, needle: &str) -> bool {
+    let mut buffer = Vec::new();
+    for segment in Segment::iterator(text) {
+        match segment {
+            Segment::Ascii(s) | Segment::Utf8(s) => buffer.extend(s.bytes()),
+            Segment::AnsiEscapes(_) => {}
+        }
+    }
+    std::str::from_utf8(&buffer).map_or(false, |s| s.contains(needle))
+}
+
 /// Strips ANSI escape codes from text and appends lowercase content to buffer.
 ///
 /// Used for building search indices where case-insensitive matching is needed

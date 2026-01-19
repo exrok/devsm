@@ -6,8 +6,8 @@ use toml_spanner::{
 };
 
 use crate::config::{
-    Alias, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, StringExpr, StringListExpr, TaskCall,
-    TaskConfigExpr, TaskKind, TestConfigExpr, WorkspaceConfig,
+    Alias, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, ReadyConfig, ReadyPredicate, StringExpr,
+    StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, WorkspaceConfig,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, toml_error_to_diagnostic};
 
@@ -156,6 +156,7 @@ fn parse_task<'a>(
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut require: &[TaskCall<'a>] = &[];
     let mut cache: Option<CacheConfig<'a>> = None;
+    let mut ready: Option<ReadyConfig<'a>> = None;
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
@@ -272,6 +273,53 @@ fn parse_task<'a>(
                 };
                 info = alloc.alloc_str(s);
             }
+            "ready" => {
+                if kind != TaskKind::Service {
+                    re(Diagnostic::error()
+                        .with_message("`ready` is only valid for services")
+                        .with_label(DiagnosticLabel::primary(value.span.into())));
+                    return Err(());
+                }
+                let Some(ready_table) = value.as_table() else {
+                    mismatched_in_object(re, "table", value, "ready");
+                    return Err(());
+                };
+                let Some(when_value) = ready_table.get("when") else {
+                    re(Diagnostic::error()
+                        .with_message("`ready` requires a `when` field")
+                        .with_label(DiagnosticLabel::primary(value.span.into())));
+                    return Err(());
+                };
+                let Some(when_table) = when_value.as_table() else {
+                    mismatched_in_object(re, "table", when_value, "when");
+                    return Err(());
+                };
+                let when = if let Some(output_contains_val) = when_table.get("output_contains") {
+                    let Some(needle) = output_contains_val.as_str() else {
+                        mismatched_in_object(re, "string", output_contains_val, "output_contains");
+                        return Err(());
+                    };
+                    ReadyPredicate::OutputContains(alloc.alloc_str(needle))
+                } else {
+                    re(Diagnostic::error()
+                        .with_message("`ready.when` must specify a predicate (e.g., `output_contains`)")
+                        .with_label(DiagnosticLabel::primary(when_value.span.into())));
+                    return Err(());
+                };
+                let timeout = if let Some(timeout_val) = ready_table.get("timeout") {
+                    match &timeout_val.value {
+                        ValueInner::Float(f) => Some(*f),
+                        ValueInner::Integer(i) => Some(*i as f64),
+                        _ => {
+                            mismatched_in_object(re, "number", timeout_val, "timeout");
+                            return Err(());
+                        }
+                    }
+                } else {
+                    None
+                };
+                ready = Some(ReadyConfig { when, timeout });
+            }
             _ => {
                 re(Diagnostic::error()
                     .with_message(format!("unknown key `{}` in task definition", key_str))
@@ -307,6 +355,7 @@ fn parse_task<'a>(
         envvar: envvar_vec.into_bump_slice(),
         require,
         cache,
+        ready,
         tags: &[],
     })
 }

@@ -220,6 +220,34 @@
         "initKeys": ["key"]
       }
     },
+    "readyPredicate": {
+      "type": "object",
+      "description": "Predicate determining when a service is ready",
+      "additionalProperties": false,
+      "properties": {
+        "output_contains": {
+          "type": "string",
+          "description": "Ready when output contains this string (ANSI codes ignored)"
+        }
+      }
+    },
+    "readyConfig": {
+      "type": "object",
+      "description": "Ready condition configuration for services",
+      "additionalProperties": false,
+      "required": ["when"],
+      "properties": {
+        "when": {
+          "$ref": "#/definitions/readyPredicate",
+          "description": "Predicate determining when the service is ready"
+        },
+        "timeout": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Timeout in seconds for ready condition"
+        }
+      }
+    },
     "action": {
       "type": "object",
       "description": "Action configuration - a one-time task",
@@ -314,6 +342,10 @@
           "items": {
             "$ref": "#/definitions/taskCall"
           }
+        },
+        "ready": {
+          "$ref": "#/definitions/readyConfig",
+          "description": "Ready condition - dependents wait until this condition is met"
         },
         "info": {
           "type": "string",

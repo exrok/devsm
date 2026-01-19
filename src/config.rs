@@ -66,6 +66,20 @@ pub struct CacheConfig<'a> {
     /// Empty means no key-based invalidation (simple success-based caching).
     pub key: &'a [CacheKeyInput<'a>],
 }
+
+/// Predicate determining when a service is ready.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadyPredicate<'a> {
+    /// Ready when stdout/stderr contains this string (ANSI stripped, case-sensitive).
+    OutputContains(&'a str),
+}
+
+/// Ready condition configuration for services.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadyConfig<'a> {
+    pub when: ReadyPredicate<'a>,
+    pub timeout: Option<f64>,
+}
 #[derive(Clone)]
 pub struct TaskConfigRc(Arc<(TaskConfig<'static>, Bump)>);
 unsafe impl Send for TaskConfigRc {}
@@ -90,6 +104,7 @@ pub struct TaskConfig<'a> {
     pub envvar: &'a [(&'a str, &'a str)],
     pub require: &'a [TaskCall<'a>],
     pub cache: Option<CacheConfig<'a>>,
+    pub ready: Option<ReadyConfig<'a>>,
 }
 
 pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
@@ -214,6 +229,7 @@ pub struct TaskConfigExpr<'a> {
     envvar: &'a [(&'a str, StringExpr<'a>)],
     pub require: &'a [TaskCall<'a>],
     pub cache: Option<CacheConfig<'a>>,
+    pub ready: Option<ReadyConfig<'a>>,
     /// Tags for test filtering. Empty for non-test tasks.
     pub tags: &'a [&'a str],
 }
@@ -244,6 +260,7 @@ impl TestConfigExpr<'static> {
             envvar: self.envvar,
             require: self.require,
             cache: self.cache.clone(),
+            ready: None,
             tags: self.tags,
         }))
     }
@@ -262,6 +279,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         envvar: &[],
         require: EMPTY_TASK_CALLS,
         cache: None,
+        ready: None,
         tags: &[],
     }
 };
@@ -281,7 +299,7 @@ impl TaskConfigExpr<'static> {
     pub fn eval(&self, env: &Enviroment) -> Result<TaskConfigRc, EvalError> {
         #[allow(clippy::arc_with_non_send_sync)]
         let mut new = Arc::new((
-            TaskConfig { pwd: "", command: Command::Cmd(&[]), require: &[], cache: None, envvar: &[] },
+            TaskConfig { pwd: "", command: Command::Cmd(&[]), require: &[], cache: None, ready: None, envvar: &[] },
             Bump::new(),
         ));
         let alloc = Arc::get_mut(&mut new).unwrap();
@@ -314,6 +332,7 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
             command: self.command.bump_eval(env, bump)?,
             require: self.require,
             cache: self.cache.clone(),
+            ready: self.ready.clone(),
             envvar: if self.envvar.is_empty() {
                 &[]
             } else {
@@ -598,6 +617,7 @@ mod tests {
             envvar: &[],
             require: EMPTY_TASK_CALLS,
             cache: None,
+            ready: None,
             tags: &[],
         };
         let vars = TEST_EXPR.collect_variables();
@@ -621,6 +641,7 @@ mod tests {
             envvar: &[],
             require: EMPTY_TASK_CALLS,
             cache: None,
+            ready: None,
             tags: &[],
         };
         let vars = TEST_EXPR.collect_variables();

@@ -34,6 +34,14 @@ pub(crate) enum Pipe {
 }
 
 type WorkspaceIndex = u32;
+/// Tracks ready condition checking for a service process.
+pub(crate) struct ReadyChecker {
+    /// String to search for in output (ANSI stripped).
+    pub(crate) needle: String,
+    /// When to timeout if ready condition not met.
+    pub(crate) timeout_at: Option<std::time::Instant>,
+}
+
 pub(crate) struct ActiveProcess {
     pub(crate) log_group: LogGroup,
     pub(crate) job_index: JobIndex,
@@ -44,6 +52,8 @@ pub(crate) struct ActiveProcess {
     pub(crate) style: Style,
     pub(crate) child: Child,
     pub(crate) pending_exit_cause: Option<ExitCause>,
+    /// Ready condition checker. None if no ready condition or already ready.
+    pub(crate) ready_checker: Option<ReadyChecker>,
 }
 
 impl ActiveProcess {
@@ -222,6 +232,7 @@ impl ProcessManager {
             }
         }
 
+        let mut ready_matched = false;
         while let Some(line) = buffer.readline() {
             if let Ok(text) = std::str::from_utf8(line) {
                 let mut new_style = process.style;
@@ -237,18 +248,30 @@ impl ProcessManager {
                 if let Some(workspace) = self.workspaces.get_mut(process.workspace_index as usize) {
                     workspace.line_writer.push_line(text, width as u32, process.log_group, process.style);
                 }
+
+                if let Some(ref checker) = process.ready_checker {
+                    if crate::line_width::strip_ansi_and_contains(text, &checker.needle) {
+                        ready_matched = true;
+                        process.ready_checker = None;
+                    }
+                }
                 process.style = new_style;
             }
         }
+        let ws_index = process.workspace_index;
+        let job_index = process.job_index;
         if buffer.is_empty() || !expecting_more {
             buffer.reset();
             self.buffer_pool.push(buffer.data)
         } else {
-            // todo should compact buffer it too much space left
             match pipe {
                 Pipe::Stdout => process.stdout_buffer = Some(buffer),
                 Pipe::Stderr => process.stderr_buffer = Some(buffer),
             }
+        }
+
+        if ready_matched {
+            self.mark_service_ready(ws_index, job_index);
         }
 
         Ok(())
@@ -282,6 +305,31 @@ impl ProcessManager {
             break;
         }
     }
+
+    fn mark_service_ready(&mut self, ws_index: WorkspaceIndex, job_index: JobIndex) {
+        if let Some(ws) = self.workspaces.get(ws_index as usize) {
+            let mut state = ws.handle.state.write().unwrap();
+            if let JobStatus::Running { ready_state, .. } = &mut state[job_index].process_status {
+                *ready_state = Some(true);
+            }
+            state.change_number = state.change_number.wrapping_add(1);
+            drop(state);
+        }
+        self.scheduled();
+    }
+
+    fn check_ready_timeouts(&mut self) {
+        let now = std::time::Instant::now();
+        for (_, process) in &mut self.processes {
+            if let Some(ref checker) = process.ready_checker {
+                if checker.timeout_at.is_some_and(|t| now > t) {
+                    process.ready_checker = None;
+                }
+            }
+        }
+        self.scheduled();
+    }
+
     pub(crate) fn spawn(
         &mut self,
         workspace_index: WorkspaceIndex,
@@ -367,6 +415,16 @@ impl ProcessManager {
                 Interest::READABLE,
             )?;
         };
+        let ready_checker = tc.ready.as_ref().map(|rc| {
+            use crate::config::ReadyPredicate;
+            ReadyChecker {
+                needle: match &rc.when {
+                    ReadyPredicate::OutputContains(s) => s.to_string(),
+                },
+                timeout_at: rc.timeout.map(|secs| std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)),
+            }
+        });
+        let ready_state = ready_checker.as_ref().map(|_| false);
         let process_index = self.processes.insert(ActiveProcess {
             workspace_index,
             job_index,
@@ -377,10 +435,11 @@ impl ProcessManager {
             style: Style::default(),
             child,
             pending_exit_cause: None,
+            ready_checker,
         });
         {
             let mut ws = workspace.handle.state.write().unwrap();
-            ws.update_job_status(job_index, JobStatus::Running { process_index });
+            ws.update_job_status(job_index, JobStatus::Running { process_index, ready_state });
         }
         self.broadcast_job_status(workspace_index, job_index, crate::rpc::JobStatusKind::Running);
         Ok(())
@@ -1497,7 +1556,8 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
         poll,
     };
     loop {
-        job_manager.poll.poll(&mut events, None).unwrap();
+        let poll_timeout = Some(std::time::Duration::from_millis(500));
+        job_manager.poll.poll(&mut events, poll_timeout).unwrap();
 
         for event in &events {
             match TokenHandle::from(event.token()) {
@@ -1526,6 +1586,9 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
                 }
             }
         }
+
+        job_manager.check_ready_timeouts();
+
         for (_, client) in &job_manager.clients {
             let _ = client.channel.wake();
         }
