@@ -600,7 +600,12 @@ impl LogWidget {
 
     pub fn scrollable_render(&mut self, scroll: i32, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         if scroll == 0 {
-            self.render(buf, rect, view, style);
+            if let LogWidget::Scroll(_) = self {
+                // this handles new entries appearing.
+                self.scroll_down(0, buf, rect, view, style);
+            } else {
+                self.render(buf, rect, view, style);
+            }
         } else if scroll > 0 {
             self.scroll_up(scroll as u32, buf, rect, view, style);
         } else if scroll < 0 {
@@ -806,7 +811,7 @@ impl LogScrollWidget {
         let use_batch_clear = rect.y == 0 && !style.assume_blank;
 
         if use_batch_clear {
-            vt::MoveCursor(rect.x, rect.y + rect.h - 1).write_to_buffer(buf);
+            vt::MoveCursor(rect.x + rect.w, rect.y + rect.h - 1).write_to_buffer(buf);
             buf.extend_from_slice(vt::CLEAR_ABOVE);
         }
 
@@ -1006,7 +1011,7 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
     let use_batch_clear = rect.y == 0 && !style.assume_blank;
 
     if use_batch_clear {
-        vt::MoveCursor(rect.x, rect.y + rect.h - 1).write_to_buffer(buf);
+        vt::MoveCursor(rect.x + rect.w, rect.y + rect.h - 1).write_to_buffer(buf);
         buf.extend_from_slice(vt::CLEAR_ABOVE);
     }
 

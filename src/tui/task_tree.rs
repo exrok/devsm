@@ -179,6 +179,21 @@ impl TaskTreeState {
         self.collapsed
     }
 
+    /// Returns the current selection without normalization. Used for read-only display.
+    pub fn selection_state_readonly(&self, ws: &WorkspaceState) -> Option<SelectionState> {
+        let entry = self.selected_entry?;
+        match entry {
+            PrimaryEntry::Task(bti) => {
+                let job = self.job_index;
+                Some(SelectionState { base_task: Some(bti), job, meta_group: None })
+            }
+            PrimaryEntry::MetaGroup(kind) => {
+                let base_task = self.job_index.map(|ji| ws[ji].log_group.base_task_index());
+                Some(SelectionState { base_task, job: self.job_index, meta_group: Some(kind) })
+            }
+        }
+    }
+
     fn normalize_secondary(&mut self, jobs: &[JobIndex]) -> Option<JobIndex> {
         let ji = self.job_index?;
         match jobs.get(self.job_list_index) {

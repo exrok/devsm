@@ -180,6 +180,11 @@ impl LogSearchState {
         self.matches.get(self.selected).map(|m| m.log_id)
     }
 
+    /// Returns the current selected match index.
+    pub fn selected_index(&self) -> usize {
+        self.selected
+    }
+
     /// Updates the search index with new log entries.
     pub fn update_index(&mut self, logs: &Logs) {
         if logs.tail() <= self.index.indexed_tail {
@@ -308,9 +313,6 @@ impl LogSearchState {
 
         let cursor_rect = Rect { x: input_rect.x + 1 + self.pattern[..self.cursor].width() as u16, w: 1, ..input_rect };
         cursor_rect.with(Color::Grey[28].with_fg(Color::Grey[2])).fill(out);
-
-        let status_rect = rect.take_top(1);
-        status_rect.with(Color::Grey[8].as_fg()).fmt(out, format_args!("{} matches", self.matches.len()));
 
         if self.matches.is_empty() {
             return;

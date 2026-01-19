@@ -157,7 +157,10 @@ fn render<'a>(
 
     let mut bot = Rect { x: 0, y: 0, w, h: menu_height };
 
-    bot.take_top(1).with(Color::Grey[6].with_fg(Color::Grey[25])).fill(&mut tui.frame).skip(1).text(&mut tui.frame, "");
+    {
+        let status_data = build_status_bar_data(tui, workspace);
+        render_status_bar(&mut tui.frame, bot.take_top(1), &status_data);
+    }
     {
         let mut task_tree_rect = bot.take_top(19);
 
@@ -215,6 +218,132 @@ fn render<'a>(
     tui.frame.render_internal();
 
     pre_truncate(&mut tui.frame.buf)
+}
+
+struct StatusBarData {
+    mode_name: &'static str,
+    mode_bg: Color,
+    selection_text: String,
+    search_info: Option<(usize, usize)>,
+    running: usize,
+    scheduled: usize,
+    is_collapsed: bool,
+    log_mode: &'static str,
+    is_scrolled: bool,
+}
+
+fn render_status_bar(frame: &mut DoubleBuffer, mut rect: Rect, data: &StatusBarData) {
+    rect.with(Color::Grey[4].with_fg(Color::Grey[4])).fill(frame);
+
+    let mode_text = format!(" {} ", data.mode_name);
+    rect.take_left(mode_text.len() as i32).with(data.mode_bg.with_fg(Color::Black)).text(frame, &mode_text);
+
+    if !data.selection_text.is_empty() {
+        rect.take_left(data.selection_text.len() as i32)
+            .with(Color::Grey[8].with_fg(Color::Grey[25]))
+            .text(frame, &data.selection_text);
+    }
+
+    if let Some((selected, total)) = data.search_info {
+        let match_text = format!(" {}/{} ", selected + 1, total);
+        rect.take_left(match_text.len() as i32).with(Color::Grey[6].with_fg(Color::Grey[20])).text(frame, &match_text);
+    }
+
+    if data.is_scrolled {
+        let scroll_text = " SCROLL ";
+        rect.take_left(scroll_text.len() as i32)
+            .with(Color(215).with_fg(Color::Black))
+            .text(frame, scroll_text);
+    }
+
+    let view_mode = if data.is_collapsed { "C" } else { "E" };
+    let right_text = format!(" R:{} S:{} ", data.running, data.scheduled);
+    let view_text = format!(" {} {} ", data.log_mode, view_mode);
+
+    let right_width = right_text.len() + view_text.len();
+    let gap_width = rect.w as usize - right_width.min(rect.w as usize);
+    rect.take_left(gap_width as i32);
+
+    if data.running > 0 {
+        rect.take_left(right_text.len() as i32)
+            .with(Color::DarkOliveGreen.with_fg(Color::Black))
+            .text(frame, &right_text);
+    } else if data.scheduled > 0 {
+        rect.take_left(right_text.len() as i32).with(Color::Violet.with_fg(Color::Black)).text(frame, &right_text);
+    } else {
+        rect.take_left(right_text.len() as i32).with(Color::Grey[6].with_fg(Color::Grey[20])).text(frame, &right_text);
+    }
+
+    rect.take_left(view_text.len() as i32).with(Color::Grey[8].with_fg(Color::Grey[25])).text(frame, &view_text);
+}
+
+fn build_status_bar_data(tui: &TuiState, workspace: &Workspace) -> StatusBarData {
+    let ws = workspace.state();
+
+    let (mode_name, mode_bg) = match &tui.overlay {
+        FocusOverlap::Group { .. } => ("GROUP", Color::Violet),
+        FocusOverlap::LogSearch { .. } => ("SEARCH", Color::LightSkyBlue1),
+        FocusOverlap::TaskLauncher { .. } => ("LAUNCH", Color::LightGoldenrod2),
+        FocusOverlap::None => ("NORMAL", Color::DarkOliveGreen),
+    };
+
+    let sel = tui.task_tree.selection_state_readonly(&ws);
+    let selection_text = if let Some(sel) = sel {
+        if let Some(job_idx) = sel.job {
+            let job = &ws[job_idx];
+            let bti = job.log_group.base_task_index();
+            let name = ws.base_tasks[bti.idx()].name;
+            format!(" {}:{} ", name, job_idx.idx())
+        } else if let Some(bti) = sel.base_task {
+            format!(" {} ", ws.base_tasks[bti.idx()].name)
+        } else if let Some(kind) = sel.meta_group {
+            match kind {
+                MetaGroupKind::Tests => " @tests ".to_string(),
+                MetaGroupKind::Actions => " @actions ".to_string(),
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let search_info = if let FocusOverlap::LogSearch { state } = &tui.overlay {
+        Some((state.selected_index(), state.matches.len()))
+    } else {
+        None
+    };
+
+    let mut running = 0usize;
+    let mut scheduled = 0usize;
+    for bt in &ws.base_tasks {
+        if bt.removed {
+            continue;
+        }
+        running += bt.jobs.running().len();
+        scheduled += bt.jobs.scheduled().len();
+    }
+
+    let log_mode = match tui.logs.mode() {
+        log_stack::Mode::All => "1",
+        log_stack::Mode::OnlySelected(_) => "2",
+        log_stack::Mode::Hybrid(_) => "3",
+    };
+
+    let scroll_state = tui.logs.scroll_state(&ws, workspace);
+    let is_scrolled = scroll_state.top.is_scrolled || scroll_state.bottom.map_or(false, |b| b.is_scrolled);
+
+    StatusBarData {
+        mode_name,
+        mode_bg,
+        selection_text,
+        search_info,
+        running,
+        scheduled,
+        is_collapsed: tui.task_tree.is_collapsed(),
+        log_mode,
+        is_scrolled,
+    }
 }
 
 fn render_help_menu(
@@ -563,7 +692,7 @@ fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_
     let mut file = unsafe { std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(out.as_raw_fd())) };
     let ws = workspace.state();
     let selection = tui.task_tree.selection_state(&ws);
-    let scroll_state = tui.logs.scroll_state(workspace);
+    let scroll_state = tui.logs.scroll_state(&ws, workspace);
     let mut message = jsony::object! {
         tty_render_byte_count,
         collapsed: tui.task_tree.is_collapsed(),

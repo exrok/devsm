@@ -102,11 +102,10 @@ impl LogStack {
     }
 
     /// Returns the scroll state for both top and bottom panes.
-    pub fn scroll_state(&self, ws: &Workspace) -> LogStackScrollState {
-        let ws_state = ws.state();
+    pub fn scroll_state(&self, ws_state: &WorkspaceState, ws: &Workspace) -> LogStackScrollState {
         let logs = ws.logs.read().unwrap();
 
-        let (top_filter, bot_filter) = (self.mode.top_filter(&ws_state), self.mode.bottom_filter(&ws_state));
+        let (top_filter, bot_filter) = (self.mode.top_filter(ws_state), self.mode.bottom_filter(ws_state));
 
         let top_view = logs.view(top_filter);
         let top_style = match &self.mode {
