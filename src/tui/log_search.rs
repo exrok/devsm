@@ -311,7 +311,7 @@ impl LogSearchState {
             let text = unsafe { entry.text(logs) };
 
             let base_style = if is_selected { Color::LightSkyBlue1.with_fg(Color::Black) } else { Style::DEFAULT };
-            let highlight_style = Color::DarkOrange.with_fg(Color::Black);
+            let highlight_style = Color::Grey[25].with_fg(Color::Black);
 
             if is_selected {
                 entry_rect.with(base_style).fill(out);

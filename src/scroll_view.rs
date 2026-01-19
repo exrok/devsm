@@ -39,7 +39,7 @@ fn render_single_entry(
     }
 
     let highlight_info = style.highlight.filter(|h| h.log_id == log_id);
-    let highlight_style = Color::DarkOrange.as_bg();
+    let highlight_style = Color::Grey[25].with_fg(Color::Black);
 
     let prefix = style.prefix(entry.log_group);
     let prefix_width = prefix.map(|p| p.width).unwrap_or(0) as u16;

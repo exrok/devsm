@@ -171,12 +171,18 @@ fn render<'a>(
         match &mut tui.overlay {
             FocusOverlap::Group { selection } => {
                 let ws = &*workspace.state();
-                selection.render(&mut tui.frame, task_tree_rect, "group> ", |out, rect, bti: usize, selected| {
-                    let mut x = rect.with(Style::default());
+                let groups = &ws.config.current.groups;
+                let max_name_width = groups.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 2;
+                selection.render(&mut tui.frame, task_tree_rect, "group> ", |out, mut rect, idx: usize, selected| {
+                    let style = if selected { Color(153).with_fg(Color::Black) } else { Style::DEFAULT };
+                    let substyle = if selected { Color::Grey[5].with_bg(Color(153)) } else { Color::Grey[14].as_fg() };
                     if selected {
-                        x = x.with(Color::LightSkyBlue1.with_fg(Color::Black)).fill(out)
+                        rect.with(style).fill(out);
                     }
-                    x.text(out, ws.config.current.groups[bti].0);
+                    let (name, tasks) = &groups[idx];
+                    rect.take_left(max_name_width as i32).with(style).text(out, *name);
+                    let task_list: Vec<_> = tasks.iter().map(|t| &*t.name).collect();
+                    rect.with(substyle).text(out, &task_list.join(", "));
                 });
             }
             FocusOverlap::LogSearch { state } => {
