@@ -22,10 +22,32 @@ static SOCKET_PATH: OnceLock<String> = OnceLock::new();
 
 /// Returns the path to the Unix domain socket for daemon communication.
 ///
-/// Uses `DEVSM_SOCKET` environment variable if set, otherwise defaults to
-/// `/tmp/.devsm.socket`.
+/// Uses `DEVSM_SOCKET` environment variable if set, otherwise uses the
+/// platform-appropriate per-user runtime directory:
+/// - Linux: `$XDG_RUNTIME_DIR/devsm.socket`
+/// - macOS: `$TMPDIR/devsm.socket`
+///
+/// Falls back to `/tmp/devsm-<uid>.socket` if the standard directories are unavailable.
 pub fn socket_path() -> &'static str {
-    SOCKET_PATH.get_or_init(|| std::env::var("DEVSM_SOCKET").unwrap_or_else(|_| "/tmp/.devsm.socket".to_string()))
+    SOCKET_PATH.get_or_init(|| {
+        if let Ok(path) = std::env::var("DEVSM_SOCKET") {
+            return path;
+        }
+
+        #[cfg(target_os = "linux")]
+        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+            return format!("{runtime_dir}/devsm.socket");
+        }
+
+        #[cfg(target_os = "macos")]
+        if let Ok(tmpdir) = std::env::var("TMPDIR") {
+            let tmpdir = tmpdir.trim_end_matches('/');
+            return format!("{tmpdir}/devsm.socket");
+        }
+
+        let uid = unsafe { libc::getuid() };
+        format!("/tmp/devsm-{uid}.socket")
+    })
 }
 
 mod unix_path {
