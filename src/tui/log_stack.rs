@@ -217,8 +217,19 @@ impl LogStack {
             let ws = ws.state();
             if self.base_task_log_style.prefixes.len() != ws.base_tasks.len() {
                 self.base_task_log_style.prefixes.clear();
-                for base_task in &ws.base_tasks {
-                    let text = format!("{}> ", base_task.name);
+                for (i, base_task) in ws.base_tasks.iter().enumerate() {
+                    const SPAN_COLORS: &[&str] = &[
+                        "\x1b[48;5;235;38;5;195m",
+                        "\x1b[48;5;16;38;5;189m",
+                        "\x1b[48;5;235;38;5;183m",
+                        "\x1b[48;5;16;38;5;149m",
+                        "\x1b[48;5;235;38;5;157m",
+                        "\x1b[48;5;16;38;5;110m",
+                        "\x1b[48;5;235;38;5;229m",
+                        "\x1b[48;5;16;38;5;182m",
+                        "\x1b[48;5;235;38;5;151m",
+                    ];
+                    let text = format!("{} {} \x1b[m ", SPAN_COLORS[i % SPAN_COLORS.len()], base_task.name);
                     self.base_task_log_style
                         .prefixes
                         .push(crate::scroll_view::Prefix { width: text.len(), bytes: text.into() });

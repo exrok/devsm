@@ -1,7 +1,7 @@
 use extui::{Color, DoubleBuffer, HAlign, Rect};
 
 use crate::{
-    config::{Command, TaskKind},
+    config::{Command, ServiceHidden, TaskKind},
     tui::constrain_scroll_offset,
     workspace::{BaseTaskIndex, JobIndex, JobStatus, WorkspaceState},
 };
@@ -252,7 +252,13 @@ impl TaskTreeState {
                     continue;
                 }
                 if bt.config.kind == TaskKind::Service {
-                    self.primary_list.push(PrimaryEntry::Task(BaseTaskIndex(i as u32)));
+                    let should_display = match bt.config.hidden {
+                        ServiceHidden::Never => true,
+                        ServiceHidden::UntilRan => bt.has_run_this_session,
+                    };
+                    if should_display {
+                        self.primary_list.push(PrimaryEntry::Task(BaseTaskIndex(i as u32)));
+                    }
                 }
             }
 
@@ -270,7 +276,16 @@ impl TaskTreeState {
                 if bt.removed {
                     continue;
                 }
-                self.primary_list.push(PrimaryEntry::Task(BaseTaskIndex(i as u32)));
+                let should_display = match bt.config.kind {
+                    TaskKind::Service => match bt.config.hidden {
+                        ServiceHidden::Never => true,
+                        ServiceHidden::UntilRan => bt.has_run_this_session,
+                    },
+                    TaskKind::Action | TaskKind::Test => true,
+                };
+                if should_display {
+                    self.primary_list.push(PrimaryEntry::Task(BaseTaskIndex(i as u32)));
+                }
             }
         }
 

@@ -6,8 +6,8 @@ use toml_spanner::{
 };
 
 use crate::config::{
-    Alias, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, ReadyConfig, ReadyPredicate, StringExpr,
-    StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, WorkspaceConfig,
+    Alias, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, ReadyConfig, ReadyPredicate, ServiceHidden,
+    StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, WorkspaceConfig,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, toml_error_to_diagnostic};
 
@@ -161,6 +161,7 @@ fn parse_task<'a>(
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
     let mut managed: Option<bool> = None;
+    let mut hidden = ServiceHidden::Never;
 
     for (key, value) in task_table.iter() {
         let key_str = key.name.as_ref();
@@ -328,6 +329,31 @@ fn parse_task<'a>(
                 };
                 managed = Some(*b);
             }
+            "hidden" => {
+                if kind != TaskKind::Service {
+                    re(Diagnostic::error()
+                        .with_message("`hidden` is only valid for services")
+                        .with_label(DiagnosticLabel::primary(value.span.into())));
+                    return Err(());
+                }
+                let Some(hidden_str) = value.as_str() else {
+                    mismatched_in_object(re, "string", value, "hidden");
+                    return Err(());
+                };
+                hidden = match hidden_str {
+                    "never" => ServiceHidden::Never,
+                    "until_ran" => ServiceHidden::UntilRan,
+                    _ => {
+                        re(Diagnostic::error()
+                            .with_message(format!(
+                                "unknown hidden value `{}`, expected `never` or `until_ran`",
+                                hidden_str
+                            ))
+                            .with_label(DiagnosticLabel::primary(value.span.into())));
+                        return Err(());
+                    }
+                };
+            }
             _ => {
                 re(Diagnostic::error()
                     .with_message(format!("unknown key `{}` in task definition", key_str))
@@ -366,6 +392,7 @@ fn parse_task<'a>(
         ready,
         tags: &[],
         managed,
+        hidden,
     })
 }
 

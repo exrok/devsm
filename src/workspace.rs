@@ -234,6 +234,7 @@ impl LatestConfig {
                         profile_change_counter: 0,
                         last_profile: None,
                         test_info: None,
+                        has_run_this_session: false,
                     });
                 }
             }
@@ -265,6 +266,7 @@ impl LatestConfig {
                             profile_change_counter: 0,
                             last_profile: None,
                             test_info,
+                            has_run_this_session: false,
                         });
                     }
                 }
@@ -292,6 +294,9 @@ pub struct BaseTask {
     pub last_profile: Option<String>,
     /// Test-specific metadata. Present only for tests (kind == Test).
     pub test_info: Option<TestInfo>,
+    /// Whether this service has been run at least once this session.
+    /// Used for `hidden = "until_ran"` visibility.
+    pub has_run_this_session: bool,
 }
 
 impl BaseTask {
@@ -464,6 +469,7 @@ impl WorkspaceState {
                 profile_change_counter: 0,
                 last_profile: None,
                 test_info: None,
+                has_run_this_session: false,
             });
             if index > u32::MAX as usize {
                 panic!("Too many base tasks");
@@ -621,6 +627,9 @@ impl WorkspaceState {
 
         let spawn = pred.is_empty();
         let task_kind = bt.config.kind;
+        if task_kind == TaskKind::Service {
+            bt.has_run_this_session = true;
+        }
         if spawn {
             bt.jobs.push_active(job_index);
         } else {

@@ -358,6 +358,12 @@
         "managed": {
           "type": "boolean",
           "description": "Controls execution mode: true = must use 'devsm run' (for complex dependencies), false = must use 'devsm exec' (for interactive commands). Omit for default behavior (either allowed)."
+        },
+        "hidden": {
+          "type": "string",
+          "enum": [ "never", "until_ran" ],
+          "default": "never",
+          "description": "Controls when the service is visible in the task list. 'never' (default) always shows the service, 'until_ran' hides it until it has been run at least once this session."
         }
       },
       "x-taplo": {

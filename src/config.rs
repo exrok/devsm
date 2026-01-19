@@ -48,6 +48,16 @@ pub enum TaskKind {
     Test,
 }
 
+/// Controls when a service is visible in the task list.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ServiceHidden {
+    /// Always show the service in the task list (default behavior).
+    #[default]
+    Never,
+    /// Hide the service until it has been run at least once this session.
+    UntilRan,
+}
+
 /// A single cache key input that contributes to cache invalidation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheKeyInput<'a> {
@@ -237,6 +247,9 @@ pub struct TaskConfigExpr<'a> {
     /// - `Some(true)`: must use `run` (through daemon), for tasks with complex dependencies
     /// - `Some(false)`: must use `exec` (direct execution), for interactive commands
     pub managed: Option<bool>,
+    /// Controls when this service is visible in the task list.
+    /// Only meaningful for services; ignored for actions and tests.
+    pub hidden: ServiceHidden,
 }
 
 /// Test configuration expression (parsed form, not yet evaluated).
@@ -268,6 +281,7 @@ impl TestConfigExpr<'static> {
             ready: None,
             tags: self.tags,
             managed: None,
+            hidden: ServiceHidden::Never,
         }))
     }
 }
@@ -288,6 +302,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         ready: None,
         tags: &[],
         managed: None,
+        hidden: ServiceHidden::Never,
     }
 };
 
@@ -627,6 +642,7 @@ mod tests {
             ready: None,
             tags: &[],
             managed: None,
+            hidden: ServiceHidden::Never,
         };
         let vars = TEST_EXPR.collect_variables();
         assert_eq!(vars.iter().filter(|&&v| v == "dup").count(), 1, "dup should appear once");
@@ -652,6 +668,7 @@ mod tests {
             ready: None,
             tags: &[],
             managed: None,
+            hidden: ServiceHidden::Never,
         };
         let vars = TEST_EXPR.collect_variables();
         assert!(vars.contains(&"then_var"), "should find then_var: {:?}", vars);
