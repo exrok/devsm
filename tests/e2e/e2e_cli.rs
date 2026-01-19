@@ -1304,11 +1304,7 @@ cmd = ["true"]
 
     assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
     let expected_path = harness.temp_dir.join("devsm.toml");
-    assert_eq!(
-        result.stdout.trim(),
-        expected_path.to_str().unwrap(),
-        "Expected config path in stdout"
-    );
+    assert_eq!(result.stdout.trim(), expected_path.to_str().unwrap(), "Expected config path in stdout");
     assert!(result.stderr.is_empty(), "Expected no stderr output, got: {}", result.stderr);
 }
 

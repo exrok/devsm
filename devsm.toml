@@ -23,5 +23,8 @@ for i in $(seq 1 30); do
 done
 '''
 
+[action.htop]
+cmd = "htop"
+
 [group]
 all = [["ls:verbose", { dir = "/usr" }], "ping", "spam"]

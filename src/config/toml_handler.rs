@@ -160,6 +160,7 @@ fn parse_task<'a>(
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
+    let mut managed: Option<bool> = None;
 
     for (key, value) in task_table.iter() {
         let key_str = key.name.as_ref();
@@ -320,6 +321,13 @@ fn parse_task<'a>(
                 };
                 ready = Some(ReadyConfig { when, timeout });
             }
+            "managed" => {
+                let ValueInner::Boolean(b) = &value.value else {
+                    mismatched_in_object(re, "boolean", value, "managed");
+                    return Err(());
+                };
+                managed = Some(*b);
+            }
             _ => {
                 re(Diagnostic::error()
                     .with_message(format!("unknown key `{}` in task definition", key_str))
@@ -357,6 +365,7 @@ fn parse_task<'a>(
         cache,
         ready,
         tags: &[],
+        managed,
     })
 }
 

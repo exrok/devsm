@@ -45,6 +45,9 @@ fn main() {
         }
     };
     match command {
+        cli::Command::Help => {
+            print_help();
+        }
         cli::Command::Tui => {
             let _log_guard = self_log::init_client_logging();
             if let Err(err) = client() {
@@ -414,6 +417,21 @@ fn run_client(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
     let config = config::find_config_path_from(&cwd)
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
+    let workspace_config = config::load_from_env()?;
+    let (name, _profile) = job.rsplit_once(':').unwrap_or((job, "default"));
+    if name != "~cargo" {
+        if let Some((_, expr)) = workspace_config.tasks.iter().find(|(n, _)| *n == name) {
+            if expr.managed == Some(false) {
+                bail!(
+                    "Task '{}' has managed = false and must be run with exec.\n\
+                     Use 'devsm exec {}' instead.",
+                    name,
+                    job
+                );
+            }
+        }
+    }
+
     setup_signal_handler(libc::SIGTERM, term_handler)?;
     setup_signal_handler(libc::SIGINT, term_handler)?;
 
@@ -514,6 +532,15 @@ fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
         expr
     };
 
+    if task_expr.managed == Some(true) {
+        bail!(
+            "Task '{}' has managed = true and must be run through the daemon.\n\
+             Use 'devsm run {}' instead.",
+            name,
+            job
+        );
+    }
+
     let env = config::Enviroment { profile, param: params };
     let task = task_expr.eval(&env).map_err(|e| anyhow::anyhow!("Failed to evaluate task: {:?}", e))?;
     let tc = task.config();
@@ -564,4 +591,46 @@ fn get_self_logs() -> anyhow::Result<()> {
     }
     print!("{}", String::from_utf8_lossy(&fmt_buf));
     Ok(())
+}
+
+fn print_help() {
+    print!(
+        "\
+devsm - TUI development service manager
+
+Usage: devsm [OPTIONS] [COMMAND]
+
+Commands:
+  (default)         Launch the TUI interface
+  run <job>         Run a job and display its output
+  exec <job>        Execute a task directly, bypassing the daemon
+  restart <job>     Restart a job via the daemon
+  test [filters]    Run tests with optional filters
+  validate [path]   Validate a config file
+  get <resource>    Get information from the daemon
+  server            Start the daemon process (internal)
+
+Options:
+  -h, --help        Print this help message
+
+Job Arguments:
+  Jobs accept parameters as --key=value flags or a JSON object:
+    devsm run build --profile=release
+    devsm run build '{{\"profile\":\"release\"}}'
+
+Test Filters:
+  +tag              Include tests with this tag
+  -tag              Exclude tests with this tag
+  name              Include tests matching this name
+
+Get Resources:
+  self-logs              Retrieve daemon logs
+  workspace config-path  Get config file path
+
+Environment Variables:
+  DEVSM_SOCKET           Custom socket path
+  DEVSM_NO_AUTO_SPAWN    Disable daemon auto-spawn (set to 1)
+  DEVSM_LOG_STDOUT       Log daemon to stdout (set to 1)
+"
+    );
 }

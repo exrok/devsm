@@ -71,6 +71,7 @@ pub struct GlobalArguments<'a> {
 }
 
 pub enum Command<'a> {
+    Help,
     Tui,
     Server,
     RestartSelected,
@@ -231,11 +232,17 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
         };
         match arg {
             Component::Flags(flags) => {
-                if let Some(flag) = flags.chars().next() {
-                    bail!("Unknown flag, -{}", flag)
+                for flag in flags.chars() {
+                    match flag {
+                        'h' => break 'command Command::Help,
+                        _ => bail!("Unknown flag, -{}", flag),
+                    }
                 }
             }
             Component::Long(long) => {
+                if long == "help" {
+                    break 'command Command::Help;
+                }
                 if long == "from" {
                     if let Some(Component::Long(value) | Component::Value(value)) = parser.next() {
                         if global.from.is_some() {
@@ -270,7 +277,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                             };
                             match sub {
                                 "config-path" => {
-                                    break 'command Command::Get { resource: GetResource::WorkspaceConfigPath }
+                                    break 'command Command::Get { resource: GetResource::WorkspaceConfigPath };
                                 }
                                 _ => bail!("Unknown workspace resource: {}", sub),
                             }

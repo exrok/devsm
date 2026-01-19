@@ -22,10 +22,12 @@ cmd = ["cargo", "build"]
 pwd = "./backend"
 profiles = ["default", "release", "debug"]
 info = "Builds the backend service"
+managed = false
 
 # Action using variable in cmd
 [action.with_var]
 cmd = ["ls", { var = "dir" }]
+managed = true
 
 # Action using conditional in cmd
 [action.with_conditional]

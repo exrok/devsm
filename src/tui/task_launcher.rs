@@ -71,7 +71,7 @@ impl TaskLauncherState {
             .base_tasks
             .iter()
             .enumerate()
-            .filter(|(_, bt)| !bt.removed)
+            .filter(|(_, bt)| !bt.removed && bt.config.managed != Some(false))
             .map(|(i, bt)| TaskInfo {
                 bti: BaseTaskIndex(i as u32),
                 name: bt.name,
@@ -112,7 +112,7 @@ impl TaskLauncherState {
             .base_tasks
             .iter()
             .enumerate()
-            .filter(|(_, bt)| !bt.removed)
+            .filter(|(_, bt)| !bt.removed && bt.config.managed != Some(false))
             .map(|(i, bt)| TaskInfo {
                 bti: BaseTaskIndex(i as u32),
                 name: bt.name,

@@ -232,6 +232,11 @@ pub struct TaskConfigExpr<'a> {
     pub ready: Option<ReadyConfig<'a>>,
     /// Tags for test filtering. Empty for non-test tasks.
     pub tags: &'a [&'a str],
+    /// Controls how the task can be executed:
+    /// - `None`: default behavior, can use either `run` or `exec`
+    /// - `Some(true)`: must use `run` (through daemon), for tasks with complex dependencies
+    /// - `Some(false)`: must use `exec` (direct execution), for interactive commands
+    pub managed: Option<bool>,
 }
 
 /// Test configuration expression (parsed form, not yet evaluated).
@@ -262,6 +267,7 @@ impl TestConfigExpr<'static> {
             cache: self.cache.clone(),
             ready: None,
             tags: self.tags,
+            managed: None,
         }))
     }
 }
@@ -281,6 +287,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         cache: None,
         ready: None,
         tags: &[],
+        managed: None,
     }
 };
 
@@ -619,6 +626,7 @@ mod tests {
             cache: None,
             ready: None,
             tags: &[],
+            managed: None,
         };
         let vars = TEST_EXPR.collect_variables();
         assert_eq!(vars.iter().filter(|&&v| v == "dup").count(), 1, "dup should appear once");
@@ -643,6 +651,7 @@ mod tests {
             cache: None,
             ready: None,
             tags: &[],
+            managed: None,
         };
         let vars = TEST_EXPR.collect_variables();
         assert!(vars.contains(&"then_var"), "should find then_var: {:?}", vars);
