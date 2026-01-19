@@ -459,63 +459,53 @@ impl TaskLauncherState {
         };
 
         for (i, entry) in self.results.iter().enumerate().skip(self.scroll_offset) {
-            let entry_rect = rect.take_top(1);
+            let mut entry_rect = rect.take_top(1);
             if entry_rect.is_empty() {
                 break;
             }
 
             let is_selected = i == self.selected;
-
-            let mut styled = entry_rect.with(Style::default());
+            let style = if is_selected { Color(153).with_fg(Color::Black) } else { Style::DEFAULT };
             if is_selected {
-                styled = styled.with(Color::LightSkyBlue1.with_fg(Color::Black)).fill(out);
+                entry_rect.with(style).fill(out);
             }
 
             match self.mode {
                 LauncherMode::TaskName => {
+                    let substyle =
+                        if is_selected { Color::Grey[5].with_bg(Color(153)) } else { Color::Grey[14].as_fg() };
+
                     let Some(task) = self.task_at_entry(entry) else { continue };
                     let kind_str = match task.kind {
                         TaskKind::Service => "service",
                         TaskKind::Action => "action",
                         TaskKind::Test => "test",
                     };
-
-                    styled.text(out, task.name);
-
-                    let kind_x = entry_rect.x + name_col_width as u16;
-                    let kind_rect = Rect { x: kind_x, ..entry_rect };
-                    let mut kind_styled = kind_rect.with(Color::Grey[14].as_fg());
-                    if is_selected {
-                        kind_styled = kind_styled.with(Color::LightSkyBlue1.as_bg());
-                    }
-                    kind_styled.text(out, kind_str);
+                    entry_rect.take_left(name_col_width as i32).with(style).text(out, task.name);
+                    entry_rect.take_left(kind_col_width as i32).with(substyle).text(out, kind_str);
 
                     if !task.command_preview.is_empty() {
                         let preview = if task.command_preview.len() > 40 {
-                            &task.command_preview[..40]
+                            let b = task.command_preview.floor_char_boundary(40);
+                            // todo utf8 safe truncation
+                            &task.command_preview[..b]
                         } else {
                             task.command_preview
                         };
-                        let cmd_x = kind_x + kind_col_width as u16;
-                        let cmd_rect = Rect { x: cmd_x, ..entry_rect };
-                        let mut cmd_styled = cmd_rect.with(Color::Grey[14].as_fg());
-                        if is_selected {
-                            cmd_styled = cmd_styled.with(Color::LightSkyBlue1.as_bg());
-                        }
-                        cmd_styled.text(out, preview);
+                        entry_rect.with(substyle).text(out, preview);
                     }
                 }
                 LauncherMode::Profile => {
                     let task_name = self.confirmed_task.map(|(_, n)| n).unwrap_or("");
                     let profile = self.available_profiles.get(entry.index()).copied().unwrap_or("");
-                    styled.text(out, task_name).text(out, ":").text(out, profile);
+                    entry_rect.with(style).text(out, task_name).text(out, ":").text(out, profile);
                 }
                 LauncherMode::Variable => {
                     let assigned: Vec<_> = self.completed_vars.iter().map(|(n, _)| *n).collect();
                     let unassigned: Vec<_> =
                         self.available_variables.iter().filter(|v| !assigned.contains(v)).collect();
                     let var = unassigned.get(entry.index()).copied().copied().unwrap_or("");
-                    styled.text(out, var);
+                    entry_rect.with(style).text(out, var);
                 }
                 LauncherMode::Value => {}
             }
