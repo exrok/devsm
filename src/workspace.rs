@@ -1032,45 +1032,33 @@ impl Workspace {
 
 /// Checks if a test matches the given filters.
 /// Filter logic:
-/// - `-tag`: Absolute exclusion (applied first)
-/// - `+tag`: Include tests with this tag (OR combined)
-/// - `name`: Include tests with this name (OR combined)
-/// - If no inclusion filters, include all (minus exclusions)
+/// - `include_names`: Test name must match one (if any specified)
+/// - `include_tags`: Test must have at least one matching tag (if any specified)
+/// - `exclude_tags`: Test must not have any matching tags (if any specified)
+/// - All conditions are AND'd together
 fn matches_test_filters(name: &str, tags: &[&str], filters: &[TestFilter]) -> bool {
-    let mut has_include_filters = false;
-    let mut included = false;
-
-    for filter in filters {
-        if let TestFilter::ExcludeTag(exclude_tag) = filter
-            && tags.contains(exclude_tag)
-        {
-            return false;
-        }
-    }
+    let mut include_names: Vec<&str> = Vec::new();
+    let mut include_tags: Vec<&str> = Vec::new();
+    let mut exclude_tags: Vec<&str> = Vec::new();
 
     for filter in filters {
         match filter {
-            TestFilter::IncludeName(include_name) => {
-                has_include_filters = true;
-                if name == *include_name {
-                    included = true;
-                }
-            }
-            TestFilter::IncludeTag(include_tag) => {
-                has_include_filters = true;
-                if tags.contains(include_tag) {
-                    included = true;
-                }
-            }
-            TestFilter::ExcludeTag(_) => {}
+            TestFilter::IncludeName(n) => include_names.push(n),
+            TestFilter::IncludeTag(t) => include_tags.push(t),
+            TestFilter::ExcludeTag(t) => exclude_tags.push(t),
         }
     }
 
-    if !has_include_filters {
-        return true;
+    if !include_names.is_empty() && !include_names.contains(&name) {
+        return false;
     }
-
-    included
+    if !include_tags.is_empty() && !include_tags.iter().any(|tag| tags.contains(tag)) {
+        return false;
+    }
+    if !exclude_tags.is_empty() && exclude_tags.iter().any(|tag| tags.contains(tag)) {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]

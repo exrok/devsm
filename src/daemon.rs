@@ -16,7 +16,7 @@ use jsony::Jsony;
 use jsony_value::ValueMap;
 use sendfd::RecvWithFd;
 
-use crate::{process_manager::ProcessManagerHandle, workspace::BaseTask};
+use crate::process_manager::ProcessManagerHandle;
 
 static SOCKET_PATH: OnceLock<String> = OnceLock::new();
 
@@ -83,27 +83,6 @@ pub struct TestFilters<'a> {
     pub include_tags: Vec<&'a str>,
     pub exclude_tags: Vec<&'a str>,
     pub include_names: Vec<&'a str>,
-}
-impl<'a> TestFilters<'a> {
-    pub fn matches(&self, bt: &BaseTask) -> bool {
-        let Some(test) = &bt.test_info else { return false };
-        if !self.include_names.is_empty() && !self.include_names.contains(&test.base_name) {
-            return false;
-        }
-        if !self.include_tags.is_empty() {
-            // If a include tag is present, there must be overlap
-            if !self.include_tags.iter().any(|tag| bt.config.tags.contains(tag)) {
-                return false;
-            }
-        }
-        if !self.exclude_tags.is_empty() {
-            // If a exclude tag is present, there must not be any overlap
-            if self.exclude_tags.iter().any(|tag| bt.config.tags.contains(tag)) {
-                return false;
-            }
-        }
-        true
-    }
 }
 
 #[derive(Jsony, Debug)]
