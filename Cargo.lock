@@ -146,9 +146,9 @@ dependencies = [
 
 [[package]]
 name = "kvlog"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cde579377d0b0c424de4312e57a2ff62bf75b6ba8c93abc81879038293df13da"
+checksum = "d19a7ec601eeca59ee3d5f377bfae8acb67a9f3b247c7d090c72dd37f87d6e20"
 dependencies = [
  "itoa",
  "kvlog-macros",

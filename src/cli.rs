@@ -79,6 +79,11 @@ pub enum Command<'a> {
     Run { job: &'a str, value_map: ValueMap<'a> },
     Test { filters: Vec<TestFilter<'a>> },
     Validate { path: Option<&'a str>, skip_path_checks: bool },
+    Get { resource: GetResource },
+}
+
+pub enum GetResource {
+    SelfLogs,
 }
 
 /// Filter for test selection.
@@ -252,6 +257,15 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                 "run" => break 'command parse_run(&mut parser)?,
                 "test" => break 'command parse_test_filters(&mut parser)?,
                 "validate" => break 'command parse_validate(&mut parser)?,
+                "get" => {
+                    let Some(Component::Term(resource)) = parser.next() else {
+                        bail!("get requires a resource name");
+                    };
+                    match resource {
+                        "self-logs" => break 'command Command::Get { resource: GetResource::SelfLogs },
+                        _ => bail!("Unknown resource: {}", resource),
+                    }
+                }
                 unknown_command => bail!("Unknown Command: {:?}", unknown_command),
             },
         }

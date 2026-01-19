@@ -1,5 +1,5 @@
 use std::{
-    io::ErrorKind,
+    io::{ErrorKind, Write},
     os::{
         fd::OwnedFd,
         unix::{
@@ -90,7 +90,19 @@ impl<'a> TestFilters<'a> {
         if !self.include_names.is_empty() && !self.include_names.contains(&test.base_name) {
             return false;
         }
-        false
+        if !self.include_tags.is_empty() {
+            // If a include tag is present, there must be overlap
+            if !self.include_tags.iter().any(|tag| bt.config.tags.contains(tag)) {
+                return false;
+            }
+        }
+        if !self.exclude_tags.is_empty() {
+            // If a exclude tag is present, there must not be any overlap
+            if self.exclude_tags.iter().any(|tag| bt.config.tags.contains(tag)) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -122,6 +134,7 @@ pub enum Request<'a> {
         config: &'a Path,
         subscribe: bool,
     },
+    GetSelfLogs,
 }
 
 struct FdSet<'a>(&'a [i32]);
@@ -221,6 +234,11 @@ fn handle_request(
                 workspace_config: config.into(),
                 kind: crate::process_manager::AttachKind::Rpc { subscribe },
             });
+        }
+        Request::GetSelfLogs => {
+            let logs = crate::self_log::get_daemon_logs().unwrap_or_default();
+            let mut socket = socket;
+            let _ = socket.write_all(&logs);
         }
     }
     Ok(())

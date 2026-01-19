@@ -26,6 +26,7 @@ mod process_manager;
 mod rpc;
 mod scroll_view;
 mod searcher;
+mod self_log;
 mod test_summary_ui;
 mod tui;
 mod user_config;
@@ -39,14 +40,14 @@ fn main() {
     let (_config, command) = cli::parse(&args).unwrap();
     match command {
         cli::Command::Tui => {
-            let _log_guard = kvlog::collector::init_file_logger("/tmp/.client.devsm.log");
+            let _log_guard = self_log::init_client_logging();
             client().unwrap();
         }
         cli::Command::Server => {
             let _log_guard = if std::env::var("DEVSM_LOG_STDOUT").as_deref() == Ok("1") {
                 None
             } else {
-                Some(kvlog::collector::init_file_logger("/tmp/.devsm.log"))
+                Some(self_log::init_daemon_logging())
             };
             if let Err(err) = daemon::worker() {
                 kvlog::error!("Daemon terminated with error", ?err);
@@ -65,14 +66,14 @@ fn main() {
             }
         }
         cli::Command::Run { job, value_map } => {
-            let _log_guard = kvlog::collector::init_file_logger("/tmp/.client.devsm.log");
+            let _log_guard = self_log::init_client_logging();
             if let Err(err) = run_client(job, value_map) {
                 eprintln!("run failed: {}", err);
                 std::process::exit(1);
             }
         }
         cli::Command::Test { filters } => {
-            let _log_guard = kvlog::collector::init_file_logger("/tmp/.client.devsm.log");
+            let _log_guard = self_log::init_client_logging();
             if let Err(err) = test_client(filters) {
                 eprintln!("test failed: {}", err);
                 std::process::exit(1);
@@ -102,6 +103,14 @@ fn main() {
                 }
             }
         }
+        cli::Command::Get { resource } => match resource {
+            cli::GetResource::SelfLogs => {
+                if let Err(err) = get_self_logs() {
+                    eprintln!("Failed to get logs: {}", err);
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 }
 
@@ -503,4 +512,25 @@ fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
 
     let err = command.exec();
     bail!("exec failed: {}", err);
+}
+
+fn get_self_logs() -> anyhow::Result<()> {
+    let mut socket = connect_or_spawn_daemon()?;
+    socket.write_all(&jsony::to_binary(&daemon::RequestMessage {
+        cwd: &std::env::current_dir()?,
+        request: daemon::Request::GetSelfLogs,
+    }))?;
+
+    let mut logs = Vec::new();
+    socket.read_to_end(&mut logs)?;
+
+    let mut fmt_buf = Vec::new();
+    let mut parents = kvlog::collector::ParentSpanSuffixCache::new_boxed();
+    for log in kvlog::encoding::decode(&logs) {
+        if let Ok((ts, level, span, fields)) = log {
+            kvlog::collector::format_statement_with_colors(&mut fmt_buf, &mut parents, ts, level, span, fields);
+        }
+    }
+    print!("{}", String::from_utf8_lossy(&fmt_buf));
+    Ok(())
 }
