@@ -118,6 +118,23 @@ pub fn strip_ansi_to_buffer(text: &str, buffer: &mut Vec<u8>) {
     }
 }
 
+/// Strips ANSI escape codes from text and appends content to buffer preserving case.
+///
+/// Used for building search indices where case-sensitive matching is needed.
+pub fn strip_ansi_to_buffer_preserve_case(text: &str, buffer: &mut Vec<u8>) {
+    for segment in Segment::iterator(text) {
+        match segment {
+            Segment::Ascii(s) => {
+                buffer.extend_from_slice(s.as_bytes());
+            }
+            Segment::Utf8(s) => {
+                buffer.extend_from_slice(s.as_bytes());
+            }
+            Segment::AnsiEscapes(_) => {}
+        }
+    }
+}
+
 /// Match highlight information for rendering.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MatchHighlight {

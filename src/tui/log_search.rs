@@ -6,7 +6,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     keybinds::{Command, InputEvent, Keybinds, Mode},
-    line_width::{MatchHighlight, Segment, strip_ansi_to_buffer},
+    line_width::{MatchHighlight, Segment, strip_ansi_to_buffer, strip_ansi_to_buffer_preserve_case},
     log_storage::{LogEntry, LogFilter, LogId, Logs},
     tui::constrain_scroll_offset,
 };
@@ -22,12 +22,15 @@ pub struct LogMatch {
 
 /// Flat buffer search index for efficient substring searching.
 ///
-/// This struct accumulates stripped (ANSI-free) and lowercased log text into
-/// a contiguous buffer for cache-coherent searching. Each entry is separated
-/// by a 0xFF sentinel byte (invalid in UTF-8).
+/// This struct accumulates stripped (ANSI-free) log text into contiguous buffers
+/// for cache-coherent searching. Each entry is separated by a 0xFF sentinel byte
+/// (invalid in UTF-8). Two buffers are maintained: one lowercased for case-insensitive
+/// search, one preserving case for case-sensitive search (smart case).
 pub struct LogSearchIndex {
-    /// Flat buffer of stripped text with 0xFF separators.
-    buffer: Vec<u8>,
+    /// Flat buffer of stripped and lowercased text with 0xFF separators.
+    buffer_lower: Vec<u8>,
+    /// Flat buffer of stripped text preserving original case with 0xFF separators.
+    buffer_original: Vec<u8>,
     /// Maps each entry to its buffer offset and LogId.
     offsets: Vec<(usize, LogId)>,
     /// The LogId up to which the index has been built.
@@ -37,7 +40,8 @@ pub struct LogSearchIndex {
 impl LogSearchIndex {
     /// Builds a search index from filtered logs.
     pub fn build(logs: &Logs, filter: &LogFilter) -> Self {
-        let mut buffer = Vec::with_capacity(64 * 1024);
+        let mut buffer_lower = Vec::with_capacity(64 * 1024);
+        let mut buffer_original = Vec::with_capacity(64 * 1024);
         let mut offsets = Vec::new();
 
         let (a, b) = logs.slices();
@@ -51,20 +55,25 @@ impl LogSearchIndex {
                 }
 
                 let text = unsafe { entry.text(logs) };
-                let buffer_start = buffer.len();
+                let buffer_start = buffer_lower.len();
 
-                strip_ansi_to_buffer(text, &mut buffer);
+                strip_ansi_to_buffer(text, &mut buffer_lower);
+                strip_ansi_to_buffer_preserve_case(text, &mut buffer_original);
                 offsets.push((buffer_start, current_id));
-                buffer.push(0xFF);
+                buffer_lower.push(0xFF);
+                buffer_original.push(0xFF);
 
                 current_id.0 += 1;
             }
         }
 
-        LogSearchIndex { buffer, offsets, indexed_tail: logs.tail() }
+        LogSearchIndex { buffer_lower, buffer_original, offsets, indexed_tail: logs.tail() }
     }
 
-    /// Searches for pattern in indexed logs.
+    /// Searches for pattern in indexed logs using smart case sensitivity.
+    ///
+    /// If the pattern contains any uppercase characters, the search is case-sensitive.
+    /// Otherwise, the search is case-insensitive.
     ///
     /// Matches are returned in temporal order (oldest first). Only the first
     /// match per log entry is included to avoid duplicates.
@@ -75,14 +84,26 @@ impl LogSearchIndex {
             return;
         }
 
-        let pattern_lower = pattern.to_lowercase();
-        let finder = memchr::memmem::Finder::new(pattern_lower.as_bytes());
+        let case_sensitive = pattern.chars().any(|c| c.is_uppercase());
+        let (buffer, search_pattern);
+        let pattern_lower;
+
+        if case_sensitive {
+            buffer = &self.buffer_original;
+            search_pattern = pattern.as_bytes();
+        } else {
+            buffer = &self.buffer_lower;
+            pattern_lower = pattern.to_lowercase();
+            search_pattern = pattern_lower.as_bytes();
+        }
+
+        let finder = memchr::memmem::Finder::new(search_pattern);
 
         let mut search_pos = 0;
         let mut offset_idx = 0;
         let mut last_matched_log_id: Option<LogId> = None;
 
-        while let Some(match_pos) = finder.find(&self.buffer[search_pos..]) {
+        while let Some(match_pos) = finder.find(&buffer[search_pos..]) {
             let abs_pos = search_pos + match_pos;
 
             while offset_idx + 1 < self.offsets.len() && self.offsets[offset_idx + 1].0 <= abs_pos {
@@ -176,11 +197,13 @@ impl LogSearchState {
                 }
 
                 let text = unsafe { entry.text(logs) };
-                let buffer_start = self.index.buffer.len();
+                let buffer_start = self.index.buffer_lower.len();
 
-                strip_ansi_to_buffer(text, &mut self.index.buffer);
+                strip_ansi_to_buffer(text, &mut self.index.buffer_lower);
+                strip_ansi_to_buffer_preserve_case(text, &mut self.index.buffer_original);
                 self.index.offsets.push((buffer_start, current_id));
-                self.index.buffer.push(0xFF);
+                self.index.buffer_lower.push(0xFF);
+                self.index.buffer_original.push(0xFF);
 
                 current_id.0 += 1;
             }
