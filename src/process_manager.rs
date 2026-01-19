@@ -841,6 +841,7 @@ impl ProcessManager {
                         ExitCause::Unknown => crate::rpc::ExitCause::Unknown,
                         ExitCause::Killed => crate::rpc::ExitCause::Killed,
                         ExitCause::Restarted => crate::rpc::ExitCause::Restarted,
+                        ExitCause::SpawnFailed => crate::rpc::ExitCause::SpawnFailed,
                     };
                     if let Some(workspace) = self.workspaces.get(ws_idx as usize) {
                         let mut ws = workspace.handle.state.write().unwrap();
@@ -867,6 +868,21 @@ impl ProcessManager {
             ProcessRequest::Spawn { task, job_id, workspace_id, job_index } => {
                 if let Err(err) = self.spawn(workspace_id, job_id, job_index, task) {
                     kvlog::error!("Failed to spawn process", ?err, ?job_id);
+                    if let Some(workspace) = self.workspaces.get(workspace_id as usize) {
+                        let log_end = workspace.line_writer.tail();
+                        let mut ws = workspace.handle.state.write().unwrap();
+                        ws.update_job_status(
+                            job_index,
+                            JobStatus::Exited {
+                                finished_at: std::time::Instant::now(),
+                                log_end,
+                                cause: ExitCause::SpawnFailed,
+                                status: 127,
+                            },
+                        );
+                        drop(ws);
+                        self.broadcast_job_exited(workspace_id, job_index, 127, crate::rpc::ExitCause::SpawnFailed);
+                    }
                 }
                 false
             }

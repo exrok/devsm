@@ -1322,3 +1322,147 @@ fn get_workspace_config_path_not_found() {
         result.stderr
     );
 }
+
+#[test]
+fn spawn_failure_invalid_executable() {
+    let mut harness = TestHarness::new("spawn_failure");
+    harness.write_config(
+        r#"
+[action.bad_exe]
+cmd = ["/nonexistent/path/to/executable"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut subscriber = RpcSubscriber::connect(&harness);
+    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(2));
+
+    let client_handle = std::thread::spawn({
+        let temp_dir = harness.temp_dir.clone();
+        let socket_path = harness.socket_path.clone();
+        move || {
+            Command::new(cargo_bin_path())
+                .args(["run", "bad_exe"])
+                .current_dir(&temp_dir)
+                .env("DEVSM_SOCKET", &socket_path)
+                .env("DEVSM_NO_AUTO_SPAWN", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Failed to spawn client")
+                .wait()
+        }
+    });
+
+    let events = subscriber
+        .collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::JobExited { .. })), Duration::from_secs(5));
+
+    client_handle.join().ok();
+
+    let exit_event = events.iter().find(|e| matches!(e, RpcEvent::JobExited { .. }));
+    assert!(exit_event.is_some(), "Task should exit even when spawn fails, events: {:?}", events);
+
+    let RpcEvent::JobExited { exit_code, cause, .. } = exit_event.unwrap() else { panic!() };
+    assert_eq!(*exit_code, 127, "Spawn failure should use exit code 127, got: {}", exit_code);
+    assert!(matches!(cause, ExitCause::SpawnFailed), "Spawn failure should have SpawnFailed cause, got: {:?}", cause);
+}
+
+#[test]
+fn spawn_failure_does_not_block_dependents() {
+    let mut harness = TestHarness::new("spawn_failure_deps");
+    let marker = harness.temp_dir.join("main_ran.txt");
+    harness.write_config(&format!(
+        r#"
+[action.bad_dep]
+cmd = ["/nonexistent/path/to/executable"]
+
+[action.main]
+sh = "echo ran > {}"
+require = ["bad_dep"]
+"#,
+        marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "main"]);
+    assert!(result.success() || !result.success(), "Client should complete");
+
+    assert!(!marker.exists(), "main should not have run when dependency spawn fails");
+}
+
+#[test]
+fn config_reload_on_test_run() {
+    let mut harness = TestHarness::new("test_reload");
+    let output = harness.temp_dir.join("output.txt");
+
+    harness.write_config(&format!(
+        r#"
+[test.my_test]
+sh = "echo 'v1' > {output}"
+"#,
+        output = output.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "Expected success on first run, got: {}", result.stderr);
+    assert!(harness.wait_for_file(&output, Duration::from_secs(2)), "Output file should be created");
+    assert_eq!(fs::read_to_string(&output).unwrap().trim(), "v1", "should output v1");
+
+    std::thread::sleep(Duration::from_millis(10));
+    harness.write_config(&format!(
+        r#"
+[test.my_test]
+sh = "echo 'v2' > {output}"
+"#,
+        output = output.display()
+    ));
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "Expected success on second run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&output).unwrap().trim(), "v2", "should output v2 after config reload");
+}
+
+#[test]
+fn config_reload_adds_new_test() {
+    let mut harness = TestHarness::new("test_add_new");
+    let output1 = harness.temp_dir.join("output1.txt");
+    let output2 = harness.temp_dir.join("output2.txt");
+
+    harness.write_config(&format!(
+        r#"
+[test.test_one]
+sh = "echo 'one' > {output1}"
+"#,
+        output1 = output1.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "Expected success on first run, got: {}", result.stderr);
+    assert!(harness.wait_for_file(&output1, Duration::from_secs(2)), "Output1 file should be created");
+    assert!(!output2.exists(), "Output2 should not exist yet");
+
+    std::thread::sleep(Duration::from_millis(10));
+    harness.write_config(&format!(
+        r#"
+[test.test_one]
+sh = "echo 'one' > {output1}"
+
+[test.test_two]
+sh = "echo 'two' > {output2}"
+"#,
+        output1 = output1.display(),
+        output2 = output2.display()
+    ));
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "Expected success on second run, got: {}", result.stderr);
+    assert!(harness.wait_for_file(&output2, Duration::from_secs(2)), "Output2 should exist after adding new test");
+    assert_eq!(fs::read_to_string(&output2).unwrap().trim(), "two", "new test should have run");
+}

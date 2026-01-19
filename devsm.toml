@@ -9,22 +9,42 @@ profiles = ["alpha", "beta"]
 sh = 'head -c10 /dev/random | base64 > /tmp/devsm.test.key'
 cache.key = [{ modified = "/tmp/cat" }, { profile_changed = "print_key" }]
 
-[action.ls]
-cmd = ["ls", { if.profile = "verbose", then = "-al" }, { var = "dir" }]
-profiles = ["default", "verbose"]
-
-[service.ping]
-cmd = ["ping", "1.1.1.1"]
-
-[action.spam]
-sh = '''
-for i in $(seq 1 30); do
-    echo $$ $i
-done
-'''
-
-[action.htop]
-cmd = "htop"
-
 [group]
 all = [["ls:verbose", { dir = "/usr" }], "ping", "spam"]
+
+[test.taplo-validate-json-schema]
+cmd = [
+    "taplo",
+    "validate",
+    "--schema",
+    "file:///home/user/Projects/git/devsm/schema/devsm.json",
+    "./schema/devsm.example-big.toml",
+]
+
+[test.devsm-validate-big-config]
+cmd = [
+    "cargo",
+    "run",
+    "--",
+    "validate",
+    "--skip-path-checks",
+    "schema/devsm.example-big.toml",
+]
+
+[test.typos]
+cmd = ["typos", "--color", "always"]
+
+[test.check]
+cmd = ["cargo", "check"]
+tag = "lint"
+
+[test.cargo-test]
+cmd = ["cargo", "test"]
+
+[test.slow_faliure]
+sh = """
+echo Slow Failing Test
+sleep 1
+echo Sadness
+exit 1
+"""

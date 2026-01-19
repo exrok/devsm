@@ -369,6 +369,7 @@ pub enum ExitCause {
     Unknown = 0,
     Killed = 1,
     Restarted = 2,
+    SpawnFailed = 3,
 }
 
 #[derive(Jsony, Debug)]

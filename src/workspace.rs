@@ -52,6 +52,7 @@ pub enum ExitCause {
     Unknown,
     Killed,
     Restarted,
+    SpawnFailed,
 }
 
 pub struct Job {

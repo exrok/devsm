@@ -251,9 +251,7 @@ fn render_status_bar(frame: &mut DoubleBuffer, mut rect: Rect, data: &StatusBarD
 
     if data.is_scrolled {
         let scroll_text = " SCROLL ";
-        rect.take_left(scroll_text.len() as i32)
-            .with(Color(215).with_fg(Color::Black))
-            .text(frame, scroll_text);
+        rect.take_left(scroll_text.len() as i32).with(Color(215).with_fg(Color::Black)).text(frame, scroll_text);
     }
 
     let view_mode = if data.is_collapsed { "C" } else { "E" };
