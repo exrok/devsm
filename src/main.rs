@@ -37,11 +37,20 @@ fn main() {
     let mut args = std::env::args();
     args.next();
     let args = args.collect::<Vec<_>>();
-    let (_config, command) = cli::parse(&args).unwrap();
+    let (_config, command) = match cli::parse(&args) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!("error: {}", err);
+            std::process::exit(1);
+        }
+    };
     match command {
         cli::Command::Tui => {
             let _log_guard = self_log::init_client_logging();
-            client().unwrap();
+            if let Err(err) = client() {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
         }
         cli::Command::Server => {
             let _log_guard = if std::env::var("DEVSM_LOG_STDOUT").as_deref() == Ok("1") {
@@ -54,28 +63,34 @@ fn main() {
             }
         }
         cli::Command::RestartSelected => {
-            workspace_command(WorkspaceCommand::RestartSelected).unwrap();
+            if let Err(err) = workspace_command(WorkspaceCommand::RestartSelected) {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
         }
         cli::Command::Restart { job, value_map } => {
-            workspace_command(WorkspaceCommand::Run { name: job.into(), params: value_map }).unwrap()
+            if let Err(err) = workspace_command(WorkspaceCommand::Run { name: job.into(), params: value_map }) {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
         }
         cli::Command::Exec { job, value_map } => {
             if let Err(err) = exec_task(job, value_map) {
-                eprintln!("exec failed: {}", err);
+                eprintln!("error: {}", err);
                 std::process::exit(1);
             }
         }
         cli::Command::Run { job, value_map } => {
             let _log_guard = self_log::init_client_logging();
             if let Err(err) = run_client(job, value_map) {
-                eprintln!("run failed: {}", err);
+                eprintln!("error: {}", err);
                 std::process::exit(1);
             }
         }
         cli::Command::Test { filters } => {
             let _log_guard = self_log::init_client_logging();
             if let Err(err) = test_client(filters) {
-                eprintln!("test failed: {}", err);
+                eprintln!("error: {}", err);
                 std::process::exit(1);
             }
         }
@@ -83,11 +98,14 @@ fn main() {
             let config_path = match path {
                 Some(p) => std::path::PathBuf::from(p),
                 None => {
-                    let cwd = std::env::current_dir().unwrap();
+                    let cwd = std::env::current_dir().unwrap_or_else(|err| {
+                        eprintln!("error: failed to get current directory: {}", err);
+                        std::process::exit(1);
+                    });
                     match config::find_config_path_from(&cwd) {
                         Some(p) => p,
                         None => {
-                            eprintln!("Cannot find devsm.toml in current or parent directories");
+                            eprintln!("error: cannot find devsm.toml in current or parent directories");
                             std::process::exit(1);
                         }
                     }
@@ -98,7 +116,7 @@ fn main() {
                 Ok(true) => std::process::exit(0),
                 Ok(false) => std::process::exit(1),
                 Err(err) => {
-                    eprintln!("validation error: {}", err);
+                    eprintln!("error: {}", err);
                     std::process::exit(1);
                 }
             }
@@ -106,8 +124,21 @@ fn main() {
         cli::Command::Get { resource } => match resource {
             cli::GetResource::SelfLogs => {
                 if let Err(err) = get_self_logs() {
-                    eprintln!("Failed to get logs: {}", err);
+                    eprintln!("error: failed to get logs: {}", err);
                     std::process::exit(1);
+                }
+            }
+            cli::GetResource::WorkspaceConfigPath => {
+                let cwd = std::env::current_dir().unwrap_or_else(|err| {
+                    eprintln!("error: failed to get current directory: {}", err);
+                    std::process::exit(1);
+                });
+                match config::find_config_path_from(&cwd) {
+                    Some(path) => println!("{}", path.display()),
+                    None => {
+                        eprintln!("error: cannot find devsm.toml in current or parent directories");
+                        std::process::exit(1);
+                    }
                 }
             }
         },

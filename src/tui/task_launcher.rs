@@ -487,7 +487,6 @@ impl TaskLauncherState {
                     if !task.command_preview.is_empty() {
                         let preview = if task.command_preview.len() > 40 {
                             let b = task.command_preview.floor_char_boundary(40);
-                            // todo utf8 safe truncation
                             &task.command_preview[..b]
                         } else {
                             task.command_preview

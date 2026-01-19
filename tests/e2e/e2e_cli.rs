@@ -1289,3 +1289,40 @@ while true; do sleep 1; done
     let RpcEvent::JobExited { cause, .. } = exit_event.unwrap() else { panic!() };
     assert!(matches!(cause, ExitCause::Restarted), "Restarted service should have Restarted cause, got: {:?}", cause);
 }
+
+#[test]
+fn get_workspace_config_path_success() {
+    let harness = TestHarness::new("get_config_path");
+    harness.write_config(
+        r#"
+[action.dummy]
+cmd = ["true"]
+"#,
+    );
+
+    let result = harness.run_client(&["get", "workspace", "config-path"]);
+
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+    let expected_path = harness.temp_dir.join("devsm.toml");
+    assert_eq!(
+        result.stdout.trim(),
+        expected_path.to_str().unwrap(),
+        "Expected config path in stdout"
+    );
+    assert!(result.stderr.is_empty(), "Expected no stderr output, got: {}", result.stderr);
+}
+
+#[test]
+fn get_workspace_config_path_not_found() {
+    let harness = TestHarness::new("get_config_path_missing");
+
+    let result = harness.run_client(&["get", "workspace", "config-path"]);
+
+    assert!(!result.success(), "Expected failure when config not found");
+    assert!(result.stdout.is_empty(), "Expected no stdout output, got: {}", result.stdout);
+    assert!(
+        result.stderr.contains("cannot find devsm.toml"),
+        "Expected error message about missing config, got: {}",
+        result.stderr
+    );
+}

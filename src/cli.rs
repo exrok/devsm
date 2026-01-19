@@ -84,6 +84,7 @@ pub enum Command<'a> {
 
 pub enum GetResource {
     SelfLogs,
+    WorkspaceConfigPath,
 }
 
 /// Filter for test selection.
@@ -263,6 +264,17 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                     };
                     match resource {
                         "self-logs" => break 'command Command::Get { resource: GetResource::SelfLogs },
+                        "workspace" => {
+                            let Some(Component::Term(sub)) = parser.next() else {
+                                bail!("get workspace requires a sub-resource");
+                            };
+                            match sub {
+                                "config-path" => {
+                                    break 'command Command::Get { resource: GetResource::WorkspaceConfigPath }
+                                }
+                                _ => bail!("Unknown workspace resource: {}", sub),
+                            }
+                        }
                         _ => bail!("Unknown resource: {}", resource),
                     }
                 }
