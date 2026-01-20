@@ -1,5 +1,3 @@
-#:schema ./schema/devsm.json
-
 [action.print_key]
 sh = 'cat /tmp/devsm.test.key'
 require = ["gen_key"]
@@ -9,8 +7,13 @@ profiles = ["alpha", "beta"]
 sh = 'head -c10 /dev/random | base64 > /tmp/devsm.test.key'
 cache.key = [{ modified = "/tmp/cat" }, { profile_changed = "print_key" }]
 
-[group]
-all = [["ls:verbose", { dir = "/usr" }], "ping", "spam"]
+[service.ping]
+cmd = ["ping", { var = "address" }]
+
+[action.ls]
+cmd = ["ls", { if.profile = "verbose", then = "-al" }]
+profiles = ["default", "verbose"]
+
 
 [test.taplo-validate-json-schema]
 cmd = [
@@ -41,10 +44,17 @@ tag = "lint"
 [test.cargo-test]
 cmd = ["cargo", "test"]
 
-[test.slow_faliure]
+[test.slow_failure]
 sh = """
 echo Slow Failing Test
 sleep 1
 echo Sadness
 exit 1
+"""
+
+[action.spam]
+sh = """
+for i in $(seq 1 1000); do
+    echo $i
+done
 """

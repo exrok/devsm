@@ -9,7 +9,9 @@ use jsony_value::ValueMap;
 use crate::config::TaskKind;
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 use crate::log_storage::{BaseTaskSet, LogFilter};
-use crate::process_manager::{Action, ClientChannel};
+use crate::process_manager::{
+    Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_TESTS,
+};
 use crate::tui::log_search::{LogSearchState, SearchAction};
 use crate::tui::log_stack::LogStack;
 use crate::tui::select_search::SelectSearch;
@@ -839,11 +841,17 @@ pub fn run(
             let ws = workspace.state();
             if let Some(sel) = tui.task_tree.selection_state(&ws) {
                 tui.logs.update_selection(sel);
-                // Update the channel's selected atomic so RestartSelected command works
-                // For meta-groups, we use the base_task from the selected job if available
-                if let Some(bti) = sel.base_task {
-                    extui_channel.selected.store(bti.idx() as u64, std::sync::atomic::Ordering::Relaxed);
-                }
+                let selected_value = if let Some(bti) = sel.base_task {
+                    bti.idx() as u64
+                } else if let Some(kind) = sel.meta_group {
+                    match kind {
+                        MetaGroupKind::Tests => SELECTED_META_GROUP_TESTS,
+                        MetaGroupKind::Actions => SELECTED_META_GROUP_ACTIONS,
+                    }
+                } else {
+                    0
+                };
+                extui_channel.selected.store(selected_value, std::sync::atomic::Ordering::Relaxed);
             }
         }
 

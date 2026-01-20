@@ -2,7 +2,8 @@
 //! Bidirectional RPC protocol for devsm client-daemon communication.
 //!
 //! Currently this is just a module, but in the future may be extracted into owns crate.
-//! I just don't want to worry about publish one.
+//! I just don't want to worry about publishing one and maintaining semver version this
+//! early.
 
 use jsony::Jsony;
 

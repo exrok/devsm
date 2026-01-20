@@ -67,7 +67,7 @@ fn main() {
             }
         }
         cli::Command::RestartSelected => {
-            if let Err(err) = workspace_command(WorkspaceCommand::RestartSelected) {
+            if let Err(err) = restart_selected_command() {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -324,6 +324,36 @@ fn workspace_command(command: WorkspaceCommand) -> anyhow::Result<()> {
         request: daemon::Request::WorkspaceCommand { config: &config, command },
     }))?;
     std::io::copy(&mut socket, &mut std::io::stdout())?;
+    Ok(())
+}
+
+fn restart_selected_command() -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    let mut socket = connect_or_spawn_daemon()?;
+    socket.write_all(&jsony::to_binary(&daemon::RequestMessage {
+        cwd: &cwd,
+        request: daemon::Request::WorkspaceCommand {
+            config: &config,
+            command: WorkspaceCommand::RestartSelected,
+        },
+    }))?;
+
+    let mut response = String::new();
+    socket.read_to_string(&mut response)?;
+
+    #[derive(jsony::Jsony)]
+    struct Response<'a> {
+        #[jsony(default)]
+        error: Option<&'a str>,
+    }
+
+    let parsed: Response = jsony::from_json(&response)?;
+    if let Some(err) = parsed.error {
+        bail!("{err}");
+    }
     Ok(())
 }
 

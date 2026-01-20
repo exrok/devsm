@@ -288,7 +288,7 @@ impl TestConfigExpr<'static> {
 
 pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
     TaskConfigExpr {
-        kind: TaskKind::Action,
+        kind: TaskKind::Test,
         info: "Default Expression for Cargo Innvocations",
         pwd: StringExpr::Var("pwd"),
         command: CommandExpr::Cmd(StringListExpr::List(&[
