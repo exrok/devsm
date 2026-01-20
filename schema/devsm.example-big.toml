@@ -132,6 +132,11 @@ cache.key = [
     { profile_changed = "full_basic" },
 ]
 
+# Action with cache.never (always re-runs when required, never uses cached result)
+[action.with_cache_never]
+cmd = ["./always-run.sh"]
+cache.never = true
+
 # Action combining all features (cmd version)
 [action.kitchen_sink_cmd]
 cmd = [
@@ -192,12 +197,18 @@ export HOST=0.0.0.0
 ./my-server --port=$PORT --host=$HOST
 '''
 
-# Service with all basic fields (no cache - services don't support cache)
+# Service with all basic fields
 [service.full_service]
 cmd = ["./backend-server", "--port", "8080"]
 pwd = "./backend"
 profiles = ["dev", "staging", "production"]
 info = "Main backend HTTP server"
+
+# Service with cache.never (always restarts when required, even if already running)
+[service.always_restart_service]
+cmd = ["./ephemeral-worker"]
+cache.never = true
+info = "Worker that must restart fresh for each dependent task"
 
 # Service with environment variables
 [service.service_with_env]

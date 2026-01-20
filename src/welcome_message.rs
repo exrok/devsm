@@ -74,7 +74,7 @@ pub fn render_welcome_message(buf: &mut Vec<u8>, rect: Rect, keybinds: &Keybinds
     };
 
     let header: Vec<WelcomeLine> =
-        vec![Section("Welcome to devsm"), Empty, Text("No jobs have been spawned yet."), Empty];
+        vec![Section("Welcome to Devsm"), Empty, Text("No jobs have been spawned yet."), Empty];
 
     let mut quick_start: Vec<WelcomeLine> = vec![Section("Quick start:")];
     if let Some(key) = key_str(Command::LaunchTask) {

@@ -557,6 +557,16 @@ impl WorkspaceState {
                         continue;
                     };
 
+                    if cache_config.never {
+                        let new_job =
+                            self.spawn_task(workspace_id, channel, dep_base_task, log_start, dep_params, dep_profile);
+                        pred.push(ScheduleRequirement {
+                            job: new_job,
+                            predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
+                        });
+                        continue;
+                    }
+
                     let expected_cache_key =
                         self.compute_cache_key_with_require(cache_config.key, dep_profile, &dep_params);
                     let spawner = &self.base_tasks[dep_base_task.idx()];
@@ -599,12 +609,15 @@ impl WorkspaceState {
                     });
                 }
                 TaskKind::Service => {
-                    let spawner = &self.base_tasks[dep_base_task.idx()];
-                    for &ji in spawner.jobs.running() {
-                        let job = &self[ji];
-                        if service_matches_require(job, dep_profile, &dep_params) {
-                            pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
-                            continue 'outer;
+                    let cache_never = dep_config.cache.as_ref().is_some_and(|c| c.never);
+                    if !cache_never {
+                        let spawner = &self.base_tasks[dep_base_task.idx()];
+                        for &ji in spawner.jobs.running() {
+                            let job = &self[ji];
+                            if service_matches_require(job, dep_profile, &dep_params) {
+                                pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
+                                continue 'outer;
+                            }
                         }
                     }
                     let new_job =
@@ -927,25 +940,27 @@ impl Workspace {
                 match dep_config.kind {
                     TaskKind::Action => {
                         if let Some(cache_config) = dep_config.cache.as_ref() {
-                            let expected_cache_key =
-                                state.compute_cache_key_with_require(cache_config.key, &req.profile, &req.params);
-                            let spawner = &state.base_tasks[dep_base_task.idx()];
-                            let mut found_cached = false;
-                            for ji in spawner.jobs.all().iter().rev() {
-                                let job = &state.jobs[ji.idx()];
-                                if matches!(job.process_status, JobStatus::Cancelled) {
-                                    continue;
-                                }
-                                if job.process_status.is_successful_completion() {
-                                    if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
-                                        found_cached = true;
-                                        break;
+                            if !cache_config.never {
+                                let expected_cache_key =
+                                    state.compute_cache_key_with_require(cache_config.key, &req.profile, &req.params);
+                                let spawner = &state.base_tasks[dep_base_task.idx()];
+                                let mut found_cached = false;
+                                for ji in spawner.jobs.all().iter().rev() {
+                                    let job = &state.jobs[ji.idx()];
+                                    if matches!(job.process_status, JobStatus::Cancelled) {
+                                        continue;
                                     }
+                                    if job.process_status.is_successful_completion() {
+                                        if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
+                                            found_cached = true;
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                }
+                                if found_cached {
                                     continue;
                                 }
-                            }
-                            if found_cached {
-                                continue;
                             }
                         }
                         let new_job = state.spawn_task(
@@ -962,14 +977,17 @@ impl Workspace {
                         });
                     }
                     TaskKind::Service => {
-                        let spawner = &state.base_tasks[dep_base_task.idx()];
+                        let cache_never = dep_config.cache.as_ref().is_some_and(|c| c.never);
                         let mut found_running = false;
-                        for &ji in spawner.jobs.running() {
-                            let job = &state.jobs[ji.idx()];
-                            if service_matches_require(job, &req.profile, &req.params) {
-                                pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
-                                found_running = true;
-                                break;
+                        if !cache_never {
+                            let spawner = &state.base_tasks[dep_base_task.idx()];
+                            for &ji in spawner.jobs.running() {
+                                let job = &state.jobs[ji.idx()];
+                                if service_matches_require(job, &req.profile, &req.params) {
+                                    pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
+                                    found_running = true;
+                                    break;
+                                }
                             }
                         }
                         if !found_running {

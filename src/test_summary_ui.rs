@@ -105,7 +105,7 @@ pub fn run(
 }
 
 fn run_simple_mode(
-    stdin: OwnedFd,
+    _stdin: OwnedFd,
     stdout: OwnedFd,
     mut socket: Option<UnixStream>,
     workspace: &Workspace,
@@ -118,6 +118,13 @@ fn run_simple_mode(
     let mut encoder = Encoder::new();
 
     let _ = writeln!(file, "Running {} test(s)...\n", test_run.test_jobs.len());
+
+    let mut pipe_fds = [0i32; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let dummy_read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
+    let _dummy_write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
 
     loop {
         if channel.is_terminated() {
@@ -135,18 +142,7 @@ fn run_simple_mode(
             break;
         }
 
-        match extui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), None) {
-            Ok(extui::event::Polled::ReadReady) => {
-                let mut buf = [0u8; 64];
-                let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n == 0 {
-                    let _ = writeln!(file, "\nDetached. Tests will continue running in background.");
-                    send_termination(&mut encoder, &mut socket);
-                    break;
-                }
-            }
-            Ok(extui::event::Polled::Woken) | Ok(extui::event::Polled::TimedOut) | Err(_) => {}
-        }
+        let _ = extui::event::poll_with_custom_waker(&dummy_read_fd, Some(&channel.waker), None);
     }
 
     Ok(())

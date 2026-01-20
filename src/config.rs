@@ -67,7 +67,7 @@ pub enum CacheKeyInput<'a> {
     ProfileChanged(&'a str),
 }
 
-/// Cache configuration for actions. When present, the action's result
+/// Cache configuration for tasks. When present, the task's result
 /// is cached for the session - it won't re-run via `require` if the
 /// last non-cancelled run was successful.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -75,6 +75,10 @@ pub struct CacheConfig<'a> {
     /// Cache key inputs that determine when the cache should be invalidated.
     /// Empty means no key-based invalidation (simple success-based caching).
     pub key: &'a [CacheKeyInput<'a>],
+    /// When true, the task is never considered initially satisfied.
+    /// For actions: always re-run when required, ignoring any cached results.
+    /// For services: always restart when required, even if already running.
+    pub never: bool,
 }
 
 /// Predicate determining when a service is ready.

@@ -213,18 +213,29 @@ fn parse_task<'a>(
                 require = calls.into_bump_slice();
             }
             "cache" => {
-                if kind != TaskKind::Action {
-                    re(Diagnostic::error()
-                        .with_message("`cache` is only valid for actions")
-                        .with_label(DiagnosticLabel::primary(value.span.into())));
-                    return Err(());
-                }
                 let Some(cache_table) = value.as_table() else {
                     mismatched_in_object(re, "table", value, "cache");
                     return Err(());
                 };
+
                 let mut key_inputs = bumpalo::collections::Vec::new_in(alloc);
+                let mut never = false;
+
+                if let Some(never_value) = cache_table.get("never") {
+                    let ValueInner::Boolean(b) = &never_value.value else {
+                        mismatched_in_object(re, "boolean", never_value, "never");
+                        return Err(());
+                    };
+                    never = *b;
+                }
+
                 if let Some(key_value) = cache_table.get("key") {
+                    if kind == TaskKind::Service {
+                        re(Diagnostic::error()
+                            .with_message("`cache.key` is not valid for services, only `cache.never` is allowed")
+                            .with_label(DiagnosticLabel::primary(key_value.span.into())));
+                        return Err(());
+                    }
                     let Some(key_array) = key_value.as_array() else {
                         mismatched_in_object(re, "array", key_value, "key");
                         return Err(());
@@ -254,7 +265,7 @@ fn parse_task<'a>(
                         }
                     }
                 }
-                cache = Some(CacheConfig { key: key_inputs.into_bump_slice() });
+                cache = Some(CacheConfig { key: key_inputs.into_bump_slice(), never });
             }
             "before" => {
                 re(Diagnostic::error()
@@ -403,6 +414,16 @@ fn parse_cache_config<'a>(
     re: &mut dyn FnMut(Diagnostic),
 ) -> Result<CacheConfig<'a>, ()> {
     let mut key_inputs = bumpalo::collections::Vec::new_in(alloc);
+    let mut never = false;
+
+    if let Some(never_value) = cache_table.get("never") {
+        let ValueInner::Boolean(b) = &never_value.value else {
+            mismatched_in_object(re, "boolean", never_value, "never");
+            return Err(());
+        };
+        never = *b;
+    }
+
     if let Some(key_value) = cache_table.get("key") {
         let Some(key_array) = key_value.as_array() else {
             mismatched_in_object(re, "array", key_value, "key");
@@ -433,7 +454,7 @@ fn parse_cache_config<'a>(
             }
         }
     }
-    Ok(CacheConfig { key: key_inputs.into_bump_slice() })
+    Ok(CacheConfig { key: key_inputs.into_bump_slice(), never })
 }
 
 /// Parse a test configuration from a TOML table.
@@ -837,11 +858,11 @@ cache = {}
     }
 
     #[test]
-    fn test_cache_invalid_for_service() {
+    fn test_cache_key_invalid_for_service() {
         let text = r#"
 [service.server]
 cmd = ["./server"]
-cache = {}
+cache.key = [{ modified = "/tmp/file" }]
 "#;
         let bump = Bump::new();
         let mut errors = Vec::new();
@@ -850,9 +871,33 @@ cache = {}
         };
 
         let result = parse(Path::new("/"), &bump, text, &mut error);
-        assert!(result.is_err(), "Expected error for cache on service");
+        assert!(result.is_err(), "Expected error for cache.key on service");
         assert!(!errors.is_empty());
-        assert!(errors[0].message.contains("cache"));
+        assert!(errors[0].message.contains("cache.key"));
+    }
+
+    #[test]
+    fn test_cache_never_valid_for_service() {
+        let text = r#"
+[service.server]
+cmd = ["./server"]
+cache.never = true
+"#;
+        let bump = Bump::new();
+        let mut errors = Vec::new();
+        let mut error = |diag: Diagnostic| {
+            errors.push(diag);
+        };
+
+        let result = parse(Path::new("/"), &bump, text, &mut error);
+        assert!(result.is_ok(), "Expected successful parse for cache.never on service: {:?}", errors);
+        let config = result.unwrap();
+        assert_eq!(config.tasks.len(), 1);
+        let (name, task) = &config.tasks[0];
+        assert_eq!(*name, "server");
+        let cache = task.cache.as_ref().expect("cache should be present");
+        assert!(cache.never);
+        assert!(cache.key.is_empty());
     }
 
     #[test]

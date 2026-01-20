@@ -1629,17 +1629,29 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
         timed_ready_count: 0,
     };
     loop {
+        if TERMINATED.load(std::sync::atomic::Ordering::Relaxed) {
+            job_manager.handle_request(ProcessRequest::GlobalTermination);
+            return;
+        }
+
         let poll_timeout =
             if job_manager.timed_ready_count > 0 { Some(std::time::Duration::from_millis(500)) } else { None };
-        job_manager.poll.poll(&mut events, poll_timeout).unwrap();
+
+        if let Err(err) = job_manager.poll.poll(&mut events, poll_timeout) {
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return;
+        }
+
+        if TERMINATED.load(std::sync::atomic::Ordering::Relaxed) {
+            job_manager.handle_request(ProcessRequest::GlobalTermination);
+            return;
+        }
 
         for event in &events {
             match TokenHandle::from(event.token()) {
                 TokenHandle::RequestChannel => {
-                    if TERMINATED.load(std::sync::atomic::Ordering::Relaxed) {
-                        job_manager.handle_request(ProcessRequest::GlobalTermination);
-                        return;
-                    }
                     let mut reqs = Vec::new();
                     job_manager.request.swap_recv(&mut reqs);
                     for req in reqs {

@@ -1,28 +1,36 @@
-[action.print_key]
-sh = 'cat /tmp/devsm.test.key'
-require = ["gen_key"]
-profiles = ["alpha", "beta"]
+[service.devsm]
+pwd = "tests/workspace"
+cmd = ["cargo", "run", "--", "server"]
+env.DEVSM_SOCKET = "/tmp/.devsm.test.socket"
+env.DEVSM_LOG_STDOUT = "1"
+ready.when.output_contains = "RPC Socket bound"
+ready.timeout = 5.0
+cache.never = true
 
-[action.gen_key]
-sh = 'head -c10 /dev/random | base64 > /tmp/devsm.test.key'
-cache.key = [{ modified = "/tmp/cat" }, { profile_changed = "print_key" }]
+[action.devsm-in-tmux]
+pwd = "tests/workspace"
+sh = """
+tmux send-keys -t devsm-tester:0 "env DEVSM_SOCKET=/tmp/.devsm.test.socket DEVSM_NO_AUTO_SPAWN=1 cargo run" "ENTER"
+"""
+require = ["devsm"]
 
-[service.ping]
-cmd = ["ping", { var = "address" }]
+[action.tmux-attach]
+pwd = "tests/workspace"
+sh = 'tmux attach -t devsm-tester:0 || tmux new-session -A -s devsm-tester'
+env.DEVSM_SOCKET = "/tmp/.devsm.test.socket"
+managed = false
 
-[action.ls]
-cmd = ["ls", { if.profile = "verbose", then = "-al" }]
-profiles = ["default", "verbose"]
-
+[action.devsm-tui]
+pwd = "tests/workspace"
+cmd = ["cargo", "run"]
+env.DEVSM_SOCKET = "/tmp/.devsm.test.socket"
+managed = false
 
 [test.taplo-validate-json-schema]
-cmd = [
-    "taplo",
-    "validate",
-    "--schema",
-    "file:///home/user/Projects/git/devsm/schema/devsm.json",
-    "./schema/devsm.example-big.toml",
-]
+sh = """
+taplo validate --schema "file://$(realpath schema/devsm.json)" ./schema/devsm.example-big.toml
+"""
+tag = ["schema"]
 
 [test.devsm-validate-big-config]
 cmd = [
@@ -33,6 +41,7 @@ cmd = [
     "--skip-path-checks",
     "schema/devsm.example-big.toml",
 ]
+tag = ["schema"]
 
 [test.typos]
 cmd = ["typos", "--color", "always"]
@@ -43,18 +52,3 @@ tag = "lint"
 
 [test.cargo-test]
 cmd = ["cargo", "test"]
-
-[test.slow_failure]
-sh = """
-echo Slow Failing Test
-sleep 1
-echo Sadness
-exit 1
-"""
-
-[action.spam]
-sh = """
-for i in $(seq 1 1000); do
-    echo $i
-done
-"""
