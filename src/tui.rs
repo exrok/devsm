@@ -562,11 +562,17 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
                 let Some(bti) = sel.base_task else {
                     return false;
                 };
-                let profiles = ws.base_tasks[bti.idx()].config.profiles;
-                if profiles.is_empty() {
+                if ws.base_tasks[bti.idx()].config.profiles.is_empty() {
                     return false;
                 }
-                tui.overlay = FocusOverlap::TaskLauncher { state: TaskLauncherState::with_task(&ws, bti) };
+                let mut state = TaskLauncherState::with_task(&ws, bti);
+                match state.try_auto_start(&ws) {
+                    LauncherAction::Start { base_task, profile, params } => {
+                        drop(ws);
+                        workspace.restart_task(base_task, params, &profile);
+                    }
+                    _ => tui.overlay = FocusOverlap::TaskLauncher { state },
+                }
             }
         }
         Command::SelectPrev => {

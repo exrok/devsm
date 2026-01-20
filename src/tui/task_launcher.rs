@@ -151,6 +151,15 @@ impl TaskLauncherState {
         }
     }
 
+    /// Attempts to auto-start if only one profile exists.
+    /// Returns `Start` if no variables needed, otherwise advances to Variable mode.
+    pub fn try_auto_start(&mut self, ws: &WorkspaceState) -> LauncherAction {
+        if self.available_profiles.len() == 1 {
+            return self.handle_confirm(ws);
+        }
+        LauncherAction::None
+    }
+
     /// Returns the current input string.
     pub fn input(&self) -> &str {
         &self.input
@@ -355,6 +364,18 @@ impl TaskLauncherState {
         match key.code {
             KeyCode::Backspace => {
                 self.handle_backspace();
+            }
+            KeyCode::Tab if self.mode == LauncherMode::TaskName => {
+                self.accept_task_autocomplete(ws);
+                self.switch_to_profile_mode();
+            }
+            KeyCode::Tab if self.mode == LauncherMode::Profile => {
+                self.accept_profile_autocomplete();
+                self.switch_to_variable_mode();
+            }
+            KeyCode::Tab if self.mode == LauncherMode::Variable => {
+                self.accept_variable_autocomplete();
+                self.mode = LauncherMode::Value;
             }
             KeyCode::Char(':') if self.mode == LauncherMode::TaskName => {
                 self.accept_task_autocomplete(ws);
