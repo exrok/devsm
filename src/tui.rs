@@ -153,7 +153,7 @@ fn render<'a>(
     };
 
     let dest = Rect { x: 0, y: 0, w, h: h - menu_height };
-    tui.logs.render(&mut tui.frame.buf, dest, workspace, delta.any(Has::RESIZED));
+    tui.logs.render(&mut tui.frame.buf, dest, workspace, keybinds, delta.any(Has::RESIZED));
 
     let mut bot = Rect { x: 0, y: 0, w, h: menu_height };
 
@@ -477,8 +477,10 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
     }
 
     let Some(command) = keybinds.lookup(Mode::Global, input) else {
+        kvlog::info!("no input command found", %input);
         return false;
     };
+    kvlog::info!("input", ?input, ?command);
 
     match command {
         Command::Quit => return true,
@@ -554,7 +556,7 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
                 tui.logs.set_mode(log_stack::Mode::Hybrid(sel));
             }
         }
-        Command::SelectProfile => {
+        Command::StartSelection => {
             let ws = workspace.state();
             if let Some(sel) = tui.task_tree.selection_state(&ws) {
                 let Some(bti) = sel.base_task else {
@@ -579,11 +581,12 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
         Command::FocusSecondary => {
             tui.task_tree.enter_secondary(&workspace.state());
         }
-        Command::TailTopLog => {
-            tui.logs.tail_top();
+        Command::JumpToOldestLogs => {
+            tui.logs.jump_to_oldest(workspace);
         }
-        Command::TailBottomLog => {
-            tui.logs.tail_bottom();
+        Command::JumpToNewestLogs => {
+            kvlog::info!("Jump to newest");
+            tui.logs.jump_to_newest();
         }
         Command::LogScrollUp => {
             tui.logs.pending_top_scroll += 5;
@@ -774,7 +777,7 @@ fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_
 pub enum OutputMode {
     /// The normal tui interface
     Terminal,
-    /// A line seperated JSON stream used for testing
+    /// A line separated JSON stream used for testing
     JsonStateStream,
 }
 pub fn run(

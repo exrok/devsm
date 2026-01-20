@@ -486,7 +486,7 @@ impl LogWriter {
             let mut lock = self.buffer.write().unwrap();
             let count = lock.line_count.load(Ordering::Acquire).div_ceil(2);
             self.range = lock.free_lines(count);
-            kvlog::warn!("After cleanup new capcity is", count = self.range.len);
+            kvlog::warn!("After cleanup new capacity is", count = self.range.len);
             self.remaining = MAX_LINES - *lock.line_count.get_mut();
             if let Some(offset) = self.range.munch(line.len())
                 && self.remaining > 0

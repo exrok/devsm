@@ -282,7 +282,7 @@ sh = "while true; do sleep 1; done"
     let state = tui.wait_until(|s| s.find_task_by_name("my_service").is_some(), timeout);
     assert!(state.is_some(), "Should see my_service task, server_log: {}", harness.server_log());
 
-    tui.send_key(b" ");
+    tui.send_key(b"s");
     let state = tui.wait_until(
         |s| s.overlay.as_ref().map(|o| o.kind.as_deref() == Some("TaskLauncher")).unwrap_or(false),
         timeout,
@@ -392,7 +392,7 @@ sh = "echo hello"
     let state = tui.wait_until(|s| s.find_task_by_name("my_action").is_some(), timeout);
     assert!(state.is_some(), "Should receive initial state, server_log: {}", harness.server_log());
 
-    tui.send_key(b" ");
+    tui.send_key(b"s");
 
     let state = tui.wait_until(
         |s| s.overlay.as_ref().map(|o| o.kind.as_deref() == Some("TaskLauncher")).unwrap_or(false),
@@ -447,7 +447,7 @@ sh = "for i in $(seq 1 200); do echo \"log line $i\"; done"
 
     tui.send_ctrl_key('k');
 
-    tui.send_key(b" ");
+    tui.send_key(b"s");
     let state = tui.wait_until(
         |s| s.overlay.as_ref().map(|o| o.kind.as_deref() == Some("TaskLauncher")).unwrap_or(false),
         timeout,
@@ -459,7 +459,7 @@ sh = "for i in $(seq 1 200); do echo \"log line $i\"; done"
     tui.send_key(b"\x1b");
     let _ = tui.wait_until(|s| s.overlay.is_none(), timeout);
 
-    tui.send_key(b" ");
+    tui.send_key(b"s");
     let _ = tui.wait_until(
         |s| s.overlay.as_ref().map(|o| o.kind.as_deref() == Some("TaskLauncher")).unwrap_or(false),
         timeout,

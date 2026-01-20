@@ -1,6 +1,6 @@
 use crate::{
     cli::TestFilter,
-    config::{CARGO_AUTO_EXPR, CacheKeyInput, Enviroment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig},
+    config::{CARGO_AUTO_EXPR, CacheKeyInput, Environment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig},
     log_storage::{LogGroup, LogId, Logs},
     process_manager::MioChannel,
 };
@@ -73,7 +73,7 @@ pub struct Job {
 #[derive(Debug)]
 pub enum JobPredicate {
     Terminated,
-    TerminatedNaturallyAndSucessfully,
+    TerminatedNaturallyAndSuccessfully,
     Active,
 }
 
@@ -100,7 +100,7 @@ impl ScheduleRequirement {
                 JobStatus::Exited { .. } => RequirementStatus::Met,
                 JobStatus::Cancelled => RequirementStatus::Met,
             },
-            JobPredicate::TerminatedNaturallyAndSucessfully => match &job.process_status {
+            JobPredicate::TerminatedNaturallyAndSuccessfully => match &job.process_status {
                 JobStatus::Scheduled { .. } => RequirementStatus::Pending,
                 JobStatus::Starting => RequirementStatus::Pending,
                 JobStatus::Running { .. } => RequirementStatus::Pending,
@@ -526,7 +526,7 @@ impl WorkspaceState {
                 exit_cause: ExitCause::Restarted,
             });
         }
-        let task = bt.config.eval(&Enviroment { profile, param: params.clone() }).unwrap();
+        let task = bt.config.eval(&Environment { profile, param: params.clone() }).unwrap();
 
         'outer: for dep_call in task.config().require {
             let dep_name = &*dep_call.name;
@@ -552,7 +552,7 @@ impl WorkspaceState {
                         );
                         pred.push(ScheduleRequirement {
                             job: new_job,
-                            predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                            predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
                         });
                         continue;
                     };
@@ -587,7 +587,7 @@ impl WorkspaceState {
                     if let Some(pending_job) = found_pending {
                         pred.push(ScheduleRequirement {
                             job: pending_job,
-                            predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                            predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
                         });
                         continue 'outer;
                     }
@@ -595,7 +595,7 @@ impl WorkspaceState {
                         self.spawn_task(workspace_id, channel, dep_base_task, log_start, dep_params, dep_profile);
                     pred.push(ScheduleRequirement {
                         job: new_job,
-                        predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                        predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
                     });
                 }
                 TaskKind::Service => {
@@ -889,7 +889,7 @@ impl Workspace {
             if !matches_test_filters(test_info.base_name, tags, filters) {
                 continue;
             }
-            let env = Enviroment { profile: "", param: ValueMap::new() };
+            let env = Environment { profile: "", param: ValueMap::new() };
             let Ok(task_config) = base_task.config.eval(&env) else {
                 kvlog::error!("Failed to evaluate test config", name = base_task.name);
                 continue;
@@ -958,7 +958,7 @@ impl Workspace {
                         );
                         pred.push(ScheduleRequirement {
                             job: new_job,
-                            predicate: JobPredicate::TerminatedNaturallyAndSucessfully,
+                            predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
                         });
                     }
                     TaskKind::Service => {
@@ -1106,7 +1106,7 @@ mod scheduling_tests {
 
         // Note: is_successful_completion only checks status code, not exit cause.
         // The ScheduleRequirement::status method does check for Killed separately
-        // when evaluating the TerminatedNaturallyAndSucessfully predicate.
+        // when evaluating the TerminatedNaturallyAndSuccessfully predicate.
         assert!(
             JobStatus::Exited { finished_at: Instant::now(), log_end: LogId(0), cause: ExitCause::Killed, status: 0 }
                 .is_successful_completion()

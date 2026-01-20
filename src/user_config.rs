@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
@@ -6,11 +7,48 @@ use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 #[derive(Default)]
 pub struct UserConfig {
     pub keybinds: Keybinds,
+    /// Whether the config was loaded from a user config file.
+    pub loaded_from_file: bool,
 }
 
 /// Returns the path to the user config file.
 pub fn user_config_path() -> Option<PathBuf> {
     dirs_path().map(|p| p.join("devsm.user.toml"))
+}
+
+/// Returns the default user configuration as a TOML string.
+pub fn default_user_config_toml() -> String {
+    let keybinds = Keybinds::default();
+    let mut output = String::new();
+
+    for (i, mode) in Mode::ALL.iter().enumerate() {
+        let mut bindings: Vec<_> = keybinds.mode_bindings(*mode).collect();
+        if bindings.is_empty() {
+            continue;
+        }
+
+        bindings.sort_by_key(|(input, _)| *input);
+
+        if i > 0 {
+            output.push('\n');
+        }
+        writeln!(output, "[bind.{}]", mode.config_name()).unwrap();
+
+        for (input, command) in bindings {
+            let key_str = input.to_string();
+            let formatted_key = format_toml_key(&key_str);
+            writeln!(output, "{} = \"{}\"", formatted_key, command.config_name()).unwrap();
+        }
+    }
+
+    output
+}
+
+fn format_toml_key(key: &str) -> String {
+    let needs_quotes =
+        key.is_empty() || key.bytes().any(|b| !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'));
+
+    if needs_quotes { format!("\"{}\"", key.replace('\\', "\\\\").replace('"', "\\\"")) } else { key.to_string() }
 }
 
 fn dirs_path() -> Option<PathBuf> {
@@ -30,8 +68,9 @@ impl UserConfig {
 
         match std::fs::read_to_string(&path) {
             Ok(content) => match parse_user_config_for_daemon(&content) {
-                Ok(config) => {
+                Ok(mut config) => {
                     kvlog::info!("Loaded user config", path = %path.display());
+                    config.loaded_from_file = true;
                     config
                 }
                 Err(err) => {
@@ -90,7 +129,7 @@ fn parse_user_config_for_daemon(content: &str) -> Result<UserConfig, String> {
         }
     }
 
-    Ok(UserConfig { keybinds })
+    Ok(UserConfig { keybinds, loaded_from_file: false })
 }
 
 #[cfg(test)]
@@ -133,7 +172,7 @@ fn parse_user_config(content: &str) -> Result<UserConfig, String> {
         }
     }
 
-    Ok(UserConfig { keybinds })
+    Ok(UserConfig { keybinds, loaded_from_file: false })
 }
 
 #[cfg(test)]
@@ -176,5 +215,27 @@ mod tests {
         .unwrap();
         let ctrl_g: InputEvent = "C-g".parse().unwrap();
         assert_eq!(config.keybinds.lookup(Mode::JobList, ctrl_g), Some(Command::StartGroup), "mode-specific");
+
+        // Test numeric key binding
+        let config = parse_user_config(
+            r#"
+            [bind.global]
+            "4" = "LogModeAll"
+            "#,
+        )
+        .unwrap();
+        let four: InputEvent = "4".parse().unwrap();
+        assert_eq!(config.keybinds.lookup(Mode::Global, four), Some(Command::LogModeAll), "numeric key 4");
+
+        // Verify the numeric key works without quotes too
+        let config = parse_user_config(
+            r#"
+            [bind.global]
+            4 = "LogModeAll"
+            "#,
+        )
+        .unwrap();
+        let four: InputEvent = "4".parse().unwrap();
+        assert_eq!(config.keybinds.lookup(Mode::Global, four), Some(Command::LogModeAll), "numeric key 4 unquoted");
     }
 }

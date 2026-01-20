@@ -86,6 +86,7 @@ pub enum Command<'a> {
 pub enum GetResource {
     SelfLogs,
     WorkspaceConfigPath,
+    DefaultUserConfig,
 }
 
 /// Filter for test selection.
@@ -271,6 +272,9 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                     };
                     match resource {
                         "self-logs" => break 'command Command::Get { resource: GetResource::SelfLogs },
+                        "default-user-config" => {
+                            break 'command Command::Get { resource: GetResource::DefaultUserConfig };
+                        }
                         "workspace" => {
                             let Some(Component::Term(sub)) = parser.next() else {
                                 bail!("get workspace requires a sub-resource");

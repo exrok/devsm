@@ -598,6 +598,14 @@ impl LogWidget {
         scroll_view.previous = Rect::EMPTY; // Force full re-render
     }
 
+    /// Jumps to the oldest (first) logs in the view.
+    pub fn jump_to_oldest(&mut self, view: &LogView, style: &LogStyle) {
+        let scroll_view = self.scrollify(view, style);
+        scroll_view.top_index = scroll_view.min_index;
+        scroll_view.scroll_shift_up = 0;
+        scroll_view.previous = Rect::EMPTY;
+    }
+
     pub fn scrollable_render(&mut self, scroll: i32, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         if scroll == 0 {
             if let LogWidget::Scroll(_) = self {
@@ -700,6 +708,8 @@ impl LogWidget {
 
             if !is_at_bottom && scrolled_lines > 0 {
                 handle_scroll_render(scroll_view, buf, rect, view, scrolled_lines, ScrollDirection::Down, style);
+            } else if !is_at_bottom && scroll_view.previous == Rect::EMPTY {
+                scroll_view.render_reset(buf, rect, view, style);
             }
 
             is_at_bottom

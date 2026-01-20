@@ -76,7 +76,7 @@ impl FatSearch {
             return;
         };
         'cont: while let Some(next) = finder.find(&self.buffer[offset..]) {
-            let ot = offset;
+            let off = offset;
             offset += next;
             let (end, index) = 'blk: {
                 for (id, start) in foof.by_ref() {
@@ -91,7 +91,7 @@ impl FatSearch {
                 offset = self.buffer.len();
                 (self.buffer.len() - 1, last_entry_index)
             };
-            let bytes = &self.buffer[ot..end];
+            let bytes = &self.buffer[off..end];
             let Some(sec_start) = finder2.find(&bytes[next + pattern.len()..]) else {
                 continue 'cont;
             };

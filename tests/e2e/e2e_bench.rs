@@ -74,7 +74,7 @@ impl BenchHarness {
     }
 
     fn run_task_to_completion(&mut self) {
-        self.tui.send_key(b" ");
+        self.tui.send_key(b"s");
         let state = self.tui.wait_until(
             |s| s.overlay.as_ref().map(|o| o.kind.as_deref() == Some("TaskLauncher")).unwrap_or(false),
             Duration::from_millis(TIMEOUT_MS),

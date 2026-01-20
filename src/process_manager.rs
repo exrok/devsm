@@ -1713,10 +1713,18 @@ fn setup_signal_handler(sig: i32, handler: unsafe extern "C" fn(i32)) -> anyhow:
 }
 
 static GLOBAL_WAKER: std::sync::OnceLock<&'static Waker> = std::sync::OnceLock::new();
-static GLOBAL_KEYBINDS: std::sync::OnceLock<crate::keybinds::Keybinds> = std::sync::OnceLock::new();
+static GLOBAL_USER_CONFIG: std::sync::OnceLock<crate::user_config::UserConfig> = std::sync::OnceLock::new();
+
+fn global_user_config() -> &'static crate::user_config::UserConfig {
+    GLOBAL_USER_CONFIG.get_or_init(crate::user_config::UserConfig::load)
+}
 
 pub(crate) fn global_keybinds() -> &'static crate::keybinds::Keybinds {
-    GLOBAL_KEYBINDS.get_or_init(|| crate::user_config::UserConfig::load().keybinds)
+    &global_user_config().keybinds
+}
+
+pub(crate) fn user_config_loaded() -> bool {
+    global_user_config().loaded_from_file
 }
 
 impl ProcessManagerHandle {

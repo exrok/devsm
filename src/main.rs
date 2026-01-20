@@ -31,6 +31,7 @@ mod test_summary_ui;
 mod tui;
 mod user_config;
 mod validate;
+mod welcome_message;
 mod workspace;
 
 fn main() {
@@ -143,6 +144,9 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
+            }
+            cli::GetResource::DefaultUserConfig => {
+                print!("{}", user_config::default_user_config_toml());
             }
         },
     }
@@ -541,7 +545,7 @@ fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
         );
     }
 
-    let env = config::Enviroment { profile, param: params };
+    let env = config::Environment { profile, param: params };
     let task = task_expr.eval(&env).map_err(|e| anyhow::anyhow!("Failed to evaluate task: {:?}", e))?;
     let tc = task.config();
 
@@ -626,6 +630,7 @@ Test Filters:
 Get Resources:
   self-logs              Retrieve daemon logs
   workspace config-path  Get config file path
+  default-user-config    Print default user config (keybindings)
 
 Environment Variables:
   DEVSM_SOCKET           Custom socket path

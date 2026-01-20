@@ -2,7 +2,7 @@ use crate::workspace::JobIndex;
 
 /// Ordered job index storing a list of job indices tracking 3 main states
 /// (Terminal | Running | Scheduled) in that order, with tasks which transitioned
-/// to there current state earlier appearing eariler in the list.
+/// to there current state earlier appearing earlier in the list.
 ///
 /// This JobIndexList is optimized around the ideas:
 /// - For specific base task there is rarely more then 1 task either running

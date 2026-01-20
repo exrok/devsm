@@ -131,7 +131,7 @@ impl SelectSearch {
         label: &str,
         func: &dyn Fn(&mut extui::DoubleBuffer, Rect, u64, bool),
     ) {
-        // tood need to scroll text but is probably better to put this in a sperate input boxk
+        // todo need to scroll text but is probably better to put this in a separate input boxk
         let input_rect = rect.take_top(1);
 
         input_rect.with(Color::Grey[16].as_fg()).text(out, label).with(Style::DEFAULT).text(out, &self.pattern);
@@ -157,11 +157,11 @@ impl SelectSearch {
             func(out, entry_rect, self.ids[entry.index()], std::ptr::eq(entry, selected));
         }
     }
-    pub fn new<Id: PackU64>(entires: impl Iterator<Item = (Id, impl AsRef<str>)>) -> SelectSearch {
+    pub fn new<Id: PackU64>(entries: impl Iterator<Item = (Id, impl AsRef<str>)>) -> SelectSearch {
         let mut searcher = FatSearch::default();
         let mut ids = Vec::new();
         let mut results: Vec<Entry> = Vec::new();
-        for (id, text) in entires {
+        for (id, text) in entries {
             searcher.insert(text.as_ref());
             ids.push(id.pack_u64())
         }

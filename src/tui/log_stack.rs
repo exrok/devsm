@@ -2,9 +2,12 @@ use extui::{Color, Rect, vt::BufferWrite};
 
 use crate::{
     config::TaskKind,
+    keybinds::Keybinds,
     log_storage::{BaseTaskSet, LogFilter, LogId},
+    process_manager::user_config_loaded,
     scroll_view::{LogHighlight, LogStyle, LogWidget, ScrollState},
     tui::task_tree::{MetaGroupKind, SelectionState},
+    welcome_message::render_welcome_message,
     workspace::{BaseTaskIndex, Workspace, WorkspaceState},
 };
 
@@ -94,6 +97,8 @@ pub struct LogStack {
     pub highlight: Option<LogHighlight>,
     /// Cached separator bar state to avoid redundant redraws.
     last_separator: Option<SeparatorState>,
+    /// Tracks whether the welcome message was rendered (to avoid redundant redraws).
+    welcome_shown: bool,
 }
 impl LogStack {
     /// Returns the current display mode.
@@ -181,14 +186,21 @@ impl LogStack {
         }
     }
 
-    /// Resets the top log view to tailing mode (following new logs).
-    pub fn tail_top(&mut self) {
-        self.top.reset();
+    /// Jumps to the oldest logs in both panels.
+    pub fn jump_to_oldest(&mut self, ws: &Workspace) {
+        let ws_state = ws.state();
+        let logs = ws.logs.read().unwrap();
+        let top_view = logs.view(self.mode.top_filter(&ws_state));
+        self.top.jump_to_oldest(&top_view, &self.base_task_log_style);
+        if let Some(bot_filter) = self.mode.bottom_filter(&ws_state) {
+            let bot_view = logs.view(bot_filter);
+            self.bottom.jump_to_oldest(&bot_view, &LogStyle::default());
+        }
     }
 
-    /// Resets the bottom log view to tailing mode (following new logs).
-    /// Only effective in Hybrid mode.
-    pub fn tail_bottom(&mut self) {
+    /// Jumps to the newest logs in both panels (resets to tailing mode).
+    pub fn jump_to_newest(&mut self) {
+        self.top.reset();
         self.bottom.reset();
     }
     pub fn update_selection(&mut self, selection: SelectionState) {
@@ -209,11 +221,22 @@ impl LogStack {
             }
         }
     }
-    pub fn render(&mut self, buf: &mut Vec<u8>, mut dest: Rect, ws: &Workspace, resized: bool) {
-        // self.base_task_log_style.assume_blank = true;
-        // todo move this logic else where to avoid taking the log
+    pub fn render(&mut self, buf: &mut Vec<u8>, mut dest: Rect, ws: &Workspace, keybinds: &Keybinds, resized: bool) {
         let (top_filter, bot_filter) = {
             let ws = ws.state();
+
+            let no_jobs_spawned = ws.jobs.is_empty();
+
+            if no_jobs_spawned {
+                if !self.welcome_shown || resized {
+                    render_welcome_message(buf, dest, keybinds, user_config_loaded());
+                    self.welcome_shown = true;
+                }
+                return;
+            }
+
+            self.welcome_shown = false;
+
             if self.base_task_log_style.prefixes.len() != ws.base_tasks.len() {
                 self.base_task_log_style.prefixes.clear();
                 for (i, base_task) in ws.base_tasks.iter().enumerate() {

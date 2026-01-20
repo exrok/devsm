@@ -306,7 +306,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
     }
 };
 
-pub struct Enviroment<'a> {
+pub struct Environment<'a> {
     pub profile: &'a str,
     pub param: jsony_value::ValueMap<'a>,
 }
@@ -318,7 +318,7 @@ pub enum EvalError {
 }
 
 impl TaskConfigExpr<'static> {
-    pub fn eval(&self, env: &Enviroment) -> Result<TaskConfigRc, EvalError> {
+    pub fn eval(&self, env: &Environment) -> Result<TaskConfigRc, EvalError> {
         #[allow(clippy::arc_with_non_send_sync)]
         let mut new = Arc::new((
             TaskConfig { pwd: "", command: Command::Cmd(&[]), require: &[], cache: None, ready: None, envvar: &[] },
@@ -338,7 +338,7 @@ impl TaskConfigExpr<'static> {
 
 impl<'a> BumpEval<'a> for CommandExpr<'static> {
     type Object = Command<'a>;
-    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<Command<'a>, EvalError> {
+    fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<Command<'a>, EvalError> {
         Ok(match self {
             CommandExpr::Cmd(cmd_expr) => Command::Cmd(cmd_expr.bump_eval(env, bump)?),
             CommandExpr::Sh(sh_expr) => Command::Sh(sh_expr.bump_eval(env, bump)?),
@@ -348,7 +348,7 @@ impl<'a> BumpEval<'a> for CommandExpr<'static> {
 
 impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
     type Object = TaskConfig<'a>;
-    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<TaskConfig<'a>, EvalError> {
+    fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<TaskConfig<'a>, EvalError> {
         Ok(TaskConfig {
             pwd: self.pwd.bump_eval(env, bump)?,
             command: self.command.bump_eval(env, bump)?,
@@ -371,7 +371,7 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
 
 impl<'a> BumpEval<'a> for StringExpr<'static> {
     type Object = &'a str;
-    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a str, EvalError> {
+    fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<&'a str, EvalError> {
         match self {
             StringExpr::Literal(s) => Ok(*s),
             StringExpr::Var(var_name) => match env.param[*var_name].as_ref() {
@@ -385,7 +385,7 @@ impl<'a> BumpEval<'a> for StringExpr<'static> {
 
 impl<'a> BumpEval<'a> for StringListExpr<'static> {
     type Object = &'a [&'a str];
-    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<&'a [&'a str], EvalError> {
+    fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<&'a [&'a str], EvalError> {
         match self {
             StringListExpr::List([StringListExpr::Literal(s)]) => Ok(std::slice::from_ref(s)),
             _ => {
@@ -429,7 +429,7 @@ fn append_value<'a>(
 
 fn eval_append_str<'a>(
     expr: &StringListExpr<'static>,
-    env: &Enviroment,
+    env: &Environment,
     bump: &'a Bump,
     target: &mut bumpalo::collections::Vec<&'a str>,
 ) {
@@ -457,7 +457,7 @@ enum Predicate<'a> {
     Profile(&'a str),
 }
 impl<'a> Predicate<'a> {
-    fn eval(&self, env: &Enviroment) -> bool {
+    fn eval(&self, env: &Environment) -> bool {
         match self {
             Predicate::Profile(p) => *p == env.profile,
         }
@@ -479,7 +479,7 @@ pub enum StringExpr<'a> {
 }
 impl<'a, T: BumpEval<'a>> BumpEval<'a> for If<'a, T> {
     type Object = T::Object;
-    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<Self::Object, EvalError> {
+    fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<Self::Object, EvalError> {
         match &self.cond {
             Predicate::Profile(p) => {
                 if *p == env.profile {
@@ -504,7 +504,7 @@ enum StringListExpr<'a> {
 
 pub trait BumpEval<'a> {
     type Object: Sized;
-    fn bump_eval(&self, env: &Enviroment, bump: &'a Bump) -> Result<Self::Object, EvalError>;
+    fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<Self::Object, EvalError>;
 }
 
 fn collect_string_expr_vars(expr: &StringExpr<'static>, out: &mut Vec<&'static str>) {

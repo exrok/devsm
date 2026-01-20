@@ -165,13 +165,13 @@ pub enum Command {
     TerminateTask,
     LaunchTask,
     StartGroup,
-    SelectProfile,
+    StartSelection,
     SearchLogs,
     LogModeAll,
     LogModeSelected,
     LogModeHybrid,
-    TailTopLog,
-    TailBottomLog,
+    JumpToOldestLogs,
+    JumpToNewestLogs,
     LogScrollUp,
     LogScrollDown,
     ToggleHelp,
@@ -196,13 +196,13 @@ impl FromStr for Command {
             "TerminateTask" => Command::TerminateTask,
             "LaunchTask" => Command::LaunchTask,
             "StartGroup" => Command::StartGroup,
-            "SelectProfile" => Command::SelectProfile,
+            "SelectProfile" => Command::StartSelection,
             "SearchLogs" => Command::SearchLogs,
             "LogModeAll" => Command::LogModeAll,
             "LogModeSelected" => Command::LogModeSelected,
             "LogModeHybrid" => Command::LogModeHybrid,
-            "TailTopLog" => Command::TailTopLog,
-            "TailBottomLog" => Command::TailBottomLog,
+            "JumpToOldestLogs" => Command::JumpToOldestLogs,
+            "JumpToNewestLogs" => Command::JumpToNewestLogs,
             "LogScrollUp" => Command::LogScrollUp,
             "LogScrollDown" => Command::LogScrollDown,
             "ToggleHelp" => Command::ToggleHelp,
@@ -224,6 +224,20 @@ pub enum Mode {
     SelectSearch,
     LogSearch,
     TaskLauncher,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 5] = [Mode::Global, Mode::JobList, Mode::SelectSearch, Mode::LogSearch, Mode::TaskLauncher];
+
+    pub fn config_name(self) -> &'static str {
+        match self {
+            Mode::Global => "global",
+            Mode::JobList => "joblist",
+            Mode::SelectSearch => "select_search",
+            Mode::LogSearch => "log_search",
+            Mode::TaskLauncher => "task_launcher",
+        }
+    }
 }
 
 impl FromStr for Mode {
@@ -295,18 +309,22 @@ impl Keybinds {
         self.bind(Mode::Global, "/", Command::SearchLogs);
         self.bind(Mode::Global, "g", Command::StartGroup);
         self.bind(Mode::Global, "r", Command::RestartTask);
+        self.bind(Mode::Global, "ENTER", Command::StartSelection);
         self.bind(Mode::Global, "d", Command::TerminateTask);
-        self.bind(Mode::Global, " ", Command::LaunchTask);
+        self.bind(Mode::Global, "s", Command::LaunchTask);
         self.bind(Mode::Global, "1", Command::LogModeAll);
         self.bind(Mode::Global, "2", Command::LogModeSelected);
         self.bind(Mode::Global, "3", Command::LogModeHybrid);
-        self.bind(Mode::Global, "p", Command::SelectProfile);
         self.bind(Mode::Global, "k", Command::SelectPrev);
         self.bind(Mode::Global, "j", Command::SelectNext);
         self.bind(Mode::Global, "h", Command::FocusPrimary);
         self.bind(Mode::Global, "l", Command::FocusSecondary);
-        self.bind(Mode::Global, "END", Command::TailTopLog);
-        self.bind(Mode::Global, "C-END", Command::TailBottomLog);
+        self.bind(Mode::Global, "UP", Command::SelectPrev);
+        self.bind(Mode::Global, "DOWN", Command::SelectNext);
+        self.bind(Mode::Global, "LEFT", Command::FocusPrimary);
+        self.bind(Mode::Global, "RIGHT", Command::FocusSecondary);
+        self.bind(Mode::Global, "HOME", Command::JumpToOldestLogs);
+        self.bind(Mode::Global, "END", Command::JumpToNewestLogs);
         self.bind(Mode::Global, "C-k", Command::LogScrollUp);
         self.bind(Mode::Global, "C-j", Command::LogScrollDown);
         self.bind(Mode::Global, "?", Command::ToggleHelp);
@@ -330,6 +348,7 @@ impl Keybinds {
         self.bind(Mode::LogSearch, "C-g", Command::OverlayCancel);
         self.bind(Mode::LogSearch, "ESC", Command::OverlayCancel);
         self.bind(Mode::LogSearch, "ENTER", Command::OverlayConfirm);
+        self.bind(Mode::LogSearch, "C-l", Command::OverlayConfirm);
 
         self.bind(Mode::TaskLauncher, "C-k", Command::SelectPrev);
         self.bind(Mode::TaskLauncher, "UP", Command::SelectPrev);
@@ -338,6 +357,7 @@ impl Keybinds {
         self.bind(Mode::TaskLauncher, "C-g", Command::OverlayCancel);
         self.bind(Mode::TaskLauncher, "ESC", Command::OverlayCancel);
         self.bind(Mode::TaskLauncher, "ENTER", Command::OverlayConfirm);
+        self.bind(Mode::TaskLauncher, "C-l", Command::OverlayConfirm);
     }
 
     /// Binds a key to a command in a specific mode.
@@ -411,6 +431,12 @@ impl Keybinds {
     pub fn mode_bindings(&self, mode: Mode) -> impl Iterator<Item = (InputEvent, Command)> + '_ {
         self.table_for_mode(mode).iter().map(|(k, v)| (*k, *v))
     }
+
+    /// Finds the first key bound to a command in global mode.
+    /// When multiple keys are bound to the same command, returns the smallest by Ord for consistency.
+    pub fn key_for_command(&self, command: Command) -> Option<InputEvent> {
+        self.global.iter().filter(|(_, cmd)| *cmd == command).map(|(key, _)| *key).min()
+    }
 }
 
 impl Command {
@@ -426,13 +452,13 @@ impl Command {
             Command::TerminateTask => "Terminate",
             Command::LaunchTask => "Launch",
             Command::StartGroup => "Start Group",
-            Command::SelectProfile => "Profile",
+            Command::StartSelection => "Profile",
             Command::SearchLogs => "Search",
             Command::LogModeAll => "Log: All",
             Command::LogModeSelected => "Log: Selected",
             Command::LogModeHybrid => "Log: Hybrid",
-            Command::TailTopLog => "Tail Top",
-            Command::TailBottomLog => "Tail Bottom",
+            Command::JumpToOldestLogs => "Oldest Logs",
+            Command::JumpToNewestLogs => "Newest Logs",
             Command::LogScrollUp => "Scroll Up",
             Command::LogScrollDown => "Scroll Down",
             Command::ToggleHelp => "Help",
@@ -441,6 +467,36 @@ impl Command {
             Command::ToggleViewMode => "Toggle View",
             Command::OverlayCancel => "Cancel",
             Command::OverlayConfirm => "Confirm",
+        }
+    }
+
+    /// Returns the config name for the command (used in TOML config files).
+    pub fn config_name(self) -> &'static str {
+        match self {
+            Command::Quit => "Quit",
+            Command::SelectNext => "SelectNext",
+            Command::SelectPrev => "SelectPrev",
+            Command::FocusPrimary => "FocusPrimary",
+            Command::FocusSecondary => "FocusSecondary",
+            Command::RestartTask => "RestartTask",
+            Command::TerminateTask => "TerminateTask",
+            Command::LaunchTask => "LaunchTask",
+            Command::StartGroup => "StartGroup",
+            Command::StartSelection => "SelectProfile",
+            Command::SearchLogs => "SearchLogs",
+            Command::LogModeAll => "LogModeAll",
+            Command::LogModeSelected => "LogModeSelected",
+            Command::LogModeHybrid => "LogModeHybrid",
+            Command::JumpToOldestLogs => "JumpToOldestLogs",
+            Command::JumpToNewestLogs => "JumpToNewestLogs",
+            Command::LogScrollUp => "LogScrollUp",
+            Command::LogScrollDown => "LogScrollDown",
+            Command::ToggleHelp => "ToggleHelp",
+            Command::HelpScrollUp => "HelpScrollUp",
+            Command::HelpScrollDown => "HelpScrollDown",
+            Command::ToggleViewMode => "ToggleViewMode",
+            Command::OverlayCancel => "OverlayCancel",
+            Command::OverlayConfirm => "OverlayConfirm",
         }
     }
 }
@@ -484,9 +540,26 @@ mod tests {
         let ctrl_c: InputEvent = "C-c".parse().unwrap();
         assert_eq!(keybinds.lookup(Mode::SelectSearch, ctrl_c), Some(Command::Quit));
 
+        let home: InputEvent = "HOME".parse().unwrap();
         let end: InputEvent = "END".parse().unwrap();
-        let ctrl_end: InputEvent = "C-END".parse().unwrap();
-        assert_eq!(keybinds.lookup(Mode::Global, end), Some(Command::TailTopLog));
-        assert_eq!(keybinds.lookup(Mode::Global, ctrl_end), Some(Command::TailBottomLog));
+        assert_eq!(keybinds.lookup(Mode::Global, home), Some(Command::JumpToOldestLogs));
+        assert_eq!(keybinds.lookup(Mode::Global, end), Some(Command::JumpToNewestLogs));
+    }
+
+    #[test]
+    fn key_for_command_reverse_lookup() {
+        let keybinds = Keybinds::default();
+
+        let key = keybinds.key_for_command(Command::LogScrollUp);
+        assert!(key.is_some(), "LogScrollUp should have a binding");
+        assert_eq!(key.unwrap().to_string(), "C-k");
+
+        let key = keybinds.key_for_command(Command::LogScrollDown);
+        assert!(key.is_some(), "LogScrollDown should have a binding");
+        assert_eq!(key.unwrap().to_string(), "C-j");
+
+        let key = keybinds.key_for_command(Command::LaunchTask);
+        assert!(key.is_some(), "LaunchTask should have a binding");
+        assert_eq!(key.unwrap().to_string(), "s");
     }
 }
