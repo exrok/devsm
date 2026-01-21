@@ -1,5 +1,6 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use extui::event::{Event, KeyEvent};
 use extui::vt::BufferWrite;
@@ -100,6 +101,27 @@ mod task_tree;
 
 use config_error::{ConfigErrorAction, ConfigErrorState, ConfigSource};
 
+struct StatusMessage {
+    text: String,
+    is_error: bool,
+    created_at: Instant,
+}
+
+impl StatusMessage {
+    fn info(text: impl Into<String>) -> Self {
+        Self { text: text.into(), is_error: false, created_at: Instant::now() }
+    }
+
+    fn error(text: impl Into<String>) -> Self {
+        Self { text: text.into(), is_error: true, created_at: Instant::now() }
+    }
+
+    fn is_visible(&self) -> bool {
+        let duration = if self.is_error { Duration::from_secs(5) } else { Duration::from_secs(2) };
+        self.created_at.elapsed() < duration
+    }
+}
+
 enum FocusOverlap {
     Group { selection: SelectSearch },
     LogSearch { state: LogSearchState },
@@ -120,6 +142,7 @@ struct TuiState {
     task_tree: TaskTreeState,
     overlay: FocusOverlap,
     help: HelpMenu,
+    status_message: Option<StatusMessage>,
 }
 
 fn render<'a>(
@@ -238,6 +261,7 @@ struct StatusBarData {
     is_collapsed: bool,
     log_mode: &'static str,
     is_scrolled: bool,
+    status_message: Option<(String, bool)>,
 }
 
 fn render_status_bar(frame: &mut DoubleBuffer, mut rect: Rect, data: &StatusBarData) {
@@ -260,6 +284,12 @@ fn render_status_bar(frame: &mut DoubleBuffer, mut rect: Rect, data: &StatusBarD
     if data.is_scrolled {
         let scroll_text = " SCROLL ";
         rect.take_left(scroll_text.len() as i32).with(Color(215).with_fg(Color::Black)).text(frame, scroll_text);
+    }
+
+    if let Some((text, is_error)) = &data.status_message {
+        let msg_text = format!(" {} ", text);
+        let fg_color = if *is_error { Color(218) } else { Color::Grey[14] };
+        rect.take_left(msg_text.len() as i32).with(Color::Grey[4].with_fg(fg_color)).text(frame, &msg_text);
     }
 
     let view_mode = if data.is_collapsed { "C" } else { "E" };
@@ -340,6 +370,9 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace) -> StatusBarData
     let scroll_state = tui.logs.scroll_state(&ws, workspace);
     let is_scrolled = scroll_state.top.is_scrolled || scroll_state.bottom.map_or(false, |b| b.is_scrolled);
 
+    let status_message =
+        tui.status_message.as_ref().filter(|m| m.is_visible()).map(|m| (m.text.clone(), m.is_error));
+
     StatusBarData {
         mode_name,
         mode_bg,
@@ -350,6 +383,7 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace) -> StatusBarData
         is_collapsed: tui.task_tree.is_collapsed(),
         log_mode,
         is_scrolled,
+        status_message,
     }
 }
 
@@ -431,9 +465,6 @@ fn process_key(
                 }
                 select_search::Action::Enter => {
                     if let Some(group) = selection.selected::<usize>() {
-                        // FIX: Handle cases where the config has changed since the selection
-                        // was opened. Currently if the group indices change we may try to start
-                        // the wronge group.
                         let mut ws1 = workspace.state.write().unwrap();
                         let ws = &mut *ws1;
                         if let Some((_, tasks)) = ws.config.current.groups.get(group) {
@@ -447,6 +478,7 @@ fn process_key(
                             for (task, vars, profile) in new_tasks {
                                 workspace.restart_task(task, vars, profile);
                             }
+                            tui.status_message = Some(StatusMessage::info("Group Started"));
                         }
                     }
 
@@ -488,6 +520,7 @@ fn process_key(
                     drop(ws);
                     workspace.restart_task(base_task, params, &profile);
                     tui.overlay = FocusOverlap::None;
+                    tui.status_message = Some(StatusMessage::info("Task Spawned"));
                 }
                 LauncherAction::None => {}
             }
@@ -507,6 +540,7 @@ fn process_key(
 
     let Some(command) = keybinds.lookup(Mode::Global, input) else {
         kvlog::info!("no input command found", %input);
+        tui.status_message = Some(StatusMessage::error(format!("No binding for input: {}", input)));
         return ProcessKeyResult::Continue;
     };
     kvlog::info!("input", ?input, ?command);
@@ -547,6 +581,11 @@ fn process_key(
                         let job = &ws[last_ji];
                         (job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone())
                     } else {
+                        let msg = match kind {
+                            MetaGroupKind::Tests => "No Test to Restart",
+                            MetaGroupKind::Actions => "No Action to Restart",
+                        };
+                        tui.status_message = Some(StatusMessage::error(msg));
                         return ProcessKeyResult::Continue;
                     }
                 } else {
@@ -554,6 +593,7 @@ fn process_key(
                 };
                 drop(ws);
                 workspace.restart_task(base_task, params, &profile);
+                tui.status_message = Some(StatusMessage::info("Task Restarted"));
             }
         }
         Command::TerminateTask => {
@@ -562,6 +602,7 @@ fn process_key(
             drop(ws);
             if let Some(bti) = bti {
                 workspace.terminate_tasks(bti);
+                tui.status_message = Some(StatusMessage::info("Task Killed"));
             }
         }
         Command::LaunchTask => {
@@ -605,10 +646,14 @@ fn process_key(
             }
         }
         Command::SelectPrev => {
-            tui.task_tree.move_cursor_up(&workspace.state());
+            if !tui.task_tree.move_cursor_up(&workspace.state()) {
+                tui.status_message = Some(StatusMessage::error("Already at top of list"));
+            }
         }
         Command::SelectNext => {
-            tui.task_tree.move_cursor_down(&workspace.state());
+            if !tui.task_tree.move_cursor_down(&workspace.state()) {
+                tui.status_message = Some(StatusMessage::error("Already at bottom of list"));
+            }
         }
         Command::FocusPrimary => {
             tui.task_tree.exit_secondary();
@@ -856,6 +901,7 @@ fn attempt_config_reload(tui: &mut TuiState, workspace: &Workspace, keybinds: &m
 
     if errors.is_empty() {
         tui.overlay = FocusOverlap::None;
+        tui.status_message = Some(StatusMessage::info("Config Reloaded"));
     } else {
         let error_message = errors.join("\n");
         let source = match (user_errored, workspace_errored) {
@@ -905,6 +951,7 @@ pub fn run(
         task_tree: TaskTreeState::default(),
         overlay: FocusOverlap::None,
         help: HelpMenu { visible: false, scroll: 0 },
+        status_message: None,
     };
 
     let mut delta = Has(0);
@@ -985,15 +1032,17 @@ pub fn run(
                         extui::event::MouseEventKind::ScrollDown => match target {
                             ScrollTarget::TopLog => tui.logs.pending_top_scroll -= 5,
                             ScrollTarget::BottomLog => tui.logs.pending_bottom_scroll -= 5,
-                            ScrollTarget::TaskList => tui.task_tree.move_cursor_down(&workspace.state()),
-                            ScrollTarget::JobList => tui.task_tree.move_cursor_down(&workspace.state()),
+                            ScrollTarget::TaskList | ScrollTarget::JobList => {
+                                let _ = tui.task_tree.move_cursor_down(&workspace.state());
+                            }
                             ScrollTarget::None => (),
                         },
                         extui::event::MouseEventKind::ScrollUp => match target {
                             ScrollTarget::TopLog => tui.logs.pending_top_scroll += 5,
                             ScrollTarget::BottomLog => tui.logs.pending_bottom_scroll += 5,
-                            ScrollTarget::TaskList => tui.task_tree.move_cursor_up(&workspace.state()),
-                            ScrollTarget::JobList => tui.task_tree.move_cursor_up(&workspace.state()),
+                            ScrollTarget::TaskList | ScrollTarget::JobList => {
+                                let _ = tui.task_tree.move_cursor_up(&workspace.state());
+                            }
                             ScrollTarget::None => (),
                         },
                         _ => {}

@@ -354,54 +354,52 @@ impl TaskTreeState {
         }
     }
 
-    pub fn move_cursor_down(&mut self, ws: &WorkspaceState) {
+    pub fn move_cursor_down(&mut self, ws: &WorkspaceState) -> bool {
         if self.job_index.is_some() {
-            // Note since we always render the job list in reverse
-            // moving the cursor down, looks more like moving the cursor up
             if self.job_list_index == 0 {
-                return;
+                return false;
             }
             let jli = self.job_list_index - 1;
             self.job_list_index = jli;
             let entry = match self.normalize_primary() {
                 Some(entry) => entry,
-                None => return,
+                None => return false,
             };
             let jobs = self.get_job_list(ws, entry);
             self.job_index = Some(jobs[jli]);
         } else {
             if self.primary_index + 1 >= self.primary_list.len() {
-                return;
+                return false;
             }
             let pti = self.primary_index + 1;
             self.primary_index = pti;
             self.selected_entry = Some(self.primary_list[pti]);
         }
+        true
     }
 
-    pub fn move_cursor_up(&mut self, ws: &WorkspaceState) {
+    pub fn move_cursor_up(&mut self, ws: &WorkspaceState) -> bool {
         if self.job_index.is_some() {
-            // Note since we always render the job list in reverse
-            // moving the cursor up, looks more like moving the cursor down
             let entry = match self.normalize_primary() {
                 Some(entry) => entry,
-                None => return,
+                None => return false,
             };
             let jobs = self.get_job_list(ws, entry);
             if self.job_list_index + 1 >= jobs.len() {
-                return;
+                return false;
             }
             let jli = self.job_list_index + 1;
             self.job_list_index = jli;
             self.job_index = Some(jobs[jli]);
         } else {
             if self.primary_index == 0 {
-                return;
+                return false;
             }
             let pti = self.primary_index - 1;
             self.primary_index = pti;
             self.selected_entry = Some(self.primary_list[pti]);
         }
+        true
     }
 
     fn is_entry_selected(&self, entry: PrimaryEntry, sel: &SelectionState) -> bool {
