@@ -3,6 +3,7 @@ use extui::{Color, Rect, vt::BufferWrite};
 use crate::{
     config::TaskKind,
     keybinds::Keybinds,
+    line_width::display_width,
     log_storage::{BaseTaskSet, LogFilter, LogId},
     process_manager::user_config_loaded,
     scroll_view::{LogHighlight, LogStyle, LogWidget, ScrollState},
@@ -254,7 +255,7 @@ impl LogStack {
                     let text = format!("{} {} \x1b[m ", SPAN_COLORS[i % SPAN_COLORS.len()], base_task.name);
                     self.base_task_log_style
                         .prefixes
-                        .push(crate::scroll_view::Prefix { width: text.len(), bytes: text.into() });
+                        .push(crate::scroll_view::Prefix { width: display_width(&text), bytes: text.into() });
                 }
             }
             (self.mode.top_filter(&ws), self.mode.bottom_filter(&ws))

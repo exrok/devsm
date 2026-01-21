@@ -135,6 +135,21 @@ pub fn strip_ansi_to_buffer_preserve_case(text: &str, buffer: &mut Vec<u8>) {
     }
 }
 
+/// Calculates display width of text, ignoring ANSI escape codes.
+///
+/// Uses unicode_width for accurate display width of Unicode characters.
+pub fn display_width(text: &str) -> usize {
+    let mut width = 0;
+    for segment in Segment::iterator(text) {
+        match segment {
+            Segment::Ascii(s) => width += s.len(),
+            Segment::Utf8(s) => width += s.width(),
+            Segment::AnsiEscapes(_) => {}
+        }
+    }
+    width
+}
+
 /// Match highlight information for rendering.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MatchHighlight {

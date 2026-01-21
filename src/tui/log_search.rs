@@ -371,9 +371,11 @@ fn filter_contains(filter: &LogFilter, entry: &LogEntry) -> bool {
     }
 }
 
-/// Renders text with ANSI codes stripped and optional substring highlighting.
+/// Renders text with optional substring highlighting, preserving ANSI colors for non-selected entries.
 ///
 /// Uses extui's chaining API to render each segment with appropriate styling.
+/// For selected entries (non-default base_style), ANSI codes are ignored to maintain readability.
+/// For non-selected entries, ANSI colors are preserved.
 fn render_stripped_with_highlight(
     rect: Rect,
     out: &mut DoubleBuffer,
@@ -382,14 +384,18 @@ fn render_stripped_with_highlight(
     highlight_style: Style,
     highlight: MatchHighlight,
 ) {
+    use crate::line_width::apply_raw_display_mode_vt_to_style;
     use extui::DisplayRect;
 
     let match_start = highlight.start as usize;
     let match_end = match_start + highlight.len as usize;
     let has_highlight = highlight.len > 0;
 
+    let preserve_ansi = base_style == Style::DEFAULT;
+
     let mut stripped_pos = 0usize;
-    let mut styled: DisplayRect = rect.with(base_style);
+    let mut current_style = base_style;
+    let mut styled: DisplayRect = rect.with(current_style);
 
     for segment in Segment::iterator(text) {
         match segment {
@@ -406,9 +412,9 @@ fn render_stripped_with_highlight(
                     }
                     styled = styled.with(highlight_style).text(out, &s[hl_start_in_seg..hl_end_in_seg]);
                     if hl_end_in_seg < s.len() {
-                        styled = styled.with(base_style).text(out, &s[hl_end_in_seg..]);
+                        styled = styled.with(current_style).text(out, &s[hl_end_in_seg..]);
                     } else {
-                        styled = styled.with(base_style);
+                        styled = styled.with(current_style);
                     }
                 } else {
                     styled = styled.text(out, s);
@@ -433,7 +439,7 @@ fn render_stripped_with_highlight(
                         if current_in_highlight {
                             styled = styled.with(highlight_style).text(out, batch);
                         } else {
-                            styled = styled.with(base_style).text(out, batch);
+                            styled = styled.with(current_style).text(out, batch);
                         }
                         batch_start = byte_idx;
                         current_in_highlight = in_highlight;
@@ -445,13 +451,18 @@ fn render_stripped_with_highlight(
                 if batch_start < s.len() {
                     let batch = &s[batch_start..];
                     if current_in_highlight {
-                        styled = styled.with(highlight_style).text(out, batch).with(base_style);
+                        styled = styled.with(highlight_style).text(out, batch).with(current_style);
                     } else {
-                        styled = styled.with(base_style).text(out, batch);
+                        styled = styled.with(current_style).text(out, batch);
                     }
                 }
             }
-            Segment::AnsiEscapes(_) => {}
+            Segment::AnsiEscapes(escape) => {
+                if preserve_ansi {
+                    apply_raw_display_mode_vt_to_style(&mut current_style, escape);
+                    styled = styled.with(current_style);
+                }
+            }
         }
     }
 }
