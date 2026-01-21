@@ -606,33 +606,7 @@ fn process_key(
             tui.overlay = FocusOverlap::Group { selection: entries.collect() }
         }
         Command::RestartTask => {
-            let ws = workspace.state();
-            if let Some(sel) = tui.task_tree.selection_state(&ws) {
-                let (base_task, params, profile) = if let Some(job_index) = sel.job {
-                    let job = &ws[job_index];
-                    (job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone())
-                } else if let Some(bti) = sel.base_task {
-                    (bti, ValueMap::new(), String::new())
-                } else if let Some(kind) = sel.meta_group {
-                    let jobs = ws.jobs_by_kind(kind.task_kind());
-                    if let Some(&last_ji) = jobs.last() {
-                        let job = &ws[last_ji];
-                        (job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone())
-                    } else {
-                        let msg = match kind {
-                            MetaGroupKind::Tests => "No Test to Restart",
-                            MetaGroupKind::Actions => "No Action to Restart",
-                        };
-                        tui.status_message = Some(StatusMessage::error(msg));
-                        return ProcessKeyResult::Continue;
-                    }
-                } else {
-                    return ProcessKeyResult::Continue;
-                };
-                drop(ws);
-                workspace.restart_task(base_task, params, &profile);
-                tui.status_message = Some(StatusMessage::info("Task Restarted"));
-            }
+            restart_selected_task(tui, workspace);
         }
         Command::TerminateTask => {
             let ws = workspace.state();
@@ -765,17 +739,55 @@ impl std::ops::BitOrAssign for Has {
     }
 }
 
+fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {
+    let ws = workspace.state();
+    let Some(sel) = tui.task_tree.selection_state(&ws) else {
+        return;
+    };
+    let had_job_selected = sel.job.is_some();
+    let Some((base_task, params, profile)) = (if let Some(job_index) = sel.job {
+        let job = &ws[job_index];
+        Some((job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone()))
+    } else if let Some(bti) = sel.base_task {
+        Some((bti, ValueMap::new(), String::new()))
+    } else if let Some(kind) = sel.meta_group {
+        let jobs = ws.jobs_by_kind(kind.task_kind());
+        if let Some(&last_ji) = jobs.last() {
+            let job = &ws[last_ji];
+            Some((job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone()))
+        } else {
+            let msg = match kind {
+                MetaGroupKind::Tests => "No Test to Restart",
+                MetaGroupKind::Actions => "No Action to Restart",
+            };
+            tui.status_message = Some(StatusMessage::error(msg));
+            return;
+        }
+    } else {
+        None
+    }) else {
+        return;
+    };
+    drop(ws);
+    let new_job = workspace.restart_task(base_task, params, &profile);
+    if had_job_selected {
+        let ws = workspace.state();
+        tui.task_tree.select_job(new_job, &ws);
+    }
+    tui.status_message = Some(StatusMessage::info("Task Restarted"));
+}
+
 #[derive(Debug)]
 pub enum ScrollTarget {
     TopLog,
     BottomLog,
-    TaskList,
-    JobList,
+    TaskList { row: u16 },
+    JobList { row: u16 },
     None,
 }
 
 fn scroll_target(w: u16, h: u16, x: u16, y: u16) -> ScrollTarget {
-    let menu_height = 10;
+    let menu_height = compute_menu_height(h) as i32;
     let mut dest = Rect { x: 0, y: 0, w, h };
     let mut bot = dest.take_bottom(menu_height);
     let (tl, bl) = dest.v_split(0.5);
@@ -784,13 +796,13 @@ fn scroll_target(w: u16, h: u16, x: u16, y: u16) -> ScrollTarget {
     let (p, mut s) = task_tree_rect.h_split(0.5);
     s.take_left(1);
     if p.contains(x, y) {
-        ScrollTarget::TaskList
+        ScrollTarget::TaskList { row: y - p.y }
     } else if tl.contains(x, y) {
         ScrollTarget::TopLog
     } else if bl.contains(x, y) {
         ScrollTarget::BottomLog
     } else if s.contains(x, y) {
-        ScrollTarget::JobList
+        ScrollTarget::JobList { row: y - s.y }
     } else {
         ScrollTarget::None
     }
@@ -1071,12 +1083,11 @@ pub fn run(
                     let x = mouse.column;
                     let y = mouse.row;
                     let target = scroll_target(w, h, x, y);
-                    println!("{} {} -> {:?}", x, y, target);
                     match mouse.kind {
                         extui::event::MouseEventKind::ScrollDown => match target {
                             ScrollTarget::TopLog => tui.logs.pending_top_scroll -= 5,
                             ScrollTarget::BottomLog => tui.logs.pending_bottom_scroll -= 5,
-                            ScrollTarget::TaskList | ScrollTarget::JobList => {
+                            ScrollTarget::TaskList { .. } | ScrollTarget::JobList { .. } => {
                                 let _ = tui.task_tree.move_cursor_down(&workspace.state());
                             }
                             ScrollTarget::None => (),
@@ -1084,10 +1095,25 @@ pub fn run(
                         extui::event::MouseEventKind::ScrollUp => match target {
                             ScrollTarget::TopLog => tui.logs.pending_top_scroll += 5,
                             ScrollTarget::BottomLog => tui.logs.pending_bottom_scroll += 5,
-                            ScrollTarget::TaskList | ScrollTarget::JobList => {
+                            ScrollTarget::TaskList { .. } | ScrollTarget::JobList { .. } => {
                                 let _ = tui.task_tree.move_cursor_up(&workspace.state());
                             }
                             ScrollTarget::None => (),
+                        },
+                        extui::event::MouseEventKind::Down(button) => match target {
+                            ScrollTarget::TaskList { row } => {
+                                tui.task_tree.select_primary_by_row(row as usize, &workspace.state());
+                                if matches!(button, extui::event::MouseButton::Right) {
+                                    restart_selected_task(&mut tui, workspace);
+                                }
+                            }
+                            ScrollTarget::JobList { row } => {
+                                tui.task_tree.select_job_by_row(row as usize, &workspace.state());
+                                if matches!(button, extui::event::MouseButton::Right) {
+                                    restart_selected_task(&mut tui, workspace);
+                                }
+                            }
+                            _ => {}
                         },
                         _ => {}
                     }

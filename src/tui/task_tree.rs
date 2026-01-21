@@ -402,6 +402,52 @@ impl TaskTreeState {
         true
     }
 
+    pub fn select_primary_by_row(&mut self, row: usize, ws: &WorkspaceState) {
+        let list_index = self.primary_scroll_offset + row;
+        if list_index >= self.primary_list.len() {
+            return;
+        }
+        self.primary_index = list_index;
+        self.selected_entry = Some(self.primary_list[list_index]);
+        self.job_index = None;
+        self.job_list_index = usize::MAX;
+        self.job_list_scroll_offset = 0;
+        let _ = self.selection_state(ws);
+    }
+
+    pub fn select_job_by_row(&mut self, row: usize, ws: &WorkspaceState) {
+        let entry = match self.normalize_primary() {
+            Some(entry) => entry,
+            None => return,
+        };
+        let jobs = self.get_job_list(ws, entry);
+        if jobs.is_empty() {
+            return;
+        }
+        let display_offset = self.job_list_scroll_offset + row;
+        if display_offset >= jobs.len() {
+            return;
+        }
+        let job_list_index = jobs.len() - 1 - display_offset;
+        self.job_list_index = job_list_index;
+        self.job_index = Some(jobs[job_list_index]);
+    }
+
+    pub fn select_job(&mut self, job_index: JobIndex, ws: &WorkspaceState) {
+        let entry = match self.normalize_primary() {
+            Some(entry) => entry,
+            None => return,
+        };
+        let jobs = self.get_job_list(ws, entry);
+        for (i, &ji) in jobs.iter().enumerate() {
+            if ji == job_index {
+                self.job_list_index = i;
+                self.job_index = Some(job_index);
+                return;
+            }
+        }
+    }
+
     fn is_entry_selected(&self, entry: PrimaryEntry, sel: &SelectionState) -> bool {
         match entry {
             PrimaryEntry::Task(bti) => sel.base_task == Some(bti) && sel.meta_group.is_none(),

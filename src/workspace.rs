@@ -870,7 +870,7 @@ impl Workspace {
     pub fn state(&self) -> std::sync::RwLockReadGuard<'_, WorkspaceState> {
         self.state.read().unwrap()
     }
-    pub fn restart_task(&self, base_task: BaseTaskIndex, params: ValueMap, profile: &str) {
+    pub fn restart_task(&self, base_task: BaseTaskIndex, params: ValueMap, profile: &str) -> JobIndex {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
         state.refresh_config();
@@ -881,7 +881,7 @@ impl Workspace {
             self.logs.read().unwrap().tail(),
             params,
             profile,
-        );
+        )
     }
 
     pub fn terminate_tasks(&self, base_task: BaseTaskIndex) {

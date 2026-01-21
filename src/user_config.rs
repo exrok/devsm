@@ -1,7 +1,7 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use crate::diagnostic::{render_diagnostic, toml_error_to_diagnostic, Diagnostic, DiagnosticLabel};
+use crate::diagnostic::{Diagnostic, DiagnosticLabel, render_diagnostic, toml_error_to_diagnostic};
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 
 /// User configuration loaded from ~/.config/devsm.user.toml
