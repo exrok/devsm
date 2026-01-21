@@ -699,76 +699,15 @@ impl ProcessManager {
                 let ws = &self.workspaces[ws_index as usize];
                 let mut state = ws.handle.state.write().unwrap();
 
-                if let Some(action) = state.session_functions.get(&*name).cloned() {
-                    match action {
-                        FunctionAction::RestartCaptured { task_name, profile } => {
-                            if let Some(index) = state.base_index_by_name(&task_name) {
-                                drop(state);
-                                ws.handle.restart_task(index, ValueMap::new(), &profile);
-                                let _ = socket.write_all(b"ok\n");
-                            } else {
-                                let _ = socket.write_all(format!("error: task '{}' not found\n", task_name).as_bytes());
-                            }
-                        }
-                        FunctionAction::RestartSelected => {
-                            drop(state);
-                            let mut found_client = false;
-                            let mut error: Option<&str> = None;
-                            for (_, client) in &self.clients {
-                                if client.workspace != ws_index {
-                                    continue;
-                                }
-                                found_client = true;
-                                let selected = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
-                                if selected & SELECTED_META_GROUP_FLAG != 0 {
-                                    let kind = match selected {
-                                        SELECTED_META_GROUP_TESTS => TaskKind::Test,
-                                        SELECTED_META_GROUP_ACTIONS => TaskKind::Action,
-                                        _ => {
-                                            error = Some("invalid meta-group selection");
-                                            break;
-                                        }
-                                    };
-                                    let ws_state = ws.handle.state();
-                                    let jobs = ws_state.jobs_by_kind(kind);
-                                    let Some(&last_ji) = jobs.last() else {
-                                        error = Some("no jobs in selected meta-group");
-                                        break;
-                                    };
-                                    let job = &ws_state[last_ji];
-                                    let bti = job.log_group.base_task_index();
-                                    let params = job.spawn_params.clone();
-                                    let profile = job.spawn_profile.clone();
-                                    drop(ws_state);
-                                    ws.handle.restart_task(bti, params, &profile);
-                                } else {
-                                    let bti = workspace::BaseTaskIndex(selected as u32);
-                                    let ws_state = ws.handle.state();
-                                    let Some(bt) = ws_state.base_tasks.get(bti.idx()) else {
-                                        error = Some("selected task no longer exists");
-                                        break;
-                                    };
-                                    if let Some(&last_ji) = bt.jobs.all().last() {
-                                        let job = &ws_state[last_ji];
-                                        let params = job.spawn_params.clone();
-                                        let profile = job.spawn_profile.clone();
-                                        drop(ws_state);
-                                        ws.handle.restart_task(bti, params, &profile);
-                                    } else {
-                                        drop(ws_state);
-                                        ws.handle.restart_task(bti, ValueMap::new(), "");
-                                    }
-                                }
-                                break;
-                            }
-                            if let Some(err) = error {
-                                let _ = socket.write_all(format!("error: {}\n", err).as_bytes());
-                            } else if !found_client {
-                                let _ = socket.write_all(b"error: no active TUI session\n");
-                            } else {
-                                let _ = socket.write_all(b"ok\n");
-                            }
-                        }
+                if let Some(FunctionAction::RestartCaptured { task_name, profile }) =
+                    state.session_functions.get(&*name).cloned()
+                {
+                    if let Some(index) = state.base_index_by_name(&task_name) {
+                        drop(state);
+                        ws.handle.restart_task(index, ValueMap::new(), &profile);
+                        let _ = socket.write_all(b"ok\n");
+                    } else {
+                        let _ = socket.write_all(format!("error: task '{}' not found\n", task_name).as_bytes());
                     }
                     return;
                 }
@@ -813,6 +752,67 @@ impl ProcessManager {
                         }
                         return;
                     }
+                }
+
+                if let Some(FunctionAction::RestartSelected) = state.session_functions.get(&*name) {
+                    drop(state);
+                    let mut found_client = false;
+                    let mut error: Option<&str> = None;
+                    for (_, client) in &self.clients {
+                        if client.workspace != ws_index {
+                            continue;
+                        }
+                        found_client = true;
+                        let selected = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
+                        if selected & SELECTED_META_GROUP_FLAG != 0 {
+                            let kind = match selected {
+                                SELECTED_META_GROUP_TESTS => TaskKind::Test,
+                                SELECTED_META_GROUP_ACTIONS => TaskKind::Action,
+                                _ => {
+                                    error = Some("invalid meta-group selection");
+                                    break;
+                                }
+                            };
+                            let ws_state = ws.handle.state();
+                            let jobs = ws_state.jobs_by_kind(kind);
+                            let Some(&last_ji) = jobs.last() else {
+                                error = Some("no jobs in selected meta-group");
+                                break;
+                            };
+                            let job = &ws_state[last_ji];
+                            let bti = job.log_group.base_task_index();
+                            let params = job.spawn_params.clone();
+                            let profile = job.spawn_profile.clone();
+                            drop(ws_state);
+                            ws.handle.restart_task(bti, params, &profile);
+                        } else {
+                            let bti = workspace::BaseTaskIndex(selected as u32);
+                            let ws_state = ws.handle.state();
+                            let Some(bt) = ws_state.base_tasks.get(bti.idx()) else {
+                                error = Some("selected task no longer exists");
+                                break;
+                            };
+                            if let Some(&last_ji) = bt.jobs.all().last() {
+                                let job = &ws_state[last_ji];
+                                let params = job.spawn_params.clone();
+                                let profile = job.spawn_profile.clone();
+                                drop(ws_state);
+                                ws.handle.restart_task(bti, params, &profile);
+                            } else {
+                                drop(ws_state);
+                                ws.handle.restart_task(bti, ValueMap::new(), "");
+                            }
+                        }
+                        break;
+                    }
+                    if let Some(err) = error {
+                        let _ = socket.write_all(format!("error: {}\n", err).as_bytes());
+                    } else if !found_client {
+                        let _ = socket.write_all(b"error: no active TUI session\n");
+                    } else {
+                        let _ = socket.write_all(b"ok\n");
+                    }
+                    return;
                 }
 
                 let _ = socket.write_all(format!("error: function '{}' not configured\n", name).as_bytes());

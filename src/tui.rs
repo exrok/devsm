@@ -707,32 +707,15 @@ fn process_key(
 
 fn call_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str) {
     let ws = workspace.state();
-    if let Some(action) = ws.session_functions.get(fn_name) {
-        match action {
-            FunctionAction::RestartCaptured { task_name, profile } => {
-                let task_name = task_name.clone();
-                let profile = profile.clone();
-                if let Some(&bti) = ws.name_map.get(task_name.as_str()) {
-                    drop(ws);
-                    workspace.restart_task(bti, ValueMap::new(), &profile);
-                    tui.status_message = Some(StatusMessage::info(format!("{} restarted {}", fn_name, task_name)));
-                } else {
-                    tui.status_message =
-                        Some(StatusMessage::error(format!("{} task '{}' not found", fn_name, task_name)));
-                }
-            }
-            FunctionAction::RestartSelected => {
-                if let Some(sel) = tui.task_tree.selection_state(&ws) {
-                    if let Some(bti) = sel.base_task {
-                        let task_name = ws.base_tasks[bti.idx()].name;
-                        drop(ws);
-                        workspace.restart_task(bti, ValueMap::new(), "");
-                        tui.status_message = Some(StatusMessage::info(format!("{} restarted {}", fn_name, task_name)));
-                        return;
-                    }
-                }
-                tui.status_message = Some(StatusMessage::error(format!("{} no task selected", fn_name)));
-            }
+    if let Some(FunctionAction::RestartCaptured { task_name, profile }) = ws.session_functions.get(fn_name) {
+        let task_name = task_name.clone();
+        let profile = profile.clone();
+        if let Some(&bti) = ws.name_map.get(task_name.as_str()) {
+            drop(ws);
+            workspace.restart_task(bti, ValueMap::new(), &profile);
+            tui.status_message = Some(StatusMessage::info(format!("{} restarted {}", fn_name, task_name)));
+        } else {
+            tui.status_message = Some(StatusMessage::error(format!("{} task '{}' not found", fn_name, task_name)));
         }
         return;
     }
@@ -777,15 +760,12 @@ fn call_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str) {
         }
     }
 
-    if let Some(sel) = tui.task_tree.selection_state(&ws) {
-        if let Some(bti) = sel.base_task {
-            let task_name = ws.base_tasks[bti.idx()].name;
-            drop(ws);
-            workspace.restart_task(bti, ValueMap::new(), "");
-            tui.status_message = Some(StatusMessage::info(format!("{} restarted {} (default)", fn_name, task_name)));
-            return;
-        }
+    if let Some(FunctionAction::RestartSelected) = ws.session_functions.get(fn_name) {
+        drop(ws);
+        restart_selected_task(tui, workspace);
+        return;
     }
+
     tui.status_message = Some(StatusMessage::error(format!("{} not configured", fn_name)));
 }
 
