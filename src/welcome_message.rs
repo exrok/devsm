@@ -66,7 +66,7 @@ pub fn render_welcome_message(buf: &mut Vec<u8>, rect: Rect, keybinds: &Keybinds
     use WelcomeLine::*;
     use extui::splat;
 
-    let key_str = |cmd: Command| -> Option<String> {
+    let key_str = |cmd: &Command| -> Option<String> {
         keybinds.key_for_command(cmd).map(|k| {
             let s = k.to_string();
             if s == " " { "Space".to_string() } else { s }
@@ -77,41 +77,41 @@ pub fn render_welcome_message(buf: &mut Vec<u8>, rect: Rect, keybinds: &Keybinds
         vec![Section("Welcome to Devsm"), Empty, Text("No jobs have been spawned yet."), Empty];
 
     let mut quick_start: Vec<WelcomeLine> = vec![Section("Quick start:")];
-    if let Some(key) = key_str(Command::LaunchTask) {
+    if let Some(key) = key_str(&Command::LaunchTask) {
         quick_start.push(Binding { key, desc: "Spawn task" });
     }
-    if let Some(key) = key_str(Command::StartGroup) {
+    if let Some(key) = key_str(&Command::StartGroup) {
         quick_start.push(Binding { key, desc: "Group Spawn" });
     }
-    if let Some(key) = key_str(Command::StartSelection) {
+    if let Some(key) = key_str(&Command::StartSelection) {
         quick_start.push(Binding { key, desc: "Start selection" });
     }
-    if let Some(key) = key_str(Command::RestartTask) {
+    if let Some(key) = key_str(&Command::RestartTask) {
         quick_start.push(Binding { key, desc: "Restart selection" });
     }
-    if let Some(key) = key_str(Command::TerminateTask) {
+    if let Some(key) = key_str(&Command::TerminateTask) {
         quick_start.push(Binding { key, desc: "Kill selection" });
     }
 
     let mut log_view: Vec<WelcomeLine> = vec![Section("Log view:")];
-    if let Some(key) = key_str(Command::SearchLogs) {
+    if let Some(key) = key_str(&Command::SearchLogs) {
         log_view.push(Binding { key, desc: "Search logs" });
     }
     if let (Some(key1), Some(key2), Some(key3)) =
-        (key_str(Command::LogModeAll), key_str(Command::LogModeSelected), key_str(Command::LogModeHybrid))
+        (key_str(&Command::LogModeAll), key_str(&Command::LogModeSelected), key_str(&Command::LogModeHybrid))
     {
         log_view.push(Binding3 { key1, key2, key3, desc: "Switch log view mode" });
     }
-    if let Some(key) = key_str(Command::LogScrollUp) {
+    if let Some(key) = key_str(&Command::LogScrollUp) {
         log_view.push(Binding { key, desc: "Scroll logs up" });
     }
-    if let Some(key) = key_str(Command::LogScrollDown) {
+    if let Some(key) = key_str(&Command::LogScrollDown) {
         log_view.push(Binding { key, desc: "Scroll logs down" });
     }
-    if let Some(key) = key_str(Command::JumpToOldestLogs) {
+    if let Some(key) = key_str(&Command::JumpToOldestLogs) {
         log_view.push(Binding { key, desc: "Jump to oldest logs" });
     }
-    if let Some(key) = key_str(Command::JumpToNewestLogs) {
+    if let Some(key) = key_str(&Command::JumpToNewestLogs) {
         log_view.push(Binding { key, desc: "Jump to newest logs" });
     }
 
@@ -122,10 +122,10 @@ pub fn render_welcome_message(buf: &mut Vec<u8>, rect: Rect, keybinds: &Keybinds
     navigation.push(Empty);
     navigation.push(Binding { key: "Mouse Wheel".into(), desc: "Scroll list or logs under cursor" });
     navigation.push(Empty);
-    if let Some(key) = key_str(Command::ToggleHelp) {
+    if let Some(key) = key_str(&Command::ToggleHelp) {
         navigation.push(Binding { key, desc: "Toggle help menu" });
     }
-    if let Some(key) = key_str(Command::Quit) {
+    if let Some(key) = key_str(&Command::Quit) {
         navigation.push(Binding { key, desc: "Quit" });
     }
 

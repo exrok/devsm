@@ -1,5 +1,10 @@
 # The following config is used for validating the json schema.
 
+[function]
+f1 = { kill = "full_basic" }
+f2 = { spawn = [["with_var", { dir = "/tmp/" }], "multline_sh"]}
+f3 = { restart = "full_basic"}
+
 # Minimal action with cmd array
 [action.simple_cmd]
 cmd = ["echo", "hello"]

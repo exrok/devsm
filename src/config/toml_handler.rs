@@ -6,8 +6,9 @@ use toml_spanner::{
 };
 
 use crate::config::{
-    Alias, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, ReadyConfig, ReadyPredicate, ServiceHidden,
-    StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, VarMeta, WorkspaceConfig,
+    Alias, CacheConfig, CacheKeyInput, CommandExpr, FunctionDef, FunctionDefAction, If, Predicate, ReadyConfig,
+    ReadyPredicate, ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr,
+    VarMeta, WorkspaceConfig,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, toml_error_to_diagnostic};
 
@@ -716,6 +717,77 @@ fn parse_task_call<'a>(
     }
 }
 
+fn parse_function_action<'a>(
+    alloc: &'a Bump,
+    func_table: &Table<'a>,
+    func_value: &TomlValue<'a>,
+    re: &mut dyn FnMut(Diagnostic),
+) -> Result<FunctionDefAction<'a>, ()> {
+    if let Some(restart_val) = func_table.get("restart") {
+        let Some(task_name) = restart_val.as_str() else {
+            mismatched_in_object(re, "string", restart_val, "restart");
+            return Err(());
+        };
+        return Ok(FunctionDefAction::Restart { task: alloc.alloc_str(task_name) });
+    }
+
+    if let Some(kill_val) = func_table.get("kill") {
+        let Some(task_name) = kill_val.as_str() else {
+            mismatched_in_object(re, "string", kill_val, "kill");
+            return Err(());
+        };
+        return Ok(FunctionDefAction::Kill { task: alloc.alloc_str(task_name) });
+    }
+
+    if let Some(spawn_val) = func_table.get("spawn") {
+        let tasks = match &spawn_val.value {
+            ValueInner::Array(arr) => {
+                let mut calls = bumpalo::collections::Vec::new_in(alloc);
+                for item in arr {
+                    calls.push(parse_task_call(alloc, item, re)?);
+                }
+                calls.into_bump_slice()
+            }
+            ValueInner::String(_) => {
+                let call = parse_task_call(alloc, spawn_val, re)?;
+                std::slice::from_ref(alloc.alloc(call))
+            }
+            _ => {
+                mismatched_in_object(re, "string or array", spawn_val, "spawn");
+                return Err(());
+            }
+        };
+        return Ok(FunctionDefAction::Spawn { tasks });
+    }
+
+    re(Diagnostic::error()
+        .with_message("function must have 'restart', 'kill', or 'spawn' action")
+        .with_label(DiagnosticLabel::primary(func_value.span.into())));
+    Err(())
+}
+
+fn parse_functions<'a>(
+    alloc: &'a Bump,
+    func_table: &Table<'a>,
+    re: &mut dyn FnMut(Diagnostic),
+) -> Result<&'a [FunctionDef<'a>], ()> {
+    let mut functions = bumpalo::collections::Vec::new_in(alloc);
+
+    for (name, func_value) in func_table.iter() {
+        let name_str = name.name.as_ref();
+
+        let Some(table) = func_value.as_table() else {
+            mismatched_in_object(re, "table", func_value, name_str);
+            return Err(());
+        };
+
+        let action = parse_function_action(alloc, table, func_value, re)?;
+        functions.push(FunctionDef { name: alloc.alloc_str(name_str), action });
+    }
+
+    Ok(functions.into_bump_slice())
+}
+
 pub fn parse<'a>(
     base_path: &'a std::path::Path,
     alloc: &'a Bump,
@@ -803,11 +875,15 @@ pub fn parse<'a>(
         }
     }
 
+    let functions =
+        if let Some(func_table) = table(root, "function", re)? { parse_functions(alloc, func_table, re)? } else { &[] };
+
     Ok(WorkspaceConfig {
         base_path,
         tasks: tasks_vec.into_bump_slice(),
         tests: tests_vec.into_bump_slice(),
         groups: groups_vec.into_bump_slice(),
+        functions,
     })
 }
 

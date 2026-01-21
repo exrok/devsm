@@ -81,6 +81,7 @@ pub enum Command<'a> {
     Test { filters: Vec<TestFilter<'a>> },
     Validate { path: Option<&'a str>, skip_path_checks: bool },
     Get { resource: GetResource },
+    FunctionCall { name: &'a str },
 }
 
 pub enum GetResource {
@@ -266,6 +267,20 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                 "run" => break 'command parse_run(&mut parser)?,
                 "test" => break 'command parse_test_filters(&mut parser)?,
                 "validate" => break 'command parse_validate(&mut parser)?,
+                "function" => {
+                    let Some(Component::Term(subcommand)) = parser.next() else {
+                        bail!("function requires a subcommand (call)");
+                    };
+                    match subcommand {
+                        "call" => {
+                            let Some(Component::Term(fn_name)) = parser.next() else {
+                                bail!("function call requires a function name");
+                            };
+                            break 'command Command::FunctionCall { name: fn_name };
+                        }
+                        _ => bail!("Unknown function subcommand: {}", subcommand),
+                    }
+                }
                 "get" => {
                     let Some(Component::Term(resource)) = parser.next() else {
                         bail!("get requires a resource name");

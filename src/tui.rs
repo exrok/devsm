@@ -7,7 +7,8 @@ use extui::vt::BufferWrite;
 use extui::{Color, DoubleBuffer, Rect, Style, TerminalFlags, vt};
 use jsony_value::ValueMap;
 
-use crate::config::TaskKind;
+use crate::config::{FunctionDefAction, TaskKind};
+use crate::function::{FunctionAction, SetFunctionAction};
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 use crate::log_storage::{BaseTaskSet, LogFilter};
 use crate::process_manager::{Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_TESTS};
@@ -405,7 +406,7 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
         tui.status_message.as_ref().map(|m| (m.text.clone(), m.is_error))
     } else if tui.task_tree_hidden && matches!(tui.overlay, FocusOverlap::None) {
         keybinds
-            .key_for_command(Command::ToggleTaskTree)
+            .key_for_command(&Command::ToggleTaskTree)
             .map(|key| (format!("Press '{}' to show task tree", key), false))
     } else {
         None
@@ -702,8 +703,127 @@ fn process_key(
         Command::RefreshConfig => {
             return ProcessKeyResult::ReloadConfig;
         }
+        Command::CallFunction(fn_name) => {
+            call_function(tui, workspace, &fn_name);
+        }
+        Command::SetFunction { name, action } => {
+            set_function(tui, workspace, &name, action);
+        }
     }
     ProcessKeyResult::Continue
+}
+
+fn call_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str) {
+    let ws = workspace.state();
+    if let Some(action) = ws.session_functions.get(fn_name) {
+        match action {
+            FunctionAction::RestartCaptured { task_name, profile } => {
+                let task_name = task_name.clone();
+                let profile = profile.clone();
+                if let Some(&bti) = ws.name_map.get(task_name.as_str()) {
+                    drop(ws);
+                    workspace.restart_task(bti, ValueMap::new(), &profile);
+                    tui.status_message = Some(StatusMessage::info(format!("{} restarted {}", fn_name, task_name)));
+                } else {
+                    tui.status_message =
+                        Some(StatusMessage::error(format!("{} task '{}' not found", fn_name, task_name)));
+                }
+            }
+            FunctionAction::RestartSelected => {
+                if let Some(sel) = tui.task_tree.selection_state(&ws) {
+                    if let Some(bti) = sel.base_task {
+                        let task_name = ws.base_tasks[bti.idx()].name;
+                        drop(ws);
+                        workspace.restart_task(bti, ValueMap::new(), "");
+                        tui.status_message = Some(StatusMessage::info(format!("{} restarted {}", fn_name, task_name)));
+                        return;
+                    }
+                }
+                tui.status_message = Some(StatusMessage::error(format!("{} no task selected", fn_name)));
+            }
+        }
+        return;
+    }
+
+    for func_def in ws.config.current.functions {
+        if func_def.name == fn_name {
+            match &func_def.action {
+                FunctionDefAction::Restart { task } => {
+                    let task_name = *task;
+                    if let Some(&bti) = ws.name_map.get(task_name) {
+                        drop(ws);
+                        workspace.restart_task(bti, ValueMap::new(), "");
+                        tui.status_message = Some(StatusMessage::info(format!("{} restarted {}", fn_name, task_name)));
+                    } else {
+                        tui.status_message =
+                            Some(StatusMessage::error(format!("{} task '{}' not found", fn_name, task_name)));
+                    }
+                }
+                FunctionDefAction::Kill { task } => {
+                    let task_name = *task;
+                    if let Some(&bti) = ws.name_map.get(task_name) {
+                        drop(ws);
+                        workspace.terminate_tasks(bti);
+                        tui.status_message = Some(StatusMessage::info(format!("{} killed {}", fn_name, task_name)));
+                    } else {
+                        tui.status_message =
+                            Some(StatusMessage::error(format!("{} task '{}' not found", fn_name, task_name)));
+                    }
+                }
+                FunctionDefAction::Spawn { tasks } => {
+                    drop(ws);
+                    for call in *tasks {
+                        if let Some(&bti) = workspace.state().name_map.get(&*call.name) {
+                            let profile = call.profile.unwrap_or("");
+                            workspace.restart_task(bti, call.vars.clone(), profile);
+                        }
+                    }
+                    tui.status_message = Some(StatusMessage::info(format!("{} spawned tasks", fn_name)));
+                }
+            }
+            return;
+        }
+    }
+
+    if let Some(sel) = tui.task_tree.selection_state(&ws) {
+        if let Some(bti) = sel.base_task {
+            let task_name = ws.base_tasks[bti.idx()].name;
+            drop(ws);
+            workspace.restart_task(bti, ValueMap::new(), "");
+            tui.status_message = Some(StatusMessage::info(format!("{} restarted {} (default)", fn_name, task_name)));
+            return;
+        }
+    }
+    tui.status_message = Some(StatusMessage::error(format!("{} not configured", fn_name)));
+}
+
+fn set_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str, action: SetFunctionAction) {
+    match action {
+        SetFunctionAction::RestartCurrentSelection => {
+            let ws = workspace.state();
+            if let Some(sel) = tui.task_tree.selection_state(&ws) {
+                if let Some(bti) = sel.base_task {
+                    let task_name = ws.base_tasks[bti.idx()].name.to_string();
+                    let profile = sel.job.map(|ji| ws[ji].spawn_profile.clone()).unwrap_or_default();
+                    drop(ws);
+                    let mut ws = workspace.state.write().unwrap();
+                    ws.session_functions.insert(
+                        fn_name.to_string(),
+                        FunctionAction::RestartCaptured { task_name: task_name.clone(), profile: profile.clone() },
+                    );
+                    drop(ws);
+                    let msg = if profile.is_empty() {
+                        format!("{} set to restart {}", fn_name, task_name)
+                    } else {
+                        format!("{} set to restart {}:{}", fn_name, task_name, profile)
+                    };
+                    tui.status_message = Some(StatusMessage::info(msg));
+                    return;
+                }
+            }
+            tui.status_message = Some(StatusMessage::error(format!("No task selected for {}", fn_name)));
+        }
+    }
 }
 
 fn pre_truncate(data: &mut Vec<u8>) -> &[u8] {
@@ -786,12 +906,21 @@ pub enum ScrollTarget {
     None,
 }
 
-fn scroll_target(w: u16, h: u16, x: u16, y: u16) -> ScrollTarget {
-    let menu_height = compute_menu_height(h) as i32;
+fn scroll_target(w: u16, h: u16, x: u16, y: u16, show_task_tree: bool) -> ScrollTarget {
+    let menu_height = if show_task_tree { compute_menu_height(h) } else { 1 } as i32;
     let mut dest = Rect { x: 0, y: 0, w, h };
     let mut bot = dest.take_bottom(menu_height);
     let (tl, bl) = dest.v_split(0.5);
     bot.take_top(1);
+    if !show_task_tree {
+        return if tl.contains(x, y) {
+            ScrollTarget::TopLog
+        } else if bl.contains(x, y) {
+            ScrollTarget::BottomLog
+        } else {
+            ScrollTarget::None
+        };
+    }
     let task_tree_rect = bot.take_top(19);
     let (p, mut s) = task_tree_rect.h_split(0.5);
     s.take_left(1);
@@ -1082,7 +1211,9 @@ pub fn run(
                 Event::Mouse(mouse) => {
                     let x = mouse.column;
                     let y = mouse.row;
-                    let target = scroll_target(w, h, x, y);
+                    let has_overlay = !matches!(tui.overlay, FocusOverlap::None);
+                    let show_task_tree = has_overlay || !tui.task_tree_hidden;
+                    let target = scroll_target(w, h, x, y, show_task_tree);
                     match mouse.kind {
                         extui::event::MouseEventKind::ScrollDown => match target {
                             ScrollTarget::TopLog => tui.logs.pending_top_scroll -= 5,

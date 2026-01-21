@@ -1,6 +1,7 @@
 use crate::{
     cli::TestFilter,
     config::{CARGO_AUTO_EXPR, CacheKeyInput, Environment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig},
+    function::FunctionAction,
     log_storage::{LogGroup, LogId, Logs},
     process_manager::MioChannel,
 };
@@ -388,6 +389,9 @@ pub struct WorkspaceState {
     pub action_jobs: JobIndexList,
     pub test_jobs: JobIndexList,
     pub service_jobs: JobIndexList,
+    /// Session-level function overrides (fn1, fn2).
+    /// These are set by keybindings and persist for the daemon's lifetime.
+    pub session_functions: hashbrown::HashMap<String, FunctionAction>,
 }
 
 impl WorkspaceState {
@@ -810,6 +814,10 @@ impl WorkspaceState {
             action_jobs: JobIndexList::default(),
             test_jobs: JobIndexList::default(),
             service_jobs: JobIndexList::default(),
+            session_functions: hashbrown::HashMap::from_iter([
+                ("fn1".to_string(), FunctionAction::RestartSelected),
+                ("fn2".to_string(), FunctionAction::RestartSelected),
+            ]),
         })
     }
 

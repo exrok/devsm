@@ -18,3 +18,7 @@ cache.key = [{ modified = "/tmp/cat" }, { profile_changed = "print_key" }]
 [service.ping]
 cmd = ["ping", { var = "address" }]
 var.address = { description = "IP Address to ping", default = "127.0.0.1" }
+
+[action.ls]
+cmd = ['ls', { if.profile = "verbose", then = "-v" }]
+profiles = ["default", "verbose"]

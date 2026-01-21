@@ -8,6 +8,8 @@ use extui::event::{KeyCode, KeyEvent, KeyModifiers};
 use foldhash::quality::RandomState;
 use hashbrown::HashTable;
 
+use crate::function::SetFunctionAction;
+
 /// Compact representation of a key input event.
 /// Lower 32 bits: key code (char value or special key)
 /// Upper 32 bits: modifiers (CONTROL, ALT, etc.)
@@ -154,7 +156,7 @@ impl FromStr for InputEvent {
 }
 
 /// Commands that can be triggered by keybindings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Quit,
     SelectNext,
@@ -182,6 +184,13 @@ pub enum Command {
     OverlayCancel,
     OverlayConfirm,
     RefreshConfig,
+    /// Call a saved function by name.
+    CallFunction(Box<str>),
+    /// Set a saved function to capture current selection.
+    SetFunction {
+        name: Box<str>,
+        action: SetFunctionAction,
+    },
 }
 
 impl FromStr for Command {
@@ -215,6 +224,8 @@ impl FromStr for Command {
             "OverlayCancel" => Command::OverlayCancel,
             "OverlayConfirm" => Command::OverlayConfirm,
             "RefreshConfig" => Command::RefreshConfig,
+            "CallFunction1" => Command::CallFunction("fn1".into()),
+            "CallFunction2" => Command::CallFunction("fn2".into()),
             _ => return Err(format!("Unknown command: `{s}`")),
         })
     }
@@ -273,7 +284,7 @@ pub struct Keybinds {
 
 impl Keybinds {
     fn table_lookup(&self, table: &BindingTable, input: InputEvent) -> Option<Command> {
-        table.find(hash_input(&self.hasher, input), |(k, _)| *k == input).map(|(_, cmd)| *cmd)
+        table.find(hash_input(&self.hasher, input), |(k, _)| *k == input).map(|(_, cmd)| cmd.clone())
     }
 }
 
@@ -429,25 +440,25 @@ impl Keybinds {
     }
 
     /// Returns an iterator over all bindings in the global mode.
-    pub fn global_bindings(&self) -> impl Iterator<Item = (InputEvent, Command)> + '_ {
-        self.global.iter().map(|(k, v)| (*k, *v))
+    pub fn global_bindings(&self) -> impl Iterator<Item = (InputEvent, &Command)> + '_ {
+        self.global.iter().map(|(k, v)| (*k, v))
     }
 
     /// Returns an iterator over all bindings in a specific mode.
-    pub fn mode_bindings(&self, mode: Mode) -> impl Iterator<Item = (InputEvent, Command)> + '_ {
-        self.table_for_mode(mode).iter().map(|(k, v)| (*k, *v))
+    pub fn mode_bindings(&self, mode: Mode) -> impl Iterator<Item = (InputEvent, &Command)> + '_ {
+        self.table_for_mode(mode).iter().map(|(k, v)| (*k, v))
     }
 
     /// Finds the first key bound to a command in global mode.
     /// When multiple keys are bound to the same command, returns the smallest by Ord for consistency.
-    pub fn key_for_command(&self, command: Command) -> Option<InputEvent> {
-        self.global.iter().filter(|(_, cmd)| *cmd == command).map(|(key, _)| *key).min()
+    pub fn key_for_command(&self, command: &Command) -> Option<InputEvent> {
+        self.global.iter().filter(|(_, cmd)| *cmd == *command).map(|(key, _)| *key).min()
     }
 }
 
 impl Command {
     /// Returns a short display name for the command.
-    pub fn display_name(self) -> &'static str {
+    pub fn display_name(&self) -> &'static str {
         match self {
             Command::Quit => "Quit",
             Command::SelectNext => "Next",
@@ -475,11 +486,17 @@ impl Command {
             Command::OverlayCancel => "Cancel",
             Command::OverlayConfirm => "Confirm",
             Command::RefreshConfig => "Refresh Config",
+            Command::CallFunction(name) if &**name == "fn1" => "Call fn1",
+            Command::CallFunction(name) if &**name == "fn2" => "Call fn2",
+            Command::CallFunction(_) => "Call Function",
+            Command::SetFunction { name, .. } if &**name == "fn1" => "Set fn1",
+            Command::SetFunction { name, .. } if &**name == "fn2" => "Set fn2",
+            Command::SetFunction { .. } => "Set Function",
         }
     }
 
     /// Returns the config name for the command (used in TOML config files).
-    pub fn config_name(self) -> &'static str {
+    pub fn config_name(&self) -> &'static str {
         match self {
             Command::Quit => "Quit",
             Command::SelectNext => "SelectNext",
@@ -507,6 +524,10 @@ impl Command {
             Command::OverlayCancel => "OverlayCancel",
             Command::OverlayConfirm => "OverlayConfirm",
             Command::RefreshConfig => "RefreshConfig",
+            Command::CallFunction(name) if &**name == "fn1" => "CallFunction1",
+            Command::CallFunction(name) if &**name == "fn2" => "CallFunction2",
+            Command::CallFunction(_) => "CallFunction",
+            Command::SetFunction { .. } => "SetFunction",
         }
     }
 }
@@ -560,15 +581,15 @@ mod tests {
     fn key_for_command_reverse_lookup() {
         let keybinds = Keybinds::default();
 
-        let key = keybinds.key_for_command(Command::LogScrollUp);
+        let key = keybinds.key_for_command(&Command::LogScrollUp);
         assert!(key.is_some(), "LogScrollUp should have a binding");
         assert_eq!(key.unwrap().to_string(), "C-k");
 
-        let key = keybinds.key_for_command(Command::LogScrollDown);
+        let key = keybinds.key_for_command(&Command::LogScrollDown);
         assert!(key.is_some(), "LogScrollDown should have a binding");
         assert_eq!(key.unwrap().to_string(), "C-j");
 
-        let key = keybinds.key_for_command(Command::LaunchTask);
+        let key = keybinds.key_for_command(&Command::LaunchTask);
         assert!(key.is_some(), "LaunchTask should have a binding");
         assert_eq!(key.unwrap().to_string(), "s");
     }

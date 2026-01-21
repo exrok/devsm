@@ -2,6 +2,7 @@ use extui::{Color, DoubleBuffer, HAlign, Rect};
 
 use crate::{
     config::{Command, ServiceHidden, TaskKind},
+    function::FunctionAction,
     tui::constrain_scroll_offset,
     workspace::{BaseTaskIndex, JobIndex, JobStatus, WorkspaceState},
 };
@@ -526,7 +527,10 @@ impl TaskTreeState {
                         })
                         .text(out, status.padded_text());
 
-                    line.with(if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() })
+                    let fn_indicator = get_bound_function(ws, task_id);
+
+                    let rem = line
+                        .with(if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() })
                         .fill(out)
                         .skip(1)
                         .fmt(
@@ -537,7 +541,17 @@ impl TaskTreeState {
                                 task.jobs.running().len(),
                                 task.jobs.scheduled().len()
                             ),
-                        );
+                        )
+                        .with(HAlign::Right);
+
+                    if let Some(fn_name) = fn_indicator {
+                        rem.with(if is_selected {
+                            status.dark_bg().with_fg(Color::Black)
+                        } else {
+                            status.dark_bg().with_bg(Color::Grey[4])
+                        })
+                        .fmt(out, format_args!(" {} ", fn_name));
+                    }
                 }
                 PrimaryEntry::MetaGroup(kind) => {
                     let status = self.meta_group_status(ws, kind);
@@ -632,4 +646,16 @@ impl TaskTreeState {
             };
         }
     }
+}
+
+fn get_bound_function<'a>(ws: &'a WorkspaceState, bti: BaseTaskIndex) -> Option<&'a str> {
+    let task_name = ws.base_tasks[bti.idx()].name;
+    for (fn_name, action) in &ws.session_functions {
+        if let FunctionAction::RestartCaptured { task_name: captured, .. } = action {
+            if captured == task_name {
+                return Some(fn_name);
+            }
+        }
+    }
+    None
 }

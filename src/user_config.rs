@@ -2,6 +2,7 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, render_diagnostic, toml_error_to_diagnostic};
+use crate::function::SetFunctionAction;
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 
 /// User configuration loaded from ~/.config/devsm.user.toml
@@ -111,6 +112,56 @@ pub fn reload_user_config() -> Result<UserConfig, String> {
     parse_user_config_for_daemon(&content, &file_name)
 }
 
+fn parse_table_binding(
+    table: &toml_spanner::value::Table<'_>,
+    span: std::ops::Range<usize>,
+    file_name: &str,
+    content: &str,
+) -> Result<Option<Command>, String> {
+    for (key, value) in table.iter() {
+        let key_name = key.name.as_ref();
+
+        if key_name == "set_function" {
+            let Some(inner_table) = value.as_table() else {
+                let diagnostic = Diagnostic::error()
+                    .with_message("set_function must be a table like {set_function.fn1 = \"...\"}")
+                    .with_label(DiagnosticLabel::primary(span));
+                return Err(render_diagnostic(file_name, content, &diagnostic));
+            };
+
+            for (fn_key, action_value) in inner_table.iter() {
+                let fn_name = fn_key.name.as_ref();
+
+                let Some(action_str) = action_value.as_str() else {
+                    let diagnostic = Diagnostic::error()
+                        .with_message("set_function action must be a string")
+                        .with_label(DiagnosticLabel::primary(span));
+                    return Err(render_diagnostic(file_name, content, &diagnostic));
+                };
+
+                let action = match action_str {
+                    "RestartCurrentSelection" => SetFunctionAction::RestartCurrentSelection,
+                    _ => {
+                        let diagnostic = Diagnostic::error()
+                            .with_message(format!("unknown set_function action: '{}'", action_str))
+                            .with_label(DiagnosticLabel::primary(span))
+                            .with_note("valid actions: RestartCurrentSelection");
+                        return Err(render_diagnostic(file_name, content, &diagnostic));
+                    }
+                };
+
+                return Ok(Some(Command::SetFunction { name: fn_name.into(), action }));
+            }
+        }
+    }
+
+    let diagnostic = Diagnostic::error()
+        .with_message("unrecognized table binding")
+        .with_label(DiagnosticLabel::primary(span))
+        .with_note("expected {set_function.<name> = \"...\"}");
+    Err(render_diagnostic(file_name, content, &diagnostic))
+}
+
 fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserConfig, String> {
     let toml = toml_spanner::parse(content).map_err(|e| {
         let diagnostic = toml_error_to_diagnostic(&e);
@@ -173,7 +224,7 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                     } else {
                         let span: std::ops::Range<usize> = cmd_value.span.into();
                         let diagnostic = Diagnostic::error()
-                            .with_message("expected command string or nan to unbind")
+                            .with_message("expected command string, table, or nan to unbind")
                             .with_label(DiagnosticLabel::primary(span));
                         return Err(render_diagnostic(file_name, content, &diagnostic));
                     }
@@ -184,10 +235,12 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                         render_diagnostic(file_name, content, &diagnostic)
                     })?;
                     Some(cmd)
+                } else if let Some(cmd_table) = cmd_value.as_table() {
+                    parse_table_binding(cmd_table, cmd_value.span.into(), file_name, content)?
                 } else {
                     let span: std::ops::Range<usize> = cmd_value.span.into();
                     let diagnostic = Diagnostic::error()
-                        .with_message("expected command string or nan to unbind")
+                        .with_message("expected command string, table, or nan to unbind")
                         .with_label(DiagnosticLabel::primary(span));
                     return Err(render_diagnostic(file_name, content, &diagnostic));
                 };

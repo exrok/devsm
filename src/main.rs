@@ -18,6 +18,7 @@ mod collection;
 mod config;
 pub mod daemon;
 mod diagnostic;
+mod function;
 mod keybinds;
 mod line_width;
 mod log_fowarder_ui;
@@ -149,6 +150,12 @@ fn main() {
                 print!("{}", user_config::default_user_config_toml());
             }
         },
+        cli::Command::FunctionCall { name } => {
+            if let Err(err) = workspace_command(WorkspaceCommand::CallFunction { name: name.into() }) {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
+        }
     }
 }
 

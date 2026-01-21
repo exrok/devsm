@@ -36,6 +36,13 @@
           "$ref": "#/definitions/taskCall"
         }
       }
+    },
+    "function": {
+      "type": "object",
+      "description": "Custom functions that can be bound to keys",
+      "additionalProperties": {
+        "$ref": "#/definitions/functionDef"
+      }
     }
   },
   "definitions": {
@@ -502,6 +509,40 @@
             "$ref": "#/definitions/test"
           }
         }
+      ]
+    },
+    "functionDef": {
+      "type": "object",
+      "description": "Function definition with exactly one action: restart, kill, or spawn",
+      "additionalProperties": false,
+      "properties": {
+        "restart": {
+          "type": "string",
+          "description": "Task name to restart"
+        },
+        "kill": {
+          "type": "string",
+          "description": "Task name to kill"
+        },
+        "spawn": {
+          "description": "Task(s) to spawn - single task call or array of task calls",
+          "oneOf": [
+            {
+              "$ref": "#/definitions/taskCall"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/taskCall"
+              }
+            }
+          ]
+        }
+      },
+      "oneOf": [
+        { "required": [ "restart" ] },
+        { "required": [ "kill" ] },
+        { "required": [ "spawn" ] }
       ]
     }
   }

@@ -1,3 +1,7 @@
+
+[function]
+fn1 = { restart = "devsm-in-tmux" }
+
 [service.devsm]
 pwd = "tests/workspace"
 cmd = ["cargo", "run", "--", "server"]
@@ -10,7 +14,7 @@ cache.never = true
 [action.devsm-in-tmux]
 pwd = "tests/workspace"
 sh = """
-tmux send-keys -t devsm-tester:0 "env DEVSM_SOCKET=/tmp/.devsm.test.socket DEVSM_NO_AUTO_SPAWN=1 cargo run" "ENTER"
+tmux send-keys -t devsm-tester:0 "env DEVSM_SOCKET=/tmp/.devsm.test.socket DEVSM_NO_AUTO_SPAWN=1 cargo run" "ENTER" || exit 1
 """
 require = ["devsm"]
 

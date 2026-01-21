@@ -100,6 +100,24 @@ pub struct ReadyConfig<'a> {
     pub when: ReadyPredicate<'a>,
     pub timeout: Option<f64>,
 }
+
+/// Action that a saved function performs.
+#[derive(Debug, Clone)]
+pub enum FunctionDefAction<'a> {
+    /// Restart a specific task.
+    Restart { task: &'a str },
+    /// Spawn one or more tasks (same syntax as groups).
+    Spawn { tasks: &'a [TaskCall<'a>] },
+    /// Kill a specific task.
+    Kill { task: &'a str },
+}
+
+/// Definition of a saved function from workspace config.
+#[derive(Debug, Clone)]
+pub struct FunctionDef<'a> {
+    pub name: &'a str,
+    pub action: FunctionDefAction<'a>,
+}
 #[derive(Clone)]
 pub struct TaskConfigRc(Arc<(TaskConfig<'static>, Bump)>);
 unsafe impl Send for TaskConfigRc {}
@@ -230,6 +248,8 @@ pub struct WorkspaceConfig<'a> {
     /// Single tests `[test.name]` have one variant, arrays `[[test.name]]` have multiple.
     pub tests: &'a [(&'a str, &'a [TestConfigExpr<'a>])],
     pub groups: &'a [(&'a str, &'a [TaskCall<'a>])],
+    /// Saved function definitions (fn1, fn2).
+    pub functions: &'a [FunctionDef<'a>],
 }
 
 #[derive(Debug, Clone)]
