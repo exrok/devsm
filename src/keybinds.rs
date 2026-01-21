@@ -471,10 +471,20 @@ impl Keybinds {
         self.table_for_mode(mode).iter().map(|(k, v)| (*k, v))
     }
 
-    /// Finds the first key bound to a command in global mode.
+    /// Finds the first key bound to a command across all modes.
     /// When multiple keys are bound to the same command, returns the smallest by Ord for consistency.
     pub fn key_for_command(&self, command: &Command) -> Option<InputEvent> {
-        self.global.iter().filter(|(_, cmd)| *cmd == *command).map(|(key, _)| *key).min()
+        self.global
+            .iter()
+            .chain(self.task_tree.iter())
+            .chain(self.pager.iter())
+            .chain(self.input.iter())
+            .chain(self.select_search.iter())
+            .chain(self.log_search.iter())
+            .chain(self.task_launcher.iter())
+            .filter(|(_, cmd)| *cmd == *command)
+            .map(|(key, _)| *key)
+            .min()
     }
 }
 

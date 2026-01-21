@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use extui::event::{Event, KeyEvent};
 use extui::vt::BufferWrite;
-use extui::{Color, DoubleBuffer, Rect, Style, TerminalFlags, vt};
+use extui::{Color, DoubleBuffer, HAlign, Rect, Style, TerminalFlags, vt};
 use jsony_value::ValueMap;
 
 use crate::config::{FunctionDefAction, TaskKind};
@@ -118,7 +118,7 @@ impl StatusMessage {
     }
 
     fn is_visible(&self) -> bool {
-        let duration = if self.is_error { Duration::from_secs(5) } else { Duration::from_secs(2) };
+        let duration = if self.is_error { Duration::from_millis(800) } else { Duration::from_millis(600) };
         self.created_at.elapsed() < duration
     }
 }
@@ -295,53 +295,45 @@ struct StatusBarData {
     status_message: Option<(String, bool)>,
 }
 
-fn render_status_bar(frame: &mut DoubleBuffer, mut rect: Rect, data: &StatusBarData) {
+fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData) {
     rect.with(Color::Grey[4].with_fg(Color::Grey[4])).fill(frame);
 
-    let mode_text = format!(" {} ", data.mode_name);
-    rect.take_left(mode_text.len() as i32).with(data.mode_bg.with_fg(Color::Black)).text(frame, &mode_text);
+    let mode_text = format_args!(" {} ", data.mode_name);
+    let mut r = rect.with(data.mode_bg.with_fg(Color::Black)).fmt(frame, mode_text);
 
     if !data.selection_text.is_empty() {
-        rect.take_left(data.selection_text.len() as i32)
-            .with(Color::Grey[8].with_fg(Color::Grey[25]))
-            .text(frame, &data.selection_text);
+        r = r.with(Color::Grey[8].with_fg(Color::Grey[25])).text(frame, &data.selection_text);
     }
 
     if let Some((selected, total)) = data.search_info {
-        let match_text = format!(" {}/{} ", selected + 1, total);
-        rect.take_left(match_text.len() as i32).with(Color::Grey[6].with_fg(Color::Grey[20])).text(frame, &match_text);
+        let match_text = format_args!(" {}/{} ", selected + 1, total);
+        r = r.with(Color::Grey[6].with_fg(Color::Grey[20])).fmt(frame, match_text);
     }
 
     if data.is_scrolled {
         let scroll_text = " SCROLL ";
-        rect.take_left(scroll_text.len() as i32).with(Color(215).with_fg(Color::Black)).text(frame, scroll_text);
+        r = r.with(Color(215).with_fg(Color::Black)).text(frame, scroll_text);
     }
+
+    r = r.with(HAlign::Right);
+
+    let view_mode = if data.is_collapsed { "C" } else { "E" };
+    r = r.with(Color::Grey[8].with_fg(Color::Grey[25])).fmt(frame, format_args!(" {} {} ", data.log_mode, view_mode));
+
+    let block_style = if data.running > 0 {
+        Color::DarkOliveGreen.with_fg(Color::Black)
+    } else if data.scheduled > 0 {
+        Color::Violet.with_fg(Color::Black)
+    } else {
+        Color::Grey[6].with_fg(Color::Grey[20])
+    };
+    r = r.with(block_style).fmt(frame, format_args!(" R:{} S:{} ", data.running, data.scheduled));
 
     if let Some((text, is_error)) = &data.status_message {
         let msg_text = format!(" {} ", text);
-        let fg_color = if *is_error { Color(218) } else { Color::Grey[14] };
-        rect.take_left(msg_text.len() as i32).with(Color::Grey[4].with_fg(fg_color)).text(frame, &msg_text);
+        let fg_color = if *is_error { Color::Salmon } else { Color::Grey[14] };
+        r.with(Color::Grey[4].with_fg(fg_color)).text(frame, &msg_text);
     }
-
-    let view_mode = if data.is_collapsed { "C" } else { "E" };
-    let right_text = format!(" R:{} S:{} ", data.running, data.scheduled);
-    let view_text = format!(" {} {} ", data.log_mode, view_mode);
-
-    let right_width = right_text.len() + view_text.len();
-    let gap_width = rect.w as usize - right_width.min(rect.w as usize);
-    rect.take_left(gap_width as i32);
-
-    if data.running > 0 {
-        rect.take_left(right_text.len() as i32)
-            .with(Color::DarkOliveGreen.with_fg(Color::Black))
-            .text(frame, &right_text);
-    } else if data.scheduled > 0 {
-        rect.take_left(right_text.len() as i32).with(Color::Violet.with_fg(Color::Black)).text(frame, &right_text);
-    } else {
-        rect.take_left(right_text.len() as i32).with(Color::Grey[6].with_fg(Color::Grey[20])).text(frame, &right_text);
-    }
-
-    rect.take_left(view_text.len() as i32).with(Color::Grey[8].with_fg(Color::Grey[25])).text(frame, &view_text);
 }
 
 fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybinds) -> StatusBarData {
