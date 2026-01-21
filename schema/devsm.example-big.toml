@@ -29,6 +29,22 @@ managed = false
 cmd = ["ls", { var = "dir" }]
 managed = true
 
+# Action with variable metadata - description only
+[action.var_with_description]
+cmd = ["curl", { var = "url" }]
+var.url = { description = "The URL to fetch" }
+
+# Action with variable metadata - default only
+[action.var_with_default]
+cmd = ["ping", "-c", "3", { var = "host" }]
+var.host = { default = "127.0.0.1" }
+
+# Action with variable metadata - description and default
+[action.var_with_both]
+cmd = ["grep", { var = "pattern" }, { var = "file" }]
+var.pattern = { description = "Search pattern (regex supported)", default = "TODO" }
+var.file = { description = "File to search", default = "." }
+
 # Action using conditional in cmd
 [action.with_conditional]
 cmd = ["cargo", "build", { if.profile = "release", then = "--release" }]
@@ -223,6 +239,12 @@ profiles = ["dev", "production"]
 cmd = ["node", { if.profile = "watch", then = "--watch" }, "server.js"]
 profiles = ["default", "watch"]
 
+# Service with variable metadata
+[service.service_with_var_meta]
+cmd = ["./server", "--port", { var = "port" }, "--host", { var = "host" }]
+var.port = { description = "Port to listen on", default = "8080" }
+var.host = { description = "Host address to bind", default = "0.0.0.0" }
+
 # Service with require (dependencies must be active/running)
 [service.service_with_require]
 cmd = ["./api-server"]
@@ -289,6 +311,12 @@ cmd = ["./run-tests.sh"]
 env.TEST_DATABASE = "postgres://localhost/test"
 env.CI = "true"
 env.LOG_LEVEL = { var = "log_level" }
+
+# Test with variable metadata
+[test.test_with_var_meta]
+cmd = ["cargo", "test", "--", { var = "filter" }]
+var.filter = { description = "Test name filter pattern", default = "" }
+tag = "unit"
 
 # Test with require
 [test.test_with_require]

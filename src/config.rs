@@ -40,6 +40,12 @@ pub struct TaskCall<'a> {
 /// Empty slice of task calls, used as default for require field.
 pub static EMPTY_TASK_CALLS: &[TaskCall<'static>] = &[];
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VarMeta<'a> {
+    pub description: Option<&'a str>,
+    pub default: Option<&'a str>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Jsony)]
 #[jsony(rename_all = "snake_case")]
 pub enum TaskKind {
@@ -254,6 +260,8 @@ pub struct TaskConfigExpr<'a> {
     /// Controls when this service is visible in the task list.
     /// Only meaningful for services; ignored for actions and tests.
     pub hidden: ServiceHidden,
+    /// Variable metadata (description, default) for variables used in this task.
+    pub vars: &'a [(&'a str, VarMeta<'a>)],
 }
 
 /// Test configuration expression (parsed form, not yet evaluated).
@@ -266,6 +274,8 @@ pub struct TestConfigExpr<'a> {
     pub require: &'a [TaskCall<'a>],
     pub tags: &'a [&'a str],
     pub cache: Option<CacheConfig<'a>>,
+    /// Variable metadata (description, default) for variables used in this test.
+    pub vars: &'a [(&'a str, VarMeta<'a>)],
 }
 
 impl TestConfigExpr<'static> {
@@ -286,6 +296,7 @@ impl TestConfigExpr<'static> {
             tags: self.tags,
             managed: None,
             hidden: ServiceHidden::Never,
+            vars: self.vars,
         }))
     }
 }
@@ -307,12 +318,18 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         tags: &[],
         managed: None,
         hidden: ServiceHidden::Never,
+        vars: &[],
     }
 };
 
 pub struct Environment<'a> {
     pub profile: &'a str,
     pub param: jsony_value::ValueMap<'a>,
+    pub vars: &'a [(&'a str, VarMeta<'a>)],
+}
+
+fn get_var_default<'a>(vars: &[(&str, VarMeta<'a>)], name: &str) -> Option<&'a str> {
+    vars.iter().find(|(n, _)| *n == name).and_then(|(_, meta)| meta.default)
 }
 
 #[derive(Debug)]
@@ -380,7 +397,7 @@ impl<'a> BumpEval<'a> for StringExpr<'static> {
             StringExpr::Literal(s) => Ok(*s),
             StringExpr::Var(var_name) => match env.param[*var_name].as_ref() {
                 ValueRef::String(value_string) | ValueRef::Other(value_string) => Ok(bump.alloc_str(value_string)),
-                _ => Err(EvalError::Todo),
+                _ => get_var_default(env.vars, var_name).map(|s| bump.alloc_str(s) as &str).ok_or(EvalError::Todo),
             },
             StringExpr::If(if_expr) => Ok(if_expr.bump_eval(env, bump)?),
         }
@@ -445,7 +462,14 @@ fn eval_append_str<'a>(
                 eval_append_str(item, env, bump, target);
             }
         }
-        Expr::Var(key) => append_value(&env.param[key], bump, target).unwrap(),
+        Expr::Var(key) => match env.param[key].as_ref() {
+            ValueRef::Null(_) => {
+                if let Some(default) = get_var_default(env.vars, key) {
+                    target.push(bump.alloc_str(default));
+                }
+            }
+            _ => append_value(&env.param[key], bump, target).unwrap(),
+        },
         Expr::If(branch) => {
             if branch.cond.eval(env) {
                 eval_append_str(&branch.then, env, bump, target);
@@ -647,6 +671,7 @@ mod tests {
             tags: &[],
             managed: None,
             hidden: ServiceHidden::Never,
+            vars: &[],
         };
         let vars = TEST_EXPR.collect_variables();
         assert_eq!(vars.iter().filter(|&&v| v == "dup").count(), 1, "dup should appear once");
@@ -673,6 +698,7 @@ mod tests {
             tags: &[],
             managed: None,
             hidden: ServiceHidden::Never,
+            vars: &[],
         };
         let vars = TEST_EXPR.collect_variables();
         assert!(vars.contains(&"then_var"), "should find then_var: {:?}", vars);

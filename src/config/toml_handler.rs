@@ -7,7 +7,7 @@ use toml_spanner::{
 
 use crate::config::{
     Alias, CacheConfig, CacheKeyInput, CommandExpr, If, Predicate, ReadyConfig, ReadyPredicate, ServiceHidden,
-    StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, WorkspaceConfig,
+    StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, VarMeta, WorkspaceConfig,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, toml_error_to_diagnostic};
 
@@ -88,6 +88,47 @@ fn parse_string_expr<'a>(
     }
 }
 
+fn parse_var_meta<'a>(
+    alloc: &'a Bump,
+    value: &TomlValue<'a>,
+    re: &mut dyn FnMut(Diagnostic),
+) -> Result<VarMeta<'a>, ()> {
+    let Some(table) = value.as_table() else {
+        mismatched_in_object(re, "table", value, "var");
+        return Err(());
+    };
+
+    let mut description = None;
+    let mut default = None;
+
+    for (key, val) in table.iter() {
+        match key.name.as_ref() {
+            "description" => {
+                let Some(s) = val.as_str() else {
+                    mismatched_in_object(re, "string", val, "description");
+                    return Err(());
+                };
+                description = Some(alloc.alloc_str(s) as &str);
+            }
+            "default" => {
+                let Some(s) = val.as_str() else {
+                    mismatched_in_object(re, "string", val, "default");
+                    return Err(());
+                };
+                default = Some(alloc.alloc_str(s) as &str);
+            }
+            unknown => {
+                re(Diagnostic::error()
+                    .with_message(format!("unknown key `{}` in var definition", unknown))
+                    .with_label(DiagnosticLabel::primary(val.span.into())));
+                return Err(());
+            }
+        }
+    }
+
+    Ok(VarMeta { description, default })
+}
+
 fn parse_string_list_expr<'a>(
     alloc: &'a Bump,
     value: &TomlValue<'a>,
@@ -162,6 +203,7 @@ fn parse_task<'a>(
     let mut sh: Option<StringExpr> = None;
     let mut managed: Option<bool> = None;
     let mut hidden = ServiceHidden::Never;
+    let mut vars_vec = bumpalo::collections::Vec::new_in(alloc);
 
     for (key, value) in task_table.iter() {
         let key_str = key.name.as_ref();
@@ -365,6 +407,17 @@ fn parse_task<'a>(
                     }
                 };
             }
+            "var" => {
+                let Some(var_table) = value.as_table() else {
+                    mismatched_in_object(re, "table", value, "var");
+                    return Err(());
+                };
+                for (var_key, var_value) in var_table.iter() {
+                    let var_name = alloc.alloc_str(var_key.name.as_ref()) as &str;
+                    let meta = parse_var_meta(alloc, var_value, re)?;
+                    vars_vec.push((var_name, meta));
+                }
+            }
             _ => {
                 re(Diagnostic::error()
                     .with_message(format!("unknown key `{}` in task definition", key_str))
@@ -404,6 +457,7 @@ fn parse_task<'a>(
         tags: &[],
         managed,
         hidden,
+        vars: vars_vec.into_bump_slice(),
     })
 }
 
@@ -473,6 +527,7 @@ fn parse_test<'a>(
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
+    let mut vars_vec = bumpalo::collections::Vec::new_in(alloc);
 
     for (key, value) in test_table.iter() {
         let key_str = key.name.as_ref();
@@ -541,6 +596,17 @@ fn parse_test<'a>(
                 };
                 info = alloc.alloc_str(s);
             }
+            "var" => {
+                let Some(var_table) = value.as_table() else {
+                    mismatched_in_object(re, "table", value, "var");
+                    return Err(());
+                };
+                for (var_key, var_value) in var_table.iter() {
+                    let var_name = alloc.alloc_str(var_key.name.as_ref()) as &str;
+                    let meta = parse_var_meta(alloc, var_value, re)?;
+                    vars_vec.push((var_name, meta));
+                }
+            }
             _ => {
                 re(Diagnostic::error()
                     .with_message(format!("unknown key `{}` in test definition", key_str))
@@ -575,6 +641,7 @@ fn parse_test<'a>(
         require,
         tags: tags_vec.into_bump_slice(),
         cache,
+        vars: vars_vec.into_bump_slice(),
     })
 }
 

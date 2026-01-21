@@ -9,9 +9,7 @@ use jsony_value::ValueMap;
 use crate::config::TaskKind;
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 use crate::log_storage::{BaseTaskSet, LogFilter};
-use crate::process_manager::{
-    Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_TESTS,
-};
+use crate::process_manager::{Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_TESTS};
 use crate::tui::log_search::{LogSearchState, SearchAction};
 use crate::tui::log_stack::LogStack;
 use crate::tui::select_search::SelectSearch;

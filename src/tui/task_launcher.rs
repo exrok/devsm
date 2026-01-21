@@ -12,7 +12,7 @@ use jsony_value::ValueMap;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
-    config::TaskKind,
+    config::{TaskKind, VarMeta},
     keybinds::{Command, InputEvent, Keybinds, Mode},
     searcher::{Entry, FatSearch},
     tui::constrain_scroll_offset,
@@ -62,6 +62,7 @@ pub struct TaskLauncherState {
     tasks: Vec<TaskInfo>,
     available_profiles: &'static [&'static str],
     available_variables: Vec<&'static str>,
+    available_var_meta: &'static [(&'static str, VarMeta<'static>)],
 }
 
 impl TaskLauncherState {
@@ -103,6 +104,7 @@ impl TaskLauncherState {
             tasks,
             available_profiles: &[],
             available_variables: Vec::new(),
+            available_var_meta: &[],
         }
     }
 
@@ -148,6 +150,7 @@ impl TaskLauncherState {
             tasks,
             available_profiles: profiles,
             available_variables: variables,
+            available_var_meta: bt.config.vars,
         }
     }
 
@@ -206,10 +209,9 @@ impl TaskLauncherState {
     }
 
     fn rebuild_variable_searcher(&mut self) {
-        let assigned: Vec<_> = self.completed_vars.iter().map(|(n, _)| *n).collect();
         self.searcher = FatSearch::default();
         for var in &self.available_variables {
-            if !assigned.contains(var) {
+            if !self.completed_vars.iter().any(|(n, _)| n == var) {
                 self.searcher.insert(var);
             }
         }
@@ -229,11 +231,17 @@ impl TaskLauncherState {
         let config = &ws.base_tasks[task.bti.idx()].config;
         self.available_profiles = config.profiles;
         self.available_variables = config.collect_variables();
+        self.available_var_meta = config.vars;
     }
 
     fn switch_to_profile_mode(&mut self) {
-        self.mode = LauncherMode::Profile;
-        self.rebuild_profile_searcher();
+        if self.available_profiles.len() == 1 {
+            self.confirmed_profile = Some(self.available_profiles[0]);
+            self.switch_to_variable_mode();
+        } else {
+            self.mode = LauncherMode::Profile;
+            self.rebuild_profile_searcher();
+        }
     }
 
     fn accept_profile_autocomplete(&mut self) {
@@ -260,15 +268,13 @@ impl TaskLauncherState {
     }
 
     fn accept_variable_autocomplete(&mut self) {
-        let var_name = if let Some(entry) = self.results.get(self.selected) {
-            let assigned: Vec<_> = self.completed_vars.iter().map(|(n, _)| *n).collect();
-            let unassigned: Vec<_> = self.available_variables.iter().filter(|v| !assigned.contains(v)).collect();
-            unassigned.get(entry.index()).copied().copied()
-        } else {
-            None
-        };
-
-        self.current_var_name = var_name;
+        self.current_var_name = self.results.get(self.selected).and_then(|entry| {
+            self.available_variables
+                .iter()
+                .filter(|v| !self.completed_vars.iter().any(|(n, _)| n == *v))
+                .nth(entry.index())
+                .copied()
+        });
         self.input.clear();
         self.cursor = 0;
     }
@@ -287,6 +293,14 @@ impl TaskLauncherState {
         let mut params = ValueMap::new();
         for (name, value) in &self.completed_vars {
             params.insert((*name).to_string().into(), value.clone().into());
+        }
+
+        for (name, meta) in self.available_var_meta {
+            if !params.entries().iter().any(|(k, _)| k.as_ref() as &str == *name) {
+                if let Some(default) = meta.default {
+                    params.insert((*name).to_string().into(), default.to_string().into());
+                }
+            }
         }
 
         Some(LauncherAction::Start { base_task, profile, params })
@@ -521,11 +535,25 @@ impl TaskLauncherState {
                     entry_rect.with(style).text(out, task_name).text(out, ":").text(out, profile);
                 }
                 LauncherMode::Variable => {
-                    let assigned: Vec<_> = self.completed_vars.iter().map(|(n, _)| *n).collect();
-                    let unassigned: Vec<_> =
-                        self.available_variables.iter().filter(|v| !assigned.contains(v)).collect();
-                    let var = unassigned.get(entry.index()).copied().copied().unwrap_or("");
-                    entry_rect.with(style).text(out, var);
+                    let substyle =
+                        if is_selected { Color::Grey[5].with_bg(Color(153)) } else { Color::Grey[14].as_fg() };
+                    let Some(&var) = self
+                        .available_variables
+                        .iter()
+                        .filter(|v| !self.completed_vars.iter().any(|(n, _)| n == *v))
+                        .nth(entry.index())
+                    else {
+                        return;
+                    };
+                    let mut r = entry_rect.with(style).text(out, var);
+                    if let Some((_, meta)) = self.available_var_meta.iter().find(|(n, _)| *n == var) {
+                        if let Some(desc) = meta.description {
+                            r = r.with(substyle).text(out, " - ").text(out, desc);
+                        }
+                        if let Some(default) = meta.default {
+                            r.with(substyle).text(out, " (default: ").text(out, default).text(out, ")");
+                        }
+                    }
                 }
                 LauncherMode::Value => {}
             }
@@ -586,6 +614,7 @@ mod tests {
             tasks: Vec::new(),
             available_profiles: &[],
             available_variables: Vec::new(),
+            available_var_meta: &[],
         };
         assert_eq!(state.build_display_prefix(), "");
     }
@@ -607,6 +636,7 @@ mod tests {
             tasks: Vec::new(),
             available_profiles: &[],
             available_variables: Vec::new(),
+            available_var_meta: &[],
         };
         assert_eq!(state.build_display_prefix(), "my_task:");
     }
@@ -628,6 +658,7 @@ mod tests {
             tasks: Vec::new(),
             available_profiles: &[],
             available_variables: Vec::new(),
+            available_var_meta: &[],
         };
         assert_eq!(state.build_display_prefix(), "my_task:release ");
     }
@@ -649,6 +680,7 @@ mod tests {
             tasks: Vec::new(),
             available_profiles: &[],
             available_variables: Vec::new(),
+            available_var_meta: &[],
         };
         assert_eq!(state.build_display_prefix(), "my_task:default foo=bar ");
     }
@@ -670,6 +702,7 @@ mod tests {
             tasks: Vec::new(),
             available_profiles: &[],
             available_variables: Vec::new(),
+            available_var_meta: &[],
         };
         assert_eq!(state.build_display_prefix(), "my_task:default message=");
     }
@@ -691,6 +724,7 @@ mod tests {
             tasks: Vec::new(),
             available_profiles: &["default", "release"],
             available_variables: vec!["foo", "bar"],
+            available_var_meta: &[],
         };
 
         assert_eq!(state.mode(), LauncherMode::TaskName);

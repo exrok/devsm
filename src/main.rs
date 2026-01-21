@@ -335,10 +335,7 @@ fn restart_selected_command() -> anyhow::Result<()> {
     let mut socket = connect_or_spawn_daemon()?;
     socket.write_all(&jsony::to_binary(&daemon::RequestMessage {
         cwd: &cwd,
-        request: daemon::Request::WorkspaceCommand {
-            config: &config,
-            command: WorkspaceCommand::RestartSelected,
-        },
+        request: daemon::Request::WorkspaceCommand { config: &config, command: WorkspaceCommand::RestartSelected },
     }))?;
 
     let mut response = String::new();
@@ -575,7 +572,7 @@ fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
         );
     }
 
-    let env = config::Environment { profile, param: params };
+    let env = config::Environment { profile, param: params, vars: task_expr.vars };
     let task = task_expr.eval(&env).map_err(|e| anyhow::anyhow!("Failed to evaluate task: {:?}", e))?;
     let tc = task.config();
 

@@ -265,6 +265,21 @@
         }
       }
     },
+    "varMeta": {
+      "type": "object",
+      "description": "Variable metadata with optional description and default value",
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of the variable"
+        },
+        "default": {
+          "type": "string",
+          "description": "Default value used when the variable is not provided"
+        }
+      }
+    },
     "action": {
       "type": "object",
       "description": "Action configuration - a one-time task",
@@ -317,6 +332,13 @@
         "managed": {
           "type": "boolean",
           "description": "Controls execution mode: true = must use 'devsm run' (for complex dependencies), false = must use 'devsm exec' (for interactive commands). Omit for default behavior (either allowed)."
+        },
+        "var": {
+          "type": "object",
+          "description": "Variable metadata table (e.g., var.myvar = { description = '...', default = '...' })",
+          "additionalProperties": {
+            "$ref": "#/definitions/varMeta"
+          }
         }
       },
       "x-taplo": {
@@ -385,6 +407,13 @@
         "cache": {
           "$ref": "#/definitions/serviceCacheConfig",
           "description": "Cache configuration - when 'never' is true, the service always restarts when required instead of reusing a running instance"
+        },
+        "var": {
+          "type": "object",
+          "description": "Variable metadata table (e.g., var.myvar = { description = '...', default = '...' })",
+          "additionalProperties": {
+            "$ref": "#/definitions/varMeta"
+          }
         }
       },
       "x-taplo": {
@@ -447,6 +476,13 @@
         "info": {
           "type": "string",
           "description": "Description of the test"
+        },
+        "var": {
+          "type": "object",
+          "description": "Variable metadata table (e.g., var.myvar = { description = '...', default = '...' })",
+          "additionalProperties": {
+            "$ref": "#/definitions/varMeta"
+          }
         }
       },
       "x-taplo": {

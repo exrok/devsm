@@ -1,7 +1,20 @@
 
-[action.span]
+[action.spam]
 sh = """
 for i in $(seq 1 100); do
   echo $i
 done
 """
+
+[action.print_key]
+sh = 'cat /tmp/devsm.test.key'
+require = ["gen_key"]
+profiles = ["alpha", "beta"]
+
+[action.gen_key]
+sh = 'head -c10 /dev/random | base64 > /tmp/devsm.test.key'
+cache.key = [{ modified = "/tmp/cat" }, { profile_changed = "print_key" }]
+
+[service.ping]
+cmd = ["ping", { var = "address" }]
+var.address = { description = "IP Address to ping", default = "127.0.0.1" }

@@ -526,7 +526,7 @@ impl WorkspaceState {
                 exit_cause: ExitCause::Restarted,
             });
         }
-        let task = bt.config.eval(&Environment { profile, param: params.clone() }).unwrap();
+        let task = bt.config.eval(&Environment { profile, param: params.clone(), vars: bt.config.vars }).unwrap();
 
         'outer: for dep_call in task.config().require {
             let dep_name = &*dep_call.name;
@@ -902,7 +902,7 @@ impl Workspace {
             if !matches_test_filters(test_info.base_name, tags, filters) {
                 continue;
             }
-            let env = Environment { profile: "", param: ValueMap::new() };
+            let env = Environment { profile: "", param: ValueMap::new(), vars: base_task.config.vars };
             let Ok(task_config) = base_task.config.eval(&env) else {
                 kvlog::error!("Failed to evaluate test config", name = base_task.name);
                 continue;
