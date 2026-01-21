@@ -178,6 +178,7 @@ pub enum Command {
     HelpScrollUp,
     HelpScrollDown,
     ToggleViewMode,
+    ToggleTaskTree,
     OverlayCancel,
     OverlayConfirm,
     RefreshConfig,
@@ -210,6 +211,7 @@ impl FromStr for Command {
             "HelpScrollUp" => Command::HelpScrollUp,
             "HelpScrollDown" => Command::HelpScrollDown,
             "ToggleViewMode" => Command::ToggleViewMode,
+            "ToggleTaskTree" => Command::ToggleTaskTree,
             "OverlayCancel" => Command::OverlayCancel,
             "OverlayConfirm" => Command::OverlayConfirm,
             "RefreshConfig" => Command::RefreshConfig,
@@ -333,6 +335,7 @@ impl Keybinds {
         self.bind(Mode::Global, "PGUP", Command::HelpScrollUp);
         self.bind(Mode::Global, "PGDN", Command::HelpScrollDown);
         self.bind(Mode::Global, "v", Command::ToggleViewMode);
+        self.bind(Mode::Global, "\\", Command::ToggleTaskTree);
         self.bind(Mode::Global, "R", Command::RefreshConfig);
 
         self.bind(Mode::SelectSearch, "C-k", Command::SelectPrev);
@@ -468,6 +471,7 @@ impl Command {
             Command::HelpScrollUp => "Help Up",
             Command::HelpScrollDown => "Help Down",
             Command::ToggleViewMode => "Toggle View",
+            Command::ToggleTaskTree => "Toggle Tasks",
             Command::OverlayCancel => "Cancel",
             Command::OverlayConfirm => "Confirm",
             Command::RefreshConfig => "Refresh Config",
@@ -499,6 +503,7 @@ impl Command {
             Command::HelpScrollUp => "HelpScrollUp",
             Command::HelpScrollDown => "HelpScrollDown",
             Command::ToggleViewMode => "ToggleViewMode",
+            Command::ToggleTaskTree => "ToggleTaskTree",
             Command::OverlayCancel => "OverlayCancel",
             Command::OverlayConfirm => "OverlayConfirm",
             Command::RefreshConfig => "RefreshConfig",

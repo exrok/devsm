@@ -137,12 +137,30 @@ struct HelpMenu {
 
 struct TuiState {
     frame: DoubleBuffer,
+    frame_width: u16,
+    frame_height: u16,
 
     logs: LogStack,
     task_tree: TaskTreeState,
     overlay: FocusOverlap,
     help: HelpMenu,
     status_message: Option<StatusMessage>,
+    task_tree_hidden: bool,
+}
+
+fn compute_menu_height(terminal_height: u16) -> u16 {
+    const MIN_HEIGHT: u16 = 5;
+    const MAX_HEIGHT: u16 = 10;
+    const MIN_TERMINAL: u16 = 35;
+    const MAX_TERMINAL: u16 = 60;
+
+    if terminal_height >= MAX_TERMINAL {
+        MAX_HEIGHT
+    } else if terminal_height <= MIN_TERMINAL {
+        MIN_HEIGHT
+    } else {
+        (MIN_HEIGHT + (terminal_height - MIN_TERMINAL + 4) / 5).min(MAX_HEIGHT)
+    }
 }
 
 fn render<'a>(
@@ -153,10 +171,21 @@ fn render<'a>(
     keybinds: &Keybinds,
     delta: Has,
 ) -> &'a [u8] {
-    if delta.any(Has::RESIZED) {
-        tui.frame.resize(w, h);
+    let has_overlay = !matches!(tui.overlay, FocusOverlap::None);
+    let show_task_tree_area = has_overlay || !tui.task_tree_hidden;
+    let menu_height = if show_task_tree_area { compute_menu_height(h) } else { 1 };
+
+    let dimensions_changed = tui.frame_width != w || tui.frame_height != menu_height;
+    let resized = delta.any(Has::RESIZED) || dimensions_changed;
+    if dimensions_changed {
+        tui.frame.resize(w, menu_height);
+        tui.frame_width = w;
+        tui.frame_height = menu_height;
     }
-    let menu_height = 10;
+    if resized {
+        tui.frame.reset();
+    }
+
     let sel = {
         let ws = workspace.state();
         tui.task_tree.selection_state(&ws)
@@ -180,15 +209,16 @@ fn render<'a>(
     };
 
     let dest = Rect { x: 0, y: 0, w, h: h - menu_height };
-    tui.logs.render(&mut tui.frame.buf, dest, workspace, keybinds, delta.any(Has::RESIZED));
+    tui.logs.render(&mut tui.frame.buf, dest, workspace, keybinds, resized);
 
     let mut bot = Rect { x: 0, y: 0, w, h: menu_height };
 
     {
-        let status_data = build_status_bar_data(tui, workspace);
+        let status_data = build_status_bar_data(tui, workspace, keybinds);
         render_status_bar(&mut tui.frame, bot.take_top(1), &status_data);
     }
-    {
+
+    if show_task_tree_area {
         let mut task_tree_rect = bot.take_top(19);
 
         let help_rect = if tui.help.visible {
@@ -313,7 +343,7 @@ fn render_status_bar(frame: &mut DoubleBuffer, mut rect: Rect, data: &StatusBarD
     rect.take_left(view_text.len() as i32).with(Color::Grey[8].with_fg(Color::Grey[25])).text(frame, &view_text);
 }
 
-fn build_status_bar_data(tui: &TuiState, workspace: &Workspace) -> StatusBarData {
+fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybinds) -> StatusBarData {
     let ws = workspace.state();
 
     let (mode_name, mode_bg) = match &tui.overlay {
@@ -370,8 +400,16 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace) -> StatusBarData
     let scroll_state = tui.logs.scroll_state(&ws, workspace);
     let is_scrolled = scroll_state.top.is_scrolled || scroll_state.bottom.map_or(false, |b| b.is_scrolled);
 
-    let status_message =
-        tui.status_message.as_ref().filter(|m| m.is_visible()).map(|m| (m.text.clone(), m.is_error));
+    let has_active_status = tui.status_message.as_ref().is_some_and(|m| m.is_visible());
+    let status_message = if has_active_status {
+        tui.status_message.as_ref().map(|m| (m.text.clone(), m.is_error))
+    } else if tui.task_tree_hidden && matches!(tui.overlay, FocusOverlap::None) {
+        keybinds
+            .key_for_command(Command::ToggleTaskTree)
+            .map(|key| (format!("Press '{}' to show task tree", key), false))
+    } else {
+        None
+    };
 
     StatusBarData {
         mode_name,
@@ -612,6 +650,9 @@ fn process_key(
         }
         Command::ToggleViewMode => {
             tui.task_tree.toggle_collapsed();
+        }
+        Command::ToggleTaskTree => {
+            tui.task_tree_hidden = !tui.task_tree_hidden;
         }
         Command::LogModeAll => {
             tui.logs.set_mode(log_stack::Mode::All);
@@ -942,16 +983,19 @@ pub fn run(
         terminal.write_all(&[vt::MOVE_CURSOR_TO_ORIGIN, vt::CLEAR_BELOW].concat())?;
     }
     let (mut w, mut h) = if let Some(terminal) = &terminal { terminal.size()? } else { (160, 90) };
-    let bh = 10;
+    let initial_menu_height = compute_menu_height(h);
 
     let mut previous = 0;
     let mut tui = TuiState {
-        frame: DoubleBuffer::new(w, bh),
+        frame: DoubleBuffer::new(w, initial_menu_height),
+        frame_width: w,
+        frame_height: initial_menu_height,
         logs: LogStack::default(),
         task_tree: TaskTreeState::default(),
         overlay: FocusOverlap::None,
         help: HelpMenu { visible: false, scroll: 0 },
         status_message: None,
+        task_tree_hidden: false,
     };
 
     let mut delta = Has(0);
