@@ -255,7 +255,7 @@ impl LogSearchState {
     pub fn process_input(&mut self, key: KeyEvent, keybinds: &Keybinds) -> SearchAction {
         let input = InputEvent::from(key);
 
-        if let Some(cmd) = keybinds.lookup_mode_only(Mode::LogSearch, input) {
+        if let Some(cmd) = keybinds.lookup_chain(&[Mode::LogSearch, Mode::Input, Mode::Global], input) {
             match cmd {
                 Command::SelectPrev => {
                     self.flush();
@@ -280,7 +280,10 @@ impl LogSearchState {
                         return SearchAction::Cancel;
                     }
                 }
-                _ => {}
+                _ => {
+                    kvlog::warn!("Unsupported command triggered by binding", %input, mode = "LogSearch", ?cmd);
+                    return SearchAction::None;
+                }
             }
         }
 

@@ -235,19 +235,31 @@ impl FromStr for Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {
     Global,
-    JobList,
+    Input,
+    Pager,
+    TaskTree,
     SelectSearch,
     LogSearch,
     TaskLauncher,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 5] = [Mode::Global, Mode::JobList, Mode::SelectSearch, Mode::LogSearch, Mode::TaskLauncher];
+    pub const ALL: [Mode; 7] = [
+        Mode::Global,
+        Mode::Input,
+        Mode::Pager,
+        Mode::TaskTree,
+        Mode::SelectSearch,
+        Mode::LogSearch,
+        Mode::TaskLauncher,
+    ];
 
     pub fn config_name(self) -> &'static str {
         match self {
             Mode::Global => "global",
-            Mode::JobList => "joblist",
+            Mode::Input => "input",
+            Mode::Pager => "pager",
+            Mode::TaskTree => "task_tree",
             Mode::SelectSearch => "select_search",
             Mode::LogSearch => "log_search",
             Mode::TaskLauncher => "task_launcher",
@@ -261,7 +273,9 @@ impl FromStr for Mode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "global" => Mode::Global,
-            "joblist" => Mode::JobList,
+            "input" => Mode::Input,
+            "pager" => Mode::Pager,
+            "task_tree" | "tasktree" | "joblist" => Mode::TaskTree,
             "select_search" | "selectsearch" => Mode::SelectSearch,
             "log_search" | "logsearch" => Mode::LogSearch,
             "task_launcher" | "tasklauncher" => Mode::TaskLauncher,
@@ -276,7 +290,9 @@ type BindingTable = HashTable<(InputEvent, Command)>;
 pub struct Keybinds {
     hasher: RandomState,
     global: BindingTable,
-    joblist: BindingTable,
+    input: BindingTable,
+    pager: BindingTable,
+    task_tree: BindingTable,
     select_search: BindingTable,
     log_search: BindingTable,
     task_launcher: BindingTable,
@@ -302,7 +318,9 @@ impl Keybinds {
         Keybinds {
             hasher: RandomState::default(),
             global: HashTable::new(),
-            joblist: HashTable::new(),
+            input: HashTable::new(),
+            pager: HashTable::new(),
+            task_tree: HashTable::new(),
             select_search: HashTable::new(),
             log_search: HashTable::new(),
             task_launcher: HashTable::new(),
@@ -312,7 +330,9 @@ impl Keybinds {
     fn table_for_mode(&self, mode: Mode) -> &BindingTable {
         match mode {
             Mode::Global => &self.global,
-            Mode::JobList => &self.joblist,
+            Mode::Input => &self.input,
+            Mode::Pager => &self.pager,
+            Mode::TaskTree => &self.task_tree,
             Mode::SelectSearch => &self.select_search,
             Mode::LogSearch => &self.log_search,
             Mode::TaskLauncher => &self.task_launcher,
@@ -321,60 +341,44 @@ impl Keybinds {
 
     fn load_defaults(&mut self) {
         self.bind(Mode::Global, "C-c", Command::Quit);
-        self.bind(Mode::Global, "/", Command::SearchLogs);
-        self.bind(Mode::Global, "g", Command::StartGroup);
-        self.bind(Mode::Global, "r", Command::RestartTask);
-        self.bind(Mode::Global, "ENTER", Command::StartSelection);
-        self.bind(Mode::Global, "d", Command::TerminateTask);
-        self.bind(Mode::Global, "s", Command::LaunchTask);
-        self.bind(Mode::Global, "1", Command::LogModeAll);
-        self.bind(Mode::Global, "2", Command::LogModeSelected);
-        self.bind(Mode::Global, "3", Command::LogModeHybrid);
-        self.bind(Mode::Global, "k", Command::SelectPrev);
-        self.bind(Mode::Global, "j", Command::SelectNext);
-        self.bind(Mode::Global, "h", Command::FocusPrimary);
-        self.bind(Mode::Global, "l", Command::FocusSecondary);
-        self.bind(Mode::Global, "UP", Command::SelectPrev);
-        self.bind(Mode::Global, "DOWN", Command::SelectNext);
-        self.bind(Mode::Global, "LEFT", Command::FocusPrimary);
-        self.bind(Mode::Global, "RIGHT", Command::FocusSecondary);
-        self.bind(Mode::Global, "HOME", Command::JumpToOldestLogs);
-        self.bind(Mode::Global, "END", Command::JumpToNewestLogs);
-        self.bind(Mode::Global, "C-k", Command::LogScrollUp);
-        self.bind(Mode::Global, "C-j", Command::LogScrollDown);
         self.bind(Mode::Global, "?", Command::ToggleHelp);
-        self.bind(Mode::Global, "PGUP", Command::HelpScrollUp);
-        self.bind(Mode::Global, "PGDN", Command::HelpScrollDown);
-        self.bind(Mode::Global, "v", Command::ToggleViewMode);
-        self.bind(Mode::Global, "\\", Command::ToggleTaskTree);
-        self.bind(Mode::Global, "R", Command::RefreshConfig);
 
-        self.bind(Mode::SelectSearch, "C-k", Command::SelectPrev);
-        self.bind(Mode::SelectSearch, "UP", Command::SelectPrev);
-        self.bind(Mode::SelectSearch, "C-j", Command::SelectNext);
-        self.bind(Mode::SelectSearch, "DOWN", Command::SelectNext);
-        self.bind(Mode::SelectSearch, "C-g", Command::OverlayCancel);
-        self.bind(Mode::SelectSearch, "ESC", Command::OverlayCancel);
-        self.bind(Mode::SelectSearch, "C-l", Command::OverlayConfirm);
-        self.bind(Mode::SelectSearch, "ENTER", Command::OverlayConfirm);
+        self.bind(Mode::Input, "C-k", Command::SelectPrev);
+        self.bind(Mode::Input, "UP", Command::SelectPrev);
+        self.bind(Mode::Input, "C-j", Command::SelectNext);
+        self.bind(Mode::Input, "DOWN", Command::SelectNext);
+        self.bind(Mode::Input, "C-g", Command::OverlayCancel);
+        self.bind(Mode::Input, "ESC", Command::OverlayCancel);
+        self.bind(Mode::Input, "C-l", Command::OverlayConfirm);
+        self.bind(Mode::Input, "ENTER", Command::OverlayConfirm);
 
-        self.bind(Mode::LogSearch, "C-k", Command::SelectPrev);
-        self.bind(Mode::LogSearch, "UP", Command::SelectPrev);
-        self.bind(Mode::LogSearch, "C-j", Command::SelectNext);
-        self.bind(Mode::LogSearch, "DOWN", Command::SelectNext);
-        self.bind(Mode::LogSearch, "C-g", Command::OverlayCancel);
-        self.bind(Mode::LogSearch, "ESC", Command::OverlayCancel);
-        self.bind(Mode::LogSearch, "ENTER", Command::OverlayConfirm);
-        self.bind(Mode::LogSearch, "C-l", Command::OverlayConfirm);
+        self.bind(Mode::Pager, "/", Command::SearchLogs);
+        self.bind(Mode::Pager, "HOME", Command::JumpToOldestLogs);
+        self.bind(Mode::Pager, "END", Command::JumpToNewestLogs);
+        self.bind(Mode::Pager, "C-k", Command::LogScrollUp);
+        self.bind(Mode::Pager, "C-j", Command::LogScrollDown);
+        self.bind(Mode::Pager, "PGUP", Command::HelpScrollUp);
+        self.bind(Mode::Pager, "PGDN", Command::HelpScrollDown);
+        self.bind(Mode::Pager, "1", Command::LogModeAll);
+        self.bind(Mode::Pager, "2", Command::LogModeSelected);
+        self.bind(Mode::Pager, "3", Command::LogModeHybrid);
 
-        self.bind(Mode::TaskLauncher, "C-k", Command::SelectPrev);
-        self.bind(Mode::TaskLauncher, "UP", Command::SelectPrev);
-        self.bind(Mode::TaskLauncher, "C-j", Command::SelectNext);
-        self.bind(Mode::TaskLauncher, "DOWN", Command::SelectNext);
-        self.bind(Mode::TaskLauncher, "C-g", Command::OverlayCancel);
-        self.bind(Mode::TaskLauncher, "ESC", Command::OverlayCancel);
-        self.bind(Mode::TaskLauncher, "ENTER", Command::OverlayConfirm);
-        self.bind(Mode::TaskLauncher, "C-l", Command::OverlayConfirm);
+        self.bind(Mode::TaskTree, "j", Command::SelectNext);
+        self.bind(Mode::TaskTree, "k", Command::SelectPrev);
+        self.bind(Mode::TaskTree, "UP", Command::SelectPrev);
+        self.bind(Mode::TaskTree, "DOWN", Command::SelectNext);
+        self.bind(Mode::TaskTree, "h", Command::FocusPrimary);
+        self.bind(Mode::TaskTree, "l", Command::FocusSecondary);
+        self.bind(Mode::TaskTree, "LEFT", Command::FocusPrimary);
+        self.bind(Mode::TaskTree, "RIGHT", Command::FocusSecondary);
+        self.bind(Mode::TaskTree, "r", Command::RestartTask);
+        self.bind(Mode::TaskTree, "d", Command::TerminateTask);
+        self.bind(Mode::TaskTree, "s", Command::LaunchTask);
+        self.bind(Mode::TaskTree, "g", Command::StartGroup);
+        self.bind(Mode::TaskTree, "ENTER", Command::StartSelection);
+        self.bind(Mode::TaskTree, "v", Command::ToggleViewMode);
+        self.bind(Mode::TaskTree, "\\", Command::ToggleTaskTree);
+        self.bind(Mode::TaskTree, "R", Command::RefreshConfig);
     }
 
     /// Binds a key to a command in a specific mode.
@@ -384,7 +388,9 @@ impl Keybinds {
         let hash = hash_input(hasher, input);
         let table = match mode {
             Mode::Global => &mut self.global,
-            Mode::JobList => &mut self.joblist,
+            Mode::Input => &mut self.input,
+            Mode::Pager => &mut self.pager,
+            Mode::TaskTree => &mut self.task_tree,
             Mode::SelectSearch => &mut self.select_search,
             Mode::LogSearch => &mut self.log_search,
             Mode::TaskLauncher => &mut self.task_launcher,
@@ -403,7 +409,9 @@ impl Keybinds {
         let hash = hash_input(hasher, input);
         let table = match mode {
             Mode::Global => &mut self.global,
-            Mode::JobList => &mut self.joblist,
+            Mode::Input => &mut self.input,
+            Mode::Pager => &mut self.pager,
+            Mode::TaskTree => &mut self.task_tree,
             Mode::SelectSearch => &mut self.select_search,
             Mode::LogSearch => &mut self.log_search,
             Mode::TaskLauncher => &mut self.task_launcher,
@@ -435,8 +443,22 @@ impl Keybinds {
     }
 
     /// Looks up a command only in the specified mode (no fallback).
+    #[expect(unused, reason = "kept for user config querying specific mode bindings")]
     pub fn lookup_mode_only(&self, mode: Mode, input: InputEvent) -> Option<Command> {
         self.table_lookup(self.table_for_mode(mode), input)
+    }
+
+    /// Looks up a command by searching through a chain of modes in order.
+    /// Returns the first matching command found.
+    pub fn lookup_chain(&self, modes: &[Mode], input: InputEvent) -> Option<Command> {
+        let hash = hash_input(&self.hasher, input);
+        for &mode in modes {
+            let table = self.table_for_mode(mode);
+            if let Some((_, cmd)) = table.find(hash, |(k, _)| *k == input) {
+                return Some(cmd.clone());
+            }
+        }
+        None
     }
 
     /// Returns an iterator over all bindings in the global mode.
@@ -566,31 +588,51 @@ mod tests {
         let keybinds = Keybinds::default();
 
         let j: InputEvent = "j".parse().unwrap();
-        assert_eq!(keybinds.lookup(Mode::Global, j), Some(Command::SelectNext));
+        assert_eq!(keybinds.lookup(Mode::TaskTree, j), Some(Command::SelectNext));
+        assert_eq!(keybinds.lookup(Mode::Global, j), None);
 
         let ctrl_c: InputEvent = "C-c".parse().unwrap();
         assert_eq!(keybinds.lookup(Mode::SelectSearch, ctrl_c), Some(Command::Quit));
+        assert_eq!(keybinds.lookup(Mode::Global, ctrl_c), Some(Command::Quit));
 
         let home: InputEvent = "HOME".parse().unwrap();
         let end: InputEvent = "END".parse().unwrap();
-        assert_eq!(keybinds.lookup(Mode::Global, home), Some(Command::JumpToOldestLogs));
-        assert_eq!(keybinds.lookup(Mode::Global, end), Some(Command::JumpToNewestLogs));
+        assert_eq!(keybinds.lookup(Mode::Pager, home), Some(Command::JumpToOldestLogs));
+        assert_eq!(keybinds.lookup(Mode::Pager, end), Some(Command::JumpToNewestLogs));
     }
 
     #[test]
-    fn key_for_command_reverse_lookup() {
+    fn lookup_chain_traverses_modes() {
         let keybinds = Keybinds::default();
 
-        let key = keybinds.key_for_command(&Command::LogScrollUp);
-        assert!(key.is_some(), "LogScrollUp should have a binding");
-        assert_eq!(key.unwrap().to_string(), "C-k");
+        let j: InputEvent = "j".parse().unwrap();
+        assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Pager, Mode::Global], j), Some(Command::SelectNext));
 
-        let key = keybinds.key_for_command(&Command::LogScrollDown);
-        assert!(key.is_some(), "LogScrollDown should have a binding");
-        assert_eq!(key.unwrap().to_string(), "C-j");
+        let ctrl_c: InputEvent = "C-c".parse().unwrap();
+        assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Pager, Mode::Global], ctrl_c), Some(Command::Quit));
 
-        let key = keybinds.key_for_command(&Command::LaunchTask);
-        assert!(key.is_some(), "LaunchTask should have a binding");
-        assert_eq!(key.unwrap().to_string(), "s");
+        let slash: InputEvent = "/".parse().unwrap();
+        assert_eq!(
+            keybinds.lookup_chain(&[Mode::TaskTree, Mode::Pager, Mode::Global], slash),
+            Some(Command::SearchLogs)
+        );
+    }
+
+    #[test]
+    fn input_mode_bindings() {
+        let keybinds = Keybinds::default();
+
+        let ctrl_k: InputEvent = "C-k".parse().unwrap();
+        let esc: InputEvent = "ESC".parse().unwrap();
+        let enter: InputEvent = "ENTER".parse().unwrap();
+
+        assert_eq!(keybinds.lookup(Mode::Input, ctrl_k), Some(Command::SelectPrev));
+        assert_eq!(keybinds.lookup(Mode::Input, esc), Some(Command::OverlayCancel));
+        assert_eq!(keybinds.lookup(Mode::Input, enter), Some(Command::OverlayConfirm));
+
+        assert_eq!(
+            keybinds.lookup_chain(&[Mode::SelectSearch, Mode::Input, Mode::Global], ctrl_k),
+            Some(Command::SelectPrev)
+        );
     }
 }

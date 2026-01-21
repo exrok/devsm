@@ -353,7 +353,7 @@ impl TaskLauncherState {
     pub fn process_input(&mut self, key: KeyEvent, keybinds: &Keybinds, ws: &WorkspaceState) -> LauncherAction {
         let input = InputEvent::from(key);
 
-        if let Some(cmd) = keybinds.lookup_mode_only(Mode::TaskLauncher, input) {
+        if let Some(cmd) = keybinds.lookup_chain(&[Mode::TaskLauncher, Mode::Input, Mode::Global], input) {
             match cmd {
                 Command::SelectPrev => {
                     self.selected = self.selected.saturating_sub(1);
@@ -371,7 +371,10 @@ impl TaskLauncherState {
                 Command::OverlayConfirm => {
                     return self.handle_confirm(ws);
                 }
-                _ => {}
+                _ => {
+                    kvlog::warn!("Unsupported command triggered by binding", %input, mode = "TaskLauncher", ?cmd);
+                    return LauncherAction::None;
+                }
             }
         }
 

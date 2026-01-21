@@ -304,7 +304,9 @@ mod tests {
     fn parse_user_config_keybinds() {
         let config = parse_user_config("").unwrap();
         let j: InputEvent = "j".parse().unwrap();
-        assert_eq!(config.keybinds.lookup(Mode::Global, j), Some(Command::SelectNext), "empty config uses defaults");
+        assert_eq!(config.keybinds.lookup(Mode::TaskTree, j), Some(Command::SelectNext), "j is in TaskTree mode");
+        let ctrl_c: InputEvent = "C-c".parse().unwrap();
+        assert_eq!(config.keybinds.lookup(Mode::Global, ctrl_c), Some(Command::Quit), "C-c is in Global mode");
 
         let config = parse_user_config(
             r#"
@@ -319,13 +321,13 @@ mod tests {
 
         let config = parse_user_config(
             r#"
-            [bind.global]
+            [bind.task_tree]
             g = nan
             "#,
         )
         .unwrap();
         let g: InputEvent = "g".parse().unwrap();
-        assert_eq!(config.keybinds.lookup(Mode::Global, g), None, "unbind with nan");
+        assert_eq!(config.keybinds.lookup(Mode::TaskTree, g), None, "unbind with nan");
 
         let config = parse_user_config(
             r#"
@@ -335,28 +337,26 @@ mod tests {
         )
         .unwrap();
         let ctrl_g: InputEvent = "C-g".parse().unwrap();
-        assert_eq!(config.keybinds.lookup(Mode::JobList, ctrl_g), Some(Command::StartGroup), "mode-specific");
+        assert_eq!(config.keybinds.lookup(Mode::TaskTree, ctrl_g), Some(Command::StartGroup), "mode-specific");
 
-        // Test numeric key binding
         let config = parse_user_config(
             r#"
-            [bind.global]
+            [bind.pager]
             "4" = "LogModeAll"
             "#,
         )
         .unwrap();
         let four: InputEvent = "4".parse().unwrap();
-        assert_eq!(config.keybinds.lookup(Mode::Global, four), Some(Command::LogModeAll), "numeric key 4");
+        assert_eq!(config.keybinds.lookup(Mode::Pager, four), Some(Command::LogModeAll), "numeric key 4");
 
-        // Verify the numeric key works without quotes too
         let config = parse_user_config(
             r#"
-            [bind.global]
+            [bind.pager]
             4 = "LogModeAll"
             "#,
         )
         .unwrap();
         let four: InputEvent = "4".parse().unwrap();
-        assert_eq!(config.keybinds.lookup(Mode::Global, four), Some(Command::LogModeAll), "numeric key 4 unquoted");
+        assert_eq!(config.keybinds.lookup(Mode::Pager, four), Some(Command::LogModeAll), "numeric key 4 unquoted");
     }
 }

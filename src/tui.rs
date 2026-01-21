@@ -577,7 +577,7 @@ fn process_key(
         FocusOverlap::None => {}
     }
 
-    let Some(command) = keybinds.lookup(Mode::Global, input) else {
+    let Some(command) = keybinds.lookup_chain(&[Mode::TaskTree, Mode::Pager, Mode::Global], input) else {
         kvlog::info!("no input command found", %input);
         tui.status_message = Some(StatusMessage::error(format!("No binding for input: {}", input)));
         return ProcessKeyResult::Continue;

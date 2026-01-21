@@ -59,7 +59,7 @@ impl SelectSearch {
     pub fn process_input(&mut self, key: KeyEvent, keybinds: &Keybinds) -> Action {
         let input = InputEvent::from(key);
 
-        if let Some(cmd) = keybinds.lookup_mode_only(Mode::SelectSearch, input) {
+        if let Some(cmd) = keybinds.lookup_chain(&[Mode::SelectSearch, Mode::Input, Mode::Global], input) {
             match cmd {
                 Command::SelectPrev => {
                     self.flush();
@@ -84,7 +84,10 @@ impl SelectSearch {
                         return Action::Enter;
                     }
                 }
-                _ => {}
+                _ => {
+                    kvlog::warn!("Unsupported command triggered by binding", %input, mode = "SelectSearch", ?cmd);
+                    return Action::None;
+                }
             }
         }
 
