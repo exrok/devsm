@@ -48,7 +48,6 @@ cmd = ["typos", "--color", "always"]
 
 [test.check]
 cmd = ["cargo", "check"]
-tag = "lint"
 
 [test.cargo-test]
 cmd = ["cargo", "test"]

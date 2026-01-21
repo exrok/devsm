@@ -207,7 +207,32 @@ impl LatestConfig {
         Ok(true)
     }
 
-    fn update_base_tasks(
+    pub fn refresh_capturing(&mut self) -> Result<bool, String> {
+        let metadata = self.path.metadata().map_err(|e| format!("Failed to read {}: {}", self.path.display(), e))?;
+        let modified = metadata.modified().map_err(|e| format!("Failed to get mtime: {}", e))?;
+
+        if self.modified_time == modified {
+            return Ok(false);
+        }
+
+        let content = std::fs::read_to_string(&self.path)
+            .map_err(|e| format!("Failed to read {}: {}", self.path.display(), e))?;
+        let content: &'static str = content.leak();
+
+        let config_path = self.current.base_path.join("devsm.toml");
+        let new_config =
+            crate::config::load_workspace_config_capturing(&config_path, content).map_err(|e| e.message)?;
+
+        self.current = new_config;
+        self.modified_time = modified;
+        Ok(true)
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn update_base_tasks(
         &self,
         base_tasks: &mut Vec<BaseTask>,
         name_map: &mut hashbrown::HashMap<&'static str, BaseTaskIndex>,

@@ -91,16 +91,20 @@ fn selection_to_filter(sel: &SelectionState, ws: &WorkspaceState) -> LogFilter {
     }
 }
 
+mod config_error;
 mod log_search;
 mod log_stack;
 mod select_search;
 mod task_launcher;
 mod task_tree;
 
+use config_error::{ConfigErrorAction, ConfigErrorState, ConfigSource};
+
 enum FocusOverlap {
     Group { selection: SelectSearch },
     LogSearch { state: LogSearchState },
     TaskLauncher { state: TaskLauncherState },
+    ConfigError { state: ConfigErrorState },
     None,
 }
 
@@ -195,6 +199,9 @@ fn render<'a>(
             FocusOverlap::TaskLauncher { state } => {
                 state.render(&mut tui.frame, task_tree_rect);
             }
+            FocusOverlap::ConfigError { state } => {
+                state.render(&mut tui.frame, task_tree_rect);
+            }
             FocusOverlap::None => {
                 let (p, mut s) = task_tree_rect.h_split(0.5);
                 s.take_left(1);
@@ -209,6 +216,7 @@ fn render<'a>(
                 FocusOverlap::Group { .. } => Mode::SelectSearch,
                 FocusOverlap::LogSearch { .. } => Mode::LogSearch,
                 FocusOverlap::TaskLauncher { .. } => Mode::TaskLauncher,
+                FocusOverlap::ConfigError { .. } => Mode::Global,
                 FocusOverlap::None => Mode::Global,
             };
             render_help_menu(&mut tui.frame, help_rect, keybinds, &mut tui.help, current_mode);
@@ -282,6 +290,7 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace) -> StatusBarData
         FocusOverlap::Group { .. } => ("GROUP", Color::Violet),
         FocusOverlap::LogSearch { .. } => ("SEARCH", Color::LightSkyBlue1),
         FocusOverlap::TaskLauncher { .. } => ("LAUNCH", Color::LightGoldenrod2),
+        FocusOverlap::ConfigError { .. } => ("ERROR", Color::Red1),
         FocusOverlap::None => ("NORMAL", Color::DarkOliveGreen),
     };
 
@@ -344,6 +353,12 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace) -> StatusBarData
     }
 }
 
+enum ProcessKeyResult {
+    Continue,
+    Quit,
+    ReloadConfig,
+}
+
 fn render_help_menu(
     frame: &mut DoubleBuffer,
     mut rect: Rect,
@@ -396,11 +411,16 @@ fn render_help_menu(
     }
 }
 
-fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, keybinds: &Keybinds) -> bool {
+fn process_key(
+    tui: &mut TuiState,
+    workspace: &Workspace,
+    key_event: KeyEvent,
+    keybinds: &Keybinds,
+) -> ProcessKeyResult {
     let input = InputEvent::from(key_event);
 
     if keybinds.lookup(Mode::Global, input) == Some(Command::Quit) {
-        return true;
+        return ProcessKeyResult::Quit;
     }
 
     match &mut tui.overlay {
@@ -434,7 +454,7 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
                 }
                 select_search::Action::None => selection.flush(),
             }
-            return false;
+            return ProcessKeyResult::Continue;
         }
         FocusOverlap::LogSearch { state } => {
             match state.process_input(key_event, keybinds) {
@@ -456,7 +476,7 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
                     }
                 }
             }
-            return false;
+            return ProcessKeyResult::Continue;
         }
         FocusOverlap::TaskLauncher { state } => {
             let ws = workspace.state();
@@ -471,19 +491,28 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
                 }
                 LauncherAction::None => {}
             }
-            return false;
+            return ProcessKeyResult::Continue;
+        }
+        FocusOverlap::ConfigError { state } => {
+            match state.process_input(key_event, keybinds) {
+                ConfigErrorAction::Retry => {
+                    return ProcessKeyResult::ReloadConfig;
+                }
+                ConfigErrorAction::None => {}
+            }
+            return ProcessKeyResult::Continue;
         }
         FocusOverlap::None => {}
     }
 
     let Some(command) = keybinds.lookup(Mode::Global, input) else {
         kvlog::info!("no input command found", %input);
-        return false;
+        return ProcessKeyResult::Continue;
     };
     kvlog::info!("input", ?input, ?command);
 
     match command {
-        Command::Quit => return true,
+        Command::Quit => return ProcessKeyResult::Quit,
         Command::SearchLogs => {
             let ws_state = workspace.state();
             let filter = match tui.logs.mode() {
@@ -518,10 +547,10 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
                         let job = &ws[last_ji];
                         (job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone())
                     } else {
-                        return false;
+                        return ProcessKeyResult::Continue;
                     }
                 } else {
-                    return false;
+                    return ProcessKeyResult::Continue;
                 };
                 drop(ws);
                 workspace.restart_task(base_task, params, &profile);
@@ -560,10 +589,10 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
             let ws = workspace.state();
             if let Some(sel) = tui.task_tree.selection_state(&ws) {
                 let Some(bti) = sel.base_task else {
-                    return false;
+                    return ProcessKeyResult::Continue;
                 };
                 if ws.base_tasks[bti.idx()].config.profiles.is_empty() {
-                    return false;
+                    return ProcessKeyResult::Continue;
                 }
                 let mut state = TaskLauncherState::with_task(&ws, bti);
                 match state.try_auto_start(&ws) {
@@ -610,8 +639,11 @@ fn process_key(tui: &mut TuiState, workspace: &Workspace, key_event: KeyEvent, k
             tui.help.scroll = tui.help.scroll.saturating_add(5);
         }
         Command::OverlayCancel | Command::OverlayConfirm => {}
+        Command::RefreshConfig => {
+            return ProcessKeyResult::ReloadConfig;
+        }
     }
-    false
+    ProcessKeyResult::Continue
 }
 
 fn pre_truncate(data: &mut Vec<u8>) -> &[u8] {
@@ -749,6 +781,9 @@ fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_
                 confirmed_profile: state.confirmed_profile(),
                 completed_vars: [for (name, value) in state.completed_vars(); { name: name, value: value }]
             },
+            FocusOverlap::ConfigError { .. } => {
+                kind: "ConfigError"
+            },
             FocusOverlap::None => None,
         },
         @[if let Some(sel) = &selection]
@@ -786,12 +821,64 @@ pub enum OutputMode {
     /// A line separated JSON stream used for testing
     JsonStateStream,
 }
+
+fn attempt_config_reload(tui: &mut TuiState, workspace: &Workspace, keybinds: &mut Arc<Keybinds>) {
+    let mut errors = Vec::new();
+    let mut workspace_errored = false;
+    let mut user_errored = false;
+
+    {
+        let mut ws = workspace.state.write().unwrap();
+        match ws.config.refresh_capturing() {
+            Ok(changed) => {
+                if changed {
+                    let ws = &mut *ws;
+                    ws.config.update_base_tasks(&mut ws.base_tasks, &mut ws.name_map);
+                }
+            }
+            Err(e) => {
+                errors.push(e);
+                workspace_errored = true;
+            }
+        }
+    }
+
+    match crate::user_config::reload_user_config() {
+        Ok(config) => {
+            crate::process_manager::update_global_keybinds(config.keybinds);
+            *keybinds = crate::process_manager::global_keybinds();
+        }
+        Err(e) => {
+            errors.push(e);
+            user_errored = true;
+        }
+    }
+
+    if errors.is_empty() {
+        tui.overlay = FocusOverlap::None;
+    } else {
+        let error_message = errors.join("\n");
+        let source = match (user_errored, workspace_errored) {
+            (true, true) => ConfigSource::Both,
+            (true, false) => ConfigSource::User,
+            (false, true) => ConfigSource::Workspace,
+            (false, false) => return,
+        };
+
+        let user_path = crate::user_config::user_config_path();
+        let workspace_path = Some(workspace.state.read().unwrap().config.path().clone());
+
+        tui.overlay = FocusOverlap::ConfigError {
+            state: ConfigErrorState::new(error_message, source, user_path, workspace_path),
+        };
+    }
+}
 pub fn run(
     stdin: OwnedFd,
     stdout: OwnedFd,
     workspace: &Workspace,
     extui_channel: Arc<ClientChannel>,
-    keybinds: &Keybinds,
+    mut keybinds: Arc<Keybinds>,
     output_mode: OutputMode,
 ) -> anyhow::Result<()> {
     let mode = TerminalFlags::RAW_MODE
@@ -825,7 +912,7 @@ pub fn run(
         if delta.any(Has::RESIZED) {
             (w, h) = if let Some(terminal) = &terminal { terminal.size()? } else { (150, 80) };
         }
-        let data = render(w, h, &mut tui, workspace, keybinds, delta);
+        let data = render(w, h, &mut tui, workspace, &keybinds, delta);
         kvlog::info!("Rendered TUI", tty_render_byte_count = data.len());
         if let Some(terminal) = &mut terminal {
             terminal.write_all(data)?;
@@ -853,10 +940,21 @@ pub fn run(
             }
         }
 
-        match extui::event::poll_with_custom_waker(&stdin, Some(&extui_channel.waker), None)? {
+        let poll_timeout = match &tui.overlay {
+            FocusOverlap::ConfigError { .. } => Some(ConfigErrorState::poll_interval()),
+            _ => None,
+        };
+
+        match extui::event::poll_with_custom_waker(&stdin, Some(&extui_channel.waker), poll_timeout)? {
             extui::event::Polled::ReadReady => events.read_from(&stdin)?,
             extui::event::Polled::Woken => {}
-            extui::event::Polled::TimedOut => {}
+            extui::event::Polled::TimedOut => {
+                if let FocusOverlap::ConfigError { state } = &mut tui.overlay {
+                    if state.check_file_changed() {
+                        attempt_config_reload(&mut tui, workspace, &mut keybinds);
+                    }
+                }
+            }
         }
         match extui_channel.actions(&mut previous) {
             Some(Action::Resized) => delta |= Has::RESIZED,
@@ -870,11 +968,13 @@ pub fn run(
 
         while let Some(event) = events.next(true) {
             match event {
-                Event::Key(key_event) => {
-                    if process_key(&mut tui, workspace, key_event, keybinds) {
-                        return Ok(());
+                Event::Key(key_event) => match process_key(&mut tui, workspace, key_event, &keybinds) {
+                    ProcessKeyResult::Quit => return Ok(()),
+                    ProcessKeyResult::ReloadConfig => {
+                        attempt_config_reload(&mut tui, workspace, &mut keybinds);
                     }
-                }
+                    ProcessKeyResult::Continue => {}
+                },
                 Event::Resized => (),
                 Event::Mouse(mouse) => {
                     let x = mouse.column;

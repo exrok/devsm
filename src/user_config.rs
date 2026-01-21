@@ -1,6 +1,7 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 
+use crate::diagnostic::{render_diagnostic, toml_error_to_diagnostic, Diagnostic, DiagnosticLabel};
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 
 /// User configuration loaded from ~/.config/devsm.user.toml
@@ -66,8 +67,9 @@ impl UserConfig {
             return UserConfig::default();
         };
 
+        let file_name = path.display().to_string();
         match std::fs::read_to_string(&path) {
-            Ok(content) => match parse_user_config_for_daemon(&content) {
+            Ok(content) => match parse_user_config_for_daemon(&content, &file_name) {
                 Ok(mut config) => {
                     kvlog::info!("Loaded user config", path = %path.display());
                     config.loaded_from_file = true;
@@ -90,38 +92,104 @@ impl UserConfig {
     }
 }
 
-fn parse_user_config_for_daemon(content: &str) -> Result<UserConfig, String> {
-    let toml = toml_spanner::parse(content).map_err(|e| format!("TOML parse error: {e}"))?;
+pub fn reload_user_config() -> Result<UserConfig, String> {
+    let Some(path) = user_config_path() else {
+        return Ok(UserConfig::default());
+    };
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(UserConfig::default());
+        }
+        Err(e) => {
+            return Err(format!("Failed to read {}: {}", path.display(), e));
+        }
+    };
+
+    let file_name = path.display().to_string();
+    parse_user_config_for_daemon(&content, &file_name)
+}
+
+fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserConfig, String> {
+    let toml = toml_spanner::parse(content).map_err(|e| {
+        let diagnostic = toml_error_to_diagnostic(&e);
+        render_diagnostic(file_name, content, &diagnostic)
+    })?;
 
     let mut keybinds = Keybinds::default();
 
-    if let Some(bind_table) = toml.as_table().and_then(|t| t.get("bind")) {
-        let bind_table = bind_table.as_table().ok_or("'bind' must be a table")?;
+    let root_table = toml.as_table().ok_or_else(|| {
+        let diagnostic = Diagnostic::error()
+            .with_message("expected table at root")
+            .with_label(DiagnosticLabel::primary(0..content.len().min(1)));
+        render_diagnostic(file_name, content, &diagnostic)
+    })?;
 
-        for (mode_name, mode_value) in bind_table.iter() {
-            let mode: Mode = mode_name.name.parse().map_err(|e: String| e)?;
-            let bindings = mode_value.as_table().ok_or_else(|| format!("'bind.{}' must be a table", mode_name.name))?;
+    for (key, _value) in root_table.iter() {
+        if key.name != "bind" {
+            let span: std::ops::Range<usize> = key.span.into();
+            let diagnostic = Diagnostic::error()
+                .with_message(format!("unknown key '{}'", key.name))
+                .with_label(DiagnosticLabel::primary(span))
+                .with_note("only 'bind' is supported at the root level");
+            return Err(render_diagnostic(file_name, content, &diagnostic));
+        }
+    }
+
+    if let Some(bind_value) = root_table.get("bind") {
+        let bind_table = bind_value.as_table().ok_or_else(|| {
+            let span: std::ops::Range<usize> = bind_value.span.into();
+            let diagnostic =
+                Diagnostic::error().with_message("'bind' must be a table").with_label(DiagnosticLabel::primary(span));
+            render_diagnostic(file_name, content, &diagnostic)
+        })?;
+
+        for (mode_key, mode_value) in bind_table.iter() {
+            let mode: Mode = mode_key.name.parse().map_err(|e: String| {
+                let span: std::ops::Range<usize> = mode_key.span.into();
+                let diagnostic = Diagnostic::error().with_message(e).with_label(DiagnosticLabel::primary(span));
+                render_diagnostic(file_name, content, &diagnostic)
+            })?;
+
+            let bindings = mode_value.as_table().ok_or_else(|| {
+                let span: std::ops::Range<usize> = mode_value.span.into();
+                let diagnostic = Diagnostic::error()
+                    .with_message(format!("'bind.{}' must be a table", mode_key.name))
+                    .with_label(DiagnosticLabel::primary(span));
+                render_diagnostic(file_name, content, &diagnostic)
+            })?;
 
             for (key_str, cmd_value) in bindings.iter() {
-                let input: InputEvent = key_str.name.parse().map_err(|e: String| e)?;
+                let input: InputEvent = key_str.name.parse().map_err(|e: String| {
+                    let span: std::ops::Range<usize> = key_str.span.into();
+                    let diagnostic = Diagnostic::error().with_message(e).with_label(DiagnosticLabel::primary(span));
+                    render_diagnostic(file_name, content, &diagnostic)
+                })?;
 
                 let command = if let Some(f) = cmd_value.as_float() {
                     if f.is_nan() {
                         None
                     } else {
-                        return Err(format!(
-                            "Invalid binding value for '{}': expected command string or nan",
-                            key_str.name
-                        ));
+                        let span: std::ops::Range<usize> = cmd_value.span.into();
+                        let diagnostic = Diagnostic::error()
+                            .with_message("expected command string or nan to unbind")
+                            .with_label(DiagnosticLabel::primary(span));
+                        return Err(render_diagnostic(file_name, content, &diagnostic));
                     }
                 } else if let Some(cmd_str) = cmd_value.as_str() {
-                    let cmd: Command = cmd_str.parse().map_err(|e: String| e)?;
+                    let cmd: Command = cmd_str.parse().map_err(|e: String| {
+                        let span: std::ops::Range<usize> = cmd_value.span.into();
+                        let diagnostic = Diagnostic::error().with_message(e).with_label(DiagnosticLabel::primary(span));
+                        render_diagnostic(file_name, content, &diagnostic)
+                    })?;
                     Some(cmd)
                 } else {
-                    return Err(format!(
-                        "Invalid binding value for '{}': expected command string or nan",
-                        key_str.name
-                    ));
+                    let span: std::ops::Range<usize> = cmd_value.span.into();
+                    let diagnostic = Diagnostic::error()
+                        .with_message("expected command string or nan to unbind")
+                        .with_label(DiagnosticLabel::primary(span));
+                    return Err(render_diagnostic(file_name, content, &diagnostic));
                 };
 
                 keybinds.set_binding(mode, input, command);

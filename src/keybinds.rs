@@ -180,6 +180,7 @@ pub enum Command {
     ToggleViewMode,
     OverlayCancel,
     OverlayConfirm,
+    RefreshConfig,
 }
 
 impl FromStr for Command {
@@ -211,6 +212,7 @@ impl FromStr for Command {
             "ToggleViewMode" => Command::ToggleViewMode,
             "OverlayCancel" => Command::OverlayCancel,
             "OverlayConfirm" => Command::OverlayConfirm,
+            "RefreshConfig" => Command::RefreshConfig,
             _ => return Err(format!("Unknown command: `{s}`")),
         })
     }
@@ -331,6 +333,7 @@ impl Keybinds {
         self.bind(Mode::Global, "PGUP", Command::HelpScrollUp);
         self.bind(Mode::Global, "PGDN", Command::HelpScrollDown);
         self.bind(Mode::Global, "v", Command::ToggleViewMode);
+        self.bind(Mode::Global, "R", Command::RefreshConfig);
 
         self.bind(Mode::SelectSearch, "C-k", Command::SelectPrev);
         self.bind(Mode::SelectSearch, "UP", Command::SelectPrev);
@@ -467,6 +470,7 @@ impl Command {
             Command::ToggleViewMode => "Toggle View",
             Command::OverlayCancel => "Cancel",
             Command::OverlayConfirm => "Confirm",
+            Command::RefreshConfig => "Refresh Config",
         }
     }
 
@@ -497,6 +501,7 @@ impl Command {
             Command::ToggleViewMode => "ToggleViewMode",
             Command::OverlayCancel => "OverlayCancel",
             Command::OverlayConfirm => "OverlayConfirm",
+            Command::RefreshConfig => "RefreshConfig",
         }
     }
 }

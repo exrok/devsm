@@ -344,7 +344,7 @@ impl LogSearchState {
 
             let highlight = MatchHighlight { start: log_match.match_start, len: self.pattern_lower_len as u32 };
 
-            render_stripped_with_highlight(entry_rect, out, text, base_style, highlight_style, highlight);
+            render_raw_to_buffer_with_highlight(entry_rect, out, text, base_style, highlight_style, highlight);
         }
     }
 
@@ -376,7 +376,7 @@ fn filter_contains(filter: &LogFilter, entry: &LogEntry) -> bool {
 /// Uses extui's chaining API to render each segment with appropriate styling.
 /// For selected entries (non-default base_style), ANSI codes are ignored to maintain readability.
 /// For non-selected entries, ANSI colors are preserved.
-fn render_stripped_with_highlight(
+fn render_raw_to_buffer_with_highlight(
     rect: Rect,
     out: &mut DoubleBuffer,
     text: &str,

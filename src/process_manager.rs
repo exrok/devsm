@@ -1772,18 +1772,30 @@ fn setup_signal_handler(sig: i32, handler: unsafe extern "C" fn(i32)) -> anyhow:
 }
 
 static GLOBAL_WAKER: std::sync::OnceLock<&'static Waker> = std::sync::OnceLock::new();
-static GLOBAL_USER_CONFIG: std::sync::OnceLock<crate::user_config::UserConfig> = std::sync::OnceLock::new();
+static GLOBAL_KEYBINDS: std::sync::OnceLock<Mutex<Arc<crate::keybinds::Keybinds>>> = std::sync::OnceLock::new();
+static GLOBAL_USER_CONFIG_LOADED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-fn global_user_config() -> &'static crate::user_config::UserConfig {
-    GLOBAL_USER_CONFIG.get_or_init(crate::user_config::UserConfig::load)
+pub(crate) fn global_keybinds() -> Arc<crate::keybinds::Keybinds> {
+    GLOBAL_KEYBINDS
+        .get_or_init(|| {
+            let config = crate::user_config::UserConfig::load();
+            GLOBAL_USER_CONFIG_LOADED.get_or_init(|| config.loaded_from_file);
+            Mutex::new(Arc::new(config.keybinds))
+        })
+        .lock()
+        .unwrap()
+        .clone()
 }
 
-pub(crate) fn global_keybinds() -> &'static crate::keybinds::Keybinds {
-    &global_user_config().keybinds
+pub(crate) fn update_global_keybinds(keybinds: crate::keybinds::Keybinds) {
+    if let Some(mutex) = GLOBAL_KEYBINDS.get() {
+        *mutex.lock().unwrap() = Arc::new(keybinds);
+    }
 }
 
 pub(crate) fn user_config_loaded() -> bool {
-    global_user_config().loaded_from_file
+    let _ = global_keybinds();
+    *GLOBAL_USER_CONFIG_LOADED.get().unwrap_or(&false)
 }
 
 impl ProcessManagerHandle {
