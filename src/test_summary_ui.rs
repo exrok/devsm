@@ -5,6 +5,7 @@
 
 use std::{
     collections::VecDeque,
+    fs::File,
     io::{IsTerminal, Write},
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -89,8 +90,8 @@ struct TuiState {
 ///
 /// Returns an error if polling fails.
 pub fn run(
-    stdin: OwnedFd,
-    stdout: OwnedFd,
+    stdin: File,
+    stdout: File,
     socket: Option<UnixStream>,
     workspace: &Workspace,
     test_run: TestRun,
@@ -105,19 +106,16 @@ pub fn run(
 }
 
 fn run_simple_mode(
-    _stdin: OwnedFd,
-    stdout: OwnedFd,
+    _stdin: File,
+    mut stdout: File,
     mut socket: Option<UnixStream>,
     workspace: &Workspace,
     mut test_run: TestRun,
     channel: Arc<ClientChannel>,
 ) -> anyhow::Result<()> {
-    let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
-    std::mem::forget(stdout);
-
     let mut encoder = Encoder::new();
 
-    let _ = writeln!(file, "Running {} test(s)...\n", test_run.test_jobs.len());
+    let _ = writeln!(stdout, "Running {} test(s)...\n", test_run.test_jobs.len());
 
     let mut pipe_fds = [0i32; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == -1 {
@@ -132,11 +130,11 @@ fn run_simple_mode(
             break;
         }
 
-        let all_done = update_test_statuses(&mut file, workspace, &mut test_run)?;
+        let all_done = update_test_statuses(&mut stdout, workspace, &mut test_run)?;
 
         if all_done {
             let state = workspace.state.read().unwrap();
-            print_summary(&mut file, &test_run, &state.base_tasks);
+            print_summary(&mut stdout, &test_run, &state.base_tasks);
             drop(state);
             send_termination(&mut encoder, &mut socket);
             break;
@@ -156,8 +154,8 @@ enum ExitReason {
 }
 
 fn run_tui_mode(
-    stdin: OwnedFd,
-    stdout: OwnedFd,
+    stdin: File,
+    stdout: File,
     mut socket: Option<UnixStream>,
     workspace: &Workspace,
     test_run: TestRun,

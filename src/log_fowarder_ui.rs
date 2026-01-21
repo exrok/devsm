@@ -5,11 +5,9 @@
 //! completes or the client disconnects.
 
 use std::{
+    fs::File,
     io::Write,
-    os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::net::UnixStream,
-    },
+    os::{fd::AsRawFd, unix::net::UnixStream},
     sync::Arc,
 };
 
@@ -64,16 +62,13 @@ fn send_termination(encoder: &mut Encoder, socket: &mut Option<UnixStream>) {
 ///
 /// Returns an error if polling fails.
 pub fn run(
-    stdin: OwnedFd,
-    stdout: OwnedFd,
+    stdin: File,
+    mut stdout: File,
     mut socket: Option<UnixStream>,
     workspace: &Workspace,
     log_group: LogGroup,
     channel: Arc<ClientChannel>,
 ) -> anyhow::Result<()> {
-    let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
-    std::mem::forget(stdout);
-
     let mut last_log_id = workspace.logs.read().unwrap().head();
     let mut phase = Phase::Initial;
     let mut encoder = Encoder::new();
@@ -83,7 +78,7 @@ pub fn run(
         if channel.is_terminated() {
             forward_new_logs(
                 &mut encoder,
-                &mut file,
+                &mut stdout,
                 &mut socket,
                 workspace,
                 log_group,
@@ -97,7 +92,7 @@ pub fn run(
 
         let (job_exited, exit_code, cause) = forward_new_logs(
             &mut encoder,
-            &mut file,
+            &mut stdout,
             &mut socket,
             workspace,
             log_group,
@@ -121,7 +116,7 @@ pub fn run(
                 if n == 0 {
                     forward_new_logs(
                         &mut encoder,
-                        &mut file,
+                        &mut stdout,
                         &mut socket,
                         workspace,
                         log_group,
@@ -129,7 +124,7 @@ pub fn run(
                         &mut phase,
                         &mut current_job,
                     )?;
-                    let _ = file.write_all(b"Detached. Task will continue running in background.\n");
+                    let _ = stdout.write_all(b"Detached. Task will continue running in background.\n");
                     send_termination(&mut encoder, &mut socket);
                     break;
                 }

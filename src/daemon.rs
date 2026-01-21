@@ -1,9 +1,10 @@
 use std::{
+    fs::File,
     io::{ErrorKind, Write},
     os::{
-        fd::OwnedFd,
+        fd::AsRawFd,
         unix::{
-            io::{AsRawFd, FromRawFd},
+            io::FromRawFd,
             net::{UnixListener, UnixStream},
         },
     },
@@ -129,13 +130,13 @@ impl<'a> FdSet<'a> {
     pub fn len(&self) -> usize {
         self.0.len()
     }
-    pub fn pop_front(&mut self) -> Option<OwnedFd> {
+    pub fn pop_front(&mut self) -> Option<File> {
         if self.0.is_empty() {
             None
         } else {
             let fd = self.0[0];
             self.0 = &self.0[1..];
-            Some(unsafe { OwnedFd::from_raw_fd(fd) })
+            Some(unsafe { File::from_raw_fd(fd) })
         }
     }
 }

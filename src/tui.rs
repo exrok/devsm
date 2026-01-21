@@ -1,4 +1,5 @@
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::fs::File;
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -926,8 +927,8 @@ fn meta_group_kind_str(kind: MetaGroupKind) -> &'static str {
     }
 }
 
-fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_count: usize, out: &OwnedFd) {
-    let mut file = unsafe { std::mem::ManuallyDrop::new(std::fs::File::from_raw_fd(out.as_raw_fd())) };
+fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_count: usize, out: &File) {
+    let mut file = out;
     let ws = workspace.state();
     let selection = tui.task_tree.selection_state(&ws);
     let scroll_state = tui.logs.scroll_state(&ws, workspace);
@@ -1074,8 +1075,8 @@ fn attempt_config_reload(tui: &mut TuiState, workspace: &Workspace, keybinds: &m
     }
 }
 pub fn run(
-    stdin: OwnedFd,
-    stdout: OwnedFd,
+    stdin: File,
+    stdout: File,
     workspace: &Workspace,
     extui_channel: Arc<ClientChannel>,
     mut keybinds: Arc<Keybinds>,

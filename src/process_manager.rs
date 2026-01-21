@@ -16,8 +16,9 @@ use mio::{Events, Interest, Poll, Token, Waker, unix::SourceFd};
 use slab::Slab;
 use std::io::Write;
 use std::{
+    fs::File,
     os::{
-        fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+        fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -474,8 +475,8 @@ pub(crate) enum ProcessRequest {
         job_index: JobIndex,
     },
     AttachClient {
-        stdin: Option<OwnedFd>,
-        stdout: Option<OwnedFd>,
+        stdin: Option<File>,
+        stdout: Option<File>,
         socket: UnixStream,
         workspace_config: PathBuf,
         kind: AttachKind,
@@ -1060,7 +1061,7 @@ impl ProcessManager {
         }
     }
 
-    fn attach_tui_client(&mut self, stdin: OwnedFd, stdout: OwnedFd, socket: UnixStream, ws_index: WorkspaceIndex) {
+    fn attach_tui_client(&mut self, stdin: File, stdout: File, socket: UnixStream, ws_index: WorkspaceIndex) {
         let ws = &mut self.workspaces[ws_index as usize];
         let ws_handle = ws.handle.clone();
         let channel = Arc::new(ClientChannel {
@@ -1105,8 +1106,8 @@ impl ProcessManager {
 
     fn attach_run_client(
         &mut self,
-        stdin: OwnedFd,
-        stdout: OwnedFd,
+        stdin: File,
+        mut stdout: File,
         socket: UnixStream,
         ws_index: WorkspaceIndex,
         task_name: &str,
@@ -1120,9 +1121,7 @@ impl ProcessManager {
             let mut state = ws.handle.state.write().unwrap();
             let Some(base_index) = state.base_index_by_name(name) else {
                 drop(state);
-                let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
-                let _ = std::io::Write::write_all(&mut file, b"Task not found\n");
-                std::mem::forget(file);
+                let _ = std::io::Write::write_all(&mut stdout, b"Task not found\n");
                 return;
             };
             drop(state);
@@ -1134,9 +1133,7 @@ impl ProcessManager {
         };
 
         let Some(job_id) = job_id else {
-            let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
-            let _ = std::io::Write::write_all(&mut file, b"Failed to start task\n");
-            std::mem::forget(file);
+            let _ = std::io::Write::write_all(&mut stdout, b"Failed to start task\n");
             return;
         };
 
@@ -1183,8 +1180,8 @@ impl ProcessManager {
 
     fn attach_test_run_client(
         &mut self,
-        stdin: OwnedFd,
-        stdout: OwnedFd,
+        stdin: File,
+        stdout: File,
         socket: UnixStream,
         ws_index: WorkspaceIndex,
         filters: Vec<u8>,
