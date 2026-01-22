@@ -55,6 +55,12 @@ impl<'a> Iterator for ArgParser<'a> {
                 self.value = Some(value);
                 return Some(Component::Long(long));
             }
+            // Support `--flag value` syntax: peek at next arg
+            if let Some(next) = self.args.as_slice().first() {
+                if !next.starts_with('-') {
+                    self.value = Some(self.args.next().unwrap());
+                }
+            }
             return Some(Component::Long(long_or_pair));
         }
 
@@ -84,6 +90,21 @@ pub enum Command<'a> {
     Get { resource: GetResource },
     FunctionCall { name: &'a str },
     Logs { options: LogsOptions<'a> },
+    Complete { context: CompleteContext<'a> },
+}
+
+#[derive(Debug, Clone)]
+pub enum CompleteContext<'a> {
+    Commands,
+    Tasks,
+    Tests,
+    Profiles { task: &'a str },
+    Vars { task: &'a str, exclude: Vec<&'a str> },
+    Groups,
+    Functions,
+    Tags,
+    GetResources,
+    Kinds,
 }
 
 #[derive(Debug, Default)]
@@ -269,6 +290,78 @@ fn parse_kind_selector(value: &str) -> KindSelector<'_> {
     }
 }
 
+fn parse_complete<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let mut task: Option<&'a str> = None;
+    let mut context_str: Option<&'a str> = None;
+    let mut exclude: Vec<&'a str> = Vec::new();
+
+    while let Some(component) = parser.next() {
+        match component {
+            Component::Term(arg) => {
+                if context_str.is_some() {
+                    bail!("Unexpected argument: {:?}", arg);
+                }
+                context_str = Some(arg);
+            }
+            Component::Long(long) => match long {
+                "task" => {
+                    let Some(Component::Value(val)) = parser.next() else {
+                        bail!("Flag --task requires a value (use --task=NAME)");
+                    };
+                    task = Some(val);
+                }
+                "exclude" => {
+                    let Some(Component::Value(val)) = parser.next() else {
+                        bail!("Flag --exclude requires a value (use --exclude=var1,var2)");
+                    };
+                    exclude.extend(val.split(',').filter(|s| !s.is_empty()));
+                }
+                _ => bail!("Unknown flag --{} in complete command", long),
+            },
+            Component::Flags(flags) => {
+                if let Some(flag) = flags.chars().next() {
+                    bail!("Unknown flag -{}", flag);
+                }
+            }
+            Component::Value(val) => {
+                bail!("Unexpected value: {:?}", val);
+            }
+        }
+    }
+
+    let Some(context_str) = context_str else {
+        bail!(
+            "complete requires a context (commands, tasks, tests, profiles, vars, groups, functions, tags, get-resources, kinds)"
+        );
+    };
+
+    let context = match context_str {
+        "commands" => CompleteContext::Commands,
+        "tasks" => CompleteContext::Tasks,
+        "tests" => CompleteContext::Tests,
+        "profiles" => {
+            let Some(task) = task else {
+                bail!("complete profiles requires --task=NAME");
+            };
+            CompleteContext::Profiles { task }
+        }
+        "vars" => {
+            let Some(task) = task else {
+                bail!("complete vars requires --task=NAME");
+            };
+            CompleteContext::Vars { task, exclude }
+        }
+        "groups" => CompleteContext::Groups,
+        "functions" => CompleteContext::Functions,
+        "tags" => CompleteContext::Tags,
+        "get-resources" => CompleteContext::GetResources,
+        "kinds" => CompleteContext::Kinds,
+        _ => bail!("Unknown complete context: {}", context_str),
+    };
+
+    Ok(Command::Complete { context })
+}
+
 fn parse_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     let mut options = LogsOptions::default();
 
@@ -403,6 +496,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                         _ => bail!("Unknown function subcommand: {}", subcommand),
                     }
                 }
+                "complete" => break 'command parse_complete(&mut parser)?,
                 "get" => {
                     let Some(Component::Term(resource)) = parser.next() else {
                         bail!("get requires a resource name");

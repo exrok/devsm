@@ -175,6 +175,11 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::Complete { context } => {
+            if !print_completions(context) {
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -784,6 +789,155 @@ fn get_self_logs(follow: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_completions(context: cli::CompleteContext) -> bool {
+    match context {
+        cli::CompleteContext::Commands => {
+            println!("run\tRun a task and display output");
+            println!("exec\tExecute task directly, bypassing daemon");
+            println!("restart\tRestart a task via daemon");
+            println!("restart-selected\tRestart selected task in TUI");
+            println!("kill\tTerminate a running task");
+            println!("test\tRun tests with optional filters");
+            println!("logs\tView and stream logs");
+            println!("validate\tValidate config file");
+            println!("get\tGet information from daemon");
+            println!("function\tCall a saved function");
+            println!("server\tStart daemon process");
+            println!("complete\tOutput completions for shell");
+            true
+        }
+        cli::CompleteContext::Tasks => {
+            let Ok(workspace) = config::load_from_env() else {
+                return false;
+            };
+            for (name, expr) in workspace.tasks {
+                let preview = expr.command_preview();
+                if preview.is_empty() {
+                    println!("{name}");
+                } else {
+                    println!("{name}\t{preview}");
+                }
+                if expr.profiles.len() > 1 {
+                    for profile in expr.profiles {
+                        if preview.is_empty() {
+                            println!("{name}:{profile}");
+                        } else {
+                            println!("{name}:{profile}\t{preview}");
+                        }
+                    }
+                }
+            }
+            true
+        }
+        cli::CompleteContext::Tests => {
+            let Ok(workspace) = config::load_from_env() else {
+                return false;
+            };
+            for (name, variants) in workspace.tests {
+                let info = variants.first().map(|v| v.info).unwrap_or("");
+                if info.is_empty() {
+                    println!("{name}");
+                } else {
+                    println!("{name}\t{info}");
+                }
+            }
+            true
+        }
+        cli::CompleteContext::Profiles { task } => {
+            let Ok(workspace) = config::load_from_env() else {
+                return false;
+            };
+            let Some((_, expr)) = workspace.tasks.iter().find(|(n, _)| *n == task) else {
+                return false;
+            };
+            for profile in expr.profiles {
+                println!("{task}:{profile}");
+            }
+            true
+        }
+        cli::CompleteContext::Vars { task, exclude } => {
+            let Ok(workspace) = config::load_from_env() else {
+                return false;
+            };
+            let Some((_, expr)) = workspace.tasks.iter().find(|(n, _)| *n == task) else {
+                return false;
+            };
+            for (name, meta) in expr.vars {
+                if exclude.contains(name) {
+                    continue;
+                }
+                if let Some(desc) = meta.description {
+                    println!("{name}\t{desc}");
+                } else {
+                    println!("{name}");
+                }
+            }
+            for var in expr.collect_variables() {
+                if exclude.contains(&var) {
+                    continue;
+                }
+                if !expr.vars.iter().any(|(n, _)| *n == var) {
+                    println!("{var}");
+                }
+            }
+            true
+        }
+        cli::CompleteContext::Groups => {
+            let Ok(workspace) = config::load_from_env() else {
+                return false;
+            };
+            for (name, _) in workspace.groups {
+                println!("{name}");
+            }
+            true
+        }
+        cli::CompleteContext::Functions => {
+            let Ok(workspace) = config::load_from_env() else {
+                return false;
+            };
+            for func in workspace.functions {
+                println!("{}", func.name);
+            }
+            true
+        }
+        cli::CompleteContext::Tags => {
+            let Ok(workspace) = config::load_from_env() else {
+                return false;
+            };
+            let mut tags = std::collections::HashSet::new();
+            for (_, expr) in workspace.tasks {
+                for tag in expr.tags {
+                    tags.insert(*tag);
+                }
+            }
+            for (_, variants) in workspace.tests {
+                for variant in *variants {
+                    for tag in variant.tags {
+                        tags.insert(*tag);
+                    }
+                }
+            }
+            for tag in tags {
+                println!("{tag}");
+            }
+            true
+        }
+        cli::CompleteContext::GetResources => {
+            println!("self-logs\tRetrieve daemon logs");
+            println!("workspace\tWorkspace resources");
+            println!("default-user-config\tPrint default user config");
+            println!("logged-rust-panics\tShow logged Rust panics");
+            true
+        }
+        cli::CompleteContext::Kinds => {
+            println!("service\tLong-running services");
+            println!("action\tOne-shot actions");
+            println!("test\tTest tasks");
+            true
+        }
+    }
+}
+
 fn print_help() {
     print!(
         "\
@@ -792,19 +946,23 @@ devsm - TUI development service manager
 Usage: devsm [OPTIONS] [COMMAND]
 
 Commands:
-  (default)         Launch the TUI interface
-  run <job>         Run a job and display its output
-  exec <job>        Execute a task directly, bypassing the daemon
-  restart <job>     Restart a job via the daemon
-  kill <task>       Terminate a running task (by name or index)
-  test [filters]    Run tests with optional filters
-  logs [options]    View and stream logs from tasks
-  validate [path]   Validate a config file
-  get <resource>    Get information from the daemon
-  server            Start the daemon process (internal)
+  (default)          Launch the TUI interface
+  run <job>          Run a job and display its output
+  exec <job>         Execute a task directly, bypassing the daemon
+  restart <job>      Restart a job via the daemon
+  restart-selected   Restart the currently selected task in TUI
+  kill <task>        Terminate a running task (by name or index)
+  test [filters]     Run tests with optional filters
+  logs [options]     View and stream logs from tasks
+  validate [path]    Validate a config file
+  get <resource>     Get information from the daemon
+  function call <n>  Call a function defined in config
+  complete <context> Output completion data for shell scripts
+  server             Start the daemon process (internal)
 
 Options:
   -h, --help        Print this help message
+  --from=DIR        Run from DIR instead of current directory
 
 Job Arguments:
   Jobs accept parameters as --key=value flags or a JSON object:
@@ -815,6 +973,9 @@ Test Filters:
   +tag              Include tests with this tag
   -tag              Exclude tests with this tag
   name              Include tests matching this name
+
+Validate Options:
+  --skip-path-checks     Skip validation of pwd paths
 
 Logs Options:
   --max-age=DURATION     Show logs since DURATION ago (5s, 10m, 1h)
@@ -832,6 +993,19 @@ Get Resources:
   self-logs [-f]         Retrieve daemon logs (-f/--follow to tail)
   workspace config-path  Get config file path
   default-user-config    Print default user config (keybindings)
+  logged-rust-panics     Show logged Rust panics from daemon
+
+Complete Contexts:
+  commands               List available commands
+  tasks                  List tasks from config
+  tests                  List tests from config
+  profiles --task=NAME   List profiles for a task
+  vars --task=NAME       List variables for a task
+  groups                 List groups from config
+  functions              List functions from config
+  tags                   List all tags
+  get-resources          List get subcommands
+  kinds                  List task kinds (service, action, test)
 
 Environment Variables:
   DEVSM_SOCKET           Custom socket path
