@@ -848,6 +848,41 @@ impl ProcessManager {
 
                 let _ = socket.write_all(format!("error: function '{}' not configured\n", name).as_bytes());
             }
+            WorkspaceCommand::Kill { name } => {
+                let ws = &self.workspaces[ws_index as usize];
+                let mut state = ws.handle.state.write().unwrap();
+
+                let index = if let Ok(job_index) = name.parse::<u32>() {
+                    let bti = workspace::BaseTaskIndex(job_index);
+                    if state.base_tasks.get(bti.idx()).is_some() {
+                        Some(bti)
+                    } else {
+                        None
+                    }
+                } else {
+                    state.base_index_by_name(&name)
+                };
+
+                let Some(index) = index else {
+                    let _ = socket.write_all(format!("error: task '{}' not found\n", name).as_bytes());
+                    return;
+                };
+
+                let bt = &state.base_tasks[index.idx()];
+                let has_non_terminal = bt.jobs.non_terminal().iter().any(|ji| {
+                    matches!(state.jobs[ji.idx()].process_status, JobStatus::Running { .. })
+                });
+
+                if !has_non_terminal {
+                    let _ = socket.write_all(format!("Task '{}' was already finished\n", bt.name).as_bytes());
+                    return;
+                }
+
+                let task_name = bt.name.to_string();
+                drop(state);
+                ws.handle.terminate_tasks(index);
+                let _ = socket.write_all(format!("Task '{}' terminated\n", task_name).as_bytes());
+            }
         }
     }
     fn handle_request(&mut self, req: ProcessRequest) -> bool {

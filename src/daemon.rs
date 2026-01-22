@@ -76,6 +76,7 @@ pub enum WorkspaceCommand<'a> {
     GetPanicLocation,
     Run { name: Box<str>, params: ValueMap<'a> },
     CallFunction { name: Box<str> },
+    Kill { name: Box<str> },
 }
 
 /// Filters for test selection (serializable for IPC).

@@ -78,6 +78,7 @@ pub enum Command<'a> {
     Restart { job: &'a str, value_map: ValueMap<'a> },
     Exec { job: &'a str, value_map: ValueMap<'a> },
     Run { job: &'a str, value_map: ValueMap<'a> },
+    Kill { job: &'a str },
     Test { filters: Vec<TestFilter<'a>> },
     Validate { path: Option<&'a str>, skip_path_checks: bool },
     Get { resource: GetResource },
@@ -265,6 +266,12 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                 "restart" => break 'command parse_restart(&mut parser)?,
                 "exec" => break 'command parse_exec(&mut parser)?,
                 "run" => break 'command parse_run(&mut parser)?,
+                "kill" => {
+                    let Some(Component::Term(job)) = parser.next() else {
+                        bail!("kill requires a task name or job index");
+                    };
+                    break 'command Command::Kill { job };
+                }
                 "test" => break 'command parse_test_filters(&mut parser)?,
                 "validate" => break 'command parse_validate(&mut parser)?,
                 "function" => {

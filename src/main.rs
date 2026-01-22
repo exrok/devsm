@@ -92,6 +92,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::Kill { job } => {
+            if let Err(err) = workspace_command(WorkspaceCommand::Kill { name: job.into() }) {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
+        }
         cli::Command::Test { filters } => {
             let _log_guard = self_log::init_client_logging();
             if let Err(err) = test_client(filters) {
@@ -673,6 +679,7 @@ Commands:
   run <job>         Run a job and display its output
   exec <job>        Execute a task directly, bypassing the daemon
   restart <job>     Restart a job via the daemon
+  kill <task>       Terminate a running task (by name or index)
   test [filters]    Run tests with optional filters
   validate [path]   Validate a config file
   get <resource>    Get information from the daemon
