@@ -165,13 +165,13 @@ pub(crate) fn try_read(fd: RawFd, buffer: &mut Vec<u8>) -> ReadResult {
         let result = unsafe { libc::read(fd, target.as_mut_ptr() as *mut libc::c_void, read_len) };
         if result < 0 {
             let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock {
-                return ReadResult::OtherError(err.kind());
-            }
             if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return ReadResult::WouldBlock;
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return ReadResult::WouldBlock;
+            }
+            return ReadResult::OtherError(err.kind());
         } else if result == 0 {
             return ReadResult::EOF;
         } else {
@@ -285,7 +285,18 @@ impl ProcessManager {
         Ok(())
     }
     pub(crate) fn scheduled(&mut self) {
+        const MAX_ITERATIONS: u32 = 10_000;
+        let mut iteration_count = 0u32;
         'outer: loop {
+            iteration_count += 1;
+            if iteration_count > MAX_ITERATIONS {
+                kvlog::error!(
+                    "Scheduler exceeded maximum iterations",
+                    iterations = MAX_ITERATIONS,
+                    workspaces = self.workspaces.len()
+                );
+                break;
+            }
             for (wsi, ws) in &self.workspaces {
                 let state = ws.handle.state();
 
@@ -717,6 +728,10 @@ impl ProcessManager {
                 let response = jsony::to_json(&self.workspaces[ws_index as usize].handle.last_rust_panic());
                 let _ = socket.write_all(response.as_bytes());
             }
+            WorkspaceCommand::GetLoggedRustPanics => {
+                let response = jsony::to_json(&self.workspaces[ws_index as usize].handle.logged_rust_panics());
+                let _ = socket.write_all(response.as_bytes());
+            }
             WorkspaceCommand::Run { name, params } => {
                 let ws = &self.workspaces[ws_index as usize];
                 let mut state = ws.handle.state.write().unwrap();
@@ -854,11 +869,7 @@ impl ProcessManager {
 
                 let index = if let Ok(job_index) = name.parse::<u32>() {
                     let bti = workspace::BaseTaskIndex(job_index);
-                    if state.base_tasks.get(bti.idx()).is_some() {
-                        Some(bti)
-                    } else {
-                        None
-                    }
+                    if state.base_tasks.get(bti.idx()).is_some() { Some(bti) } else { None }
                 } else {
                     state.base_index_by_name(&name)
                 };
@@ -869,9 +880,11 @@ impl ProcessManager {
                 };
 
                 let bt = &state.base_tasks[index.idx()];
-                let has_non_terminal = bt.jobs.non_terminal().iter().any(|ji| {
-                    matches!(state.jobs[ji.idx()].process_status, JobStatus::Running { .. })
-                });
+                let has_non_terminal = bt
+                    .jobs
+                    .non_terminal()
+                    .iter()
+                    .any(|ji| matches!(state.jobs[ji.idx()].process_status, JobStatus::Running { .. }));
 
                 if !has_non_terminal {
                     let _ = socket.write_all(format!("Task '{}' was already finished\n", bt.name).as_bytes());

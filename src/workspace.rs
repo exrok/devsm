@@ -1,6 +1,8 @@
 use crate::{
     cli::TestFilter,
-    config::{CARGO_AUTO_EXPR, CacheKeyInput, Environment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig},
+    config::{
+        CARGO_AUTO_EXPR, CacheKeyInput, Command, Environment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig,
+    },
     function::FunctionAction,
     log_storage::{LogGroup, LogId, Logs},
     process_manager::MioChannel,
@@ -313,6 +315,21 @@ pub struct TestInfo {
     /// The test group name (e.g., "frontend" for test variant "frontend:0").
     pub base_name: &'static str,
     pub variant_index: u32,
+}
+
+#[derive(jsony::Jsony)]
+#[jsony(ToJson)]
+pub struct LoggedPanic {
+    pub age: u32,
+    pub line: u64,
+    pub column: u64,
+    pub file: String,
+    pub thread: String,
+    pub task: String,
+    pub pwd: String,
+    pub cmd: Vec<String>,
+    #[jsony(skip_if = Option::is_none)]
+    pub next_line: Option<String>,
 }
 
 pub struct BaseTask {
@@ -1081,7 +1098,6 @@ impl WorkspaceState {
                      status = ?&self[job_index].process_status, ?job_index);
                     continue;
                 };
-                kvlog::info!("checking req", ?after);
                 for req in after {
                     match req.status(self) {
                         RequirementStatus::Pending => continue 'pending,
@@ -1255,11 +1271,17 @@ pub struct Workspace {
     pub process_channel: Arc<MioChannel>,
 }
 
-pub fn extract_rust_panic_from_line(line: &str) -> Option<(&str, u64)> {
-    let (file, nums) = line.strip_prefix("thread")?.split_once(") panicked at ")?.1.split_once(":")?;
-    let (line_str, _) = nums.split_once(":")?;
+pub fn extract_rust_panic_from_line(line: &str) -> Option<(&str, &str, u64, u64)> {
+    let after_thread = line.strip_prefix("thread ")?;
+    let thread_start = after_thread.strip_prefix('\'')?;
+    let (thread, rest) = thread_start.split_once('\'')?;
+    let after_panic = rest.split_once(") panicked at ")?.1;
+    let (file, nums) = after_panic.split_once(":")?;
+    let (line_str, rest) = nums.split_once(":")?;
+    let (col_str, _) = rest.split_once(":")?;
     let line = line_str.parse::<u64>().ok()?;
-    Some((file, line))
+    let col = col_str.parse::<u64>().ok()?;
+    Some((thread, file, line, col))
 }
 impl Workspace {
     pub fn last_rust_panic(&self) -> Option<(String, u64)> {
@@ -1268,13 +1290,95 @@ impl Workspace {
         for s in [b, a] {
             for entry in s {
                 let text = unsafe { entry.text(&logs) };
-                if let Some((file, line)) = extract_rust_panic_from_line(text) {
+                if let Some((_thread, file, line, _col)) = extract_rust_panic_from_line(text) {
                     return Some((file.to_string(), line));
                 }
             }
         }
         None
     }
+
+    pub fn logged_rust_panics(&self) -> Vec<LoggedPanic> {
+        struct PanicFromLog {
+            age: u32,
+            line: u64,
+            column: u64,
+            file: String,
+            thread: String,
+            log_group: LogGroup,
+            next_line: Option<String>,
+        }
+
+        let from_logs = {
+            let logs = self.logs.read().unwrap();
+            let current_elapsed = logs.elapsed_secs();
+            let cutoff = current_elapsed.saturating_sub(30);
+            let (a, b) = logs.slices();
+            let mut collected = Vec::new();
+
+            let entries: Vec<_> = a.iter().chain(b.iter()).collect();
+            for (i, entry) in entries.iter().enumerate() {
+                if entry.time < cutoff {
+                    continue;
+                }
+                let text = unsafe { entry.text(&logs) };
+                let Some((thread, file, line, column)) = extract_rust_panic_from_line(text) else {
+                    continue;
+                };
+                let next_line = entries.get(i + 1).and_then(|next| {
+                    if next.log_group == entry.log_group && next.time <= entry.time + 1 {
+                        Some(unsafe { next.text(&logs) }.to_string())
+                    } else {
+                        None
+                    }
+                });
+                collected.push(PanicFromLog {
+                    age: current_elapsed - entry.time,
+                    line,
+                    column,
+                    file: file.to_string(),
+                    thread: thread.to_string(),
+                    log_group: entry.log_group,
+                    next_line,
+                });
+            }
+            collected
+        };
+
+        let state = self.state.read().unwrap();
+        from_logs
+            .into_iter()
+            .map(|p| {
+                let base_task_idx = p.log_group.base_task_index();
+                let task_name = state.base_tasks.get(base_task_idx.idx()).map(|bt| bt.name).unwrap_or("<unknown>");
+                let job = state.jobs.iter().find(|job| job.log_group == p.log_group);
+                let (pwd, cmd) = match job {
+                    Some(job) => {
+                        let config = job.task.config();
+                        let pwd = config.pwd.to_string();
+                        let cmd = match &config.command {
+                            Command::Cmd(args) => args.iter().map(|s| s.to_string()).collect(),
+                            Command::Sh(sh) => vec!["sh".to_string(), "-c".to_string(), sh.to_string()],
+                        };
+                        (pwd, cmd)
+                    }
+                    None => (String::new(), Vec::new()),
+                };
+                LoggedPanic {
+                    age: p.age,
+                    line: p.line,
+                    column: p.column,
+                    file: p.file,
+                    thread: p.thread,
+                    task: task_name.to_string(),
+                    pwd,
+                    cmd,
+                    next_line: p.next_line,
+                }
+            })
+            .collect()
+    }
+
     pub fn state(&self) -> std::sync::RwLockReadGuard<'_, WorkspaceState> {
         self.state.read().unwrap()
     }
@@ -1603,7 +1707,7 @@ mod scheduling_tests {
         let line =
             "thread 'log_storage::tests::test_rotation_on_max_lines' (143789) panicked at src/log_storage.rs:639:9:";
         let extracted = extract_rust_panic_from_line(line);
-        assert_eq!(extracted, Some(("src/log_storage.rs", 639)));
+        assert_eq!(extracted, Some(("log_storage::tests::test_rotation_on_max_lines", "src/log_storage.rs", 639, 9)));
     }
 
     mod service_dependents_tests {

@@ -89,6 +89,7 @@ pub enum GetResource {
     SelfLogs { follow: bool },
     WorkspaceConfigPath,
     DefaultUserConfig,
+    LoggedRustPanics,
 }
 
 /// Filter for test selection.
@@ -328,6 +329,9 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                                 }
                                 _ => bail!("Unknown workspace resource: {}", sub),
                             }
+                        }
+                        "logged-rust-panics" => {
+                            break 'command Command::Get { resource: GetResource::LoggedRustPanics };
                         }
                         _ => bail!("Unknown resource: {}", resource),
                     }

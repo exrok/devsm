@@ -5,6 +5,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Instant,
 };
 
 use extui::Style;
@@ -91,6 +92,7 @@ pub struct LogEntry {
     len: u32,
     pub width: u32,
     pub style: Style,
+    pub time: u32,
 }
 impl LogEntry {
     /// Safety: The Line must be from the providd LineBuffer and
@@ -143,6 +145,7 @@ pub struct Logs {
     /// The absolute, ever-increasing LineId of the first line in the buffer.
     /// This is only ever modified under a write lock, so it does not need to be atomic.
     start_line_id: usize,
+    start_time: Instant,
 }
 
 pub struct LogIndexer<'a> {
@@ -188,6 +191,10 @@ impl Logs {
     pub fn tail(&self) -> LogId {
         let len = self.line_count.load(Ordering::Acquire);
         LogId(self.start_line_id + len)
+    }
+
+    pub fn elapsed_secs(&self) -> u32 {
+        self.start_time.elapsed().as_secs() as u32
     }
 
     pub fn slices(&self) -> (&[LogEntry], &[LogEntry]) {
@@ -429,9 +436,17 @@ fn write_line_unchecked(buf: &Logs, start: u32, line: &str, width: u32, job_id: 
     let index_start = buf.index_start();
     let line_count = buf.line_count.load(Ordering::Acquire);
     let next = (line_count + index_start) & (MAX_LINES - 1);
+    let time = buf.start_time.elapsed().as_secs() as u32;
     unsafe {
         std::ptr::copy_nonoverlapping(line.as_ptr(), buf.buffer.add(start as usize).as_ptr(), line.len());
-        buf.line_entries.add(next).write(LogEntry { log_group: job_id, start, len: line.len() as u32, width, style });
+        buf.line_entries.add(next).write(LogEntry {
+            log_group: job_id,
+            start,
+            len: line.len() as u32,
+            width,
+            style,
+            time,
+        });
         buf.line_count.fetch_add(1, Ordering::Release);
     }
 }
@@ -459,7 +474,13 @@ impl LogWriter {
             }
             NonNull::new(ptr as *mut LogEntry).unwrap()
         };
-        let line_buffer = Logs { buffer, line_entries, line_count: AtomicUsize::new(0), start_line_id: 0 };
+        let line_buffer = Logs {
+            buffer,
+            line_entries,
+            line_count: AtomicUsize::new(0),
+            start_line_id: 0,
+            start_time: Instant::now(),
+        };
         LogWriter {
             buffer: Arc::new(RwLock::new(line_buffer)),
             remaining: MAX_LINES,

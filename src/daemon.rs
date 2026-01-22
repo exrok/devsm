@@ -74,6 +74,7 @@ pub struct RequestMessage<'a> {
 pub enum WorkspaceCommand<'a> {
     RestartSelected,
     GetPanicLocation,
+    GetLoggedRustPanics,
     Run { name: Box<str>, params: ValueMap<'a> },
     CallFunction { name: Box<str> },
     Kill { name: Box<str> },

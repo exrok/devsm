@@ -2,7 +2,7 @@
 
 [function]
 f1 = { kill = "full_basic" }
-f2 = { spawn = [["with_var", { dir = "/tmp/" }], "multline_sh"]}
+f2 = { spawn = [["with_var", { dir = "/tmp/" }], "multiline_sh"]}
 f3 = { restart = "full_basic"}
 
 # Minimal action with cmd array

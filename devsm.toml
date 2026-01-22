@@ -11,18 +11,19 @@ ready.when.output_contains = "RPC Socket bound"
 ready.timeout = 5.0
 cache.never = true
 
-[action.devsm-in-tmux]
-pwd = "tests/workspace"
-sh = """
-tmux send-keys -t devsm-tester:0 "env DEVSM_SOCKET=/tmp/.devsm.test.socket DEVSM_NO_AUTO_SPAWN=1 cargo run" "ENTER" || exit 1
-"""
-require = ["devsm"]
 
 [action.tmux-attach]
 pwd = "tests/workspace"
 sh = 'tmux attach -t devsm-tester:0 || tmux new-session -A -s devsm-tester'
 env.DEVSM_SOCKET = "/tmp/.devsm.test.socket"
 managed = false
+
+[action.devsm-in-tmux]
+pwd = "tests/workspace"
+sh = """
+tmux send-keys -t devsm-tester:0 "env DEVSM_SOCKET=/tmp/.devsm.test.socket DEVSM_NO_AUTO_SPAWN=1 cargo run" "ENTER" || exit 1
+"""
+require = ["devsm"]
 
 [action.devsm-tui]
 pwd = "tests/workspace"

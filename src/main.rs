@@ -155,6 +155,12 @@ fn main() {
             cli::GetResource::DefaultUserConfig => {
                 print!("{}", user_config::default_user_config_toml());
             }
+            cli::GetResource::LoggedRustPanics => {
+                if let Err(err) = workspace_command(WorkspaceCommand::GetLoggedRustPanics) {
+                    eprintln!("error: {}", err);
+                    std::process::exit(1);
+                }
+            }
         },
         cli::Command::FunctionCall { name } => {
             if let Err(err) = workspace_command(WorkspaceCommand::CallFunction { name: name.into() }) {
