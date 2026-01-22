@@ -83,6 +83,33 @@ pub enum Command<'a> {
     Validate { path: Option<&'a str>, skip_path_checks: bool },
     Get { resource: GetResource },
     FunctionCall { name: &'a str },
+    Logs { options: LogsOptions<'a> },
+}
+
+#[derive(Debug, Default)]
+pub struct LogsOptions<'a> {
+    pub max_age: Option<&'a str>,
+    pub tasks: Vec<TaskSelector<'a>>,
+    pub job: Option<u32>,
+    pub kinds: Vec<KindSelector<'a>>,
+    pub pattern: Option<&'a str>,
+    pub follow: bool,
+    pub retry: bool,
+    pub oldest: Option<usize>,
+    pub newest: Option<usize>,
+    pub without_taskname: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskSelector<'a> {
+    pub name: &'a str,
+    pub latest: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct KindSelector<'a> {
+    pub kind: &'a str,
+    pub latest: bool,
 }
 
 pub enum GetResource {
@@ -226,6 +253,92 @@ fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<
     Ok(Command::Test { filters })
 }
 
+fn parse_task_selector(value: &str) -> TaskSelector<'_> {
+    if let Some(name) = value.strip_suffix("@latest") {
+        TaskSelector { name, latest: true }
+    } else {
+        TaskSelector { name: value, latest: false }
+    }
+}
+
+fn parse_kind_selector(value: &str) -> KindSelector<'_> {
+    if let Some(kind) = value.strip_suffix("@latest") {
+        KindSelector { kind, latest: true }
+    } else {
+        KindSelector { kind: value, latest: false }
+    }
+}
+
+fn parse_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let mut options = LogsOptions::default();
+
+    while let Some(component) = parser.next() {
+        match component {
+            Component::Term(arg) => {
+                if options.pattern.is_some() {
+                    bail!("Only one pattern argument is allowed");
+                }
+                options.pattern = Some(arg);
+            }
+            Component::Long(long) => match long {
+                "follow" => options.follow = true,
+                "retry" => options.retry = true,
+                "without-taskname" => options.without_taskname = true,
+                "max-age" => {
+                    let Some(Component::Value(val)) = parser.next() else {
+                        bail!("Flag --max-age requires a value (use --max-age=5s)");
+                    };
+                    options.max_age = Some(val);
+                }
+                "task" => {
+                    let Some(Component::Value(val)) = parser.next() else {
+                        bail!("Flag --task requires a value (use --task=NAME)");
+                    };
+                    options.tasks.push(parse_task_selector(val));
+                }
+                "job" => {
+                    let Some(Component::Value(val)) = parser.next() else {
+                        bail!("Flag --job requires a value (use --job=INDEX)");
+                    };
+                    options.job = Some(val.parse().context("Invalid job index")?);
+                }
+                "kind" => {
+                    let Some(Component::Value(val)) = parser.next() else {
+                        bail!("Flag --kind requires a value (use --kind=service)");
+                    };
+                    options.kinds.push(parse_kind_selector(val));
+                }
+                "oldest" => {
+                    let Some(Component::Value(val)) = parser.next() else {
+                        bail!("Flag --oldest requires a value (use --oldest=N)");
+                    };
+                    options.oldest = Some(val.parse().context("Invalid oldest count")?);
+                }
+                "newest" => {
+                    let Some(Component::Value(val)) = parser.next() else {
+                        bail!("Flag --newest requires a value (use --newest=N)");
+                    };
+                    options.newest = Some(val.parse().context("Invalid newest count")?);
+                }
+                _ => bail!("Unknown flag --{} in logs command", long),
+            },
+            Component::Flags(flags) => {
+                for flag in flags.chars() {
+                    match flag {
+                        'f' => options.follow = true,
+                        _ => bail!("Unknown flag -{} in logs command", flag),
+                    }
+                }
+            }
+            Component::Value(val) => {
+                bail!("Unexpected value: {:?}", val);
+            }
+        }
+    }
+
+    Ok(Command::Logs { options })
+}
+
 pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Command<'a>)> {
     let mut parser = ArgParser::new(args);
     let mut global = GlobalArguments { from: None };
@@ -275,6 +388,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                 }
                 "test" => break 'command parse_test_filters(&mut parser)?,
                 "validate" => break 'command parse_validate(&mut parser)?,
+                "logs" => break 'command parse_logs(&mut parser)?,
                 "function" => {
                     let Some(Component::Term(subcommand)) = parser.next() else {
                         bail!("function requires a subcommand (call)");

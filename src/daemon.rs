@@ -89,6 +89,37 @@ pub struct TestFilters<'a> {
     pub include_names: Vec<&'a str>,
 }
 
+/// Query parameters for the logs command.
+#[derive(Jsony, Debug, Clone, Default)]
+#[jsony(Binary)]
+pub struct LogsQuery<'a> {
+    pub max_age_secs: Option<u32>,
+    pub task_filters: Vec<TaskFilter<'a>>,
+    pub job_index: Option<u32>,
+    pub kind_filters: Vec<KindFilter<'a>>,
+    pub pattern: &'a str,
+    pub follow: bool,
+    pub retry: bool,
+    pub oldest: Option<u32>,
+    pub newest: Option<u32>,
+    pub without_taskname: bool,
+    pub is_tty: bool,
+}
+
+#[derive(Jsony, Debug, Clone)]
+#[jsony(Binary)]
+pub struct TaskFilter<'a> {
+    pub name: &'a str,
+    pub latest: bool,
+}
+
+#[derive(Jsony, Debug, Clone)]
+#[jsony(Binary)]
+pub struct KindFilter<'a> {
+    pub kind: &'a str,
+    pub latest: bool,
+}
+
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub enum Request<'a> {
@@ -116,6 +147,11 @@ pub enum Request<'a> {
         #[jsony(with = unix_path)]
         config: &'a Path,
         subscribe: bool,
+    },
+    AttachLogs {
+        #[jsony(with = unix_path)]
+        config: &'a Path,
+        query: LogsQuery<'a>,
     },
     GetSelfLogs {
         follow: bool,
@@ -218,6 +254,19 @@ fn handle_request(
                 socket,
                 workspace_config: config.into(),
                 kind: crate::process_manager::AttachKind::Rpc { subscribe },
+            });
+        }
+        Request::AttachLogs { config, query } => {
+            kvlog::info!("Receiving FD for logs command");
+            if fds.len() != 2 {
+                bail!("Expected 2 FD's for logs");
+            }
+            pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
+                stdin: Some(fds.pop_front().unwrap()),
+                stdout: Some(fds.pop_front().unwrap()),
+                socket,
+                workspace_config: config.into(),
+                kind: crate::process_manager::AttachKind::Logs { query: jsony::to_binary(&query) },
             });
         }
         Request::GetSelfLogs { follow } => {

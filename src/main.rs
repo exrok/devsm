@@ -168,6 +168,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::Logs { options } => {
+            let _log_guard = self_log::init_client_logging();
+            if let Err(err) = logs_client(options) {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -623,6 +630,110 @@ fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
     bail!("exec failed: {}", err);
 }
 
+fn logs_client(options: cli::LogsOptions) -> anyhow::Result<()> {
+    reset_terminal_to_canonical();
+
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    if options.follow {
+        setup_signal_handler(libc::SIGTERM, term_handler)?;
+        setup_signal_handler(libc::SIGINT, term_handler)?;
+    }
+
+    let mut socket = connect_or_spawn_daemon()?;
+
+    let is_tty = unsafe { libc::isatty(1) == 1 };
+
+    let query = daemon::LogsQuery {
+        max_age_secs: options.max_age.and_then(|s| parse_duration(s).ok()),
+        task_filters: options.tasks.iter().map(|t| daemon::TaskFilter { name: t.name, latest: t.latest }).collect(),
+        job_index: options.job,
+        kind_filters: options.kinds.iter().map(|k| daemon::KindFilter { kind: k.kind, latest: k.latest }).collect(),
+        pattern: options.pattern.unwrap_or(""),
+        follow: options.follow,
+        retry: options.retry,
+        oldest: options.oldest.map(|n| n as u32),
+        newest: options.newest.map(|n| n as u32),
+        without_taskname: options.without_taskname,
+        is_tty,
+    };
+
+    socket.send_with_fd(
+        &jsony::to_binary(&daemon::RequestMessage {
+            cwd: &cwd,
+            request: daemon::Request::AttachLogs { config: &config, query },
+        }),
+        &[0, 1],
+    )?;
+
+    let mut protocol = ClientProtocol::new();
+    let mut read_buf = Vec::with_capacity(1024);
+
+    loop {
+        let flags = SIGNAL_FLAGS.swap(0, Ordering::Relaxed);
+
+        if flags & TERMINATION_FLAG != 0 {
+            protocol.send_empty(RpcMessageKind::Terminate, 0);
+            socket.write_all(protocol.output())?;
+            protocol.clear_output();
+        }
+
+        read_buf.reserve(1024);
+        let spare = read_buf.spare_capacity_mut();
+        let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
+
+        match socket.read(read_slice) {
+            Ok(0) => break,
+            Ok(n) => {
+                unsafe { read_buf.set_len(read_buf.len() + n) };
+                loop {
+                    match protocol.decode(&read_buf) {
+                        DecodeResult::Message { kind, .. } => match kind {
+                            RpcMessageKind::TerminateAck | RpcMessageKind::Disconnect => {
+                                return Ok(());
+                            }
+                            _ => {}
+                        },
+                        DecodeResult::MissingData { .. } => break,
+                        DecodeResult::Empty => {
+                            read_buf.clear();
+                            break;
+                        }
+                        DecodeResult::Error(_) => break,
+                    }
+                }
+                protocol.compact(&mut read_buf, 4096);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => bail!("Socket read failed: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_duration(s: &str) -> anyhow::Result<u32> {
+    let s = s.trim();
+    if let Some(num) = s.strip_suffix("ms") {
+        let ms: u32 = num.trim().parse()?;
+        return Ok(ms / 1000);
+    }
+    if let Some(num) = s.strip_suffix('s') {
+        return Ok(num.trim().parse()?);
+    }
+    if let Some(num) = s.strip_suffix('m') {
+        let mins: u32 = num.trim().parse()?;
+        return Ok(mins * 60);
+    }
+    if let Some(num) = s.strip_suffix('h') {
+        let hours: u32 = num.trim().parse()?;
+        return Ok(hours * 3600);
+    }
+    s.parse().map_err(Into::into)
+}
+
 fn get_self_logs(follow: bool) -> anyhow::Result<()> {
     let mut socket = connect_or_spawn_daemon()?;
 
@@ -687,6 +798,7 @@ Commands:
   restart <job>     Restart a job via the daemon
   kill <task>       Terminate a running task (by name or index)
   test [filters]    Run tests with optional filters
+  logs [options]    View and stream logs from tasks
   validate [path]   Validate a config file
   get <resource>    Get information from the daemon
   server            Start the daemon process (internal)
@@ -703,6 +815,18 @@ Test Filters:
   +tag              Include tests with this tag
   -tag              Exclude tests with this tag
   name              Include tests matching this name
+
+Logs Options:
+  --max-age=DURATION     Show logs since DURATION ago (5s, 10m, 1h)
+  --task=NAME[@latest]   Filter by task name (repeatable)
+  --kind=KIND[@latest]   Filter by kind: service, action, test (repeatable)
+  --job=INDEX            Filter by job index
+  --follow, -f           Stream new logs
+  --retry                With @latest, wait for next job
+  --oldest=N             Show oldest N lines
+  --newest=N             Show newest N lines
+  --without-taskname     Omit task name prefixes
+  PATTERN                Search pattern (case-insensitive if all lowercase)
 
 Get Resources:
   self-logs [-f]         Retrieve daemon logs (-f/--follow to tail)

@@ -3,6 +3,7 @@
 use crate::harness;
 
 use std::fs;
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -1720,5 +1721,306 @@ require = ["srv:beta"]
         lines.iter().any(|l| l.contains("beta started") || l.contains("started")),
         "Service beta should have started: {:?}",
         lines
+    );
+}
+
+// ============================================================================
+// Logs command tests
+// ============================================================================
+
+#[test]
+fn logs_basic_dump() {
+    let mut harness = TestHarness::new("logs_basic");
+    harness.write_config(
+        r#"
+[action.echo_task]
+sh = "echo 'log line one'; echo 'log line two'; echo 'log line three'"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "echo_task"]);
+    assert!(result.success(), "run command failed: {}", result.stderr);
+
+    let result = harness.run_client(&["logs"]);
+    assert!(result.success(), "logs command failed: {}", result.stderr);
+    assert!(result.stdout.contains("log line one"), "logs should contain 'log line one', got: {}", result.stdout);
+    assert!(result.stdout.contains("log line two"), "logs should contain 'log line two', got: {}", result.stdout);
+    assert!(result.stdout.contains("log line three"), "logs should contain 'log line three', got: {}", result.stdout);
+}
+
+#[test]
+fn logs_with_pattern_filter() {
+    let mut harness = TestHarness::new("logs_pattern");
+    harness.write_config(
+        r#"
+[action.mixed_output]
+sh = "echo 'INFO: starting'; echo 'ERROR: something failed'; echo 'INFO: done'"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "mixed_output"]);
+    assert!(result.success(), "run command failed: {}", result.stderr);
+
+    let result = harness.run_client(&["logs", "error"]);
+    assert!(result.success(), "logs command failed: {}", result.stderr);
+    assert!(
+        result.stdout.contains("ERROR: something failed"),
+        "logs should contain error line, got: {}",
+        result.stdout
+    );
+    assert!(!result.stdout.contains("INFO: starting"), "logs should not contain INFO lines, got: {}", result.stdout);
+}
+
+#[test]
+fn logs_case_sensitive_pattern() {
+    let mut harness = TestHarness::new("logs_case_sensitive");
+    harness.write_config(
+        r#"
+[action.case_output]
+sh = "echo 'ERROR uppercase'; echo 'error lowercase'; echo 'Error mixed'"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "case_output"]);
+    assert!(result.success(), "run command failed: {}", result.stderr);
+
+    let result = harness.run_client(&["logs", "ERROR"]);
+    assert!(result.success(), "logs command failed: {}", result.stderr);
+    assert!(
+        result.stdout.contains("ERROR uppercase"),
+        "Case-sensitive search should find uppercase ERROR, got: {}",
+        result.stdout
+    );
+    assert!(
+        !result.stdout.contains("error lowercase"),
+        "Case-sensitive search should not find lowercase error, got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn logs_with_task_filter() {
+    let mut harness = TestHarness::new("logs_task_filter");
+    harness.write_config(
+        r#"
+[action.task_a]
+sh = "echo 'output from task_a'"
+
+[action.task_b]
+sh = "echo 'output from task_b'"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "task_a"]);
+    assert!(result.success(), "run task_a failed: {}", result.stderr);
+    let result = harness.run_client(&["run", "task_b"]);
+    assert!(result.success(), "run task_b failed: {}", result.stderr);
+
+    let result = harness.run_client(&["logs", "--task=task_a"]);
+    assert!(result.success(), "logs command failed: {}", result.stderr);
+    assert!(result.stdout.contains("output from task_a"), "logs should contain task_a output, got: {}", result.stdout);
+    assert!(
+        !result.stdout.contains("output from task_b"),
+        "logs should not contain task_b output when filtering, got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn logs_with_newest_limit() {
+    let mut harness = TestHarness::new("logs_newest");
+    harness.write_config(
+        r#"
+[action.many_lines]
+sh = "echo 'line 1'; echo 'line 2'; echo 'line 3'; echo 'line 4'; echo 'line 5'"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "many_lines"]);
+    assert!(result.success(), "run command failed: {}", result.stderr);
+
+    let result = harness.run_client(&["logs", "--newest=2"]);
+    assert!(result.success(), "logs command failed: {}", result.stderr);
+    let lines: Vec<&str> = result.stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "should show exactly 2 lines with --newest=2, got: {:?}", lines);
+    assert!(result.stdout.contains("line 4") || result.stdout.contains("line 5"), "should show last lines");
+}
+
+#[test]
+fn logs_with_oldest_limit() {
+    let mut harness = TestHarness::new("logs_oldest");
+    harness.write_config(
+        r#"
+[action.many_lines]
+sh = "echo 'line 1'; echo 'line 2'; echo 'line 3'; echo 'line 4'; echo 'line 5'"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "many_lines"]);
+    assert!(result.success(), "run command failed: {}", result.stderr);
+
+    let result = harness.run_client(&["logs", "--oldest=2"]);
+    assert!(result.success(), "logs command failed: {}", result.stderr);
+    let lines: Vec<&str> = result.stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2, "should show exactly 2 lines with --oldest=2, got: {:?}", lines);
+    assert!(result.stdout.contains("line 1") || result.stdout.contains("line 2"), "should show first lines");
+}
+
+#[test]
+fn logs_multiple_tasks_shows_prefixes() {
+    let mut harness = TestHarness::new("logs_prefixes");
+    harness.write_config(
+        r#"
+[action.alpha]
+sh = "echo 'alpha output'"
+
+[action.beta]
+sh = "echo 'beta output'"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "alpha"]);
+    assert!(result.success(), "run alpha failed: {}", result.stderr);
+    let result = harness.run_client(&["run", "beta"]);
+    assert!(result.success(), "run beta failed: {}", result.stderr);
+
+    let result = harness.run_client(&["logs", "--task=alpha", "--task=beta"]);
+    assert!(result.success(), "logs command failed: {}", result.stderr);
+    assert!(
+        result.stdout.contains("alpha>") || result.stdout.contains(" alpha "),
+        "should show alpha task prefix, got: {}",
+        result.stdout
+    );
+    assert!(
+        result.stdout.contains("beta>") || result.stdout.contains(" beta "),
+        "should show beta task prefix, got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn logs_without_taskname_omits_prefixes() {
+    let mut harness = TestHarness::new("logs_no_prefix");
+    harness.write_config(
+        r#"
+[action.alpha]
+sh = "echo 'alpha output'"
+
+[action.beta]
+sh = "echo 'beta output'"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "alpha"]);
+    assert!(result.success(), "run alpha failed: {}", result.stderr);
+    let result = harness.run_client(&["run", "beta"]);
+    assert!(result.success(), "run beta failed: {}", result.stderr);
+
+    let result = harness.run_client(&["logs", "--task=alpha", "--task=beta", "--without-taskname"]);
+    assert!(result.success(), "logs command failed: {}", result.stderr);
+    assert!(
+        !result.stdout.contains("alpha>") && !result.stdout.contains(" alpha "),
+        "should not show task prefixes with --without-taskname, got: {}",
+        result.stdout
+    );
+}
+
+#[test]
+fn logs_follow_mode_receives_new_output() {
+    let mut harness = TestHarness::new("logs_follow");
+    harness.write_config(
+        r#"
+[action.delayed_output]
+sh = "echo 'delayed message'"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let temp_dir = harness.temp_dir.clone();
+    let socket_path = harness.socket_path.clone();
+    let mut logs_child = Command::new(cargo_bin_path())
+        .args(["logs", "--follow", "--task=delayed_output"])
+        .current_dir(&temp_dir)
+        .env("DEVSM_SOCKET", &socket_path)
+        .env("DEVSM_NO_AUTO_SPAWN", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn logs client");
+
+    let result = harness.run_client(&["run", "delayed_output"]);
+    assert!(result.success(), "run command failed: {}", result.stderr);
+
+    let _ = logs_child.kill();
+    let _ = logs_child.wait();
+
+    let mut logs_output = String::new();
+    if let Some(mut out) = logs_child.stdout.take() {
+        out.read_to_string(&mut logs_output).ok();
+    }
+
+    assert!(logs_output.contains("delayed message"), "Follow mode should capture output, got: {}", logs_output);
+}
+
+#[test]
+fn logs_kind_filter_actions() {
+    let mut harness = TestHarness::new("logs_kind");
+    let service_marker = harness.temp_dir.join("service_started.txt");
+    harness.write_config(&format!(
+        r#"
+[action.my_action]
+sh = "echo 'action output'"
+
+[service.my_service]
+sh = "echo 'service started'; touch {marker}; while true; do sleep 1; done"
+"#,
+        marker = service_marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "my_action"]);
+    assert!(result.success(), "run my_action failed: {}", result.stderr);
+
+    let temp_dir = harness.temp_dir.clone();
+    let socket_path = harness.socket_path.clone();
+    let _service = Command::new(cargo_bin_path())
+        .args(["run", "my_service"])
+        .current_dir(&temp_dir)
+        .env("DEVSM_SOCKET", &socket_path)
+        .env("DEVSM_NO_AUTO_SPAWN", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn service");
+
+    assert!(harness.wait_for_file(&service_marker, Duration::from_secs(3)), "Service should start");
+
+    let result = harness.run_client(&["logs", "--kind=action"]);
+    assert!(result.success(), "logs command failed: {}", result.stderr);
+    assert!(result.stdout.contains("action output"), "logs should contain action output, got: {}", result.stdout);
+    assert!(
+        !result.stdout.contains("service started"),
+        "logs should not contain service output when filtering by action kind, got: {}",
+        result.stdout
     );
 }

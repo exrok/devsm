@@ -119,6 +119,7 @@ enum ClientKind {
     TestRun,
     Rpc { subscriptions: RpcSubscriptions },
     SelfLogs,
+    Logs,
 }
 
 struct ClientEntry {
@@ -497,6 +498,7 @@ pub(crate) enum AttachKind {
     Run { task_name: Box<str>, params: Vec<u8> },
     TestRun { filters: Vec<u8> },
     Rpc { subscribe: bool },
+    Logs { query: Vec<u8> },
 }
 
 pub(crate) enum ProcessRequest {
@@ -989,6 +991,13 @@ impl ProcessManager {
                     AttachKind::Rpc { subscribe } => {
                         self.attach_rpc_client(socket, ws_index, subscribe);
                     }
+                    AttachKind::Logs { query } => {
+                        let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+                            kvlog::error!("Logs client requires stdin/stdout FDs");
+                            return false;
+                        };
+                        self.attach_logs_client(stdin, stdout, socket, ws_index, query);
+                    }
                 }
 
                 false
@@ -1387,6 +1396,64 @@ impl ProcessManager {
         kvlog::info!("RPC client attached", workspace = ws_index, subscribe);
     }
 
+    fn attach_logs_client(
+        &mut self,
+        stdin: File,
+        stdout: File,
+        socket: UnixStream,
+        ws_index: WorkspaceIndex,
+        query: Vec<u8>,
+    ) {
+        let query: crate::daemon::LogsQuery =
+            jsony::from_binary(&query).unwrap_or_else(|_| crate::daemon::LogsQuery::default());
+
+        let channel = Arc::new(ClientChannel {
+            waker: extui::event::polling::Waker::new().unwrap(),
+            events: Mutex::new(Vec::new()),
+            selected: AtomicU64::new(0),
+            state: AtomicU64::new(0),
+        });
+
+        let next = self.clients.vacant_key();
+        let _ = self.poll.registry().register(
+            &mut SourceFd(&socket.as_raw_fd()),
+            TokenHandle::Client(next as u32).into(),
+            Interest::READABLE,
+        );
+        let _ = socket.set_nonblocking(true);
+
+        let forwarder_socket = socket.try_clone().ok();
+
+        let client_entry = ClientEntry {
+            channel: channel.clone(),
+            workspace: ws_index,
+            socket,
+            kind: ClientKind::Logs,
+            partial_rpc_read: None,
+        };
+        let index = self.clients.insert(client_entry);
+
+        let ws = &self.workspaces[ws_index as usize];
+        let ws_handle = ws.handle.clone();
+        let request_channel = self.request.clone();
+
+        let config = crate::log_fowarder_ui::LogForwarderConfig::from_query(&query, &ws_handle);
+
+        std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(|| {
+                if let Err(err) =
+                    crate::log_fowarder_ui::run_logs(stdin, stdout, forwarder_socket, &ws_handle, config, channel)
+                {
+                    kvlog::error!("Logs forwarder exited with error", %err);
+                }
+            });
+            kvlog::info!("Terminating logs client");
+            request_channel.send(ProcessRequest::ClientExited { index });
+        });
+
+        kvlog::info!("Logs client attached", workspace = ws_index);
+    }
+
     fn attach_self_logs_client(&mut self, stdout: File, socket: UnixStream) {
         let channel = Arc::new(ClientChannel {
             waker: extui::event::polling::Waker::new().unwrap(),
@@ -1620,6 +1687,7 @@ impl ProcessManager {
             ClientKind::TestRun => self.handle_test_run_client_read(client_index),
             ClientKind::Rpc { .. } => self.handle_rpc_client_read(client_index),
             ClientKind::SelfLogs => self.handle_self_logs_client_read(client_index),
+            ClientKind::Logs => self.handle_logs_client_read(client_index),
         }
     }
 
@@ -1810,6 +1878,69 @@ impl ProcessManager {
                     }
                     _ => {
                         kvlog::error!("Unexpected message kind from test client", ?kind);
+                    }
+                },
+                DecodeResult::MissingData { .. } => break,
+                DecodeResult::Empty => {
+                    buffer.clear();
+                    break;
+                }
+                DecodeResult::Error(e) => {
+                    kvlog::error!("Protocol decode error", ?e);
+                    terminate = true;
+                    break;
+                }
+            }
+        }
+
+        state.compact(&mut buffer, 4096);
+
+        if terminate {
+            self.buffer_pool.push(buffer);
+            self.terminate_client(client_index);
+        } else if buffer.is_empty() {
+            self.buffer_pool.push(buffer);
+        } else {
+            let Some(client) = self.clients.get_mut(client_index as usize) else { return };
+            client.partial_rpc_read = Some((state, buffer));
+        }
+    }
+
+    fn handle_logs_client_read(&mut self, client_index: ClientIndex) {
+        let Some(client) = self.clients.get_mut(client_index as usize) else {
+            return;
+        };
+        let (mut state, mut buffer) = client
+            .partial_rpc_read
+            .take()
+            .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
+
+        let mut terminate = false;
+
+        loop {
+            match try_read(client.socket.as_raw_fd(), &mut buffer) {
+                ReadResult::More => continue,
+                ReadResult::EOF => {
+                    terminate = true;
+                    break;
+                }
+                ReadResult::Done => break,
+                ReadResult::WouldBlock => break,
+                ReadResult::OtherError(_) => {
+                    terminate = true;
+                    break;
+                }
+            }
+        }
+
+        loop {
+            match state.decode(&buffer) {
+                DecodeResult::Message { kind, .. } => match kind {
+                    RpcMessageKind::Terminate => {
+                        terminate = true;
+                    }
+                    _ => {
+                        kvlog::error!("Unexpected message kind from logs client", ?kind);
                     }
                 },
                 DecodeResult::MissingData { .. } => break,

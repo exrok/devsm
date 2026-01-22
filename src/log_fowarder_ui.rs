@@ -1,6 +1,6 @@
-//! Log forwarder for the `run` command.
+//! Log forwarder for the `run` and `logs` commands.
 //!
-//! Forwards log output from a managed task directly to the client's terminal
+//! Forwards log output from managed tasks directly to the client's terminal
 //! without using the TUI. Runs in a separate thread and exits when the task
 //! completes or the client disconnects.
 
@@ -11,12 +11,343 @@ use std::{
     sync::Arc,
 };
 
+use crate::config::TaskKind;
+use crate::daemon::LogsQuery;
+use crate::line_width::{strip_ansi_to_buffer, strip_ansi_to_buffer_preserve_case};
+use crate::log_storage::{BaseTaskSet, LogEntry, LogFilter, LogGroup, LogId, Logs};
+use crate::process_manager::ClientChannel;
 use crate::rpc::{Encoder, ExitCause as RpcExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind};
-use crate::{
-    log_storage::{LogFilter, LogGroup, LogId},
-    process_manager::ClientChannel,
-    workspace::{ExitCause, JobIndex, JobStatus, Workspace},
-};
+use crate::workspace::{BaseTaskIndex, ExitCause, JobIndex, JobStatus, Workspace};
+
+const SPAN_COLORS: &[&str] = &[
+    "\x1b[48;5;235;38;5;195m",
+    "\x1b[48;5;16;38;5;189m",
+    "\x1b[48;5;235;38;5;183m",
+    "\x1b[48;5;16;38;5;149m",
+    "\x1b[48;5;235;38;5;157m",
+    "\x1b[48;5;16;38;5;110m",
+    "\x1b[48;5;235;38;5;229m",
+    "\x1b[48;5;16;38;5;182m",
+    "\x1b[48;5;235;38;5;151m",
+];
+
+pub struct LogForwarderConfig {
+    pub filter: LogForwarderFilter,
+    pub pattern: String,
+    pub case_sensitive: bool,
+    pub max_age_secs: Option<u32>,
+    pub strip_ansi: bool,
+    pub with_taskname: bool,
+    pub task_names: Vec<String>,
+    pub follow: bool,
+    pub oldest: Option<u32>,
+    pub newest: Option<u32>,
+}
+
+pub enum LogForwarderFilter {
+    All,
+    BaseTasks(BaseTaskSet),
+}
+
+impl LogForwarderConfig {
+    pub fn from_query(query: &LogsQuery, workspace: &Workspace) -> Self {
+        let mut state = workspace.state.write().unwrap();
+
+        let pattern = query.pattern.to_string();
+        let case_sensitive = pattern.chars().any(|c| c.is_uppercase());
+        let pattern_lower = if case_sensitive { pattern.clone() } else { pattern.to_lowercase() };
+
+        let strip_ansi = !query.is_tty;
+
+        let mut base_tasks = BaseTaskSet::new();
+        let mut task_names = Vec::new();
+        let mut task_count = 0usize;
+
+        if !query.task_filters.is_empty() {
+            for tf in &query.task_filters {
+                if let Some(bti) = state.base_index_by_name(tf.name) {
+                    base_tasks.insert(bti);
+                    task_count += 1;
+                    while task_names.len() <= bti.idx() {
+                        task_names.push(String::new());
+                    }
+                    task_names[bti.idx()] = tf.name.to_string();
+                }
+            }
+        } else if !query.kind_filters.is_empty() {
+            for kf in &query.kind_filters {
+                let kind = match kf.kind {
+                    "service" => TaskKind::Service,
+                    "action" => TaskKind::Action,
+                    "test" => TaskKind::Test,
+                    _ => continue,
+                };
+                for (bti, bt) in state.base_tasks.iter().enumerate() {
+                    if bt.config.kind == kind {
+                        let bti = BaseTaskIndex(bti as u32);
+                        base_tasks.insert(bti);
+                        task_count += 1;
+                        while task_names.len() <= bti.idx() {
+                            task_names.push(String::new());
+                        }
+                        task_names[bti.idx()] = bt.name.to_string();
+                    }
+                }
+            }
+        } else {
+            for (bti, bt) in state.base_tasks.iter().enumerate() {
+                let bti = BaseTaskIndex(bti as u32);
+                base_tasks.insert(bti);
+                task_count += 1;
+                while task_names.len() <= bti.idx() {
+                    task_names.push(String::new());
+                }
+                task_names[bti.idx()] = bt.name.to_string();
+            }
+        }
+
+        let filter = if task_count == state.base_tasks.len() {
+            LogForwarderFilter::All
+        } else {
+            LogForwarderFilter::BaseTasks(base_tasks)
+        };
+
+        let with_taskname = task_count > 1 && !query.without_taskname;
+
+        Self {
+            filter,
+            pattern: pattern_lower,
+            case_sensitive,
+            max_age_secs: query.max_age_secs,
+            strip_ansi,
+            with_taskname,
+            task_names,
+            follow: query.follow,
+            oldest: query.oldest,
+            newest: query.newest,
+        }
+    }
+}
+
+fn matches_pattern(text: &str, pattern: &str, case_sensitive: bool, buffer: &mut Vec<u8>) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+    buffer.clear();
+    if case_sensitive {
+        strip_ansi_to_buffer_preserve_case(text, buffer);
+    } else {
+        strip_ansi_to_buffer(text, buffer);
+    }
+    let haystack = std::str::from_utf8(buffer).unwrap_or("");
+    haystack.contains(pattern)
+}
+
+fn write_log_entry(
+    file: &mut File,
+    entry: &LogEntry,
+    logs: &Logs,
+    config: &LogForwarderConfig,
+    ansi_buffer: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let text = unsafe { entry.text(logs) };
+
+    if !matches_pattern(text, &config.pattern, config.case_sensitive, ansi_buffer) {
+        return Ok(());
+    }
+
+    if config.with_taskname {
+        let bti = entry.log_group.base_task_index();
+        let task_name = config.task_names.get(bti.idx()).map(|s| s.as_str()).unwrap_or("?");
+        if config.strip_ansi {
+            write!(file, "{}> ", task_name)?;
+        } else {
+            let color = SPAN_COLORS[bti.idx() % SPAN_COLORS.len()];
+            write!(file, "{} {} \x1b[m ", color, task_name)?;
+        }
+    }
+
+    if config.strip_ansi {
+        ansi_buffer.clear();
+        strip_ansi_to_buffer_preserve_case(text, ansi_buffer);
+        file.write_all(ansi_buffer)?;
+    } else {
+        file.write_all(text.as_bytes())?;
+    }
+    file.write_all(b"\n")?;
+
+    Ok(())
+}
+
+pub fn run_logs(
+    stdin: File,
+    mut stdout: File,
+    mut socket: Option<UnixStream>,
+    workspace: &Workspace,
+    config: LogForwarderConfig,
+    channel: Arc<ClientChannel>,
+) -> anyhow::Result<()> {
+    let mut encoder = Encoder::new();
+    let mut ansi_buffer = Vec::with_capacity(1024);
+
+    if !config.follow {
+        dump_logs(&mut stdout, workspace, &config, &mut ansi_buffer)?;
+        send_termination(&mut encoder, &mut socket);
+        return Ok(());
+    }
+
+    dump_logs(&mut stdout, workspace, &config, &mut ansi_buffer)?;
+
+    let mut last_log_id = workspace.logs.read().unwrap().tail();
+
+    loop {
+        if channel.is_terminated() {
+            forward_logs_filtered(&mut stdout, workspace, &config, &mut last_log_id, &mut ansi_buffer)?;
+            send_termination(&mut encoder, &mut socket);
+            break;
+        }
+
+        forward_logs_filtered(&mut stdout, workspace, &config, &mut last_log_id, &mut ansi_buffer)?;
+
+        match extui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), None) {
+            Ok(extui::event::Polled::ReadReady) => {
+                let mut buf = [0u8; 64];
+                let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n == 0 {
+                    forward_logs_filtered(&mut stdout, workspace, &config, &mut last_log_id, &mut ansi_buffer)?;
+                    send_termination(&mut encoder, &mut socket);
+                    break;
+                }
+            }
+            Ok(extui::event::Polled::Woken) | Ok(extui::event::Polled::TimedOut) | Err(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn dump_logs(
+    file: &mut File,
+    workspace: &Workspace,
+    config: &LogForwarderConfig,
+    ansi_buffer: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    let logs = workspace.logs.read().unwrap();
+    let elapsed_secs = logs.elapsed_secs();
+
+    let filter = match &config.filter {
+        LogForwarderFilter::All => LogFilter::All,
+        LogForwarderFilter::BaseTasks(set) => LogFilter::IsInSet(set.clone()),
+    };
+
+    let view = logs.view(filter);
+    let (a, b) = logs.slices();
+
+    let mut matching_entries: Vec<&LogEntry> = Vec::new();
+
+    for slice in [a, b] {
+        for entry in slice {
+            if !view.contains(entry) {
+                continue;
+            }
+
+            if let Some(max_age) = config.max_age_secs {
+                if entry.time + max_age < elapsed_secs {
+                    continue;
+                }
+            }
+
+            let text = unsafe { entry.text(&logs) };
+            if !matches_pattern(text, &config.pattern, config.case_sensitive, ansi_buffer) {
+                continue;
+            }
+
+            matching_entries.push(entry);
+        }
+    }
+
+    let entries_to_print: &[&LogEntry] = if let Some(oldest) = config.oldest {
+        let n = (oldest as usize).min(matching_entries.len());
+        &matching_entries[..n]
+    } else if let Some(newest) = config.newest {
+        let n = (newest as usize).min(matching_entries.len());
+        &matching_entries[matching_entries.len() - n..]
+    } else {
+        &matching_entries
+    };
+
+    for entry in entries_to_print {
+        let text = unsafe { entry.text(&logs) };
+
+        if config.with_taskname {
+            let bti = entry.log_group.base_task_index();
+            let task_name = config.task_names.get(bti.idx()).map(|s| s.as_str()).unwrap_or("?");
+            if config.strip_ansi {
+                write!(file, "{}> ", task_name)?;
+            } else {
+                let color = SPAN_COLORS[bti.idx() % SPAN_COLORS.len()];
+                write!(file, "{} {} \x1b[m ", color, task_name)?;
+            }
+        }
+
+        if config.strip_ansi {
+            ansi_buffer.clear();
+            strip_ansi_to_buffer_preserve_case(text, ansi_buffer);
+            file.write_all(ansi_buffer)?;
+        } else {
+            file.write_all(text.as_bytes())?;
+        }
+        file.write_all(b"\n")?;
+    }
+
+    let _ = file.flush();
+    Ok(())
+}
+
+fn forward_logs_filtered(
+    file: &mut File,
+    workspace: &Workspace,
+    config: &LogForwarderConfig,
+    last_log_id: &mut LogId,
+    ansi_buffer: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    let logs = workspace.logs.read().unwrap();
+    let current_tail = logs.tail();
+
+    if *last_log_id >= current_tail {
+        return Ok(());
+    }
+
+    let elapsed_secs = logs.elapsed_secs();
+
+    let filter = match &config.filter {
+        LogForwarderFilter::All => LogFilter::All,
+        LogForwarderFilter::BaseTasks(set) => LogFilter::IsInSet(set.clone()),
+    };
+
+    let view = logs.view(filter);
+    let (a, b) = logs.slices_range(*last_log_id, LogId(current_tail.0.saturating_sub(1)));
+
+    for slice in [a, b] {
+        for entry in slice {
+            if !view.contains(entry) {
+                continue;
+            }
+
+            if let Some(max_age) = config.max_age_secs {
+                if entry.time + max_age < elapsed_secs {
+                    continue;
+                }
+            }
+
+            let _ = write_log_entry(file, entry, &logs, config, ansi_buffer);
+        }
+    }
+    let _ = file.flush();
+
+    *last_log_id = current_tail;
+    Ok(())
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
