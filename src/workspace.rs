@@ -13,8 +13,11 @@ use std::{
     time::{Instant, SystemTime},
 };
 mod job_index_list;
+pub mod scheduler_backend;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub use scheduler_backend::spawn_job;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(transparent)]
 pub struct BaseTaskIndex(pub u32);
 
@@ -30,7 +33,7 @@ impl BaseTaskIndex {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(transparent)]
 pub struct JobIndex(u32);
 
@@ -48,7 +51,7 @@ impl JobIndex {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitCause {
     Unknown,
     Killed,
@@ -71,7 +74,7 @@ pub struct Job {
     pub spawn_params: ValueMap<'static>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobPredicate {
     Terminated,
     TerminatedNaturallyAndSuccessfully,
@@ -168,6 +171,9 @@ impl JobStatus {
             JobStatus::Exited { status, .. } => *status == 0,
             _ => false,
         }
+    }
+    pub fn is_running(&self) -> bool {
+        matches!(self, JobStatus::Running { .. })
     }
 }
 
@@ -375,6 +381,193 @@ fn service_matches_require(job: &Job, require_profile: &str, require_params: &Va
     require_params == &job.spawn_params
 }
 
+/// Tracks which jobs depend on each service (reverse dependency tracking).
+/// Used to determine when a service can be safely stopped.
+#[derive(Default)]
+pub struct ServiceDependents {
+    dependents: hashbrown::HashMap<JobIndex, hashbrown::HashSet<JobIndex>>,
+}
+
+impl ServiceDependents {
+    pub fn add_dependent(&mut self, service: JobIndex, dependent: JobIndex) {
+        self.dependents.entry(service).or_default().insert(dependent);
+    }
+
+    #[cfg(test)]
+    pub fn remove_dependent(&mut self, service: JobIndex, dependent: JobIndex) {
+        if let Some(deps) = self.dependents.get_mut(&service) {
+            deps.remove(&dependent);
+        }
+    }
+
+    pub fn remove_from_all(&mut self, dependent: JobIndex) {
+        for deps in self.dependents.values_mut() {
+            deps.remove(&dependent);
+        }
+    }
+
+    pub fn can_stop(&self, service: JobIndex) -> bool {
+        self.dependents.get(&service).is_none_or(|deps| deps.is_empty())
+    }
+
+    #[cfg(test)]
+    pub fn dependent_count(&self, service: JobIndex) -> usize {
+        self.dependents.get(&service).map_or(0, |deps| deps.len())
+    }
+}
+
+/// Result of checking service compatibility with a request.
+pub enum ServiceCompatibility {
+    /// A matching service is already running.
+    Compatible(JobIndex),
+    /// No service is currently running.
+    Available,
+    /// A service is running with a different profile than requested.
+    Conflict {
+        running_job: JobIndex,
+        running_profile: String,
+        requested_profile: String,
+    },
+}
+
+/// Key for deduplicating requirements across a batch of spawns.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct RequirementKey {
+    pub base_task: BaseTaskIndex,
+    pub profile: String,
+    pub params_hash: u64,
+}
+
+impl RequirementKey {
+    pub fn new(base_task: BaseTaskIndex, profile: &str, params: &ValueMap) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (k, v) in params.entries() {
+            k.hash(&mut hasher);
+            v.to_string().hash(&mut hasher);
+        }
+        Self { base_task, profile: profile.to_string(), params_hash: hasher.finish() }
+    }
+}
+
+/// A pending requirement collected during batch spawning.
+pub struct PendingRequirement {
+    pub base_task: BaseTaskIndex,
+    pub profile: String,
+    pub params: ValueMap<'static>,
+}
+
+/// A pending task collected during batch spawning.
+pub struct PendingTask<T> {
+    pub task_data: T,
+}
+
+/// Result of resolving a requirement during batch spawning.
+pub enum ResolvedRequirement {
+    Cached,
+    Pending(JobIndex),
+    Spawned(JobIndex),
+}
+
+/// A detected profile conflict within a batch.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub struct ProfileConflict {
+    pub base_task: BaseTaskIndex,
+    pub profiles: Vec<String>,
+}
+
+/// Batch spawning context for deduplicating requirements across multiple tasks.
+pub struct SpawnBatch<T> {
+    pending_requirements: hashbrown::HashMap<RequirementKey, PendingRequirement>,
+    resolved_requirements: hashbrown::HashMap<RequirementKey, ResolvedRequirement>,
+    pending_tasks: Vec<PendingTask<T>>,
+}
+
+impl<T> Default for SpawnBatch<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> SpawnBatch<T> {
+    pub fn new() -> Self {
+        Self {
+            pending_requirements: hashbrown::HashMap::new(),
+            resolved_requirements: hashbrown::HashMap::new(),
+            pending_tasks: Vec::new(),
+        }
+    }
+
+    pub fn add_requirement(
+        &mut self,
+        base_task: BaseTaskIndex,
+        profile: &str,
+        params: ValueMap<'static>,
+        _predicate: JobPredicate,
+    ) -> RequirementKey {
+        let key = RequirementKey::new(base_task, profile, &params);
+        self.pending_requirements.entry(key.clone()).or_insert_with(|| PendingRequirement {
+            base_task,
+            profile: profile.to_string(),
+            params,
+        });
+        key
+    }
+
+    pub fn add_task(&mut self, task_data: T) {
+        self.pending_tasks.push(PendingTask { task_data });
+    }
+
+    #[cfg(test)]
+    pub fn pending_requirements(&self) -> impl Iterator<Item = (&RequirementKey, &PendingRequirement)> {
+        self.pending_requirements.iter()
+    }
+
+    pub fn mark_resolved(&mut self, key: RequirementKey, result: ResolvedRequirement) {
+        self.resolved_requirements.insert(key, result);
+    }
+
+    pub fn get_resolved(&self, key: &RequirementKey) -> Option<&ResolvedRequirement> {
+        self.resolved_requirements.get(key)
+    }
+
+    pub fn take_tasks(&mut self) -> Vec<PendingTask<T>> {
+        std::mem::take(&mut self.pending_tasks)
+    }
+
+    #[cfg(test)]
+    pub fn requirement_count(&self) -> usize {
+        self.pending_requirements.len()
+    }
+
+    /// Detects profile conflicts within the batch.
+    ///
+    /// A conflict occurs when the same base task is requested with different profiles
+    /// at the same level (e.g., `group = ["srv:alpha", "srv:beta"]`). These conflicts
+    /// cannot be resolved by sequencing and should cause an immediate error.
+    #[cfg(test)]
+    pub fn detect_profile_conflicts(&self) -> Vec<ProfileConflict> {
+        let mut by_base: hashbrown::HashMap<BaseTaskIndex, Vec<&str>> = hashbrown::HashMap::new();
+        for (key, _) in &self.pending_requirements {
+            by_base.entry(key.base_task).or_default().push(&key.profile);
+        }
+
+        let mut conflicts = Vec::new();
+        for (base_task, profiles) in by_base {
+            if profiles.len() > 1 {
+                let mut unique_profiles: Vec<String> = profiles.iter().map(|s| s.to_string()).collect();
+                unique_profiles.sort();
+                unique_profiles.dedup();
+                if unique_profiles.len() > 1 {
+                    conflicts.push(ProfileConflict { base_task, profiles: unique_profiles });
+                }
+            }
+        }
+        conflicts
+    }
+}
+
 /// Stores that state of the current workspace including:
 /// - Past running tasks
 /// - Current running tasks
@@ -389,6 +582,7 @@ pub struct WorkspaceState {
     pub action_jobs: JobIndexList,
     pub test_jobs: JobIndexList,
     pub service_jobs: JobIndexList,
+    pub service_dependents: ServiceDependents,
     /// Session-level function overrides (fn1, fn2).
     /// These are set by keybindings and persist for the daemon's lifetime.
     pub session_functions: hashbrown::HashMap<String, FunctionAction>,
@@ -600,9 +794,6 @@ impl WorkspaceState {
                         self.compute_cache_key_with_require(cache_config.key, dep_profile, &dep_params);
                     let spawner = &self.base_tasks[dep_base_task.idx()];
 
-                    // When require specifies profile/params, we need to find a job with matching
-                    // cache key. Don't break early on non-matching keys since different param
-                    // combinations create different "cache buckets".
                     let mut found_pending = None;
                     for ji in spawner.jobs.all().iter().rev() {
                         let job = &self[*ji];
@@ -692,6 +883,12 @@ impl WorkspaceState {
             }
         }
 
+        for req in &pred {
+            if matches!(req.predicate, JobPredicate::Active) {
+                self.service_dependents.add_dependent(req.job, job_index);
+            }
+        }
+
         self.jobs.push(Job {
             process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
             log_group: job_id,
@@ -703,8 +900,51 @@ impl WorkspaceState {
             spawn_params: params.to_owned(),
         });
         if spawn {
-            channel.send(crate::process_manager::ProcessRequest::Spawn { task, job_index, workspace_id, job_id });
+            spawn_job(channel, job_index, task, workspace_id, job_id);
         }
+        job_index
+    }
+
+    /// Schedule a queued service that waits for a blocking service to terminate.
+    ///
+    /// Creates a job in Scheduled state that will be spawned when the blocking
+    /// service terminates. This is used when a service with a different profile
+    /// is requested while another profile is still running.
+    fn schedule_queued_service(
+        &mut self,
+        base_task: BaseTaskIndex,
+        log_start: LogId,
+        params: ValueMap,
+        profile: &str,
+        blocked_by: JobIndex,
+    ) -> JobIndex {
+        let spawner = &self.base_tasks[base_task.idx()];
+        let env = Environment { profile, param: params.clone(), vars: spawner.config.vars };
+        let task = spawner.config.eval(&env).expect("Failed to eval queued service config");
+
+        let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
+
+        let job_index = JobIndex(self.jobs.len() as u32);
+        let pc = spawner.jobs.len();
+        let job_id = LogGroup::new(base_task, pc);
+
+        let after = vec![ScheduleRequirement { job: blocked_by, predicate: JobPredicate::Terminated }];
+
+        let base_task_mut = &mut self.base_tasks[base_task.idx()];
+        base_task_mut.jobs.push_scheduled(job_index);
+        self.service_jobs.push_scheduled(job_index);
+
+        self.jobs.push(Job {
+            process_status: JobStatus::Scheduled { after },
+            log_group: job_id,
+            task,
+            started_at: Instant::now(),
+            log_start,
+            cache_key,
+            spawn_profile: profile.to_string(),
+            spawn_params: params.to_owned(),
+        });
+
         job_index
     }
 }
@@ -797,8 +1037,19 @@ impl WorkspaceState {
             }
         }
 
+        match (&job.process_status, &status) {
+            (S::Scheduled { .. }, S::Cancelled)
+            | (S::Starting, S::Cancelled)
+            | (S::Running { .. }, S::Cancelled)
+            | (S::Running { .. }, S::Exited { .. }) => {
+                self.service_dependents.remove_from_all(job_index);
+            }
+            _ => {}
+        }
+
         job.process_status = status;
     }
+
     pub fn new(config_path: PathBuf) -> Result<WorkspaceState, crate::config::ConfigError> {
         let config = LatestConfig::new(config_path)?;
         let mut base_tasks = Vec::new();
@@ -814,6 +1065,7 @@ impl WorkspaceState {
             action_jobs: JobIndexList::default(),
             test_jobs: JobIndexList::default(),
             service_jobs: JobIndexList::default(),
+            service_dependents: ServiceDependents::default(),
             session_functions: hashbrown::HashMap::from_iter([
                 ("fn1".to_string(), FunctionAction::RestartSelected),
                 ("fn2".to_string(), FunctionAction::RestartSelected),
@@ -845,6 +1097,163 @@ impl WorkspaceState {
             }
         }
         Scheduled::None
+    }
+
+    /// Find services that should be terminated to allow queued services to proceed.
+    ///
+    /// Returns the job index of a service that:
+    /// 1. Has no more dependents (can_stop returns true)
+    /// 2. Has a scheduled service waiting for it to terminate
+    ///
+    /// The caller should terminate this service to allow the queued service to start.
+    pub fn service_to_terminate_for_queue(&self) -> Option<JobIndex> {
+        for &job_index in self.service_jobs.scheduled() {
+            let JobStatus::Scheduled { after } = &self[job_index].process_status else {
+                continue;
+            };
+            for req in after {
+                if req.predicate == JobPredicate::Terminated {
+                    let blocking_job = &self.jobs[req.job.idx()];
+                    if blocking_job.process_status.is_running() && self.service_dependents.can_stop(req.job) {
+                        return Some(req.job);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check compatibility of a service request with running instances.
+    ///
+    /// Returns:
+    /// - `Compatible(job_index)` if a matching service is running
+    /// - `Available` if no instance is running
+    /// - `Conflict { ... }` if a service is running with a different profile
+    pub fn check_service_compatibility(
+        &self,
+        base_task: BaseTaskIndex,
+        requested_profile: &str,
+        requested_params: &ValueMap,
+    ) -> ServiceCompatibility {
+        let spawner = &self.base_tasks[base_task.idx()];
+
+        for &ji in spawner.jobs.running() {
+            let job = &self.jobs[ji.idx()];
+            if service_matches_require(job, requested_profile, requested_params) {
+                return ServiceCompatibility::Compatible(ji);
+            }
+            return ServiceCompatibility::Conflict {
+                running_job: ji,
+                running_profile: job.spawn_profile.clone(),
+                requested_profile: requested_profile.to_string(),
+            };
+        }
+
+        ServiceCompatibility::Available
+    }
+
+    /// Resolves a batch of requirements with deduplication.
+    ///
+    /// Takes a SpawnBatch and resolves all pending requirements, spawning each unique
+    /// requirement at most once.
+    pub fn resolve_batch_requirements<T>(
+        &mut self,
+        workspace_id: u32,
+        channel: &MioChannel,
+        batch: &mut SpawnBatch<T>,
+        log_start: LogId,
+    ) {
+        let reqs: Vec<_> = batch
+            .pending_requirements
+            .iter()
+            .map(|(k, r)| (k.clone(), r.base_task, r.profile.clone(), r.params.clone()))
+            .collect();
+
+        for (key, base_task, profile, params) in reqs {
+            if batch.resolved_requirements.contains_key(&key) {
+                continue;
+            }
+
+            let dep_config = &self.base_tasks[base_task.idx()].config;
+
+            match dep_config.kind {
+                TaskKind::Action => {
+                    let mut resolved = None;
+
+                    if let Some(cache_config) = dep_config.cache.as_ref() {
+                        if !cache_config.never {
+                            let expected_cache_key =
+                                self.compute_cache_key_with_require(cache_config.key, &profile, &params);
+                            let spawner = &self.base_tasks[base_task.idx()];
+
+                            for ji in spawner.jobs.all().iter().rev() {
+                                let job = &self.jobs[ji.idx()];
+                                if matches!(job.process_status, JobStatus::Cancelled) {
+                                    continue;
+                                }
+                                if job.process_status.is_successful_completion() {
+                                    if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
+                                        resolved = Some(ResolvedRequirement::Cached);
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                if job.process_status.is_pending_completion() {
+                                    if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
+                                        resolved = Some(ResolvedRequirement::Pending(*ji));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(r) = resolved {
+                        batch.mark_resolved(key, r);
+                        continue;
+                    }
+
+                    let new_job = self.spawn_task(workspace_id, channel, base_task, log_start, params, &profile);
+                    batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
+                }
+                TaskKind::Service => {
+                    let cache_never = dep_config.cache.as_ref().is_some_and(|c| c.never);
+
+                    if !cache_never {
+                        match self.check_service_compatibility(base_task, &profile, &params) {
+                            ServiceCompatibility::Compatible(ji) => {
+                                batch.mark_resolved(key, ResolvedRequirement::Pending(ji));
+                                continue;
+                            }
+                            ServiceCompatibility::Conflict { running_job, running_profile, requested_profile } => {
+                                kvlog::warn!(
+                                    "Service profile conflict, queuing",
+                                    ?base_task,
+                                    running_profile,
+                                    requested_profile,
+                                );
+                                let queued_job = self.schedule_queued_service(
+                                    base_task,
+                                    log_start,
+                                    params,
+                                    &profile,
+                                    running_job,
+                                );
+                                batch.mark_resolved(key, ResolvedRequirement::Pending(queued_job));
+                                continue;
+                            }
+                            ServiceCompatibility::Available => {}
+                        }
+                    }
+
+                    let new_job = self.spawn_task(workspace_id, channel, base_task, log_start, params, &profile);
+                    batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
+                }
+                TaskKind::Test => {
+                    batch.mark_resolved(key, ResolvedRequirement::Cached);
+                }
+            }
+        }
     }
 }
 
@@ -910,8 +1319,11 @@ impl Workspace {
     }
 
     /// Starts a test run with the given filters.
-    /// Returns the test run containing all scheduled test jobs.
-    pub fn start_test_run(&self, filters: &[TestFilter]) -> TestRun {
+    /// Returns the test run containing all scheduled test jobs, or an error
+    /// if any test has conflicting service profile requirements.
+    ///
+    /// Uses batch spawning to deduplicate requirements across all tests.
+    pub fn start_test_run(&self, filters: &[TestFilter]) -> Result<TestRun, String> {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
         state.refresh_config();
@@ -943,99 +1355,124 @@ impl Workspace {
             matched_tests.push(MatchedTest { base_task_idx: BaseTaskIndex::new_or_panic(base_task_idx), task_config });
         }
 
-        let mut test_jobs = Vec::new();
-        for matched in matched_tests {
-            let task_config = matched.task_config;
+        struct TestRequirements {
+            base_task_idx: BaseTaskIndex,
+            task_config: TaskConfigRc,
+            requirements: Vec<(RequirementKey, JobPredicate)>,
+        }
 
-            // Collect require calls to avoid borrow issues
-            struct RequireInfo {
-                name: String,
-                profile: String,
-                params: ValueMap<'static>,
-            }
-            let requires: Vec<RequireInfo> = task_config
+        let mut batch: SpawnBatch<TestRequirements> = SpawnBatch::new();
+
+        for matched in &matched_tests {
+            let task_config = &matched.task_config;
+            let mut requirements = Vec::new();
+
+            // Check for service profile conflicts (including transitive through services).
+            // Services need to stay Active, so their transitive service deps must also be active.
+            // Actions complete and terminate, so transitive conflicts through actions are fine.
+            let mut service_profiles: hashbrown::HashMap<BaseTaskIndex, String> = hashbrown::HashMap::new();
+            let mut services_to_check: Vec<(String, String)> = task_config
                 .config()
                 .require
                 .iter()
-                .map(|tc| RequireInfo {
-                    name: (*tc.name).to_string(),
-                    profile: tc.profile.unwrap_or("").to_string(),
-                    params: tc.vars.clone().to_owned(),
+                .filter_map(|tc| {
+                    let dep_name = &*tc.name;
+                    let dep_base_task = state.name_map.get(dep_name)?;
+                    let dep_config = &state.base_tasks[dep_base_task.idx()].config;
+                    if dep_config.kind == TaskKind::Service {
+                        Some((dep_name.to_string(), tc.profile.unwrap_or("").to_string()))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
+            let mut visited_services: hashbrown::HashSet<BaseTaskIndex> = hashbrown::HashSet::new();
 
-            let mut pred = Vec::new();
-            for req in &requires {
-                let Some(&dep_base_task) = state.name_map.get(req.name.as_str()) else {
+            while let Some((dep_name, dep_profile)) = services_to_check.pop() {
+                let Some(&dep_base_task) = state.name_map.get(&*dep_name) else {
                     continue;
                 };
                 let dep_config = &state.base_tasks[dep_base_task.idx()].config;
-                match dep_config.kind {
-                    TaskKind::Action => {
-                        if let Some(cache_config) = dep_config.cache.as_ref() {
-                            if !cache_config.never {
-                                let expected_cache_key =
-                                    state.compute_cache_key_with_require(cache_config.key, &req.profile, &req.params);
-                                let spawner = &state.base_tasks[dep_base_task.idx()];
-                                let mut found_cached = false;
-                                for ji in spawner.jobs.all().iter().rev() {
-                                    let job = &state.jobs[ji.idx()];
-                                    if matches!(job.process_status, JobStatus::Cancelled) {
-                                        continue;
-                                    }
-                                    if job.process_status.is_successful_completion() {
-                                        if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
-                                            found_cached = true;
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                }
-                                if found_cached {
-                                    continue;
-                                }
-                            }
-                        }
-                        let new_job = state.spawn_task(
-                            self.workspace_id,
-                            &self.process_channel,
-                            dep_base_task,
-                            log_start,
-                            req.params.clone(),
-                            &req.profile,
-                        );
-                        pred.push(ScheduleRequirement {
-                            job: new_job,
-                            predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
-                        });
+
+                // Check for conflicts first, before checking visited
+                if let Some(existing_profile) = service_profiles.get(&dep_base_task) {
+                    if *existing_profile != dep_profile {
+                        let test_name = state.base_tasks[matched.base_task_idx.idx()].name;
+                        let service_name = state.base_tasks[dep_base_task.idx()].name;
+                        return Err(format!(
+                            "Test '{}' has conflicting service requirements: '{}:{}' and '{}:{}'",
+                            test_name, service_name, existing_profile, service_name, dep_profile
+                        ));
                     }
-                    TaskKind::Service => {
-                        let cache_never = dep_config.cache.as_ref().is_some_and(|c| c.never);
-                        let mut found_running = false;
-                        if !cache_never {
-                            let spawner = &state.base_tasks[dep_base_task.idx()];
-                            for &ji in spawner.jobs.running() {
-                                let job = &state.jobs[ji.idx()];
-                                if service_matches_require(job, &req.profile, &req.params) {
-                                    pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
-                                    found_running = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if !found_running {
-                            let new_job = state.spawn_task(
-                                self.workspace_id,
-                                &self.process_channel,
-                                dep_base_task,
-                                log_start,
-                                req.params.clone(),
-                                &req.profile,
-                            );
-                            pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
+                    // Same profile already processed, skip recursion
+                    continue;
+                }
+                service_profiles.insert(dep_base_task, dep_profile.clone());
+
+                // Skip if already visited with this profile (avoid infinite loops)
+                if !visited_services.insert(dep_base_task) {
+                    continue;
+                }
+
+                // Recurse into this service's service dependencies
+                let env = Environment { profile: &dep_profile, param: ValueMap::new(), vars: dep_config.vars };
+                if let Ok(srv_config) = dep_config.eval(&env) {
+                    for req in srv_config.config().require.iter() {
+                        let req_name = &*req.name;
+                        let Some(&req_base_task) = state.name_map.get(req_name) else {
+                            continue;
+                        };
+                        let req_config = &state.base_tasks[req_base_task.idx()].config;
+                        if req_config.kind == TaskKind::Service {
+                            services_to_check.push((req_name.to_string(), req.profile.unwrap_or("").to_string()));
                         }
                     }
-                    TaskKind::Test => {}
+                }
+            }
+
+            for tc in task_config.config().require.iter() {
+                let dep_name = &*tc.name;
+                let dep_profile = tc.profile.unwrap_or("");
+                let dep_params = tc.vars.clone().to_owned();
+
+                let Some(&dep_base_task) = state.name_map.get(dep_name) else {
+                    continue;
+                };
+                let dep_config = &state.base_tasks[dep_base_task.idx()].config;
+
+                let predicate = match dep_config.kind {
+                    TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
+                    TaskKind::Service => JobPredicate::Active,
+                    TaskKind::Test => continue,
+                };
+
+                let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
+                requirements.push((key, predicate));
+            }
+
+            batch.add_task(TestRequirements {
+                base_task_idx: matched.base_task_idx,
+                task_config: task_config.clone(),
+                requirements,
+            });
+        }
+
+        state.resolve_batch_requirements(self.workspace_id, &self.process_channel, &mut batch, log_start);
+
+        let tasks = batch.take_tasks();
+        let mut test_jobs = Vec::new();
+
+        for task in tasks {
+            let task_config = task.task_data.task_config;
+            let mut pred = Vec::new();
+
+            for (key, predicate) in &task.task_data.requirements {
+                match batch.get_resolved(key) {
+                    Some(ResolvedRequirement::Cached) => {}
+                    Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
+                        pred.push(ScheduleRequirement { job: *ji, predicate: predicate.clone() });
+                    }
+                    None => {}
                 }
             }
 
@@ -1043,9 +1480,9 @@ impl Workspace {
                 task_config.config().cache.as_ref().map_or(String::new(), |c| state.compute_cache_key(c.key));
 
             let job_index = JobIndex(state.jobs.len() as u32);
-            let base_task = &mut state.base_tasks[matched.base_task_idx.idx()];
+            let base_task = &mut state.base_tasks[task.task_data.base_task_idx.idx()];
             let pc = base_task.jobs.len();
-            let job_id = LogGroup::new(matched.base_task_idx, pc);
+            let job_id = LogGroup::new(task.task_data.base_task_idx, pc);
 
             let spawn = pred.is_empty();
             if spawn {
@@ -1054,6 +1491,12 @@ impl Workspace {
             } else {
                 base_task.jobs.push_scheduled(job_index);
                 state.test_jobs.push_scheduled(job_index);
+            }
+
+            for req in &pred {
+                if matches!(req.predicate, JobPredicate::Active) {
+                    state.service_dependents.add_dependent(req.job, job_index);
+                }
             }
 
             state.jobs.push(Job {
@@ -1068,7 +1511,7 @@ impl Workspace {
             });
 
             test_jobs.push(TestJob {
-                base_task_index: matched.base_task_idx,
+                base_task_index: task.task_data.base_task_idx,
                 job_index,
                 status: TestJobStatus::Pending,
             });
@@ -1087,7 +1530,7 @@ impl Workspace {
         state.active_test_run =
             Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
 
-        test_run
+        Ok(test_run)
     }
 }
 
@@ -1170,5 +1613,354 @@ mod scheduling_tests {
             "thread 'log_storage::tests::test_rotation_on_max_lines' (143789) panicked at src/log_storage.rs:639:9:";
         let extracted = extract_rust_panic_from_line(line);
         assert_eq!(extracted, Some(("src/log_storage.rs", 639)));
+    }
+
+    mod service_dependents_tests {
+        use super::*;
+
+        #[test]
+        fn empty_dependents_can_stop() {
+            let dependents = ServiceDependents::default();
+            let service = JobIndex::from_usize(0);
+            assert!(dependents.can_stop(service));
+            assert_eq!(dependents.dependent_count(service), 0);
+        }
+
+        #[test]
+        fn add_dependent_tracks_relationship() {
+            let mut dependents = ServiceDependents::default();
+            let service = JobIndex::from_usize(0);
+            let dependent1 = JobIndex::from_usize(1);
+            let dependent2 = JobIndex::from_usize(2);
+
+            dependents.add_dependent(service, dependent1);
+            assert!(!dependents.can_stop(service));
+            assert_eq!(dependents.dependent_count(service), 1);
+
+            dependents.add_dependent(service, dependent2);
+            assert!(!dependents.can_stop(service));
+            assert_eq!(dependents.dependent_count(service), 2);
+        }
+
+        #[test]
+        fn remove_dependent_updates_count() {
+            let mut dependents = ServiceDependents::default();
+            let service = JobIndex::from_usize(0);
+            let dependent1 = JobIndex::from_usize(1);
+            let dependent2 = JobIndex::from_usize(2);
+
+            dependents.add_dependent(service, dependent1);
+            dependents.add_dependent(service, dependent2);
+            assert_eq!(dependents.dependent_count(service), 2);
+
+            dependents.remove_dependent(service, dependent1);
+            assert_eq!(dependents.dependent_count(service), 1);
+            assert!(!dependents.can_stop(service));
+
+            dependents.remove_dependent(service, dependent2);
+            assert_eq!(dependents.dependent_count(service), 0);
+            assert!(dependents.can_stop(service));
+        }
+
+        #[test]
+        fn remove_from_all_clears_dependent() {
+            let mut dependents = ServiceDependents::default();
+            let service1 = JobIndex::from_usize(0);
+            let service2 = JobIndex::from_usize(1);
+            let dependent = JobIndex::from_usize(2);
+
+            dependents.add_dependent(service1, dependent);
+            dependents.add_dependent(service2, dependent);
+            assert_eq!(dependents.dependent_count(service1), 1);
+            assert_eq!(dependents.dependent_count(service2), 1);
+
+            dependents.remove_from_all(dependent);
+            assert_eq!(dependents.dependent_count(service1), 0);
+            assert_eq!(dependents.dependent_count(service2), 0);
+            assert!(dependents.can_stop(service1));
+            assert!(dependents.can_stop(service2));
+        }
+
+        #[test]
+        fn duplicate_add_is_idempotent() {
+            let mut dependents = ServiceDependents::default();
+            let service = JobIndex::from_usize(0);
+            let dependent = JobIndex::from_usize(1);
+
+            dependents.add_dependent(service, dependent);
+            dependents.add_dependent(service, dependent);
+            dependents.add_dependent(service, dependent);
+            assert_eq!(dependents.dependent_count(service), 1);
+        }
+
+        #[test]
+        fn remove_nonexistent_is_safe() {
+            let mut dependents = ServiceDependents::default();
+            let service = JobIndex::from_usize(0);
+            let dependent = JobIndex::from_usize(1);
+
+            dependents.remove_dependent(service, dependent);
+            dependents.remove_from_all(dependent);
+            assert!(dependents.can_stop(service));
+        }
+
+        #[test]
+        fn multiple_services_tracked_independently() {
+            let mut dependents = ServiceDependents::default();
+            let service1 = JobIndex::from_usize(0);
+            let service2 = JobIndex::from_usize(1);
+            let dep_a = JobIndex::from_usize(10);
+            let dep_b = JobIndex::from_usize(11);
+            let dep_c = JobIndex::from_usize(12);
+
+            dependents.add_dependent(service1, dep_a);
+            dependents.add_dependent(service1, dep_b);
+            dependents.add_dependent(service2, dep_c);
+
+            assert_eq!(dependents.dependent_count(service1), 2);
+            assert_eq!(dependents.dependent_count(service2), 1);
+
+            dependents.remove_dependent(service1, dep_a);
+            assert_eq!(dependents.dependent_count(service1), 1);
+            assert_eq!(dependents.dependent_count(service2), 1);
+        }
+    }
+
+    mod requirement_key_tests {
+        use super::*;
+        use jsony_value::ValueMap;
+
+        #[test]
+        fn same_inputs_produce_same_key() {
+            let base_task = BaseTaskIndex(0);
+            let profile = "test";
+            let params = ValueMap::new();
+
+            let key1 = RequirementKey::new(base_task, profile, &params);
+            let key2 = RequirementKey::new(base_task, profile, &params);
+
+            assert_eq!(key1, key2);
+            assert_eq!(key1.params_hash, key2.params_hash);
+        }
+
+        #[test]
+        fn different_profile_produces_different_key() {
+            let base_task = BaseTaskIndex(0);
+            let params = ValueMap::new();
+
+            let key1 = RequirementKey::new(base_task, "profile1", &params);
+            let key2 = RequirementKey::new(base_task, "profile2", &params);
+
+            assert_ne!(key1, key2);
+        }
+
+        #[test]
+        fn different_base_task_produces_different_key() {
+            let profile = "test";
+            let params = ValueMap::new();
+
+            let key1 = RequirementKey::new(BaseTaskIndex(0), profile, &params);
+            let key2 = RequirementKey::new(BaseTaskIndex(1), profile, &params);
+
+            assert_ne!(key1, key2);
+        }
+
+        #[test]
+        fn key_is_hashable() {
+            use std::collections::HashSet;
+
+            let base_task = BaseTaskIndex(0);
+            let params = ValueMap::new();
+
+            let key1 = RequirementKey::new(base_task, "a", &params);
+            let key2 = RequirementKey::new(base_task, "b", &params);
+            let key3 = RequirementKey::new(base_task, "a", &params);
+
+            let mut set = HashSet::new();
+            set.insert(key1.clone());
+            set.insert(key2);
+            set.insert(key3);
+
+            assert_eq!(set.len(), 2);
+        }
+    }
+
+    mod spawn_batch_tests {
+        use super::*;
+        use jsony_value::ValueMap;
+
+        #[test]
+        fn empty_batch_has_no_requirements() {
+            let batch: SpawnBatch<()> = SpawnBatch::new();
+            assert_eq!(batch.requirement_count(), 0);
+        }
+
+        #[test]
+        fn add_requirement_increases_count() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+            let base_task = BaseTaskIndex(0);
+
+            batch.add_requirement(base_task, "test", ValueMap::new().to_owned(), JobPredicate::Active);
+            assert_eq!(batch.requirement_count(), 1);
+
+            batch.add_requirement(BaseTaskIndex(1), "test", ValueMap::new().to_owned(), JobPredicate::Active);
+            assert_eq!(batch.requirement_count(), 2);
+        }
+
+        #[test]
+        fn duplicate_requirement_is_deduplicated() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+            let base_task = BaseTaskIndex(0);
+
+            let key1 = batch.add_requirement(base_task, "test", ValueMap::new().to_owned(), JobPredicate::Active);
+            let key2 = batch.add_requirement(base_task, "test", ValueMap::new().to_owned(), JobPredicate::Active);
+            let key3 = batch.add_requirement(base_task, "test", ValueMap::new().to_owned(), JobPredicate::Active);
+
+            assert_eq!(batch.requirement_count(), 1);
+            assert_eq!(key1, key2);
+            assert_eq!(key2, key3);
+        }
+
+        #[test]
+        fn different_profiles_not_deduplicated() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+            let base_task = BaseTaskIndex(0);
+
+            batch.add_requirement(base_task, "profile1", ValueMap::new().to_owned(), JobPredicate::Active);
+            batch.add_requirement(base_task, "profile2", ValueMap::new().to_owned(), JobPredicate::Active);
+
+            assert_eq!(batch.requirement_count(), 2);
+        }
+
+        #[test]
+        fn mark_resolved_and_get_resolved() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+            let base_task = BaseTaskIndex(0);
+
+            let key = batch.add_requirement(base_task, "test", ValueMap::new().to_owned(), JobPredicate::Active);
+
+            assert!(batch.get_resolved(&key).is_none());
+
+            batch.mark_resolved(key.clone(), ResolvedRequirement::Spawned(JobIndex::from_usize(5)));
+
+            match batch.get_resolved(&key) {
+                Some(ResolvedRequirement::Spawned(ji)) => assert_eq!(ji.idx(), 5),
+                _ => panic!("Expected Spawned resolution"),
+            }
+        }
+
+        #[test]
+        fn mark_resolved_cached() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+            let key = batch.add_requirement(BaseTaskIndex(0), "test", ValueMap::new().to_owned(), JobPredicate::Active);
+
+            batch.mark_resolved(key.clone(), ResolvedRequirement::Cached);
+
+            assert!(matches!(batch.get_resolved(&key), Some(ResolvedRequirement::Cached)));
+        }
+
+        #[test]
+        fn mark_resolved_pending() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+            let key = batch.add_requirement(BaseTaskIndex(0), "test", ValueMap::new().to_owned(), JobPredicate::Active);
+            let existing_job = JobIndex::from_usize(3);
+
+            batch.mark_resolved(key.clone(), ResolvedRequirement::Pending(existing_job));
+
+            match batch.get_resolved(&key) {
+                Some(ResolvedRequirement::Pending(ji)) => assert_eq!(ji.idx(), 3),
+                _ => panic!("Expected Pending resolution"),
+            }
+        }
+
+        #[test]
+        fn pending_requirements_iterator() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+
+            batch.add_requirement(BaseTaskIndex(0), "a", ValueMap::new().to_owned(), JobPredicate::Active);
+            batch.add_requirement(BaseTaskIndex(1), "b", ValueMap::new().to_owned(), JobPredicate::Terminated);
+
+            let reqs: Vec<_> = batch.pending_requirements().collect();
+            assert_eq!(reqs.len(), 2);
+        }
+
+        #[test]
+        fn no_conflicts_with_same_profile() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+            batch.add_requirement(BaseTaskIndex(0), "alpha", ValueMap::new().to_owned(), JobPredicate::Active);
+            batch.add_requirement(BaseTaskIndex(0), "alpha", ValueMap::new().to_owned(), JobPredicate::Active);
+
+            let conflicts = batch.detect_profile_conflicts();
+            assert!(conflicts.is_empty(), "Same profile should not conflict");
+        }
+
+        #[test]
+        fn conflict_with_different_profiles() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+            batch.add_requirement(BaseTaskIndex(0), "alpha", ValueMap::new().to_owned(), JobPredicate::Active);
+            batch.add_requirement(BaseTaskIndex(0), "beta", ValueMap::new().to_owned(), JobPredicate::Active);
+
+            let conflicts = batch.detect_profile_conflicts();
+            assert_eq!(conflicts.len(), 1, "Different profiles should conflict");
+            assert_eq!(conflicts[0].base_task, BaseTaskIndex(0));
+            assert!(conflicts[0].profiles.contains(&"alpha".to_string()));
+            assert!(conflicts[0].profiles.contains(&"beta".to_string()));
+        }
+
+        #[test]
+        fn multiple_conflicts_detected() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+            batch.add_requirement(BaseTaskIndex(0), "alpha", ValueMap::new().to_owned(), JobPredicate::Active);
+            batch.add_requirement(BaseTaskIndex(0), "beta", ValueMap::new().to_owned(), JobPredicate::Active);
+            batch.add_requirement(BaseTaskIndex(1), "prod", ValueMap::new().to_owned(), JobPredicate::Active);
+            batch.add_requirement(BaseTaskIndex(1), "dev", ValueMap::new().to_owned(), JobPredicate::Active);
+
+            let conflicts = batch.detect_profile_conflicts();
+            assert_eq!(conflicts.len(), 2, "Should detect conflicts for both base tasks");
+        }
+
+        #[test]
+        fn different_base_tasks_no_conflict() {
+            let mut batch: SpawnBatch<()> = SpawnBatch::new();
+            batch.add_requirement(BaseTaskIndex(0), "alpha", ValueMap::new().to_owned(), JobPredicate::Active);
+            batch.add_requirement(BaseTaskIndex(1), "beta", ValueMap::new().to_owned(), JobPredicate::Active);
+
+            let conflicts = batch.detect_profile_conflicts();
+            assert!(conflicts.is_empty(), "Different base tasks should not conflict");
+        }
+    }
+
+    mod service_compatibility_tests {
+        use super::*;
+
+        #[test]
+        fn service_compatibility_enum_variants() {
+            let compatible = ServiceCompatibility::Compatible(JobIndex::from_usize(0));
+            let available = ServiceCompatibility::Available;
+            let conflict = ServiceCompatibility::Conflict {
+                running_job: JobIndex::from_usize(1),
+                running_profile: "prod".to_string(),
+                requested_profile: "test".to_string(),
+            };
+
+            match compatible {
+                ServiceCompatibility::Compatible(ji) => assert_eq!(ji.idx(), 0),
+                _ => panic!("Expected Compatible"),
+            }
+
+            match available {
+                ServiceCompatibility::Available => {}
+                _ => panic!("Expected Available"),
+            }
+
+            match conflict {
+                ServiceCompatibility::Conflict { running_job, running_profile, requested_profile } => {
+                    assert_eq!(running_job.idx(), 1);
+                    assert_eq!(running_profile, "prod");
+                    assert_eq!(requested_profile, "test");
+                }
+                _ => panic!("Expected Conflict"),
+            }
+        }
     }
 }

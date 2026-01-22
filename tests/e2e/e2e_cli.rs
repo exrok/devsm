@@ -1466,3 +1466,267 @@ sh = "echo 'two' > {output2}"
     assert!(harness.wait_for_file(&output2, Duration::from_secs(2)), "Output2 should exist after adding new test");
     assert_eq!(fs::read_to_string(&output2).unwrap().trim(), "two", "new test should have run");
 }
+
+/// Tests that multiple tests requiring the same dependency only spawn it once.
+/// This verifies the batch deduplication logic in start_test_run().
+#[test]
+fn test_batch_deduplication() {
+    let mut harness = TestHarness::new("batch_dedup");
+    let build_counter = harness.temp_dir.join("build_counter.txt");
+    let test1_marker = harness.temp_dir.join("test1.done");
+    let test2_marker = harness.temp_dir.join("test2.done");
+    let test3_marker = harness.temp_dir.join("test3.done");
+
+    harness.write_config(&format!(
+        r#"
+[action.build]
+sh = '''
+count=$(cat {build_counter} 2>/dev/null || echo 0)
+echo $((count + 1)) > {build_counter}
+'''
+cache.never = true
+
+[test.test_one]
+sh = "touch {test1_marker}"
+require = ["build"]
+
+[test.test_two]
+sh = "touch {test2_marker}"
+require = ["build"]
+
+[test.test_three]
+sh = "touch {test3_marker}"
+require = ["build"]
+"#,
+        build_counter = build_counter.display(),
+        test1_marker = test1_marker.display(),
+        test2_marker = test2_marker.display(),
+        test3_marker = test3_marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "Test run failed: {}", result.stderr);
+
+    assert!(harness.wait_for_file(&test1_marker, Duration::from_secs(2)), "test1 should complete");
+    assert!(harness.wait_for_file(&test2_marker, Duration::from_secs(2)), "test2 should complete");
+    assert!(harness.wait_for_file(&test3_marker, Duration::from_secs(2)), "test3 should complete");
+
+    let count = fs::read_to_string(&build_counter)
+        .unwrap_or_default()
+        .trim()
+        .parse::<i32>()
+        .unwrap_or(0);
+
+    assert_eq!(count, 1, "build should run exactly once despite 3 tests requiring it, got: {}", count);
+}
+
+/// Tests that service reuse works correctly when multiple tasks require the same service.
+#[test]
+fn service_reuse_across_batch() {
+    let mut harness = TestHarness::new("service_batch");
+    let service_counter = harness.temp_dir.join("service_starts.txt");
+    let test1_marker = harness.temp_dir.join("test1.done");
+    let test2_marker = harness.temp_dir.join("test2.done");
+
+    harness.write_config(&format!(
+        r#"
+[service.db]
+sh = '''
+count=$(cat {service_counter} 2>/dev/null || echo 0)
+echo $((count + 1)) > {service_counter}
+while true; do sleep 1; done
+'''
+
+[test.test_one]
+sh = "touch {test1_marker}"
+require = ["db"]
+
+[test.test_two]
+sh = "touch {test2_marker}"
+require = ["db"]
+"#,
+        service_counter = service_counter.display(),
+        test1_marker = test1_marker.display(),
+        test2_marker = test2_marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "Test run failed: {}", result.stderr);
+
+    assert!(harness.wait_for_file(&test1_marker, Duration::from_secs(2)), "test1 should complete");
+    assert!(harness.wait_for_file(&test2_marker, Duration::from_secs(2)), "test2 should complete");
+
+    std::thread::sleep(Duration::from_millis(100));
+    let count = fs::read_to_string(&service_counter)
+        .unwrap_or_default()
+        .trim()
+        .parse::<i32>()
+        .unwrap_or(0);
+
+    assert_eq!(count, 1, "service should start exactly once for both tests, got: {}", count);
+}
+
+/// Tests that different profile requirements are queued and executed sequentially.
+///
+/// A single test requiring conflicting service profiles should fail immediately.
+#[test]
+fn same_test_conflicting_profiles_error() {
+    let mut harness = TestHarness::new("same_test_conflict");
+
+    harness.write_config(
+        r#"
+[service.srv]
+cmd = ["sleep", "infinity"]
+profiles = ["alpha", "beta"]
+
+[[test.bad_test]]
+cmd = ["true"]
+require = ["srv:alpha", "srv:beta"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(!result.success(), "test command should fail due to conflict");
+    assert!(
+        result.stdout.contains("conflicting service requirements")
+            || result.stderr.contains("conflicting service requirements"),
+        "Error message should mention conflicting requirements. stdout: {}, stderr: {}",
+        result.stdout,
+        result.stderr
+    );
+}
+
+/// A test requiring two services that transitively need conflicting profiles should fail.
+/// Unlike actions, services need to stay Active, so their transitive service dependencies
+/// must also stay active simultaneously - making conflicts impossible to resolve.
+#[test]
+fn transitive_service_conflict_error() {
+    let mut harness = TestHarness::new("transitive_srv_conflict");
+
+    harness.write_config(
+        r#"
+[service.base_srv]
+cmd = ["sleep", "infinity"]
+profiles = ["alpha", "beta"]
+
+[service.srv_alpha]
+cmd = ["sleep", "infinity"]
+require = ["base_srv:alpha"]
+
+[service.srv_beta]
+cmd = ["sleep", "infinity"]
+require = ["base_srv:beta"]
+
+[[test.bad_test]]
+cmd = ["true"]
+require = ["srv_alpha", "srv_beta"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(!result.success(), "test command should fail due to transitive service conflict");
+    assert!(
+        result.stdout.contains("conflicting service requirements")
+            || result.stderr.contains("conflicting service requirements"),
+        "Error message should mention conflicting requirements. stdout: {}, stderr: {}",
+        result.stdout,
+        result.stderr
+    );
+}
+
+/// A test requiring actions that transitively require different service profiles should succeed.
+/// Actions complete and don't need the service to stay running, so they can be queued sequentially.
+#[test]
+fn indirect_different_profiles_succeeds() {
+    let mut harness = TestHarness::new("indirect_profiles");
+    let marker = harness.temp_dir.join("test.done");
+
+    harness.write_config(&format!(
+        r#"
+[service.srv]
+cmd = ["sleep", "infinity"]
+profiles = ["alpha", "beta"]
+
+[action.action_alpha]
+cmd = ["true"]
+require = ["srv:alpha"]
+
+[action.action_beta]
+cmd = ["true"]
+require = ["srv:beta"]
+
+[[test.good_test]]
+sh = "echo done > {marker}"
+require = ["action_alpha", "action_beta"]
+"#,
+        marker = marker.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "test command should succeed: stdout={}, stderr={}", result.stdout, result.stderr);
+    assert!(harness.wait_for_file(&marker, Duration::from_secs(10)), "test should complete");
+}
+
+/// When two tests require the same service with different profiles:
+/// 1. First test's profile is spawned
+/// 2. Second test waits for first to complete
+/// 3. First profile is terminated when it has no dependents
+/// 4. Second profile is spawned
+#[test]
+fn service_profile_queuing() {
+    let mut harness = TestHarness::new("profile_queue");
+    let alpha_marker = harness.temp_dir.join("alpha.done");
+    let beta_marker = harness.temp_dir.join("beta.done");
+    let sequence_log = harness.temp_dir.join("sequence.log");
+
+    harness.write_config(&format!(
+        r#"
+[service.srv]
+sh = "echo $PROFILE started >> {sequence}; while true; do sleep 0.1; done"
+profiles = ["alpha", "beta"]
+
+[[test.alpha_test]]
+sh = "echo alpha_test_running >> {sequence}; sleep 0.2; echo done > {alpha}"
+require = ["srv:alpha"]
+
+[[test.beta_test]]
+sh = "echo beta_test_running >> {sequence}; echo done > {beta}"
+require = ["srv:beta"]
+"#,
+        sequence = sequence_log.display(),
+        alpha = alpha_marker.display(),
+        beta = beta_marker.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "test command failed: {}", result.stderr);
+
+    assert!(harness.wait_for_file(&alpha_marker, Duration::from_secs(5)), "alpha test should complete");
+    assert!(harness.wait_for_file(&beta_marker, Duration::from_secs(5)), "beta test should complete");
+
+    let sequence = fs::read_to_string(&sequence_log).unwrap_or_default();
+    let lines: Vec<&str> = sequence.lines().collect();
+
+    assert!(
+        lines.iter().any(|l| l.contains("alpha started") || l.contains("started")),
+        "Service alpha should have started: {:?}",
+        lines
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("beta started") || l.contains("started")),
+        "Service beta should have started: {:?}",
+        lines
+    );
+}

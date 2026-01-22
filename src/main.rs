@@ -209,7 +209,10 @@ fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
         let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
 
         match socket.read(read_slice) {
-            Ok(0) => break,
+            Ok(0) => {
+                // Socket closed without TerminateAck - server encountered an error
+                bail!("Test run failed");
+            }
             Ok(n) => {
                 unsafe { read_buf.set_len(read_buf.len() + n) };
                 loop {
@@ -234,8 +237,6 @@ fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
             Err(e) => bail!("Socket read failed: {}", e),
         }
     }
-
-    Ok(())
 }
 
 // Bit 0 is for termination, Bit 1 is for resize

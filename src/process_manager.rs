@@ -287,6 +287,31 @@ impl ProcessManager {
         'outer: loop {
             for (wsi, ws) in &self.workspaces {
                 let state = ws.handle.state();
+
+                if let Some(service_to_kill) = state.service_to_terminate_for_queue() {
+                    let job = &state.jobs[service_to_kill.idx()];
+                    let job_id = job.log_group;
+                    let JobStatus::Running { process_index, .. } = job.process_status else {
+                        drop(state);
+                        continue;
+                    };
+                    drop(state);
+
+                    if let Some(process) = self.processes.get_mut(process_index) {
+                        if process.log_group == job_id && process.alive {
+                            kvlog::info!("Terminating service to allow queued service", ?service_to_kill);
+                            process.pending_exit_cause = Some(ExitCause::Restarted);
+                            let child_pid = process.child.id();
+                            let pgid_to_kill = -(child_pid as i32);
+                            unsafe {
+                                libc::kill(pgid_to_kill, libc::SIGINT);
+                            }
+                            process.alive = false;
+                        }
+                    }
+                    break;
+                }
+
                 match state.next_scheduled() {
                     workspace::Scheduled::Ready(job_index) => {
                         kvlog::info!("Scheduled task is ready");
@@ -1182,7 +1207,7 @@ impl ProcessManager {
         &mut self,
         stdin: File,
         stdout: File,
-        socket: UnixStream,
+        mut socket: UnixStream,
         ws_index: WorkspaceIndex,
         filters: Vec<u8>,
     ) {
@@ -1204,12 +1229,24 @@ impl ProcessManager {
         };
 
         let ws = &self.workspaces[ws_index as usize];
-        let test_run = ws.handle.start_test_run(&test_filters);
+        let test_run = match ws.handle.start_test_run(&test_filters) {
+            Ok(run) => run,
+            Err(err) => {
+                let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
+                let _ = std::io::Write::write_all(&mut file, format!("error: {}\n", err).as_bytes());
+                std::mem::forget(file);
+                return;
+            }
+        };
 
         if test_run.test_jobs.is_empty() {
             let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };
             let _ = std::io::Write::write_all(&mut file, b"No tests matched the filters\n");
             std::mem::forget(file);
+            // Send TerminateAck so client exits gracefully with success
+            let mut encoder = crate::rpc::Encoder::new();
+            encoder.encode_empty(RpcMessageKind::TerminateAck, 0);
+            let _ = socket.write_all(encoder.output());
             return;
         }
 

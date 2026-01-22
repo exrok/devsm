@@ -75,6 +75,7 @@ impl TestHarness {
 
         let server = Command::new(cargo_bin_path())
             .arg("server")
+            .current_dir(&self.temp_dir)
             .env("DEVSM_SOCKET", &self.socket_path)
             .env("DEVSM_LOG_STDOUT", "1")
             .stdin(Stdio::null())

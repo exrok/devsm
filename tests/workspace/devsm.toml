@@ -22,3 +22,24 @@ var.address = { description = "IP Address to ping", default = "127.0.0.1" }
 [action.ls]
 cmd = ['ls', { if.profile = "verbose", then = "-v" }]
 profiles = ["default", "verbose"]
+
+
+[service.srv]
+cmd = ["ping", "127.0.0.1"]
+profiles = ["alpha", "beta"]
+
+[[test.srv]]
+sh = """
+echo hello >> /tmp/trigger.alpha
+inotifywait /tmp/trigger.alpha
+echo ALPHA test finished
+"""
+require = ["srv:alpha"]
+
+[[test.srv]]
+sh = """
+echo hello >> /tmp/trigger.beta
+inotifywait /tmp/trigger.beta
+echo BETA test finished
+"""
+require = ["srv:beta"]
