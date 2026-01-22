@@ -166,6 +166,7 @@ pub enum Command {
     RestartTask,
     TerminateTask,
     LaunchTask,
+    LaunchTestFilter,
     StartGroup,
     StartSelection,
     SearchLogs,
@@ -206,6 +207,7 @@ impl FromStr for Command {
             "RestartTask" => Command::RestartTask,
             "TerminateTask" => Command::TerminateTask,
             "LaunchTask" => Command::LaunchTask,
+            "LaunchTestFilter" => Command::LaunchTestFilter,
             "StartGroup" => Command::StartGroup,
             "SelectProfile" => Command::StartSelection,
             "SearchLogs" => Command::SearchLogs,
@@ -241,10 +243,11 @@ pub enum Mode {
     SelectSearch,
     LogSearch,
     TaskLauncher,
+    TestFilterLauncher,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 7] = [
+    pub const ALL: [Mode; 8] = [
         Mode::Global,
         Mode::Input,
         Mode::Pager,
@@ -252,6 +255,7 @@ impl Mode {
         Mode::SelectSearch,
         Mode::LogSearch,
         Mode::TaskLauncher,
+        Mode::TestFilterLauncher,
     ];
 
     pub fn config_name(self) -> &'static str {
@@ -263,6 +267,7 @@ impl Mode {
             Mode::SelectSearch => "select_search",
             Mode::LogSearch => "log_search",
             Mode::TaskLauncher => "task_launcher",
+            Mode::TestFilterLauncher => "test_filter_launcher",
         }
     }
 }
@@ -279,6 +284,7 @@ impl FromStr for Mode {
             "select_search" | "selectsearch" => Mode::SelectSearch,
             "log_search" | "logsearch" => Mode::LogSearch,
             "task_launcher" | "tasklauncher" => Mode::TaskLauncher,
+            "test_filter_launcher" | "testfilterlauncher" => Mode::TestFilterLauncher,
             _ => return Err(format!("Unknown mode: `{s}`")),
         })
     }
@@ -296,6 +302,7 @@ pub struct Keybinds {
     select_search: BindingTable,
     log_search: BindingTable,
     task_launcher: BindingTable,
+    test_filter_launcher: BindingTable,
 }
 
 impl Keybinds {
@@ -324,6 +331,7 @@ impl Keybinds {
             select_search: HashTable::new(),
             log_search: HashTable::new(),
             task_launcher: HashTable::new(),
+            test_filter_launcher: HashTable::new(),
         }
     }
 
@@ -336,6 +344,7 @@ impl Keybinds {
             Mode::SelectSearch => &self.select_search,
             Mode::LogSearch => &self.log_search,
             Mode::TaskLauncher => &self.task_launcher,
+            Mode::TestFilterLauncher => &self.test_filter_launcher,
         }
     }
 
@@ -379,6 +388,7 @@ impl Keybinds {
         self.bind(Mode::TaskTree, "v", Command::ToggleViewMode);
         self.bind(Mode::TaskTree, "\\", Command::ToggleTaskTree);
         self.bind(Mode::TaskTree, "R", Command::RefreshConfig);
+        self.bind(Mode::TaskTree, "t", Command::LaunchTestFilter);
     }
 
     /// Binds a key to a command in a specific mode.
@@ -394,6 +404,7 @@ impl Keybinds {
             Mode::SelectSearch => &mut self.select_search,
             Mode::LogSearch => &mut self.log_search,
             Mode::TaskLauncher => &mut self.task_launcher,
+            Mode::TestFilterLauncher => &mut self.test_filter_launcher,
         };
         match table.find_mut(hash, |(k, _)| *k == input) {
             Some(entry) => entry.1 = command,
@@ -415,6 +426,7 @@ impl Keybinds {
             Mode::SelectSearch => &mut self.select_search,
             Mode::LogSearch => &mut self.log_search,
             Mode::TaskLauncher => &mut self.task_launcher,
+            Mode::TestFilterLauncher => &mut self.test_filter_launcher,
         };
         match command {
             Some(cmd) => match table.find_mut(hash, |(k, _)| *k == input) {
@@ -500,6 +512,7 @@ impl Command {
             Command::RestartTask => "Restart",
             Command::TerminateTask => "Terminate",
             Command::LaunchTask => "Launch",
+            Command::LaunchTestFilter => "Test Filter",
             Command::StartGroup => "Start Group",
             Command::StartSelection => "Profile",
             Command::SearchLogs => "Search",
@@ -538,6 +551,7 @@ impl Command {
             Command::RestartTask => "RestartTask",
             Command::TerminateTask => "TerminateTask",
             Command::LaunchTask => "LaunchTask",
+            Command::LaunchTestFilter => "LaunchTestFilter",
             Command::StartGroup => "StartGroup",
             Command::StartSelection => "SelectProfile",
             Command::SearchLogs => "SearchLogs",

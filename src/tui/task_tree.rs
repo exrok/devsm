@@ -70,19 +70,6 @@ impl StatusKind {
         }
     }
 
-    /// Returns a priority value for aggregating statuses.
-    /// Higher priority means this status "wins" when aggregating.
-    fn priority(self) -> u8 {
-        match self {
-            StatusKind::Null => 0,
-            StatusKind::Skip => 1,
-            StatusKind::Dead => 2,
-            StatusKind::Done => 3,
-            StatusKind::Wait => 4,
-            StatusKind::Live => 5,
-            StatusKind::Fail => 6,
-        }
-    }
     fn dark_bg(self) -> Color {
         use StatusKind::*;
         match self {
@@ -456,23 +443,13 @@ impl TaskTreeState {
         }
     }
 
-    /// Computes the aggregated status for a meta-group (worst status among all jobs of that kind).
+    /// Returns the status of the most recent job in the meta-group.
     fn meta_group_status(&self, ws: &WorkspaceState, kind: MetaGroupKind) -> StatusKind {
         let task_kind = kind.task_kind();
-        let mut worst = StatusKind::Null;
-        for bt in &ws.base_tasks {
-            if bt.removed || bt.config.kind != task_kind {
-                continue;
-            }
-            for ji in bt.jobs.all() {
-                let status = StatusKind::of(&ws[*ji].process_status, task_kind);
-                // Priority: Fail > Live > Wait > Done > Dead > Skip > Null
-                if status.priority() > worst.priority() {
-                    worst = status;
-                }
-            }
-        }
-        worst
+        let Some(&ji) = ws.jobs_by_kind(task_kind).last() else {
+            return StatusKind::Null;
+        };
+        StatusKind::of(&ws[ji].process_status, task_kind)
     }
 
     /// Counts running and scheduled jobs across all tasks of the given kind.

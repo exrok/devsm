@@ -19,6 +19,7 @@ use crate::tui::select_search::SelectSearch;
 use crate::tui::task_launcher::LauncherMode;
 use crate::tui::task_launcher::{LauncherAction, TaskLauncherState};
 use crate::tui::task_tree::{MetaGroupKind, SelectionState, TaskTreeState};
+use crate::tui::test_filter_launcher::{TestFilterAction, TestFilterLauncherState};
 use crate::workspace::{BaseTaskIndex, Workspace, WorkspaceState};
 
 /// Constrains scroll offset to keep the selected item visible with padding.
@@ -100,6 +101,7 @@ mod log_stack;
 mod select_search;
 mod task_launcher;
 mod task_tree;
+mod test_filter_launcher;
 
 use config_error::{ConfigErrorAction, ConfigErrorState, ConfigSource};
 
@@ -128,6 +130,7 @@ enum FocusOverlap {
     Group { selection: SelectSearch },
     LogSearch { state: LogSearchState },
     TaskLauncher { state: TaskLauncherState },
+    TestFilterLauncher { state: TestFilterLauncherState },
     ConfigError { state: ConfigErrorState },
     None,
 }
@@ -254,6 +257,9 @@ fn render<'a>(
             FocusOverlap::TaskLauncher { state } => {
                 state.render(&mut tui.frame, task_tree_rect);
             }
+            FocusOverlap::TestFilterLauncher { state } => {
+                state.render(&mut tui.frame, task_tree_rect);
+            }
             FocusOverlap::ConfigError { state } => {
                 state.render(&mut tui.frame, task_tree_rect);
             }
@@ -271,6 +277,7 @@ fn render<'a>(
                 FocusOverlap::Group { .. } => Mode::SelectSearch,
                 FocusOverlap::LogSearch { .. } => Mode::LogSearch,
                 FocusOverlap::TaskLauncher { .. } => Mode::TaskLauncher,
+                FocusOverlap::TestFilterLauncher { .. } => Mode::TestFilterLauncher,
                 FocusOverlap::ConfigError { .. } => Mode::Global,
                 FocusOverlap::None => Mode::Global,
             };
@@ -344,12 +351,15 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
         FocusOverlap::Group { .. } => ("GROUP", Color::Violet),
         FocusOverlap::LogSearch { .. } => ("SEARCH", Color::LightSkyBlue1),
         FocusOverlap::TaskLauncher { .. } => ("LAUNCH", Color::LightGoldenrod2),
+        FocusOverlap::TestFilterLauncher { .. } => ("TEST", Color::Cyan1),
         FocusOverlap::ConfigError { .. } => ("ERROR", Color::Red1),
         FocusOverlap::None => ("NORMAL", Color::DarkOliveGreen),
     };
 
     let sel = tui.task_tree.selection_state_readonly(&ws);
-    let selection_text = if let Some(sel) = sel {
+    let selection_text = if let FocusOverlap::TestFilterLauncher { state } = &tui.overlay {
+        format!(" {}/{} tests ", state.matching_test_count(&ws), state.total_test_count(&ws))
+    } else if let Some(sel) = sel {
         if let Some(job_idx) = sel.job {
             let job = &ws[job_idx];
             let bti = job.log_group.base_task_index();
@@ -558,6 +568,32 @@ fn process_key(
             }
             return ProcessKeyResult::Continue;
         }
+        FocusOverlap::TestFilterLauncher { state } => {
+            match state.process_input(key_event, keybinds) {
+                TestFilterAction::Cancel => {
+                    tui.overlay = FocusOverlap::None;
+                }
+                TestFilterAction::Start { filters } => {
+                    match workspace.start_test_run(&filters) {
+                        Ok(_) => {
+                            let count = filters.len();
+                            let msg = if count == 0 {
+                                "All tests started".to_string()
+                            } else {
+                                format!("Tests started with {} filter(s)", count)
+                            };
+                            tui.status_message = Some(StatusMessage::info(msg));
+                        }
+                        Err(e) => {
+                            tui.status_message = Some(StatusMessage::error(e));
+                        }
+                    }
+                    tui.overlay = FocusOverlap::None;
+                }
+                TestFilterAction::None => {}
+            }
+            return ProcessKeyResult::Continue;
+        }
         FocusOverlap::ConfigError { state } => {
             match state.process_input(key_event, keybinds) {
                 ConfigErrorAction::Retry => {
@@ -616,6 +652,11 @@ fn process_key(
             let state = TaskLauncherState::new(&ws);
             tui.overlay = FocusOverlap::TaskLauncher { state };
         }
+        Command::LaunchTestFilter => {
+            let ws = workspace.state();
+            let state = TestFilterLauncherState::new(&ws);
+            tui.overlay = FocusOverlap::TestFilterLauncher { state };
+        }
         Command::ToggleViewMode => {
             tui.task_tree.toggle_collapsed();
         }
@@ -638,6 +679,11 @@ fn process_key(
         Command::StartSelection => {
             let ws = workspace.state();
             if let Some(sel) = tui.task_tree.selection_state(&ws) {
+                if sel.meta_group == Some(MetaGroupKind::Tests) {
+                    let state = TestFilterLauncherState::new(&ws);
+                    tui.overlay = FocusOverlap::TestFilterLauncher { state };
+                    return ProcessKeyResult::Continue;
+                }
                 let Some(bti) = sel.base_task else {
                     return ProcessKeyResult::Continue;
                 };
@@ -980,6 +1026,12 @@ fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_
                 },
                 confirmed_profile: state.confirmed_profile(),
                 completed_vars: [for (name, value) in state.completed_vars(); { name: name, value: value }]
+            },
+            FocusOverlap::TestFilterLauncher { state } => {
+                kind: "TestFilterLauncher",
+                input: state.input(),
+                matching_count: state.matching_test_count(&ws),
+                total_count: state.total_test_count(&ws)
             },
             FocusOverlap::ConfigError { .. } => {
                 kind: "ConfigError"
