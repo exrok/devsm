@@ -1513,11 +1513,7 @@ require = ["build"]
     assert!(harness.wait_for_file(&test2_marker, Duration::from_secs(2)), "test2 should complete");
     assert!(harness.wait_for_file(&test3_marker, Duration::from_secs(2)), "test3 should complete");
 
-    let count = fs::read_to_string(&build_counter)
-        .unwrap_or_default()
-        .trim()
-        .parse::<i32>()
-        .unwrap_or(0);
+    let count = fs::read_to_string(&build_counter).unwrap_or_default().trim().parse::<i32>().unwrap_or(0);
 
     assert_eq!(count, 1, "build should run exactly once despite 3 tests requiring it, got: {}", count);
 }
@@ -1561,11 +1557,7 @@ require = ["db"]
     assert!(harness.wait_for_file(&test2_marker, Duration::from_secs(2)), "test2 should complete");
 
     std::thread::sleep(Duration::from_millis(100));
-    let count = fs::read_to_string(&service_counter)
-        .unwrap_or_default()
-        .trim()
-        .parse::<i32>()
-        .unwrap_or(0);
+    let count = fs::read_to_string(&service_counter).unwrap_or_default().trim().parse::<i32>().unwrap_or(0);
 
     assert_eq!(count, 1, "service should start exactly once for both tests, got: {}", count);
 }

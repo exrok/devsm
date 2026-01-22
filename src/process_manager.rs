@@ -118,6 +118,7 @@ enum ClientKind {
     Run { log_group: LogGroup },
     TestRun,
     Rpc { subscriptions: RpcSubscriptions },
+    SelfLogs,
 }
 
 struct ClientEntry {
@@ -517,6 +518,10 @@ pub(crate) enum ProcessRequest {
     ProcessExited {
         pid: u32,
         status: u32,
+    },
+    AttachSelfLogsClient {
+        stdout: File,
+        socket: UnixStream,
     },
     GlobalTermination,
 }
@@ -944,6 +949,10 @@ impl ProcessManager {
                 self.terminate_client(index as ClientIndex);
                 false
             }
+            ProcessRequest::AttachSelfLogsClient { stdout, socket } => {
+                self.attach_self_logs_client(stdout, socket);
+                false
+            }
             ProcessRequest::GlobalTermination => {
                 for (_, process) in &mut self.processes {
                     let child_pid = process.child.id();
@@ -1330,6 +1339,61 @@ impl ProcessManager {
         kvlog::info!("RPC client attached", workspace = ws_index, subscribe);
     }
 
+    fn attach_self_logs_client(&mut self, stdout: File, socket: UnixStream) {
+        let channel = Arc::new(ClientChannel {
+            waker: extui::event::polling::Waker::new().unwrap(),
+            events: Mutex::new(Vec::new()),
+            selected: AtomicU64::new(0),
+            state: AtomicU64::new(0),
+        });
+
+        let next = self.clients.vacant_key();
+        let _ = self.poll.registry().register(
+            &mut SourceFd(&socket.as_raw_fd()),
+            TokenHandle::Client(next as u32).into(),
+            Interest::READABLE,
+        );
+        let _ = socket.set_nonblocking(true);
+
+        let client_entry = ClientEntry {
+            channel: channel.clone(),
+            workspace: 0,
+            socket,
+            kind: ClientKind::SelfLogs,
+            partial_rpc_read: None,
+        };
+        let index = self.clients.insert(client_entry);
+        let request_channel = self.request.clone();
+
+        std::thread::spawn(move || {
+            run_self_logs_forwarder(stdout, channel, request_channel, index);
+        });
+
+        kvlog::info!("Self-logs client attached");
+    }
+
+    fn handle_self_logs_client_read(&mut self, client_index: ClientIndex) {
+        let Some(client) = self.clients.get_mut(client_index as usize) else {
+            return;
+        };
+
+        let mut buffer = Vec::new();
+        loop {
+            match try_read(client.socket.as_raw_fd(), &mut buffer) {
+                ReadResult::More => continue,
+                ReadResult::EOF => {
+                    self.terminate_client(client_index);
+                    return;
+                }
+                ReadResult::Done | ReadResult::WouldBlock => return,
+                ReadResult::OtherError(_) => {
+                    self.terminate_client(client_index);
+                    return;
+                }
+            }
+        }
+    }
+
     fn handle_rpc_client_read(&mut self, client_index: ClientIndex) {
         let Some(client) = self.clients.get_mut(client_index as usize) else {
             return;
@@ -1507,6 +1571,7 @@ impl ProcessManager {
             }
             ClientKind::TestRun => self.handle_test_run_client_read(client_index),
             ClientKind::Rpc { .. } => self.handle_rpc_client_read(client_index),
+            ClientKind::SelfLogs => self.handle_self_logs_client_read(client_index),
         }
     }
 
@@ -1985,4 +2050,58 @@ impl ProcessManagerHandle {
         process_worker(r, wait_thread, poll);
         Ok(())
     }
+}
+
+fn run_self_logs_forwarder(
+    mut stdout: File,
+    channel: Arc<ClientChannel>,
+    request_channel: Arc<MioChannel>,
+    index: usize,
+) {
+    let Some(log_state) = crate::self_log::daemon_log_state() else {
+        request_channel.send(ProcessRequest::ClientExited { index });
+        return;
+    };
+
+    let mut last_offset = 0u64;
+    let mut logs = Vec::new();
+    let mut fmt_buf = Vec::new();
+    let mut parents = kvlog::collector::ParentSpanSuffixCache::new_boxed();
+
+    loop {
+        if channel.is_terminated() {
+            break;
+        }
+
+        let (new_offset, follower_id) = {
+            let mut state = log_state.lock().unwrap();
+            let new_offset = state.snapshot_from(last_offset, &mut logs);
+            let follower_id = state.register_follower(std::thread::current());
+            (new_offset, follower_id)
+        };
+
+        if !logs.is_empty() {
+            fmt_buf.clear();
+            for log in kvlog::encoding::decode(&logs) {
+                if let Ok((ts, level, span, fields)) = log {
+                    kvlog::collector::format_statement_with_colors(&mut fmt_buf, &mut parents, ts, level, span, fields);
+                }
+            }
+            if stdout.write_all(&fmt_buf).is_err() {
+                log_state.lock().unwrap().unregister_follower(follower_id);
+                break;
+            }
+        }
+        last_offset = new_offset;
+
+        if channel.is_terminated() {
+            log_state.lock().unwrap().unregister_follower(follower_id);
+            break;
+        }
+
+        std::thread::park();
+        log_state.lock().unwrap().unregister_follower(follower_id);
+    }
+
+    request_channel.send(ProcessRequest::ClientExited { index });
 }

@@ -115,7 +115,9 @@ pub enum Request<'a> {
         config: &'a Path,
         subscribe: bool,
     },
-    GetSelfLogs,
+    GetSelfLogs {
+        follow: bool,
+    },
 }
 
 struct FdSet<'a>(&'a [i32]);
@@ -216,10 +218,20 @@ fn handle_request(
                 kind: crate::process_manager::AttachKind::Rpc { subscribe },
             });
         }
-        Request::GetSelfLogs => {
-            let logs = crate::self_log::get_daemon_logs().unwrap_or_default();
-            let mut socket = socket;
-            let _ = socket.write_all(&logs);
+        Request::GetSelfLogs { follow } => {
+            if follow {
+                if fds.len() != 1 {
+                    bail!("Expected 1 FD for self-logs follow");
+                }
+                pm.request.send(crate::process_manager::ProcessRequest::AttachSelfLogsClient {
+                    stdout: fds.pop_front().unwrap(),
+                    socket,
+                });
+            } else {
+                let logs = crate::self_log::get_daemon_logs().unwrap_or_default();
+                let mut socket = socket;
+                let _ = socket.write_all(&logs);
+            }
         }
     }
     Ok(())

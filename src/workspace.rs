@@ -423,11 +423,7 @@ pub enum ServiceCompatibility {
     /// No service is currently running.
     Available,
     /// A service is running with a different profile than requested.
-    Conflict {
-        running_job: JobIndex,
-        running_profile: String,
-        requested_profile: String,
-    },
+    Conflict { running_job: JobIndex, running_profile: String, requested_profile: String },
 }
 
 /// Key for deduplicating requirements across a batch of spawns.
@@ -1232,13 +1228,8 @@ impl WorkspaceState {
                                     running_profile,
                                     requested_profile,
                                 );
-                                let queued_job = self.schedule_queued_service(
-                                    base_task,
-                                    log_start,
-                                    params,
-                                    &profile,
-                                    running_job,
-                                );
+                                let queued_job =
+                                    self.schedule_queued_service(base_task, log_start, params, &profile, running_job);
                                 batch.mark_resolved(key, ResolvedRequirement::Pending(queued_job));
                                 continue;
                             }

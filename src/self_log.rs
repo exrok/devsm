@@ -1,6 +1,10 @@
-use std::sync::{Arc, Mutex, OnceLock};
+use std::{
+    sync::{Arc, Mutex, OnceLock},
+    thread::Thread,
+};
 
 use kvlog::collector::{LogBuffer, LoggerGuard};
+use slab::Slab;
 
 #[cfg(not(test))]
 const RING_BUFFER_SIZE: usize = 128 * 1024;
@@ -102,7 +106,60 @@ impl LogRingBuffer {
 }
 
 static CLIENT_LOGS: OnceLock<Arc<Mutex<LogRingBuffer>>> = OnceLock::new();
-static DAEMON_LOGS: OnceLock<Arc<Mutex<LogRingBuffer>>> = OnceLock::new();
+static DAEMON_LOGS: OnceLock<Arc<Mutex<DaemonLogState>>> = OnceLock::new();
+
+pub struct DaemonLogState {
+    buffer: LogRingBuffer,
+    offset: u64,
+    followers: Slab<Thread>,
+}
+
+impl DaemonLogState {
+    fn new() -> Self {
+        Self { buffer: LogRingBuffer::new(), offset: 0, followers: Slab::new() }
+    }
+
+    fn push(&mut self, entry: &[u8]) {
+        self.buffer.push(entry);
+        self.offset += entry.len() as u64;
+        for (_, thread) in &self.followers {
+            thread.unpark();
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<u8> {
+        self.buffer.snapshot()
+    }
+
+    pub fn snapshot_from(&self, from_offset: u64, out: &mut Vec<u8>) -> u64 {
+        out.clear();
+        let current_offset = self.offset;
+        let buffer_start_offset = current_offset.saturating_sub(self.buffer.len as u64);
+
+        if from_offset <= buffer_start_offset {
+            *out = self.buffer.snapshot();
+            return current_offset;
+        }
+
+        if from_offset >= current_offset {
+            return current_offset;
+        }
+
+        let skip_bytes = (from_offset - buffer_start_offset) as usize;
+        let snapshot = self.buffer.snapshot();
+        out.extend_from_slice(&snapshot[skip_bytes..]);
+
+        current_offset
+    }
+
+    pub fn register_follower(&mut self, thread: Thread) -> usize {
+        self.followers.insert(thread)
+    }
+
+    pub fn unregister_follower(&mut self, index: usize) {
+        self.followers.try_remove(index);
+    }
+}
 
 pub fn init_client_logging() -> LoggerGuard {
     let ring = Arc::new(Mutex::new(LogRingBuffer::new()));
@@ -159,13 +216,13 @@ pub fn init_client_logging() -> LoggerGuard {
 }
 
 pub fn init_daemon_logging() -> LoggerGuard {
-    let ring = Arc::new(Mutex::new(LogRingBuffer::new()));
-    DAEMON_LOGS.set(ring.clone()).ok();
+    let state = Arc::new(Mutex::new(DaemonLogState::new()));
+    DAEMON_LOGS.set(state.clone()).ok();
 
-    let ring_for_collector = ring;
+    let state_for_collector = state;
     kvlog::collector::init_closure_logger(move |log_buffer: &mut LogBuffer| {
         let bytes = log_buffer.as_bytes();
-        if let Ok(mut buffer) = ring_for_collector.lock() {
+        if let Ok(mut state) = state_for_collector.lock() {
             let mut offset = 0;
             while offset < bytes.len() {
                 let Some(len) = kvlog::encoding::log_len(&bytes[offset..]) else {
@@ -174,7 +231,7 @@ pub fn init_daemon_logging() -> LoggerGuard {
                 if offset + len > bytes.len() {
                     break;
                 }
-                buffer.push(&bytes[offset..offset + len]);
+                state.push(&bytes[offset..offset + len]);
                 offset += len;
             }
         }
@@ -183,7 +240,11 @@ pub fn init_daemon_logging() -> LoggerGuard {
 }
 
 pub fn get_daemon_logs() -> Option<Vec<u8>> {
-    DAEMON_LOGS.get().and_then(|ring| ring.lock().ok().map(|buffer| buffer.snapshot()))
+    DAEMON_LOGS.get().and_then(|state| state.lock().ok().map(|s| s.snapshot()))
+}
+
+pub fn daemon_log_state() -> Option<&'static Arc<Mutex<DaemonLogState>>> {
+    DAEMON_LOGS.get()
 }
 
 #[cfg(test)]
@@ -396,5 +457,118 @@ mod tests {
         let payloads = extract_payloads(&buffer.snapshot());
         assert_eq!(payloads.len(), 1);
         assert!(payloads[0].iter().all(|&b| b == 0x22));
+    }
+
+    #[test]
+    fn daemon_log_state_snapshot_from_basic() {
+        let mut state = DaemonLogState::new();
+
+        let entry1 = make_entry(b"first");
+        let entry2 = make_entry(b"second");
+        let entry3 = make_entry(b"third");
+
+        state.push(&entry1);
+        let offset_after_first = state.offset;
+        state.push(&entry2);
+        let offset_after_second = state.offset;
+        state.push(&entry3);
+        let offset_after_third = state.offset;
+
+        let mut out = Vec::new();
+
+        let new_offset = state.snapshot_from(0, &mut out);
+        assert_eq!(new_offset, offset_after_third);
+        let payloads = extract_payloads(&out);
+        assert_eq!(payloads, vec![b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]);
+
+        let new_offset = state.snapshot_from(offset_after_first, &mut out);
+        assert_eq!(new_offset, offset_after_third);
+        let payloads = extract_payloads(&out);
+        assert_eq!(payloads, vec![b"second".to_vec(), b"third".to_vec()]);
+
+        let new_offset = state.snapshot_from(offset_after_second, &mut out);
+        assert_eq!(new_offset, offset_after_third);
+        let payloads = extract_payloads(&out);
+        assert_eq!(payloads, vec![b"third".to_vec()]);
+
+        let new_offset = state.snapshot_from(offset_after_third, &mut out);
+        assert_eq!(new_offset, offset_after_third);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn daemon_log_state_snapshot_from_after_wrap() {
+        let mut state = DaemonLogState::new();
+
+        for i in 0..100u8 {
+            state.push(&make_entry(&[i; 20]));
+        }
+
+        let total_offset = state.offset;
+        assert_eq!(total_offset, 100 * 24);
+
+        let mut out = Vec::new();
+        let new_offset = state.snapshot_from(0, &mut out);
+        assert_eq!(new_offset, total_offset);
+
+        let payloads = extract_payloads(&out);
+        assert_eq!(payloads.len(), 42);
+        assert_eq!(payloads[0], vec![58u8; 20]);
+        assert_eq!(payloads[41], vec![99u8; 20]);
+    }
+
+    #[test]
+    fn daemon_log_state_snapshot_from_partial_after_wrap() {
+        let mut state = DaemonLogState::new();
+
+        for i in 0..50u8 {
+            state.push(&make_entry(&[i; 20]));
+        }
+        let offset_mid = state.offset;
+
+        for i in 50..100u8 {
+            state.push(&make_entry(&[i; 20]));
+        }
+
+        let mut out = Vec::new();
+        let new_offset = state.snapshot_from(offset_mid, &mut out);
+        assert_eq!(new_offset, 100 * 24);
+
+        let payloads = extract_payloads(&out);
+        assert_eq!(payloads.len(), 42);
+
+        for (i, payload) in payloads.iter().enumerate() {
+            assert_eq!(payload.len(), 20);
+            assert_eq!(payload[0], 58 + i as u8);
+        }
+    }
+
+    #[test]
+    fn daemon_log_state_offset_never_resets() {
+        let mut state = DaemonLogState::new();
+
+        for _ in 0..10 {
+            for i in 0..50u8 {
+                state.push(&make_entry(&[i; 30]));
+            }
+        }
+
+        assert_eq!(state.offset, 10 * 50 * 34);
+
+        let mut out = Vec::new();
+        let new_offset = state.snapshot_from(state.offset - 100, &mut out);
+        assert_eq!(new_offset, state.offset);
+        assert_eq!(out.len(), 100);
+    }
+
+    #[test]
+    fn daemon_log_state_snapshot_from_future_offset() {
+        let mut state = DaemonLogState::new();
+        state.push(&make_entry(b"test"));
+
+        let mut out = Vec::new();
+        let new_offset = state.snapshot_from(9999, &mut out);
+        assert_eq!(new_offset, 8);
+        assert!(out.is_empty());
     }
 }

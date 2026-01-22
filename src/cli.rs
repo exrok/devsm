@@ -85,7 +85,7 @@ pub enum Command<'a> {
 }
 
 pub enum GetResource {
-    SelfLogs,
+    SelfLogs { follow: bool },
     WorkspaceConfigPath,
     DefaultUserConfig,
 }
@@ -286,7 +286,28 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                         bail!("get requires a resource name");
                     };
                     match resource {
-                        "self-logs" => break 'command Command::Get { resource: GetResource::SelfLogs },
+                        "self-logs" => {
+                            let mut follow = false;
+                            for component in parser.by_ref() {
+                                match component {
+                                    Component::Flags(flags) => {
+                                        for flag in flags.chars() {
+                                            match flag {
+                                                'f' => follow = true,
+                                                _ => bail!("Unknown flag -{} in self-logs command", flag),
+                                            }
+                                        }
+                                    }
+                                    Component::Long(long) => match long {
+                                        "follow" => follow = true,
+                                        _ => bail!("Unknown flag --{} in self-logs command", long),
+                                    },
+                                    Component::Term(arg) => bail!("Unexpected argument: {:?}", arg),
+                                    Component::Value(val) => bail!("Unexpected value: {:?}", val),
+                                }
+                            }
+                            break 'command Command::Get { resource: GetResource::SelfLogs { follow } };
+                        }
                         "default-user-config" => {
                             break 'command Command::Get { resource: GetResource::DefaultUserConfig };
                         }

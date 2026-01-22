@@ -17,7 +17,7 @@ mio = { version = "1.0.4", features = [
 slab = "0.4.11"
 unicode-segmentation = "1.12.0"
 unicode-width = { version = "0.2.2", default-features = false }
-extui = "0.1"
+extui = "0.1.2"
 jsony = "0.1.8"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 memchr = "2.7.6"

@@ -127,8 +127,8 @@ fn main() {
             }
         }
         cli::Command::Get { resource } => match resource {
-            cli::GetResource::SelfLogs => {
-                if let Err(err) = get_self_logs() {
+            cli::GetResource::SelfLogs { follow } => {
+                if let Err(err) = get_self_logs(follow) {
                     eprintln!("error: failed to get logs: {}", err);
                     std::process::exit(1);
                 }
@@ -611,24 +611,53 @@ fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
     bail!("exec failed: {}", err);
 }
 
-fn get_self_logs() -> anyhow::Result<()> {
+fn get_self_logs(follow: bool) -> anyhow::Result<()> {
     let mut socket = connect_or_spawn_daemon()?;
-    socket.write_all(&jsony::to_binary(&daemon::RequestMessage {
-        cwd: &std::env::current_dir()?,
-        request: daemon::Request::GetSelfLogs,
-    }))?;
 
-    let mut logs = Vec::new();
-    socket.read_to_end(&mut logs)?;
+    if follow {
+        setup_signal_handler(libc::SIGTERM, term_handler)?;
+        setup_signal_handler(libc::SIGINT, term_handler)?;
 
-    let mut fmt_buf = Vec::new();
-    let mut parents = kvlog::collector::ParentSpanSuffixCache::new_boxed();
-    for log in kvlog::encoding::decode(&logs) {
-        if let Ok((ts, level, span, fields)) = log {
-            kvlog::collector::format_statement_with_colors(&mut fmt_buf, &mut parents, ts, level, span, fields);
+        socket.send_with_fd(
+            &jsony::to_binary(&daemon::RequestMessage {
+                cwd: &std::env::current_dir()?,
+                request: daemon::Request::GetSelfLogs { follow: true },
+            }),
+            &[1],
+        )?;
+
+        let mut read_buf = [0u8; 64];
+        loop {
+            let flags = SIGNAL_FLAGS.swap(0, Ordering::Relaxed);
+            if flags & TERMINATION_FLAG != 0 {
+                break;
+            }
+
+            match socket.read(&mut read_buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
         }
+    } else {
+        socket.write_all(&jsony::to_binary(&daemon::RequestMessage {
+            cwd: &std::env::current_dir()?,
+            request: daemon::Request::GetSelfLogs { follow: false },
+        }))?;
+
+        let mut logs = Vec::new();
+        socket.read_to_end(&mut logs)?;
+
+        let mut fmt_buf = Vec::new();
+        let mut parents = kvlog::collector::ParentSpanSuffixCache::new_boxed();
+        for log in kvlog::encoding::decode(&logs) {
+            if let Ok((ts, level, span, fields)) = log {
+                kvlog::collector::format_statement_with_colors(&mut fmt_buf, &mut parents, ts, level, span, fields);
+            }
+        }
+        print!("{}", String::from_utf8_lossy(&fmt_buf));
     }
-    print!("{}", String::from_utf8_lossy(&fmt_buf));
     Ok(())
 }
 
@@ -663,7 +692,7 @@ Test Filters:
   name              Include tests matching this name
 
 Get Resources:
-  self-logs              Retrieve daemon logs
+  self-logs [-f]         Retrieve daemon logs (-f/--follow to tail)
   workspace config-path  Get config file path
   default-user-config    Print default user config (keybindings)
 

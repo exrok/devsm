@@ -78,9 +78,9 @@ dependencies = [
 
 [[package]]
 name = "extui"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f97843776706df69854f0a0e714de3944ca196771656b07e77441953f0acc03"
+checksum = "a294c58940204a1c761607c3844c9141df3a8248ce5834a0d5239f5dfc2402a5"
 dependencies = [
  "bitflags",
  "itoap",
