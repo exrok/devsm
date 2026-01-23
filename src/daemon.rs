@@ -78,6 +78,7 @@ pub enum WorkspaceCommand<'a> {
     Run { name: Box<str>, params: ValueMap<'a> },
     CallFunction { name: Box<str> },
     Kill { name: Box<str> },
+    RerunTests { only_failed: bool },
 }
 
 /// Filters for test selection (serializable for IPC).
@@ -137,6 +138,7 @@ pub enum Request<'a> {
         config: &'a Path,
         name: Box<str>,
         params: ValueMap<'a>,
+        as_test: bool,
     },
     AttachTests {
         #[jsony(with = unix_path)]
@@ -220,8 +222,8 @@ fn handle_request(
                 kind: crate::process_manager::AttachKind::Tui,
             });
         }
-        Request::AttachRun { config, name, params } => {
-            kvlog::info!("Receiving FD for run command");
+        Request::AttachRun { config, name, params, as_test } => {
+            kvlog::info!("Receiving FD for run command", as_test);
             if fds.len() != 2 {
                 bail!("Expected 2 FD's found only one");
             }
@@ -230,7 +232,11 @@ fn handle_request(
                 stdout: Some(fds.pop_front().unwrap()),
                 socket,
                 workspace_config: config.into(),
-                kind: crate::process_manager::AttachKind::Run { task_name: name, params: jsony::to_binary(&params) },
+                kind: crate::process_manager::AttachKind::Run {
+                    task_name: name,
+                    params: jsony::to_binary(&params),
+                    as_test,
+                },
             });
         }
         Request::AttachTests { config, filters } => {

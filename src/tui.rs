@@ -301,6 +301,7 @@ struct StatusBarData {
     log_mode: &'static str,
     is_scrolled: bool,
     status_message: Option<(String, bool)>,
+    test_summary: Option<crate::workspace::TestGroupSummary>,
 }
 
 fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData) {
@@ -336,6 +337,22 @@ fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData)
         Color::Grey[6].with_fg(Color::Grey[20])
     };
     r = r.with(block_style).fmt(frame, format_args!(" R:{} S:{} ", data.running, data.scheduled));
+
+    if let Some(ts) = &data.test_summary {
+        let done = ts.passed + ts.failed;
+        let test_style = if ts.running > 0 || ts.pending > 0 {
+            Color::Cyan1.with_fg(Color::Black)
+        } else if ts.failed > 0 {
+            Color::NeonRed.with_fg(Color::Black)
+        } else {
+            Color::SpringGreen.with_fg(Color::Black)
+        };
+        if ts.running > 0 {
+            r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ({}) ", done, ts.total, ts.running));
+        } else {
+            r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ", done, ts.total));
+        }
+    }
 
     if let Some((text, is_error)) = &data.status_message {
         let msg_text = format!(" {} ", text);
@@ -415,6 +432,8 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
         None
     };
 
+    let test_summary = ws.compute_test_group_summary();
+
     StatusBarData {
         mode_name,
         mode_bg,
@@ -426,6 +445,7 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
         log_mode,
         is_scrolled,
         status_message,
+        test_summary,
     }
 }
 
@@ -748,6 +768,14 @@ fn process_key(
         Command::SetFunction { name, action } => {
             set_function(tui, workspace, &name, action);
         }
+        Command::RerunTestGroup => match workspace.rerun_test_group(false) {
+            Ok(_) => tui.status_message = Some(StatusMessage::info("Rerunning tests")),
+            Err(e) => tui.status_message = Some(StatusMessage::error(e)),
+        },
+        Command::NarrowTestGroup => match workspace.narrow_test_group() {
+            Ok(count) => tui.status_message = Some(StatusMessage::info(format!("Narrowed to {} failed tests", count))),
+            Err(e) => tui.status_message = Some(StatusMessage::error(e)),
+        },
     }
     ProcessKeyResult::Continue
 }

@@ -495,7 +495,7 @@ impl ProcessManager {
 
 pub(crate) enum AttachKind {
     Tui,
-    Run { task_name: Box<str>, params: Vec<u8> },
+    Run { task_name: Box<str>, params: Vec<u8>, as_test: bool },
     TestRun { filters: Vec<u8> },
     Rpc { subscribe: bool },
     Logs { query: Vec<u8> },
@@ -898,6 +898,17 @@ impl ProcessManager {
                 ws.handle.terminate_tasks(index);
                 let _ = socket.write_all(format!("Task '{}' terminated\n", task_name).as_bytes());
             }
+            WorkspaceCommand::RerunTests { only_failed } => {
+                let ws = &self.workspaces[ws_index as usize];
+                match ws.handle.rerun_test_group(only_failed) {
+                    Ok(_) => {
+                        let _ = socket.write_all(b"Rerunning tests\n");
+                    }
+                    Err(e) => {
+                        let _ = socket.write_all(format!("error: {}\n", e).as_bytes());
+                    }
+                }
+            }
         }
     }
     fn handle_request(&mut self, req: ProcessRequest) -> bool {
@@ -974,12 +985,12 @@ impl ProcessManager {
                         };
                         self.attach_tui_client(stdin, stdout, socket, ws_index);
                     }
-                    AttachKind::Run { task_name, params } => {
+                    AttachKind::Run { task_name, params, as_test } => {
                         let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
                             kvlog::error!("Run client requires stdin/stdout FDs");
                             return false;
                         };
-                        self.attach_run_client(stdin, stdout, socket, ws_index, &task_name, params);
+                        self.attach_run_client(stdin, stdout, socket, ws_index, &task_name, params, as_test);
                     }
                     AttachKind::TestRun { filters } => {
                         let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
@@ -1203,6 +1214,7 @@ impl ProcessManager {
         ws_index: WorkspaceIndex,
         task_name: &str,
         params: Vec<u8>,
+        as_test: bool,
     ) {
         let params: ValueMap = jsony::from_binary(&params).unwrap_or_else(|_| ValueMap::new());
         let (name, profile) = task_name.rsplit_once(":").unwrap_or((&*task_name, ""));
@@ -1220,13 +1232,23 @@ impl ProcessManager {
 
             let state = ws.handle.state.read().unwrap();
             let bt = &state.base_tasks[base_index.idx()];
-            bt.jobs.all().last().map(|ji| state[*ji].log_group)
+            bt.jobs.all().last().map(|ji| (state[*ji].log_group, *ji, base_index))
         };
 
-        let Some(job_id) = job_id else {
+        let Some((job_id, job_index, base_index)) = job_id else {
             let _ = std::io::Write::write_all(&mut stdout, b"Failed to start task\n");
             return;
         };
+
+        if as_test {
+            let mut state = ws.handle.state.write().unwrap();
+            let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
+            state.last_test_group = Some(workspace::TestGroup {
+                group_id,
+                base_tasks: vec![base_index],
+                job_indices: vec![job_index],
+            });
+        }
 
         let channel = Arc::new(ClientChannel {
             waker: extui::event::polling::Waker::new().unwrap(),

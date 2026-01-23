@@ -599,6 +599,8 @@ pub struct WorkspaceState {
     /// Session-level function overrides (fn1, fn2).
     /// These are set by keybindings and persist for the daemon's lifetime.
     pub session_functions: hashbrown::HashMap<String, FunctionAction>,
+    /// The most recent test group (persists across runs for rerun functionality).
+    pub last_test_group: Option<TestGroup>,
 }
 
 impl WorkspaceState {
@@ -978,6 +980,31 @@ impl WorkspaceState {
             TaskKind::Service => &[],
         }
     }
+
+    /// Computes a summary of the current test group for status bar display.
+    pub fn compute_test_group_summary(&self) -> Option<TestGroupSummary> {
+        let test_group = self.last_test_group.as_ref()?;
+
+        let mut summary = TestGroupSummary { total: test_group.job_indices.len() as u32, ..Default::default() };
+
+        for &job_index in &test_group.job_indices {
+            let Some(job) = self.jobs.get(job_index.idx()) else { continue };
+            match &job.process_status {
+                JobStatus::Scheduled { .. } | JobStatus::Starting => summary.pending += 1,
+                JobStatus::Running { .. } => summary.running += 1,
+                JobStatus::Exited { status, .. } => {
+                    if *status == 0 {
+                        summary.passed += 1;
+                    } else {
+                        summary.failed += 1;
+                    }
+                }
+                JobStatus::Cancelled => summary.failed += 1,
+            }
+        }
+
+        Some(summary)
+    }
 }
 impl std::ops::IndexMut<JobIndex> for WorkspaceState {
     fn index_mut(&mut self, index: JobIndex) -> &mut Self::Output {
@@ -1083,6 +1110,7 @@ impl WorkspaceState {
                 ("fn1".to_string(), FunctionAction::RestartSelected),
                 ("fn2".to_string(), FunctionAction::RestartSelected),
             ]),
+            last_test_group: None,
         })
     }
 
@@ -1625,8 +1653,331 @@ impl Workspace {
         state.active_test_run =
             Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
 
+        let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
+        let base_tasks_in_group: Vec<BaseTaskIndex> = test_run.test_jobs.iter().map(|tj| tj.base_task_index).collect();
+        let job_indices: Vec<JobIndex> = test_run.test_jobs.iter().map(|tj| tj.job_index).collect();
+
+        state.last_test_group = Some(TestGroup { group_id, base_tasks: base_tasks_in_group, job_indices });
+
         Ok(test_run)
     }
+
+    pub fn start_test_run_from_base_tasks(
+        &self,
+        base_task_indices: &[(BaseTaskIndex, Option<JobIndex>)],
+    ) -> Result<TestRun, String> {
+        let state = &mut *self.state.write().unwrap();
+        state.change_number = state.change_number.wrapping_add(1);
+        state.refresh_config();
+        let log_start = self.logs.read().unwrap().tail();
+
+        let run_id = state.active_test_run.as_ref().map_or(0, |r| r.run_id + 1);
+
+        struct MatchedTest {
+            base_task_idx: BaseTaskIndex,
+            task_config: TaskConfigRc,
+            spawn_profile: String,
+            spawn_params: ValueMap<'static>,
+        }
+        let mut matched_tests = Vec::new();
+        for &(base_task_idx, original_job) in base_task_indices {
+            let Some(base_task) = state.base_tasks.get(base_task_idx.idx()) else {
+                continue;
+            };
+            if base_task.removed {
+                continue;
+            }
+            let (spawn_profile, spawn_params) = original_job
+                .and_then(|ji| state.jobs.get(ji.idx()))
+                .map(|job| (job.spawn_profile.clone(), job.spawn_params.clone()))
+                .unwrap_or_else(|| (String::new(), ValueMap::new()));
+            let env =
+                Environment { profile: &spawn_profile, param: spawn_params.clone(), vars: base_task.config.vars };
+            let Ok(task_config) = base_task.config.eval(&env) else {
+                kvlog::error!("Failed to evaluate test config", name = base_task.name);
+                continue;
+            };
+            drop(env);
+            matched_tests.push(MatchedTest { base_task_idx, task_config, spawn_profile, spawn_params });
+        }
+
+        struct TestRequirements {
+            base_task_idx: BaseTaskIndex,
+            task_config: TaskConfigRc,
+            spawn_profile: String,
+            spawn_params: ValueMap<'static>,
+            requirements: Vec<(RequirementKey, JobPredicate)>,
+        }
+
+        let mut batch: SpawnBatch<TestRequirements> = SpawnBatch::new();
+
+        for matched in matched_tests {
+            let task_config = &matched.task_config;
+            let mut requirements = Vec::new();
+
+            let mut service_profiles: hashbrown::HashMap<BaseTaskIndex, String> = hashbrown::HashMap::new();
+            let mut services_to_check: Vec<(String, String)> = task_config
+                .config()
+                .require
+                .iter()
+                .filter_map(|tc| {
+                    let dep_name = &*tc.name;
+                    let dep_base_task = state.name_map.get(dep_name)?;
+                    let dep_config = &state.base_tasks[dep_base_task.idx()].config;
+                    if dep_config.kind == TaskKind::Service {
+                        Some((dep_name.to_string(), tc.profile.unwrap_or("").to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut visited_services: hashbrown::HashSet<BaseTaskIndex> = hashbrown::HashSet::new();
+
+            while let Some((dep_name, dep_profile)) = services_to_check.pop() {
+                let Some(&dep_base_task) = state.name_map.get(&*dep_name) else {
+                    continue;
+                };
+                let dep_config = &state.base_tasks[dep_base_task.idx()].config;
+
+                if let Some(existing_profile) = service_profiles.get(&dep_base_task) {
+                    if *existing_profile != dep_profile {
+                        let test_name = state.base_tasks[matched.base_task_idx.idx()].name;
+                        let service_name = state.base_tasks[dep_base_task.idx()].name;
+                        return Err(format!(
+                            "Test '{}' has conflicting service requirements: '{}:{}' and '{}:{}'",
+                            test_name, service_name, existing_profile, service_name, dep_profile
+                        ));
+                    }
+                    continue;
+                }
+                service_profiles.insert(dep_base_task, dep_profile.clone());
+
+                if !visited_services.insert(dep_base_task) {
+                    continue;
+                }
+
+                let env = Environment { profile: &dep_profile, param: ValueMap::new(), vars: dep_config.vars };
+                if let Ok(srv_config) = dep_config.eval(&env) {
+                    for req in srv_config.config().require.iter() {
+                        let req_name = &*req.name;
+                        let Some(&req_base_task) = state.name_map.get(req_name) else {
+                            continue;
+                        };
+                        let req_config = &state.base_tasks[req_base_task.idx()].config;
+                        if req_config.kind == TaskKind::Service {
+                            services_to_check.push((req_name.to_string(), req.profile.unwrap_or("").to_string()));
+                        }
+                    }
+                }
+            }
+
+            for tc in task_config.config().require.iter() {
+                let dep_name = &*tc.name;
+                let dep_profile = tc.profile.unwrap_or("");
+                let dep_params = tc.vars.clone().to_owned();
+
+                let Some(&dep_base_task) = state.name_map.get(dep_name) else {
+                    continue;
+                };
+                let dep_config = &state.base_tasks[dep_base_task.idx()].config;
+
+                let predicate = match dep_config.kind {
+                    TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
+                    TaskKind::Service => JobPredicate::Active,
+                    TaskKind::Test => continue,
+                };
+
+                let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
+                requirements.push((key, predicate));
+            }
+
+            batch.add_task(TestRequirements {
+                base_task_idx: matched.base_task_idx,
+                task_config: task_config.clone(),
+                spawn_profile: matched.spawn_profile,
+                spawn_params: matched.spawn_params,
+                requirements,
+            });
+        }
+
+        state.resolve_batch_requirements(self.workspace_id, &self.process_channel, &mut batch, log_start);
+
+        let tasks = batch.take_tasks();
+        let mut test_jobs = Vec::new();
+
+        for task in tasks {
+            let task_config = task.task_data.task_config;
+            let spawn_profile = task.task_data.spawn_profile;
+            let spawn_params = task.task_data.spawn_params;
+            let mut pred = Vec::new();
+
+            for (key, predicate) in &task.task_data.requirements {
+                match batch.get_resolved(key) {
+                    Some(ResolvedRequirement::Cached) => {}
+                    Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
+                        pred.push(ScheduleRequirement { job: *ji, predicate: predicate.clone() });
+                    }
+                    None => {}
+                }
+            }
+
+            let cache_key =
+                task_config.config().cache.as_ref().map_or(String::new(), |c| state.compute_cache_key(c.key));
+
+            let job_index = JobIndex(state.jobs.len() as u32);
+            let base_task = &mut state.base_tasks[task.task_data.base_task_idx.idx()];
+            let pc = base_task.jobs.len();
+            let job_id = LogGroup::new(task.task_data.base_task_idx, pc);
+
+            let spawn = pred.is_empty();
+            if spawn {
+                base_task.jobs.push_active(job_index);
+                state.test_jobs.push_active(job_index);
+            } else {
+                base_task.jobs.push_scheduled(job_index);
+                state.test_jobs.push_scheduled(job_index);
+            }
+
+            for req in &pred {
+                if matches!(req.predicate, JobPredicate::Active) {
+                    state.service_dependents.add_dependent(req.job, job_index);
+                }
+            }
+
+            state.jobs.push(Job {
+                process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
+                log_group: job_id,
+                task: task_config.clone(),
+                started_at: Instant::now(),
+                log_start,
+                cache_key,
+                spawn_profile,
+                spawn_params,
+            });
+
+            test_jobs.push(TestJob {
+                base_task_index: task.task_data.base_task_idx,
+                job_index,
+                status: TestJobStatus::Pending,
+            });
+
+            if spawn {
+                self.process_channel.send(crate::process_manager::ProcessRequest::Spawn {
+                    task: task_config,
+                    job_index,
+                    workspace_id: self.workspace_id,
+                    job_id,
+                });
+            }
+        }
+
+        let test_run = TestRun { run_id, started_at: Instant::now(), test_jobs };
+        state.active_test_run =
+            Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
+
+        let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
+        let base_tasks_in_group: Vec<BaseTaskIndex> = test_run.test_jobs.iter().map(|tj| tj.base_task_index).collect();
+        let job_indices: Vec<JobIndex> = test_run.test_jobs.iter().map(|tj| tj.job_index).collect();
+
+        state.last_test_group = Some(TestGroup { group_id, base_tasks: base_tasks_in_group, job_indices });
+
+        Ok(test_run)
+    }
+
+    /// Reruns the last test group.
+    /// If only_failed is true, only runs tests that failed in the last run.
+    /// Returns the TestRun or an error if no test group exists.
+    pub fn rerun_test_group(&self, only_failed: bool) -> Result<TestRun, String> {
+        let state = self.state.read().unwrap();
+        let test_group = state.last_test_group.as_ref().ok_or("No test group to rerun")?;
+
+        let tasks_to_run: Vec<(BaseTaskIndex, Option<JobIndex>)> = if only_failed {
+            let mut failed = Vec::new();
+            for (i, &job_index) in test_group.job_indices.iter().enumerate() {
+                let Some(job) = state.jobs.get(job_index.idx()) else { continue };
+                let is_failed = matches!(&job.process_status, JobStatus::Exited { status, .. } if *status != 0)
+                    || matches!(&job.process_status, JobStatus::Cancelled);
+                if is_failed {
+                    if let Some(&bti) = test_group.base_tasks.get(i) {
+                        failed.push((bti, Some(job_index)));
+                    }
+                }
+            }
+            if failed.is_empty() {
+                return Err("No failed tests to rerun".to_string());
+            }
+            failed
+        } else {
+            test_group
+                .base_tasks
+                .iter()
+                .zip(test_group.job_indices.iter())
+                .map(|(&bti, &ji)| (bti, Some(ji)))
+                .collect()
+        };
+
+        if tasks_to_run.is_empty() {
+            return Err("No tests to rerun".to_string());
+        }
+
+        drop(state);
+        self.start_test_run_from_base_tasks(&tasks_to_run)
+    }
+
+    /// Narrows the test group by removing passed tests.
+    /// Returns Ok(count) with number of remaining failed tests, or Err if no failures.
+    pub fn narrow_test_group(&self) -> Result<usize, String> {
+        let mut state = self.state.write().unwrap();
+
+        let test_group = state.last_test_group.as_ref().ok_or("No test group to narrow")?;
+        let job_indices = test_group.job_indices.clone();
+        let base_tasks = test_group.base_tasks.clone();
+
+        let mut failed_indices = Vec::new();
+        for (i, &job_index) in job_indices.iter().enumerate() {
+            let Some(job) = state.jobs.get(job_index.idx()) else { continue };
+            let failed = matches!(&job.process_status, JobStatus::Exited { status, .. } if *status != 0)
+                || matches!(&job.process_status, JobStatus::Cancelled);
+            if failed {
+                failed_indices.push(i);
+            }
+        }
+
+        if failed_indices.is_empty() {
+            return Err("No failed tests to narrow to".to_string());
+        }
+
+        let new_job_indices: Vec<JobIndex> =
+            failed_indices.iter().filter_map(|&i| job_indices.get(i).copied()).collect();
+        let new_base_tasks: Vec<BaseTaskIndex> =
+            failed_indices.iter().filter_map(|&i| base_tasks.get(i).copied()).collect();
+
+        let count = new_job_indices.len();
+        let test_group = state.last_test_group.as_mut().unwrap();
+        test_group.job_indices = new_job_indices;
+        test_group.base_tasks = new_base_tasks;
+        state.change_number = state.change_number.wrapping_add(1);
+        Ok(count)
+    }
+}
+
+/// Persistent record of a test group for rerun functionality.
+pub struct TestGroup {
+    pub group_id: u32,
+    /// Base task indices included in this group.
+    pub base_tasks: Vec<BaseTaskIndex>,
+    /// Associated job indices from the test run.
+    pub job_indices: Vec<JobIndex>,
+}
+
+/// Summary for status bar display.
+#[derive(Clone, Copy, Default)]
+pub struct TestGroupSummary {
+    pub total: u32,
+    pub passed: u32,
+    pub failed: u32,
+    pub running: u32,
+    pub pending: u32,
 }
 
 /// Checks if a test matches the given filters.

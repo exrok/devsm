@@ -39,6 +39,13 @@ impl<'a> ArgParser<'a> {
     fn new(args: &'a [String]) -> ArgParser<'a> {
         ArgParser { args: args.iter(), value: None }
     }
+
+    fn next_value(&mut self) -> Option<&'a str> {
+        match self.next()? {
+            Component::Value(v) | Component::Term(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 impl<'a> Iterator for ArgParser<'a> {
@@ -54,12 +61,6 @@ impl<'a> Iterator for ArgParser<'a> {
             if let Some((long, value)) = long_or_pair.split_once("=") {
                 self.value = Some(value);
                 return Some(Component::Long(long));
-            }
-            // Support `--flag value` syntax: peek at next arg
-            if let Some(next) = self.args.as_slice().first() {
-                if !next.starts_with('-') {
-                    self.value = Some(self.args.next().unwrap());
-                }
             }
             return Some(Component::Long(long_or_pair));
         }
@@ -83,9 +84,10 @@ pub enum Command<'a> {
     RestartSelected,
     Restart { job: &'a str, value_map: ValueMap<'a> },
     Exec { job: &'a str, value_map: ValueMap<'a> },
-    Run { job: &'a str, value_map: ValueMap<'a> },
+    Run { job: &'a str, value_map: ValueMap<'a>, as_test: bool },
     Kill { job: &'a str },
     Test { filters: Vec<TestFilter<'a>> },
+    RerunTests { only_failed: bool },
     Validate { path: Option<&'a str>, skip_path_checks: bool },
     Get { resource: GetResource },
     FunctionCall { name: &'a str },
@@ -166,7 +168,7 @@ fn parse_job_args<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<(&'a str, Va
     while let Some(component) = parser.next() {
         match component {
             Component::Long(key) => {
-                let Some(Component::Value(val)) = parser.next() else {
+                let Some(val) = parser.next_value() else {
                     bail!("Flag --{} requires a value (use --{}=value)", key, key);
                 };
                 value_map.insert(key.into(), parse_flag_value(val));
@@ -202,8 +204,47 @@ fn parse_exec<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
 }
 
 fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
-    let (job, value_map) = parse_job_args(parser)?;
-    Ok(Command::Run { job, value_map })
+    let mut as_test = false;
+    let mut job = None;
+    let mut value_map = ValueMap::new();
+
+    while let Some(component) = parser.next() {
+        match component {
+            Component::Long(long) if long == "as-test" => {
+                as_test = true;
+            }
+            Component::Long(key) => {
+                let Some(val) = parser.next_value() else {
+                    bail!("Flag --{} requires a value (use --{}=value)", key, key);
+                };
+                value_map.insert(key.into(), parse_flag_value(val));
+            }
+            Component::Term(arg) => {
+                if job.is_none() {
+                    job = Some(arg);
+                } else {
+                    let parsed: ValueMap = jsony::from_json(arg).context("Parsing job parameters")?;
+                    for (k, v) in parsed.entries() {
+                        value_map.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Component::Flags(flags) => {
+                if let Some(flag) = flags.chars().next() {
+                    bail!("Unknown flag -{}", flag);
+                }
+            }
+            Component::Value(val) => {
+                bail!("Unexpected value: {:?}", val);
+            }
+        }
+    }
+
+    let Some(job) = job else {
+        bail!("Missing name of job");
+    };
+
+    Ok(Command::Run { job, value_map, as_test })
 }
 
 /// Parse validate command arguments.
@@ -274,6 +315,18 @@ fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<
     Ok(Command::Test { filters })
 }
 
+fn parse_rerun_tests<'a>(parser: &mut ArgParser<'a>) -> Command<'a> {
+    let mut only_failed = false;
+    for component in parser.by_ref() {
+        if let Component::Long(long) = component {
+            if long == "only-failed" {
+                only_failed = true;
+            }
+        }
+    }
+    Command::RerunTests { only_failed }
+}
+
 fn parse_task_selector(value: &str) -> TaskSelector<'_> {
     if let Some(name) = value.strip_suffix("@latest") {
         TaskSelector { name, latest: true }
@@ -305,13 +358,13 @@ fn parse_complete<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
             }
             Component::Long(long) => match long {
                 "task" => {
-                    let Some(Component::Value(val)) = parser.next() else {
+                    let Some(val) = parser.next_value() else {
                         bail!("Flag --task requires a value (use --task=NAME)");
                     };
                     task = Some(val);
                 }
                 "exclude" => {
-                    let Some(Component::Value(val)) = parser.next() else {
+                    let Some(val) = parser.next_value() else {
                         bail!("Flag --exclude requires a value (use --exclude=var1,var2)");
                     };
                     exclude.extend(val.split(',').filter(|s| !s.is_empty()));
@@ -378,37 +431,37 @@ fn parse_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
                 "retry" => options.retry = true,
                 "without-taskname" => options.without_taskname = true,
                 "max-age" => {
-                    let Some(Component::Value(val)) = parser.next() else {
+                    let Some(val) = parser.next_value() else {
                         bail!("Flag --max-age requires a value (use --max-age=5s)");
                     };
                     options.max_age = Some(val);
                 }
                 "task" => {
-                    let Some(Component::Value(val)) = parser.next() else {
+                    let Some(val) = parser.next_value() else {
                         bail!("Flag --task requires a value (use --task=NAME)");
                     };
                     options.tasks.push(parse_task_selector(val));
                 }
                 "job" => {
-                    let Some(Component::Value(val)) = parser.next() else {
+                    let Some(val) = parser.next_value() else {
                         bail!("Flag --job requires a value (use --job=INDEX)");
                     };
                     options.job = Some(val.parse().context("Invalid job index")?);
                 }
                 "kind" => {
-                    let Some(Component::Value(val)) = parser.next() else {
+                    let Some(val) = parser.next_value() else {
                         bail!("Flag --kind requires a value (use --kind=service)");
                     };
                     options.kinds.push(parse_kind_selector(val));
                 }
                 "oldest" => {
-                    let Some(Component::Value(val)) = parser.next() else {
+                    let Some(val) = parser.next_value() else {
                         bail!("Flag --oldest requires a value (use --oldest=N)");
                     };
                     options.oldest = Some(val.parse().context("Invalid oldest count")?);
                 }
                 "newest" => {
-                    let Some(Component::Value(val)) = parser.next() else {
+                    let Some(val) = parser.next_value() else {
                         bail!("Flag --newest requires a value (use --newest=N)");
                     };
                     options.newest = Some(val.parse().context("Invalid newest count")?);
@@ -480,6 +533,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                     break 'command Command::Kill { job };
                 }
                 "test" => break 'command parse_test_filters(&mut parser)?,
+                "rerun-tests" => break 'command parse_rerun_tests(&mut parser),
                 "validate" => break 'command parse_validate(&mut parser)?,
                 "logs" => break 'command parse_logs(&mut parser)?,
                 "function" => {

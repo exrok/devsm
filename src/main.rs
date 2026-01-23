@@ -85,9 +85,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Run { job, value_map } => {
+        cli::Command::Run { job, value_map, as_test } => {
             let _log_guard = self_log::init_client_logging();
-            if let Err(err) = run_client(job, value_map) {
+            if let Err(err) = run_client(job, value_map, as_test) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -101,6 +101,12 @@ fn main() {
         cli::Command::Test { filters } => {
             let _log_guard = self_log::init_client_logging();
             if let Err(err) = test_client(filters) {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
+        }
+        cli::Command::RerunTests { only_failed } => {
+            if let Err(err) = workspace_command(WorkspaceCommand::RerunTests { only_failed }) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -473,7 +479,7 @@ fn reset_terminal_to_canonical() {
     }
 }
 
-fn run_client(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
+fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow::Result<()> {
     reset_terminal_to_canonical();
 
     let cwd = std::env::current_dir()?;
@@ -503,7 +509,7 @@ fn run_client(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
     socket.send_with_fd(
         &jsony::to_binary(&daemon::RequestMessage {
             cwd: &cwd,
-            request: daemon::Request::AttachRun { config: &config, name: job.into(), params },
+            request: daemon::Request::AttachRun { config: &config, name: job.into(), params, as_test },
         }),
         &[0, 1],
     )?;

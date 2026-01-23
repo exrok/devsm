@@ -185,6 +185,10 @@ pub enum Command {
     OverlayCancel,
     OverlayConfirm,
     RefreshConfig,
+    /// Rerun the last test group.
+    RerunTestGroup,
+    /// Narrow the test group by removing passed tests.
+    NarrowTestGroup,
     /// Call a saved function by name.
     CallFunction(Box<str>),
     /// Set a saved function to capture current selection.
@@ -226,6 +230,8 @@ impl FromStr for Command {
             "OverlayCancel" => Command::OverlayCancel,
             "OverlayConfirm" => Command::OverlayConfirm,
             "RefreshConfig" => Command::RefreshConfig,
+            "RerunTestGroup" => Command::RerunTestGroup,
+            "NarrowTestGroup" => Command::NarrowTestGroup,
             "CallFunction1" => Command::CallFunction("fn1".into()),
             "CallFunction2" => Command::CallFunction("fn2".into()),
             _ => return Err(format!("Unknown command: `{s}`")),
@@ -389,6 +395,8 @@ impl Keybinds {
         self.bind(Mode::TaskTree, "\\", Command::ToggleTaskTree);
         self.bind(Mode::TaskTree, "R", Command::RefreshConfig);
         self.bind(Mode::TaskTree, "t", Command::LaunchTestFilter);
+        self.bind(Mode::TaskTree, "T", Command::RerunTestGroup);
+        self.bind(Mode::TaskTree, "N", Command::NarrowTestGroup);
     }
 
     /// Binds a key to a command in a specific mode.
@@ -531,6 +539,8 @@ impl Command {
             Command::OverlayCancel => "Cancel",
             Command::OverlayConfirm => "Confirm",
             Command::RefreshConfig => "Refresh Config",
+            Command::RerunTestGroup => "Rerun Tests",
+            Command::NarrowTestGroup => "Narrow Tests",
             Command::CallFunction(name) if &**name == "fn1" => "Call fn1",
             Command::CallFunction(name) if &**name == "fn2" => "Call fn2",
             Command::CallFunction(_) => "Call Function",
@@ -570,6 +580,8 @@ impl Command {
             Command::OverlayCancel => "OverlayCancel",
             Command::OverlayConfirm => "OverlayConfirm",
             Command::RefreshConfig => "RefreshConfig",
+            Command::RerunTestGroup => "RerunTestGroup",
+            Command::NarrowTestGroup => "NarrowTestGroup",
             Command::CallFunction(name) if &**name == "fn1" => "CallFunction1",
             Command::CallFunction(name) if &**name == "fn2" => "CallFunction2",
             Command::CallFunction(_) => "CallFunction",
