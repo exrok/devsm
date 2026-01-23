@@ -2,20 +2,34 @@ use extui::{
     Rect,
     vt::{self, BufferWrite},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     line_width::{self, MatchHighlight, Segment},
     log_storage::{LogEntry, LogGroup, LogId, LogView, Logs},
 };
 
+mod scroll_widget;
+mod tail_widget;
+#[cfg(test)]
+mod test;
+
+#[inline]
+fn lowercase_byte_len(ch: char) -> usize {
+    if ch.is_ascii() { 1 } else { ch.to_lowercase().map(|c| c.len_utf8()).sum() }
+}
+
+struct HighlightScreenPos {
+    line: u16,
+    start_col: u16,
+    accumulated_style: extui::Style,
+}
+
 fn get_entry_height(entry: &LogEntry, style: &LogStyle, width: u32) -> u32 {
     let prefix_width = style.prefix(entry.log_group).map(|p| p.width).unwrap_or(0) as u32;
-
     let first_line_width = width.saturating_sub(prefix_width);
 
-    if entry.width == 0 {
-        1
-    } else if entry.width <= first_line_width {
+    if entry.width == 0 || entry.width <= first_line_width {
         1
     } else {
         1 + (entry.width - first_line_width).div_ceil(width)
@@ -31,6 +45,7 @@ fn render_single_entry(
     skip_lines: u16,
     max_lines: u16,
     style: &LogStyle,
+    highlight: Option<LogHighlight>,
 ) -> u16 {
     use extui::Color;
 
@@ -38,7 +53,7 @@ fn render_single_entry(
         return 0;
     }
 
-    let highlight_info = style.highlight.filter(|h| h.log_id == log_id);
+    let highlight_info = highlight.filter(|h| h.log_id == log_id);
     let highlight_style = Color::Grey[25].with_fg(Color::Black);
 
     let prefix = style.prefix(entry.log_group);
@@ -52,7 +67,6 @@ fn render_single_entry(
 
     let text = unsafe { entry.text(logs) };
 
-    // Optimization: If we are rendering the whole entry from the start and it fits on a single line.
     if skip_lines == 0 && max_lines >= total_height && total_height == 1 {
         if !prefix_bytes.is_empty() {
             buf.extend_from_slice(prefix_bytes);
@@ -136,9 +150,6 @@ fn render_single_entry(
 
         let mut current_stripped_offset = stripped_offset;
 
-        // We only set the style if we are just starting to render visible lines (i.e. we skipped some).
-        // If we just rendered the first line, the style is technically active, but usually splitters reset.
-        // The naive splitter returns style for every line.
         for (line, line_style) in lines {
             if let Some(hl) = highlight_info {
                 let line_stripped_len = calculate_stripped_len(line);
@@ -175,7 +186,6 @@ fn render_single_entry(
     lines_rendered
 }
 
-/// Calculate the stripped (ANSI-free) length of text for offset tracking.
 fn calculate_stripped_len(text: &str) -> usize {
     let mut len = 0;
     for segment in Segment::iterator(text) {
@@ -183,7 +193,7 @@ fn calculate_stripped_len(text: &str) -> usize {
             Segment::Ascii(s) => len += s.len(),
             Segment::Utf8(s) => {
                 for ch in s.chars() {
-                    len += ch.to_lowercase().map(|c| c.len_utf8()).sum::<usize>();
+                    len += lowercase_byte_len(ch);
                 }
             }
             Segment::AnsiEscapes(_) => {}
@@ -192,7 +202,195 @@ fn calculate_stripped_len(text: &str) -> usize {
     len
 }
 
-/// Render text with substring highlighting to a raw buffer.
+fn highlight_screen_positions(
+    entry: &LogEntry,
+    logs: &Logs,
+    style: &LogStyle,
+    width: u16,
+    highlight: MatchHighlight,
+) -> Vec<HighlightScreenPos> {
+    if highlight.len == 0 {
+        return Vec::new();
+    }
+
+    let text = unsafe { entry.text(logs) };
+    let prefix = style.prefix(entry.log_group);
+    let prefix_width = prefix.map(|p| p.width).unwrap_or(0) as u16;
+
+    let hl_start = highlight.start as usize;
+    let hl_end = hl_start + highlight.len as usize;
+
+    let mut positions = Vec::new();
+    let mut current_stripped_offset = 0usize;
+    let mut line_num = 0u16;
+
+    let first_line_capacity = width.saturating_sub(prefix_width);
+    let mut text_slice = text;
+
+    if entry.width > 0 {
+        let mut splitter = line_width::naive_line_splitting(text_slice, entry.style, first_line_capacity.into());
+        if let Some((line_text, line_style)) = splitter.next() {
+            let line_stripped_len = calculate_stripped_len(line_text);
+            let line_end = current_stripped_offset + line_stripped_len;
+
+            if hl_start < line_end && hl_end > current_stripped_offset {
+                let hl_start_in_line = hl_start.saturating_sub(current_stripped_offset);
+                let (start_col, accumulated_style) =
+                    calc_highlight_position(line_text, line_style, hl_start_in_line, prefix_width);
+                positions.push(HighlightScreenPos { line: line_num, start_col, accumulated_style });
+            }
+
+            current_stripped_offset = line_end;
+            text_slice = &text_slice[line_text.len()..];
+            line_num += 1;
+        }
+    } else {
+        return positions;
+    }
+
+    for (line, line_style) in line_width::naive_line_splitting(text_slice, entry.style, width.into()) {
+        let line_stripped_len = calculate_stripped_len(line);
+        let line_end = current_stripped_offset + line_stripped_len;
+
+        if hl_start < line_end && hl_end > current_stripped_offset {
+            let hl_start_in_line = hl_start.saturating_sub(current_stripped_offset);
+            let (start_col, accumulated_style) = calc_highlight_position(line, line_style, hl_start_in_line, 0);
+            positions.push(HighlightScreenPos { line: line_num, start_col, accumulated_style });
+        }
+
+        current_stripped_offset = line_end;
+        line_num += 1;
+
+        if current_stripped_offset >= hl_end {
+            break;
+        }
+    }
+
+    positions
+}
+
+fn calc_highlight_position(
+    line_text: &str,
+    base_style: extui::Style,
+    hl_start_in_line: usize,
+    prefix_width: u16,
+) -> (u16, extui::Style) {
+    let mut col = prefix_width;
+    let mut stripped_pos = 0usize;
+    let mut current_style = base_style;
+
+    for segment in Segment::iterator(line_text) {
+        match segment {
+            Segment::Ascii(s) => {
+                for _ in s.chars() {
+                    if stripped_pos == hl_start_in_line {
+                        return (col, current_style);
+                    }
+                    col += 1;
+                    stripped_pos += 1;
+                }
+            }
+            Segment::Utf8(s) => {
+                for ch in s.chars() {
+                    if stripped_pos == hl_start_in_line {
+                        return (col, current_style);
+                    }
+                    let char_width = UnicodeWidthStr::width(ch.to_string().as_str()) as u16;
+                    col += char_width;
+                    stripped_pos += lowercase_byte_len(ch);
+                }
+            }
+            Segment::AnsiEscapes(escape) => {
+                line_width::apply_raw_display_mode_vt_to_style(&mut current_style, escape);
+            }
+        }
+    }
+
+    (col, current_style)
+}
+
+fn extract_highlight_text(
+    text: &str,
+    hl_start: usize,
+    hl_end: usize,
+    target_line: u16,
+    entry: &LogEntry,
+    style: &LogStyle,
+    width: u16,
+) -> String {
+    let prefix_width = style.prefix(entry.log_group).map(|p| p.width).unwrap_or(0) as u16;
+    let first_line_capacity = width.saturating_sub(prefix_width);
+
+    let mut current_stripped_offset = 0usize;
+    let mut line_num = 0u16;
+    let mut text_slice = text;
+
+    if entry.width > 0 {
+        let mut splitter = line_width::naive_line_splitting(text_slice, entry.style, first_line_capacity.into());
+        if let Some((line_text, _)) = splitter.next() {
+            let line_stripped_len = calculate_stripped_len(line_text);
+
+            if line_num == target_line {
+                return extract_from_line(line_text, hl_start, hl_end, current_stripped_offset);
+            }
+
+            current_stripped_offset += line_stripped_len;
+            text_slice = &text_slice[line_text.len()..];
+            line_num += 1;
+        }
+    }
+
+    for (line, _) in line_width::naive_line_splitting(text_slice, entry.style, width.into()) {
+        if line_num == target_line {
+            return extract_from_line(line, hl_start, hl_end, current_stripped_offset);
+        }
+
+        let line_stripped_len = calculate_stripped_len(line);
+        current_stripped_offset += line_stripped_len;
+        line_num += 1;
+    }
+
+    String::new()
+}
+
+fn extract_from_line(line_text: &str, hl_start: usize, hl_end: usize, line_start_offset: usize) -> String {
+    let hl_start_in_line = hl_start.saturating_sub(line_start_offset);
+    let hl_end_in_line = hl_end.saturating_sub(line_start_offset);
+
+    let mut result = String::new();
+    let mut stripped_pos = 0usize;
+
+    for segment in Segment::iterator(line_text) {
+        match segment {
+            Segment::Ascii(s) => {
+                for ch in s.chars() {
+                    if stripped_pos >= hl_start_in_line && stripped_pos < hl_end_in_line {
+                        result.push(ch);
+                    }
+                    stripped_pos += 1;
+                    if stripped_pos >= hl_end_in_line {
+                        return result;
+                    }
+                }
+            }
+            Segment::Utf8(s) => {
+                for ch in s.chars() {
+                    if stripped_pos >= hl_start_in_line && stripped_pos < hl_end_in_line {
+                        result.push(ch);
+                    }
+                    stripped_pos += lowercase_byte_len(ch);
+                    if stripped_pos >= hl_end_in_line {
+                        return result;
+                    }
+                }
+            }
+            Segment::AnsiEscapes(_) => {}
+        }
+    }
+
+    result
+}
+
 fn render_text_with_highlight(
     buf: &mut Vec<u8>,
     text: &str,
@@ -238,27 +436,18 @@ fn render_text_with_highlight(
                 stripped_pos = seg_end;
             }
             Segment::Utf8(s) => {
-                // For UTF-8 segments, we process char-by-char because
-                // lowercasing can change byte lengths
                 for ch in s.chars() {
-                    let ch_stripped_len: usize = ch.to_lowercase().map(|c| c.len_utf8()).sum();
+                    let ch_stripped_len = lowercase_byte_len(ch);
                     let ch_start = stripped_pos;
                     let ch_end = stripped_pos + ch_stripped_len;
 
                     let in_highlight = has_highlight && ch_start < match_end && ch_end > match_start;
 
+                    let mut char_buf = [0u8; 4];
+                    let encoded = ch.encode_utf8(&mut char_buf);
                     if in_highlight {
-                        let mut char_buf = [0u8; 4];
-                        extui::splat!(
-                            buf,
-                            highlight_style,
-                            ch.encode_utf8(&mut char_buf),
-                            vt::CLEAR_STYLE,
-                            current_style,
-                        )
+                        extui::splat!(buf, highlight_style, encoded, vt::CLEAR_STYLE, current_style,)
                     } else {
-                        let mut char_buf = [0u8; 4];
-                        let encoded = ch.encode_utf8(&mut char_buf);
                         buf.extend_from_slice(encoded.as_bytes());
                     }
 
@@ -281,61 +470,22 @@ pub struct Prefix {
     pub width: usize,
 }
 
-/// Highlight information for a specific log entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LogHighlight {
-    /// The LogId to highlight.
     pub log_id: LogId,
-    /// Position and length of match in stripped text.
     pub match_info: MatchHighlight,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct LogStyle {
     pub prefixes: Vec<Prefix>,
     pub assume_blank: bool,
-    /// Log entry to highlight when rendering. Used for search result highlighting.
     pub highlight: Option<LogHighlight>,
 }
 
 impl LogStyle {
     pub fn prefix(&self, job: LogGroup) -> Option<&Prefix> {
         self.prefixes.get(job.base_task_index().idx())
-    }
-}
-
-#[derive(Debug)]
-pub struct LogScrollWidget {
-    /// The index in `ids` that has the LineId of the element at the top of the list
-    top_index: usize,
-    /// The minimum index in `ids` to be considered (lower ids are no longer in the logs)
-    min_index: usize,
-    /// The LineId's the make up the list (currently can be assumed in sorted order)
-    ids: Vec<LogId>,
-    /// The number of lines of the top element that has been scrolled up off screen
-    scroll_shift_up: u16,
-    /// The last rectangle that has been rendered, zero height rects will not rendering anything,
-    /// to force a full rerender set the previous to an Empty rectangle
-    previous: Rect,
-    /// The last LineId that has been processed in ids.
-    tail: LogId,
-    /// The last highlight state that was rendered.
-    last_highlight: Option<LogHighlight>,
-}
-
-#[derive(Debug)]
-pub struct LogTailWidget {
-    /// The last LineId that has been processed in ids.
-    tail: LogId,
-    next_screen_offset: u16,
-    /// The last rectangle that has been rendered, zero height rects will not rendering anything,
-    /// to force a full rerender set the previous to an Empty rectangle
-    previous: Rect,
-}
-
-impl Default for LogTailWidget {
-    fn default() -> Self {
-        Self { tail: Default::default(), next_screen_offset: Default::default(), previous: Rect::EMPTY }
     }
 }
 
@@ -346,19 +496,18 @@ pub struct ScrollState {
 }
 
 pub enum LogWidget {
-    Scroll(LogScrollWidget),
-    Tail(LogTailWidget),
+    Scroll(scroll_widget::LogScrollWidget),
+    Tail(tail_widget::LogTailWidget),
 }
 
 impl Default for LogWidget {
     fn default() -> Self {
-        LogWidget::Tail(LogTailWidget::default())
+        LogWidget::Tail(tail_widget::LogTailWidget::default())
     }
 }
 
 impl LogWidget {
     pub fn reset(&mut self) {
-        // todo optimize
         *self = LogWidget::default();
     }
 
@@ -396,14 +545,14 @@ impl LogWidget {
     pub fn check_resize_revert_to_tail(&mut self, view: &LogView, style: &LogStyle, rect: Rect) -> bool {
         if let LogWidget::Scroll(_) = self {
             if !self.can_scroll(view, style, rect) {
-                *self = LogWidget::Tail(LogTailWidget::default());
+                *self = LogWidget::Tail(tail_widget::LogTailWidget::default());
                 return true;
             }
         }
         false
     }
-    /// Transitions the view from `Tail` mode to `Scroll` mode if it isn't already.
-    pub fn scrollify(&mut self, view: &LogView, style: &LogStyle) -> &mut LogScrollWidget {
+
+    pub fn scrollify(&mut self, view: &LogView, style: &LogStyle) -> &mut scroll_widget::LogScrollWidget {
         if let LogWidget::Tail(tail) = self {
             let mut ids = Vec::new();
             let mut line_id = view.logs.head();
@@ -434,7 +583,7 @@ impl LogWidget {
                 0
             };
 
-            let scroll_view = LogScrollWidget {
+            let scroll_view = scroll_widget::LogScrollWidget {
                 top_index,
                 min_index: 0,
                 ids,
@@ -472,17 +621,11 @@ impl LogWidget {
 
     pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         match self {
-            LogWidget::Scroll(scroll_view) => scroll_view.render(buf, rect, view, style),
+            LogWidget::Scroll(scroll_view) => scroll_view.render_reset_if_needed(buf, rect, view, style),
             LogWidget::Tail(tail_view) => tail_view.render(buf, rect, view, style),
         }
     }
 
-    /// Scrolls the view to show a specific LogId, centering it if possible.
-    ///
-    /// This method is smart about scrolling:
-    /// 1. If the target is already visible, no scrolling occurs
-    /// 2. When scrolling is needed, the target is centered in the view
-    /// 3. Centering is clamped to avoid scrolling past start or end
     pub fn scroll_to_log_id(&mut self, target: LogId, view: &LogView, style: &LogStyle) {
         let scroll_view = self.scrollify(view, style);
         let logs = view.logs.indexer();
@@ -538,7 +681,6 @@ impl LogWidget {
 
         let target_entry = logs[scroll_view.ids[target_idx]];
         let target_height = get_entry_height(&target_entry, style, width);
-
         let lines_above_target = (screen_height.saturating_sub(target_height)) / 2;
 
         let mut lines_accumulated = 0u32;
@@ -595,10 +737,9 @@ impl LogWidget {
 
         scroll_view.top_index = new_top_index;
         scroll_view.scroll_shift_up = new_scroll_shift;
-        scroll_view.previous = Rect::EMPTY; // Force full re-render
+        scroll_view.previous = Rect::EMPTY;
     }
 
-    /// Jumps to the oldest (first) logs in the view.
     pub fn jump_to_oldest(&mut self, view: &LogView, style: &LogStyle) {
         let scroll_view = self.scrollify(view, style);
         scroll_view.top_index = scroll_view.min_index;
@@ -609,7 +750,6 @@ impl LogWidget {
     pub fn scrollable_render(&mut self, scroll: i32, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         if scroll == 0 {
             if let LogWidget::Scroll(_) = self {
-                // this handles new entries appearing.
                 self.scroll_down(0, buf, rect, view, style);
             } else {
                 self.render(buf, rect, view, style);
@@ -649,86 +789,141 @@ impl LogWidget {
 
         if scrolled_lines > 0 {
             handle_scroll_render(scroll_view, buf, rect, view, scrolled_lines, ScrollDirection::Up, style);
+        } else if scroll_view.previous != rect {
+            scroll_view.render_reset(buf, rect, view, style);
+        } else if style.highlight != scroll_view.last_highlight {
+            scroll_view.delta_highlight_only(buf, rect, view, style);
         }
     }
 
     pub fn scroll_down(&mut self, amount: u32, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
+        if let LogWidget::Tail(tail) = self {
+            tail.render(buf, rect, view, style);
+            return;
+        }
+
         let at_bottom = {
             let scroll_view = self.scrollify(view, style);
             let logs = view.logs.indexer();
-            let mut scrolled_lines = 0;
 
-            for _ in 0..amount {
-                if scroll_view.top_index >= scroll_view.ids.len() {
-                    break;
-                }
-                let entry = logs[scroll_view.ids[scroll_view.top_index]];
-                let line_count = get_entry_height(&entry, style, rect.w as u32);
-                if scroll_view.scroll_shift_up + 1 < line_count as u16 {
-                    scroll_view.scroll_shift_up += 1;
-                    scrolled_lines += 1;
-                } else if scroll_view.top_index + 1 < scroll_view.ids.len() {
-                    scroll_view.top_index += 1;
-                    scroll_view.scroll_shift_up = 0;
-                    scrolled_lines += 1;
-                } else {
-                    break;
-                }
-            }
-
-            // Determine if the scroll view is now at the very bottom of the logs.
-            // This happens if the height of all logs from top_index to the end fits within the screen height.
-            // This also covers the case where there are not enough lines to fill the screen (ineffective scrolling).
-            let mut height_accum = 0;
-            let limit = rect.h as u32;
-            let mut is_at_bottom = true;
-
-            if let Some(&id) = scroll_view.ids.get(scroll_view.top_index) {
-                let entry = logs[id];
-                let full_height = get_entry_height(&entry, style, rect.w as u32);
-                let visible_height = full_height.saturating_sub(scroll_view.scroll_shift_up as u32);
-                height_accum += visible_height;
-
-                if height_accum > limit {
-                    is_at_bottom = false;
-                } else {
-                    for &next_id in &scroll_view.ids[scroll_view.top_index + 1..] {
+            let check_at_bottom = |sv: &scroll_widget::LogScrollWidget| -> bool {
+                let mut height_accum = 0u32;
+                let limit = rect.h as u32;
+                if let Some(&id) = sv.ids.get(sv.top_index) {
+                    let entry = logs[id];
+                    let full_height = get_entry_height(&entry, style, rect.w as u32);
+                    let visible_height = full_height.saturating_sub(sv.scroll_shift_up as u32);
+                    height_accum += visible_height;
+                    if height_accum > limit {
+                        return false;
+                    }
+                    for &next_id in &sv.ids[sv.top_index + 1..] {
                         let entry = logs[next_id];
-                        let h = get_entry_height(&entry, style, rect.w as u32);
-                        height_accum += h;
+                        height_accum += get_entry_height(&entry, style, rect.w as u32);
                         if height_accum > limit {
-                            is_at_bottom = false;
-                            break;
+                            return false;
                         }
                     }
                 }
-            } else {
-                is_at_bottom = true;
+                true
+            };
+
+            let was_at_bottom = check_at_bottom(scroll_view);
+
+            let mut scrolled_lines = 0u32;
+            if !(was_at_bottom && style.highlight.is_some()) {
+                for _ in 0..amount {
+                    if scroll_view.top_index >= scroll_view.ids.len() {
+                        break;
+                    }
+                    let entry = logs[scroll_view.ids[scroll_view.top_index]];
+                    let line_count = get_entry_height(&entry, style, rect.w as u32);
+                    if scroll_view.scroll_shift_up + 1 < line_count as u16 {
+                        scroll_view.scroll_shift_up += 1;
+                        scrolled_lines += 1;
+                    } else if scroll_view.top_index + 1 < scroll_view.ids.len() {
+                        scroll_view.top_index += 1;
+                        scroll_view.scroll_shift_up = 0;
+                        scrolled_lines += 1;
+                    } else {
+                        break;
+                    }
+                }
             }
 
-            if !is_at_bottom && scrolled_lines > 0 {
+            let is_at_bottom = check_at_bottom(scroll_view);
+
+            if is_at_bottom && style.highlight.is_some() && scroll_view.previous == rect {
+                let mut current_height = 0u32;
+                if let Some(&id) = scroll_view.ids.get(scroll_view.top_index) {
+                    let entry = logs[id];
+                    let full_h = get_entry_height(&entry, style, rect.w as u32);
+                    current_height += full_h.saturating_sub(scroll_view.scroll_shift_up as u32);
+                }
+                for &id in &scroll_view.ids[scroll_view.top_index + 1..] {
+                    let entry = logs[id];
+                    current_height += get_entry_height(&entry, style, rect.w as u32);
+                }
+
+                let gap = (rect.h as u32).saturating_sub(current_height);
+                if gap > 0 {
+                    let old_top = scroll_view.top_index;
+                    let old_shift = scroll_view.scroll_shift_up;
+
+                    let mut lines_to_fill = gap;
+                    while lines_to_fill > 0 {
+                        if scroll_view.scroll_shift_up > 0 {
+                            scroll_view.scroll_shift_up -= 1;
+                            lines_to_fill -= 1;
+                        } else if scroll_view.top_index > 0 {
+                            scroll_view.top_index -= 1;
+                            let entry = logs[scroll_view.ids[scroll_view.top_index]];
+                            let h = get_entry_height(&entry, style, rect.w as u32);
+                            if h as u32 <= lines_to_fill {
+                                lines_to_fill -= h as u32;
+                            } else {
+                                scroll_view.scroll_shift_up = (h as u32 - lines_to_fill) as u16;
+                                lines_to_fill = 0;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if scroll_view.top_index != old_top || scroll_view.scroll_shift_up != old_shift {
+                        let filled = gap - lines_to_fill;
+                        scroll_view.delta_scroll_up(buf, rect, view, filled as u16, style);
+                    }
+                }
+            }
+
+            let stay_in_scroll = !is_at_bottom || style.highlight.is_some();
+            if stay_in_scroll && scrolled_lines > 0 {
                 handle_scroll_render(scroll_view, buf, rect, view, scrolled_lines, ScrollDirection::Down, style);
-            } else if !is_at_bottom && scroll_view.previous == Rect::EMPTY {
+            } else if stay_in_scroll && scroll_view.previous != rect {
                 scroll_view.render_reset(buf, rect, view, style);
+            } else if stay_in_scroll && style.highlight != scroll_view.last_highlight {
+                scroll_view.delta_highlight_only(buf, rect, view, style);
             }
 
             is_at_bottom
         };
 
-        if at_bottom {
-            *self = LogWidget::Tail(LogTailWidget::default());
+        if at_bottom && style.highlight.is_none() {
+            *self = LogWidget::Tail(tail_widget::LogTailWidget::default());
             self.render(buf, rect, view, style);
         }
     }
 }
 
+#[derive(Clone, Copy)]
 enum ScrollDirection {
     Up,
     Down,
 }
 
 fn handle_scroll_render(
-    scroll_view: &mut LogScrollWidget,
+    scroll_view: &mut scroll_widget::LogScrollWidget,
     buf: &mut Vec<u8>,
     rect: Rect,
     view: &LogView,
@@ -737,264 +932,29 @@ fn handle_scroll_render(
     style: &LogStyle,
 ) {
     let scrolled_lines = scrolled_lines as u16;
-    if scrolled_lines < rect.h && scroll_view.previous == rect {
-        vt::ScrollRegion(rect.y + 1, rect.y + rect.h).write_to_buffer(buf);
-
-        match direction {
-            ScrollDirection::Up => {
-                extui::splat!(buf, vt::ScrollBufferDown(scrolled_lines), vt::ScrollRegion::RESET);
-                scroll_view.render_top_lines(buf, rect, view, scrolled_lines, style);
-            }
-            ScrollDirection::Down => {
-                extui::splat!(buf, vt::ScrollBufferUp(scrolled_lines), vt::ScrollRegion::RESET);
-                scroll_view.render_bottom_lines(buf, rect, view, scrolled_lines, style);
-            }
-        }
-        scroll_view.previous = rect;
-    } else {
+    if scrolled_lines >= rect.h || scroll_view.previous != rect {
         scroll_view.render_reset(buf, rect, view, style);
-    }
-}
-
-impl LogScrollWidget {
-    fn render_content(
-        &self,
-        buf: &mut Vec<u8>,
-        rect: Rect,
-        view: &LogView,
-        lines_to_render: u16,
-        style: &LogStyle,
-    ) -> u16 {
-        let logs = view.logs.indexer();
-        let mut entries = self.ids[self.top_index..].iter().map(|&id| (id, logs[id]));
-        let mut remaining_height = lines_to_render;
-
-        if let Some((log_id, entry)) = entries.next() {
-            if remaining_height == 0 {
-                return 0;
-            }
-            let rendered = render_single_entry(
-                buf,
-                view.logs,
-                rect.w,
-                &entry,
-                log_id,
-                self.scroll_shift_up,
-                remaining_height,
-                style,
-            );
-            remaining_height = remaining_height.saturating_sub(rendered);
-        }
-
-        for (log_id, entry) in entries {
-            if remaining_height == 0 {
-                break;
-            }
-            let rendered = render_single_entry(buf, view.logs, rect.w, &entry, log_id, 0, remaining_height, style);
-            remaining_height = remaining_height.saturating_sub(rendered);
-        }
-        remaining_height
+        return;
     }
 
-    pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
-        if rect == self.previous && style.highlight == self.last_highlight {
+    let highlight_changed = style.highlight != scroll_view.last_highlight;
+
+    if highlight_changed {
+        if scrolled_lines as f32 / rect.h as f32 > 0.4 {
+            scroll_view.render_reset(buf, rect, view, style);
             return;
         }
-        self.render_reset(buf, rect, view, style);
-    }
-
-    pub fn render_reset(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
-        self.previous = rect;
-        self.last_highlight = style.highlight;
-        self.tail = view.tail;
-
-        while let Some(id) = self.ids.get(self.top_index) {
-            if *id < view.logs.head() {
-                self.top_index += 1;
-                self.min_index = self.top_index;
-                self.scroll_shift_up = 0;
-            } else {
-                break;
-            }
-        }
-
-        let use_batch_clear = rect.y == 0 && !style.assume_blank;
-
-        if use_batch_clear {
-            vt::MoveCursor(rect.x + rect.w, rect.y + rect.h - 1).write_to_buffer(buf);
-            buf.extend_from_slice(vt::CLEAR_ABOVE);
-        }
-
-        vt::MoveCursor(rect.x, rect.y).write_to_buffer(buf);
-        let remaining_height = self.render_content(buf, rect, view, rect.h, style);
-
-        if !use_batch_clear && !style.assume_blank {
-            for _ in 0..remaining_height {
-                buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
-                buf.extend_from_slice(b"\r\n");
-            }
+        scroll_view.delta_scroll_with_highlight(buf, rect, view, scrolled_lines, direction, style);
+    } else {
+        match direction {
+            ScrollDirection::Up => scroll_view.delta_scroll_up(buf, rect, view, scrolled_lines, style),
+            ScrollDirection::Down => scroll_view.delta_scroll_down(buf, rect, view, scrolled_lines, style),
         }
     }
 
-    fn render_top_lines(&self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, line_count: u16, style: &LogStyle) {
-        vt::MoveCursor(rect.x, rect.y).write_to_buffer(buf);
-        self.render_content(buf, rect, view, line_count, style);
-    }
-
-    fn render_bottom_lines(
-        &self,
-        buf: &mut Vec<u8>,
-        rect: Rect,
-        view: &LogView,
-        scrolled_lines: u16,
-        style: &LogStyle,
-    ) {
-        let logs = view.logs.indexer();
-        let mut entries = self.ids[self.top_index..].iter().map(|&id| (id, logs[id]));
-        let mut lines_to_skip = rect.h.saturating_sub(scrolled_lines);
-
-        let mut start_entry: Option<(LogId, LogEntry)> = None;
-        let mut sub_line_skip = 0;
-
-        if let Some((log_id, entry)) = entries.next() {
-            let total_height = get_entry_height(&entry, style, rect.w as u32) as u16;
-            let visible_height = total_height.saturating_sub(self.scroll_shift_up);
-            if lines_to_skip < visible_height {
-                start_entry = Some((log_id, entry));
-                sub_line_skip = self.scroll_shift_up + lines_to_skip;
-                lines_to_skip = 0;
-            } else {
-                lines_to_skip -= visible_height;
-            }
-        }
-
-        if lines_to_skip > 0 {
-            for (log_id, entry) in entries.by_ref() {
-                let height = get_entry_height(&entry, style, rect.w as u32) as u16;
-                if lines_to_skip < height {
-                    start_entry = Some((log_id, entry));
-                    sub_line_skip = lines_to_skip;
-                    break;
-                } else {
-                    lines_to_skip -= height;
-                }
-            }
-        }
-
-        vt::MoveCursor(rect.x, rect.y + rect.h - scrolled_lines).write_to_buffer(buf);
-        let mut remaining_height = scrolled_lines;
-
-        if let Some((log_id, entry)) = start_entry {
-            if remaining_height == 0 {
-                return;
-            }
-            let rendered =
-                render_single_entry(buf, view.logs, rect.w, &entry, log_id, sub_line_skip, remaining_height, style);
-            remaining_height = remaining_height.saturating_sub(rendered);
-        }
-
-        for (log_id, entry) in entries {
-            if remaining_height == 0 {
-                break;
-            }
-            let rendered = render_single_entry(buf, view.logs, rect.w, &entry, log_id, 0, remaining_height, style);
-            remaining_height = remaining_height.saturating_sub(rendered);
-        }
-    }
+    scroll_view.last_highlight = style.highlight;
 }
 
-impl LogTailWidget {
-    pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
-        if rect != self.previous {
-            self.previous = rect;
-            self.next_screen_offset = render_buffer_tail_reset(buf, rect, view, style);
-            self.tail = view.tail;
-            return;
-        }
-        let (a, b) = view.logs.slices_range(self.tail, view.tail);
-
-        if rect.h == 0 || (a.is_empty() && b.is_empty()) {
-            self.tail = view.tail;
-            return;
-        }
-        vt::ScrollRegion(rect.y + 1, rect.y + rect.h).write_to_buffer(buf);
-
-        let mut first = false;
-        if rect.y + self.next_screen_offset == 0 {
-            vt::MoveCursor(rect.x, 0).write_to_buffer(buf);
-            first = true;
-        } else {
-            vt::MoveCursor(rect.x, rect.y + self.next_screen_offset - 1).write_to_buffer(buf);
-        }
-        let mut offset = self.next_screen_offset as u32;
-        for entry in a.iter().chain(b.iter()) {
-            if !view.contains(entry) {
-                continue;
-            }
-            offset += get_entry_height(entry, style, rect.w as u32);
-            if first {
-                first = false
-            } else {
-                buf.extend_from_slice(b"\n\r");
-            }
-
-            let prefix = style.prefix(entry.log_group);
-            let prefix_width = prefix.map(|p| p.width).unwrap_or(0);
-            let prefix_bytes = prefix.map(|p| p.bytes.as_bytes()).unwrap_or(b"");
-
-            let text = unsafe { entry.text(view.logs) };
-
-            if entry.width as usize + prefix_width <= rect.w as usize {
-                if !prefix_bytes.is_empty() {
-                    buf.extend_from_slice(prefix_bytes);
-                }
-                entry.style.write_to_buffer(buf);
-                buf.extend_from_slice(text.as_bytes());
-                vt::CLEAR_STYLE.write_to_buffer(buf);
-                if !style.assume_blank {
-                    buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
-                }
-            } else {
-                let limit = (rect.w as usize).saturating_sub(prefix_width);
-                let mut splitter = line_width::naive_line_splitting(text, entry.style, limit);
-                let mut first_line_len = 0;
-
-                if let Some((line, l_style)) = splitter.next() {
-                    first_line_len = line.len();
-                    if !prefix_bytes.is_empty() {
-                        buf.extend_from_slice(prefix_bytes);
-                    }
-                    l_style.write_to_buffer(buf);
-                    buf.extend_from_slice(line.as_bytes());
-                    if !style.assume_blank {
-                        buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
-                    }
-                }
-
-                if first_line_len < text.len() {
-                    let rest = &text[first_line_len..];
-                    for (line, _) in line_width::naive_line_splitting(rest, entry.style, rect.w.into()) {
-                        buf.extend_from_slice(b"\r\n");
-                        buf.extend_from_slice(line.as_bytes());
-                        if !style.assume_blank {
-                            buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
-                        }
-                    }
-                }
-                vt::CLEAR_STYLE.write_to_buffer(buf);
-            }
-        }
-
-        vt::ScrollRegion::RESET.write_to_buffer(buf);
-        if offset > rect.h as u32 {
-            offset = rect.h as u32
-        }
-        self.next_screen_offset = offset as u16;
-        self.tail = view.tail;
-    }
-}
-
-/// Renders the view in "tail" mode from scratch.
 fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) -> u16 {
     let mut displayed: Vec<(LogId, LogEntry)> = Vec::new();
     let (a, b) = view.logs.slices();
@@ -1034,7 +994,17 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
         && let Some((log_id, entry)) = entries_to_render.next()
     {
         let skip = (-remaining_v_space) as u16;
-        let rendered = render_single_entry(buf, view.logs, rect.w, entry, *log_id, skip, screen_lines_left, style);
+        let rendered = render_single_entry(
+            buf,
+            view.logs,
+            rect.w,
+            entry,
+            *log_id,
+            skip,
+            screen_lines_left,
+            style,
+            style.highlight,
+        );
         screen_lines_left = screen_lines_left.saturating_sub(rendered);
     }
 
@@ -1042,7 +1012,8 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
         if screen_lines_left == 0 {
             break;
         }
-        let rendered = render_single_entry(buf, view.logs, rect.w, entry, *log_id, 0, screen_lines_left, style);
+        let rendered =
+            render_single_entry(buf, view.logs, rect.w, entry, *log_id, 0, screen_lines_left, style, style.highlight);
         screen_lines_left = screen_lines_left.saturating_sub(rendered);
     }
 
@@ -1054,360 +1025,4 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
     }
 
     rect.h.saturating_sub(screen_lines_left)
-}
-
-#[cfg(test)]
-mod test {
-
-    use extui::{Rect, vt, vt::BufferWrite};
-
-    use crate::{
-        log_storage::LogWriter,
-        scroll_view::{LogStyle, LogWidget, Prefix},
-    };
-
-    #[track_caller]
-    fn expect(parser: &vt100::Parser, content: &[&str]) {
-        for (i, (row, expected)) in parser.screen().rows(0, 8).zip(content).enumerate() {
-            let expected = expected.trim_ascii_end();
-            if row == *expected {
-                continue;
-            }
-            println!("{}", parser.screen().contents());
-            panic!("Row {} did not match expected content. \nExpected: {:?} \n   Found: {:?}", i, expected, row);
-        }
-    }
-
-    fn estimate_byte_cost(buf: &[u8]) -> usize {
-        std::str::from_utf8(buf).unwrap().split("Line").count().saturating_sub(1) * 60 + buf.len()
-    }
-
-    #[test]
-    fn scroll_insanity() {
-        let mut parser = vt100::Parser::new(6, 8, 0);
-        let mut total_written = 0;
-        let mut buf = Vec::new();
-        macro_rules! assert_scrollview {
-            ($($tt:tt)*) => {
-                parser.process(&buf);
-                total_written += estimate_byte_cost(&buf);
-                buf.clear();
-                expect(&parser, &["12345678",$($tt),*,"12345678"]);
-            };
-        }
-
-        vt::MoveCursor(0, 0).write_to_buffer(&mut buf);
-        for _ in 0..6 {
-            buf.extend_from_slice(b"12345678");
-        }
-        assert_scrollview! {
-            "12345678"
-            "12345678"
-            "12345678"
-            "12345678"
-        }
-
-        let rect = Rect { x: 0, y: 1, w: 8, h: 4 };
-        let mut writer = LogWriter::new();
-        let logs = writer.reader();
-        let mut view = LogWidget::default();
-        let style = LogStyle::default();
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "        "
-            "        "
-            "        "
-            "        "
-        }
-        writer.push("Line 0");
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 0  "
-            "        "
-            "        "
-            "        "
-        }
-        writer.push("Line 1");
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 0  "
-            "Line 1  "
-            "        "
-            "        "
-        }
-        writer.push("Line 2");
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 0  "
-            "Line 1  "
-            "Line 2  "
-            "        "
-        }
-        writer.push("Line 3");
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 0  "
-            "Line 1  "
-            "Line 2  "
-            "Line 3  "
-        }
-        writer.push("Line 4");
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 1  "
-            "Line 2  "
-            "Line 3  "
-            "Line 4  "
-        }
-        writer.push("Line 5");
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 2  "
-            "Line 3  "
-            "Line 4  "
-            "Line 5  "
-        }
-        writer.push("head1234Line 6");
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 4  "
-            "Line 5  "
-            "head1234"
-            "Line 6  "
-        }
-        view.scroll_up(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 3  "
-            "Line 4  "
-            "Line 5  "
-            "head1234"
-        }
-        view.scroll_up(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 2  "
-            "Line 3  "
-            "Line 4  "
-            "Line 5  "
-        }
-        view.scroll_up(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 1  "
-            "Line 2  "
-            "Line 3  "
-            "Line 4  "
-        }
-        view.scroll_up(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 0  "
-            "Line 1  "
-            "Line 2  "
-            "Line 3  "
-        }
-        view.scroll_up(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 0  "
-            "Line 1  "
-            "Line 2  "
-            "Line 3  "
-        }
-        view.scroll_down(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 1  "
-            "Line 2  "
-            "Line 3  "
-            "Line 4  "
-        }
-        view.scroll_down(2, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 3  "
-            "Line 4  "
-            "Line 5  "
-            "head1234"
-        }
-        view.scroll_down(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 4  "
-            "Line 5  "
-            "head1234"
-            "Line 6  "
-        }
-        kvlog::info!("hello");
-        writer.push("Line 7");
-        assert_scrollview! {
-            "Line 4  "
-            "Line 5  "
-            "head1234"
-            "Line 6  "
-        }
-        view.scroll_down(1, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        assert_scrollview! {
-            "Line 5  "
-            "head1234"
-            "Line 6  "
-            "Line 7  "
-        }
-        println!("VT {} bytes written", total_written);
-    }
-
-    #[test]
-    fn prefix_wrapping() {
-        #[track_caller]
-        fn expect(parser: &vt100::Parser, content: &[&str]) {
-            for (i, (row, expected)) in parser.screen().rows(0, 10).zip(content).enumerate() {
-                let expected = expected.trim_ascii_end();
-                if row == *expected {
-                    continue;
-                }
-                println!("{}", parser.screen().contents());
-                panic!("Row {} did not match expected content. \nExpected: {:?} \n   Found: {:?}", i, expected, row);
-            }
-        }
-        let mut parser = vt100::Parser::new(5, 10, 0);
-        let mut buf = Vec::new();
-        let rect = Rect { x: 0, y: 0, w: 10, h: 4 };
-
-        let mut writer = LogWriter::new();
-        let logs = writer.reader();
-        let mut view = LogWidget::default();
-
-        // Setup style with a prefix for Job 0
-        let prefix = Prefix { bytes: "P: ".into(), width: 3 };
-        let style = LogStyle { prefixes: vec![prefix.clone(), prefix], assume_blank: false, highlight: None };
-
-        writer.push("Short");
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        parser.process(&buf);
-        buf.clear();
-
-        expect(&parser, &["P: Short  ", "          ", "          ", "          "]);
-
-        writer.push("1234567");
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        parser.process(&buf);
-        buf.clear();
-
-        expect(&parser, &["P: Short  ", "P: 1234567", "          ", "          "]);
-
-        writer.push("12345678");
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        parser.process(&buf);
-        buf.clear();
-        expect(&parser, &["P: Short  ", "P: 1234567", "P: 1234567", "8         "]);
-    }
-
-    #[test]
-    fn batch_clear_optimization_at_y_zero() {
-        let mut parser = vt100::Parser::new(10, 20, 0);
-        let mut buf = Vec::new();
-        let rect = Rect { x: 0, y: 0, w: 20, h: 10 };
-
-        let mut writer = LogWriter::new();
-        let logs = writer.reader();
-        let mut view = LogWidget::default();
-        let style = LogStyle::default();
-
-        for i in 0..3 {
-            writer.push(&format!("Line {}", i));
-        }
-
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        parser.process(&buf);
-
-        let byte_count_optimized = buf.len();
-        buf.clear();
-
-        assert!(
-            byte_count_optimized < 150,
-            "Byte count {} should be reduced with CLEAR_ABOVE optimization",
-            byte_count_optimized
-        );
-
-        for (i, row) in parser.screen().rows(0, 20).enumerate() {
-            if i < 3 {
-                assert!(row.starts_with("Line"), "Row {} should have content", i);
-            } else if i < 10 {
-                assert!(row.trim().is_empty(), "Row {} should be blank", i);
-            }
-        }
-    }
-
-    #[test]
-    fn no_batch_clear_when_y_nonzero() {
-        let mut parser = vt100::Parser::new(12, 20, 0);
-        let mut buf = Vec::new();
-
-        vt::MoveCursor(0, 0).write_to_buffer(&mut buf);
-        buf.extend_from_slice(b"HEADER LINE         ");
-        parser.process(&buf);
-        buf.clear();
-
-        let rect = Rect { x: 0, y: 1, w: 20, h: 10 };
-
-        let mut writer = LogWriter::new();
-        let logs = writer.reader();
-        let mut view = LogWidget::default();
-        let style = LogStyle::default();
-
-        for i in 0..3 {
-            writer.push(&format!("Line {}", i));
-        }
-
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        parser.process(&buf);
-        buf.clear();
-
-        let first_row = parser.screen().rows(0, 20).next().unwrap();
-        assert_eq!(first_row.trim(), "HEADER LINE", "Header should be preserved when rect.y != 0");
-
-        for (i, row) in parser.screen().rows(0, 20).skip(1).enumerate() {
-            if i < 3 {
-                assert!(row.starts_with("Line"), "Row {} should have content", i + 1);
-            }
-        }
-    }
-
-    #[test]
-    fn reset_uses_batch_clear_at_y_zero() {
-        let mut parser = vt100::Parser::new(10, 20, 0);
-        let mut buf = Vec::new();
-        let rect = Rect { x: 0, y: 0, w: 20, h: 10 };
-
-        let mut writer = LogWriter::new();
-        let logs = writer.reader();
-        let mut view = LogWidget::default();
-        let style = LogStyle::default();
-
-        for i in 0..5 {
-            writer.push(&format!("Line {}", i));
-        }
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        parser.process(&buf);
-        let initial_len = buf.len();
-        buf.clear();
-
-        view.scroll_up(2, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        parser.process(&buf);
-        buf.clear();
-
-        view = LogWidget::default();
-        view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
-        parser.process(&buf);
-        let reset_len = buf.len();
-        buf.clear();
-
-        assert!(
-            reset_len <= initial_len + 50,
-            "Reset render ({} bytes) should be similar to initial ({} bytes)",
-            reset_len,
-            initial_len
-        );
-
-        for (i, row) in parser.screen().rows(0, 20).enumerate() {
-            if i < 5 {
-                assert!(row.starts_with("Line"), "Row {} should have content", i);
-            } else if i < 10 {
-                assert!(row.trim().is_empty(), "Row {} should be blank", i);
-            }
-        }
-    }
 }

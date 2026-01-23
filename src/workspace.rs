@@ -1691,8 +1691,7 @@ impl Workspace {
                 .and_then(|ji| state.jobs.get(ji.idx()))
                 .map(|job| (job.spawn_profile.clone(), job.spawn_params.clone()))
                 .unwrap_or_else(|| (String::new(), ValueMap::new()));
-            let env =
-                Environment { profile: &spawn_profile, param: spawn_params.clone(), vars: base_task.config.vars };
+            let env = Environment { profile: &spawn_profile, param: spawn_params.clone(), vars: base_task.config.vars };
             let Ok(task_config) = base_task.config.eval(&env) else {
                 kvlog::error!("Failed to evaluate test config", name = base_task.name);
                 continue;
@@ -1908,12 +1907,7 @@ impl Workspace {
             }
             failed
         } else {
-            test_group
-                .base_tasks
-                .iter()
-                .zip(test_group.job_indices.iter())
-                .map(|(&bti, &ji)| (bti, Some(ji)))
-                .collect()
+            test_group.base_tasks.iter().zip(test_group.job_indices.iter()).map(|(&bti, &ji)| (bti, Some(ji))).collect()
         };
 
         if tasks_to_run.is_empty() {

@@ -1243,11 +1243,8 @@ impl ProcessManager {
         if as_test {
             let mut state = ws.handle.state.write().unwrap();
             let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
-            state.last_test_group = Some(workspace::TestGroup {
-                group_id,
-                base_tasks: vec![base_index],
-                job_indices: vec![job_index],
-            });
+            state.last_test_group =
+                Some(workspace::TestGroup { group_id, base_tasks: vec![base_index], job_indices: vec![job_index] });
         }
 
         let channel = Arc::new(ClientChannel {
