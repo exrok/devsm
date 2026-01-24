@@ -10,7 +10,7 @@ use jsony_value::ValueMap;
 
 use crate::config::{FunctionDefAction, TaskKind};
 use crate::function::{FunctionAction, SetFunctionAction};
-use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
+use crate::keybinds::{BindingEntry, Command, InputEvent, Keybinds, Mode};
 use crate::log_storage::{BaseTaskSet, LogFilter};
 use crate::process_manager::{Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_TESTS};
 use crate::tui::log_search::{LogSearchState, SearchAction};
@@ -140,6 +140,23 @@ struct HelpMenu {
     scroll: usize,
 }
 
+/// State for multi-key binding chains (e.g., SPACE l for "Leader" + "LaunchTask")
+#[derive(Default)]
+struct ChainState {
+    /// Current chain group index (None = not in chain)
+    current: Option<u32>,
+}
+
+impl ChainState {
+    fn is_active(&self) -> bool {
+        self.current.is_some()
+    }
+
+    fn reset(&mut self) {
+        self.current = None;
+    }
+}
+
 struct TuiState {
     frame: DoubleBuffer,
     frame_width: u16,
@@ -151,6 +168,7 @@ struct TuiState {
     help: HelpMenu,
     status_message: Option<StatusMessage>,
     task_tree_hidden: bool,
+    chain: ChainState,
 }
 
 fn compute_menu_height(terminal_height: u16) -> u16 {
@@ -281,7 +299,8 @@ fn render<'a>(
                 FocusOverlap::ConfigError { .. } => Mode::Global,
                 FocusOverlap::None => Mode::Global,
             };
-            render_help_menu(&mut tui.frame, help_rect, keybinds, &mut tui.help, current_mode);
+            let chain_idx = if matches!(tui.overlay, FocusOverlap::None) { tui.chain.current } else { None };
+            render_help_menu(&mut tui.frame, help_rect, keybinds, &mut tui.help, current_mode, chain_idx);
         }
     }
 
@@ -302,6 +321,7 @@ struct StatusBarData {
     is_scrolled: bool,
     status_message: Option<(String, bool)>,
     test_summary: Option<crate::workspace::TestGroupSummary>,
+    chain_label: Option<String>,
 }
 
 fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData) {
@@ -310,7 +330,10 @@ fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData)
     let mode_text = format_args!(" {} ", data.mode_name);
     let mut r = rect.with(data.mode_bg.with_fg(Color::Black)).fmt(frame, mode_text);
 
-    if !data.selection_text.is_empty() {
+    if let Some(label) = &data.chain_label {
+        let label_text = format!(" {} ", label);
+        r = r.with(Color::LightGoldenrod1.with_fg(Color::Black)).text(frame, &label_text);
+    } else if !data.selection_text.is_empty() {
         r = r.with(Color::Grey[8].with_fg(Color::Grey[25])).text(frame, &data.selection_text);
     }
 
@@ -434,6 +457,12 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
 
     let test_summary = ws.compute_test_group_summary();
 
+    let chain_info = tui.chain.current.and_then(|idx| {
+        let group = keybinds.chain(idx)?;
+        let label = group.label.as_deref().unwrap_or("...");
+        Some(label.to_string())
+    });
+
     StatusBarData {
         mode_name,
         mode_bg,
@@ -446,6 +475,7 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
         is_scrolled,
         status_message,
         test_summary,
+        chain_label: chain_info,
     }
 }
 
@@ -461,17 +491,31 @@ fn render_help_menu(
     keybinds: &Keybinds,
     help: &mut HelpMenu,
     current_mode: Mode,
+    chain_idx: Option<u32>,
 ) {
-    let mut bindings: Vec<_> = keybinds.mode_bindings(current_mode).collect();
-    let mode_keys: std::collections::HashSet<_> = bindings.iter().map(|(k, _)| *k).collect();
+    let (bindings, header_text): (Vec<(InputEvent, HelpEntry)>, String) =
+        if let Some(group) = chain_idx.and_then(|idx| keybinds.chain(idx)) {
+            let bindings = group.bindings.iter().map(|(k, e)| (*k, HelpEntry::from_binding(keybinds, e))).collect();
+            let label = group.label.as_deref().unwrap_or("...");
+            (bindings, format!("Chain: {} (? to cancel)", label))
+        } else if chain_idx.is_some() {
+            (Vec::new(), "Chain (invalid)".to_string())
+        } else {
+            let mut bindings: Vec<(InputEvent, HelpEntry)> = keybinds
+                .mode_bindings(current_mode)
+                .map(|(input, entry)| (input, HelpEntry::from_binding(keybinds, entry)))
+                .collect();
+            let mode_keys: std::collections::HashSet<_> = bindings.iter().map(|(k, _)| *k).collect();
 
-    for (input, cmd) in keybinds.global_bindings() {
-        if !mode_keys.contains(&input) {
-            bindings.push((input, cmd));
-        }
-    }
+            for (input, entry) in keybinds.global_bindings() {
+                if !mode_keys.contains(&input) {
+                    bindings.push((input, HelpEntry::from_binding(keybinds, entry)));
+                }
+            }
 
-    bindings.sort_by(|a, b| a.1.display_name().cmp(b.1.display_name()));
+            bindings.sort_by(|a, b| a.1.display_name().cmp(b.1.display_name()));
+            (bindings, "Keybindings (? to close)".to_string())
+        };
 
     let total_items = bindings.len();
     let visible_height = rect.h as usize;
@@ -483,16 +527,16 @@ fn render_help_menu(
     }
 
     let header = rect.take_top(1);
-    header.with(Color::Grey[6].with_fg(Color::Grey[25])).fill(frame).skip(1).text(frame, "Keybindings (? to close)");
+    header.with(Color::Grey[6].with_fg(Color::Grey[25])).fill(frame).skip(1).text(frame, &header_text);
 
-    for (input, cmd) in bindings.iter().skip(help.scroll) {
+    for (input, entry) in bindings.iter().skip(help.scroll) {
         let line_rect = rect.take_top(1);
         if line_rect.is_empty() {
             break;
         }
 
         let key_str = input.to_string();
-        let cmd_str = cmd.display_name();
+        let display_name = entry.display_name();
 
         let mut styled = line_rect.with(Style::DEFAULT);
         styled = styled.with(Color::Cyan1.as_fg()).text(frame, &key_str);
@@ -503,7 +547,32 @@ fn render_help_menu(
             styled = styled.text(frame, " ");
         }
 
-        styled.with(Color::Grey[20].as_fg()).text(frame, cmd_str);
+        styled.with(Color::Grey[20].as_fg()).text(frame, display_name);
+    }
+}
+
+enum HelpEntry<'a> {
+    Command(&'a Command),
+    Chain { label: Option<&'a str> },
+}
+
+impl<'a> HelpEntry<'a> {
+    fn from_binding(keybinds: &'a Keybinds, entry: &'a BindingEntry) -> Self {
+        match entry {
+            BindingEntry::Command(cmd) => HelpEntry::Command(cmd),
+            BindingEntry::Chain(idx) => {
+                let label = keybinds.chain(*idx).and_then(|g| g.label.as_deref());
+                HelpEntry::Chain { label }
+            }
+        }
+    }
+
+    fn display_name(&self) -> &str {
+        match self {
+            HelpEntry::Command(cmd) => cmd.display_name(),
+            HelpEntry::Chain { label: Some(l) } => l,
+            HelpEntry::Chain { label: None } => "...",
+        }
     }
 }
 
@@ -626,10 +695,40 @@ fn process_key(
         FocusOverlap::None => {}
     }
 
-    let Some(command) = keybinds.lookup_chain(&[Mode::TaskTree, Mode::Pager, Mode::Global], input) else {
-        kvlog::info!("no input command found", %input);
-        tui.status_message = Some(StatusMessage::error(format!("No binding for input: {}", input)));
-        return ProcessKeyResult::Continue;
+    let modes = &[Mode::TaskTree, Mode::Pager, Mode::Global];
+
+    let entry = if let Some(chain_idx) = tui.chain.current {
+        let Some(group) = keybinds.chain(chain_idx) else {
+            tui.chain.reset();
+            tui.status_message = Some(StatusMessage::error("Chain invalidated"));
+            return ProcessKeyResult::Continue;
+        };
+        group.lookup(input)
+    } else {
+        keybinds.lookup_entry_chain(modes, input)
+    };
+
+    let command = match entry {
+        Some(BindingEntry::Command(cmd)) => {
+            tui.chain.reset();
+            cmd.clone()
+        }
+        Some(BindingEntry::Chain(idx)) => {
+            let label = keybinds.chain(*idx).and_then(|g| g.label.as_deref()).unwrap_or("...");
+            tui.chain.current = Some(*idx);
+            tui.status_message = Some(StatusMessage::info(format!("Chain: {}", label)));
+            return ProcessKeyResult::Continue;
+        }
+        None => {
+            if tui.chain.is_active() {
+                tui.chain.reset();
+                tui.status_message = Some(StatusMessage::error(format!("No binding for: {}", input)));
+            } else {
+                tui.status_message = Some(StatusMessage::error(format!("No binding for input: {}", input)));
+            }
+            kvlog::info!("no input command found", %input);
+            return ProcessKeyResult::Continue;
+        }
     };
     kvlog::info!("Processed Input Event", %input, ?command);
 
@@ -1190,6 +1289,7 @@ pub fn run(
         help: HelpMenu { visible: false, scroll: 0 },
         status_message: None,
         task_tree_hidden: false,
+        chain: ChainState::default(),
     };
 
     let mut delta = Has(0);

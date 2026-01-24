@@ -111,7 +111,7 @@ impl Display for InputEvent {
         if let Some(name) = self.named_key() {
             f.write_str(name)
         } else if let Some(ch) = self.as_char() {
-            f.write_char(ch)
+            if ch == ' ' { f.write_str("SPACE") } else { f.write_char(ch) }
         } else {
             f.write_str("UNKNOWN")
         }
@@ -133,6 +133,10 @@ impl FromStr for InputEvent {
     type Err = String;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
+        if input == " " {
+            return Err("Use 'SPACE' instead of ' ' for space key".to_string());
+        }
+
         let mut base = KeyModifiers::empty();
         let mut rem = input;
         while let Some((prefix, rest)) = rem.split_once('-') {
@@ -147,6 +151,8 @@ impl FromStr for InputEvent {
         let raw_base = (base.bits() as u64) << 32;
         if let Some(named_key) = parse_named_key_to_raw(rem) {
             Ok(InputEvent(raw_base | named_key))
+        } else if rem == "SPACE" {
+            Ok(InputEvent(raw_base | (' ' as u64)))
         } else if rem.len() == 1 {
             Ok(InputEvent(raw_base | (rem.as_bytes()[0] as u64)))
         } else {
@@ -239,6 +245,31 @@ impl FromStr for Command {
     }
 }
 
+/// What an InputEvent maps to in the binding table.
+#[derive(Debug, Clone)]
+pub enum BindingEntry {
+    /// Direct command execution
+    Command(Command),
+    /// Chain group index - user must press another key
+    Chain(u32),
+}
+
+/// A group of chain continuations.
+#[derive(Debug, Clone, Default)]
+pub struct ChainGroup {
+    /// Optional label shown in status bar (e.g., "Leader", "Test")
+    pub label: Option<Box<str>>,
+    /// Next keys in the chain (small, O(n) lookup is fine)
+    pub bindings: Vec<(InputEvent, BindingEntry)>,
+}
+
+impl ChainGroup {
+    /// Look up the next key in this chain group.
+    pub fn lookup(&self, input: InputEvent) -> Option<&BindingEntry> {
+        self.bindings.iter().find(|(k, _)| *k == input).map(|(_, v)| v)
+    }
+}
+
 /// Keybinding modes corresponding to different UI states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {
@@ -296,7 +327,7 @@ impl FromStr for Mode {
     }
 }
 
-type BindingTable = HashTable<(InputEvent, Command)>;
+type BindingTable = HashTable<(InputEvent, BindingEntry)>;
 
 /// Keybinding configuration with separate tables per mode.
 pub struct Keybinds {
@@ -309,11 +340,13 @@ pub struct Keybinds {
     log_search: BindingTable,
     task_launcher: BindingTable,
     test_filter_launcher: BindingTable,
+    chains: Vec<ChainGroup>,
 }
 
 impl Keybinds {
-    fn table_lookup(&self, table: &BindingTable, input: InputEvent) -> Option<Command> {
-        table.find(hash_input(&self.hasher, input), |(k, _)| *k == input).map(|(_, cmd)| cmd.clone())
+    fn table_lookup<'a>(&self, table: &'a BindingTable, input: InputEvent) -> Option<&'a BindingEntry> {
+        let hash = hash_input(&self.hasher, input);
+        table.find(hash, |(k, _)| *k == input).map(|(_, entry)| entry)
     }
 }
 
@@ -338,7 +371,25 @@ impl Keybinds {
             log_search: HashTable::new(),
             task_launcher: HashTable::new(),
             test_filter_launcher: HashTable::new(),
+            chains: Vec::new(),
         }
+    }
+
+    /// Gets a chain group by index.
+    pub fn chain(&self, index: u32) -> Option<&ChainGroup> {
+        self.chains.get(index as usize)
+    }
+
+    /// Gets a mutable chain group by index.
+    pub fn chain_mut(&mut self, index: u32) -> Option<&mut ChainGroup> {
+        self.chains.get_mut(index as usize)
+    }
+
+    /// Adds a chain group and returns its index.
+    pub fn add_chain(&mut self, group: ChainGroup) -> u32 {
+        let index = self.chains.len() as u32;
+        self.chains.push(group);
+        index
     }
 
     fn table_for_mode(&self, mode: Mode) -> &BindingTable {
@@ -414,19 +465,47 @@ impl Keybinds {
             Mode::TaskLauncher => &mut self.task_launcher,
             Mode::TestFilterLauncher => &mut self.test_filter_launcher,
         };
+        let entry = BindingEntry::Command(command);
         match table.find_mut(hash, |(k, _)| *k == input) {
-            Some(entry) => entry.1 = command,
+            Some(e) => e.1 = entry,
             None => {
-                table.insert_unique(hash, (input, command), |(k, _)| hash_input(hasher, *k));
+                table.insert_unique(hash, (input, entry), |(k, _)| hash_input(hasher, *k));
             }
         }
     }
 
-    /// Sets a binding from parsed config.
+    /// Sets a binding from parsed config (simple command).
     pub fn set_binding(&mut self, mode: Mode, input: InputEvent, command: Option<Command>) {
-        let hasher = &self.hasher;
-        let hash = hash_input(hasher, input);
-        let table = match mode {
+        match command {
+            Some(cmd) => self.set_binding_entry(mode, input, BindingEntry::Command(cmd)),
+            None => self.remove_binding(mode, input),
+        }
+    }
+
+    /// Sets a binding entry (command or chain) from parsed config.
+    pub fn set_binding_entry(&mut self, mode: Mode, input: InputEvent, entry: BindingEntry) {
+        let hash = hash_input(&self.hasher, input);
+        let hasher = self.hasher.clone();
+        let table = self.table_for_mode_mut(mode);
+        match table.find_mut(hash, |(k, _)| *k == input) {
+            Some(e) => e.1 = entry,
+            None => {
+                table.insert_unique(hash, (input, entry), |(k, _)| hash_input(&hasher, *k));
+            }
+        }
+    }
+
+    /// Removes a binding from the specified mode.
+    pub fn remove_binding(&mut self, mode: Mode, input: InputEvent) {
+        let hash = hash_input(&self.hasher, input);
+        let table = self.table_for_mode_mut(mode);
+        if let Ok(entry) = table.find_entry(hash, |(k, _)| *k == input) {
+            entry.remove();
+        }
+    }
+
+    fn table_for_mode_mut(&mut self, mode: Mode) -> &mut BindingTable {
+        match mode {
             Mode::Global => &mut self.global,
             Mode::Input => &mut self.input,
             Mode::Pager => &mut self.pager,
@@ -435,59 +514,67 @@ impl Keybinds {
             Mode::LogSearch => &mut self.log_search,
             Mode::TaskLauncher => &mut self.task_launcher,
             Mode::TestFilterLauncher => &mut self.test_filter_launcher,
-        };
-        match command {
-            Some(cmd) => match table.find_mut(hash, |(k, _)| *k == input) {
-                Some(entry) => entry.1 = cmd,
-                None => {
-                    table.insert_unique(hash, (input, cmd), |(k, _)| hash_input(hasher, *k));
-                }
-            },
-            None => {
-                if let Ok(entry) = table.find_entry(hash, |(k, _)| *k == input) {
-                    entry.remove();
-                }
-            }
         }
     }
 
-    /// Looks up a command for the given input in the specified mode.
+    /// Looks up a binding entry for the given input in the specified mode.
     /// Falls back to global bindings if no mode-specific binding exists.
-    pub fn lookup(&self, mode: Mode, input: InputEvent) -> Option<Command> {
+    pub fn lookup_entry(&self, mode: Mode, input: InputEvent) -> Option<&BindingEntry> {
         if mode != Mode::Global
-            && let Some(cmd) = self.table_lookup(self.table_for_mode(mode), input)
+            && let Some(entry) = self.table_lookup(self.table_for_mode(mode), input)
         {
-            return Some(cmd);
+            return Some(entry);
         }
         self.table_lookup(&self.global, input)
+    }
+
+    /// Looks up a command for the given input (returns None for chain entries).
+    /// Falls back to global bindings if no mode-specific binding exists.
+    pub fn lookup(&self, mode: Mode, input: InputEvent) -> Option<Command> {
+        match self.lookup_entry(mode, input) {
+            Some(BindingEntry::Command(cmd)) => Some(cmd.clone()),
+            _ => None,
+        }
     }
 
     /// Looks up a command only in the specified mode (no fallback).
     #[expect(unused, reason = "kept for user config querying specific mode bindings")]
     pub fn lookup_mode_only(&self, mode: Mode, input: InputEvent) -> Option<Command> {
-        self.table_lookup(self.table_for_mode(mode), input)
+        match self.table_lookup(self.table_for_mode(mode), input) {
+            Some(BindingEntry::Command(cmd)) => Some(cmd.clone()),
+            _ => None,
+        }
     }
 
-    /// Looks up a command by searching through a chain of modes in order.
-    /// Returns the first matching command found.
-    pub fn lookup_chain(&self, modes: &[Mode], input: InputEvent) -> Option<Command> {
+    /// Looks up a binding entry by searching through a chain of modes in order.
+    /// Returns the first matching entry found.
+    pub fn lookup_entry_chain(&self, modes: &[Mode], input: InputEvent) -> Option<&BindingEntry> {
         let hash = hash_input(&self.hasher, input);
         for &mode in modes {
             let table = self.table_for_mode(mode);
-            if let Some((_, cmd)) = table.find(hash, |(k, _)| *k == input) {
-                return Some(cmd.clone());
+            if let Some((_, entry)) = table.find(hash, |(k, _)| *k == input) {
+                return Some(entry);
             }
         }
         None
     }
 
+    /// Looks up a command by searching through a chain of modes in order.
+    /// Returns the first matching command found (returns None for chain entries).
+    pub fn lookup_chain(&self, modes: &[Mode], input: InputEvent) -> Option<Command> {
+        match self.lookup_entry_chain(modes, input) {
+            Some(BindingEntry::Command(cmd)) => Some(cmd.clone()),
+            _ => None,
+        }
+    }
+
     /// Returns an iterator over all bindings in the global mode.
-    pub fn global_bindings(&self) -> impl Iterator<Item = (InputEvent, &Command)> + '_ {
+    pub fn global_bindings(&self) -> impl Iterator<Item = (InputEvent, &BindingEntry)> + '_ {
         self.global.iter().map(|(k, v)| (*k, v))
     }
 
     /// Returns an iterator over all bindings in a specific mode.
-    pub fn mode_bindings(&self, mode: Mode) -> impl Iterator<Item = (InputEvent, &Command)> + '_ {
+    pub fn mode_bindings(&self, mode: Mode) -> impl Iterator<Item = (InputEvent, &BindingEntry)> + '_ {
         self.table_for_mode(mode).iter().map(|(k, v)| (*k, v))
     }
 
@@ -502,8 +589,10 @@ impl Keybinds {
             .chain(self.select_search.iter())
             .chain(self.log_search.iter())
             .chain(self.task_launcher.iter())
-            .filter(|(_, cmd)| *cmd == *command)
-            .map(|(key, _)| *key)
+            .filter_map(|(key, entry)| match entry {
+                BindingEntry::Command(cmd) if cmd == command => Some(*key),
+                _ => None,
+            })
             .min()
     }
 }
@@ -617,6 +706,21 @@ mod tests {
         let key: InputEvent = "C-ENTER".parse().unwrap();
         assert!(key.modifiers().contains(KeyModifiers::CONTROL));
         assert!(key.named_key().is_some());
+    }
+
+    #[test]
+    fn space_key_parsing() {
+        let key: InputEvent = "SPACE".parse().unwrap();
+        assert_eq!(key.as_char(), Some(' '));
+        assert_eq!(key.to_string(), "SPACE");
+
+        let key: InputEvent = "C-SPACE".parse().unwrap();
+        assert_eq!(key.as_char(), Some(' '));
+        assert!(key.modifiers().contains(KeyModifiers::CONTROL));
+        assert_eq!(key.to_string(), "C-SPACE");
+
+        let err = " ".parse::<InputEvent>().unwrap_err();
+        assert!(err.contains("SPACE"), "error should mention SPACE: {}", err);
     }
 
     #[test]
