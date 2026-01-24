@@ -195,6 +195,10 @@ pub enum Command {
     RerunTestGroup,
     /// Narrow the test group by removing passed tests.
     NarrowTestGroup,
+    /// Jump to next failure in the test group.
+    NextFailInTestGroup,
+    /// Jump to previous failure in the test group.
+    PrevFailInTestGroup,
     /// Call a saved function by name.
     CallFunction(Box<str>),
     /// Set a saved function to capture current selection.
@@ -238,6 +242,8 @@ impl FromStr for Command {
             "RefreshConfig" => Command::RefreshConfig,
             "RerunTestGroup" => Command::RerunTestGroup,
             "NarrowTestGroup" => Command::NarrowTestGroup,
+            "NextFailInTestGroup" => Command::NextFailInTestGroup,
+            "PrevFailInTestGroup" => Command::PrevFailInTestGroup,
             "CallFunction1" => Command::CallFunction("fn1".into()),
             "CallFunction2" => Command::CallFunction("fn2".into()),
             _ => return Err(format!("Unknown command: `{s}`")),
@@ -448,6 +454,8 @@ impl Keybinds {
         self.bind(Mode::TaskTree, "t", Command::LaunchTestFilter);
         self.bind(Mode::TaskTree, "T", Command::RerunTestGroup);
         self.bind(Mode::TaskTree, "N", Command::NarrowTestGroup);
+        self.bind(Mode::TaskTree, "n", Command::NextFailInTestGroup);
+        self.bind(Mode::TaskTree, "p", Command::PrevFailInTestGroup);
     }
 
     /// Binds a key to a command in a specific mode.
@@ -630,6 +638,8 @@ impl Command {
             Command::RefreshConfig => "Refresh Config",
             Command::RerunTestGroup => "Rerun Tests",
             Command::NarrowTestGroup => "Narrow Tests",
+            Command::NextFailInTestGroup => "Next Fail",
+            Command::PrevFailInTestGroup => "Prev Fail",
             Command::CallFunction(name) if &**name == "fn1" => "Call fn1",
             Command::CallFunction(name) if &**name == "fn2" => "Call fn2",
             Command::CallFunction(_) => "Call Function",
@@ -671,6 +681,8 @@ impl Command {
             Command::RefreshConfig => "RefreshConfig",
             Command::RerunTestGroup => "RerunTestGroup",
             Command::NarrowTestGroup => "NarrowTestGroup",
+            Command::NextFailInTestGroup => "NextFailInTestGroup",
+            Command::PrevFailInTestGroup => "PrevFailInTestGroup",
             Command::CallFunction(name) if &**name == "fn1" => "CallFunction1",
             Command::CallFunction(name) if &**name == "fn2" => "CallFunction2",
             Command::CallFunction(_) => "CallFunction",

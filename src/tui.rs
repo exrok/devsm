@@ -362,7 +362,6 @@ fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData)
     r = r.with(block_style).fmt(frame, format_args!(" R:{} S:{} ", data.running, data.scheduled));
 
     if let Some(ts) = &data.test_summary {
-        let done = ts.passed + ts.failed;
         let test_style = if ts.running > 0 || ts.pending > 0 {
             Color::Cyan1.with_fg(Color::Black)
         } else if ts.failed > 0 {
@@ -371,9 +370,9 @@ fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData)
             Color::SpringGreen.with_fg(Color::Black)
         };
         if ts.running > 0 {
-            r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ({}) ", done, ts.total, ts.running));
+            r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ({}) ", ts.passed, ts.total, ts.running));
         } else {
-            r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ", done, ts.total));
+            r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ", ts.passed, ts.total));
         }
     }
 
@@ -875,6 +874,12 @@ fn process_key(
             Ok(count) => tui.status_message = Some(StatusMessage::info(format!("Narrowed to {} failed tests", count))),
             Err(e) => tui.status_message = Some(StatusMessage::error(e)),
         },
+        Command::NextFailInTestGroup => {
+            jump_to_fail_in_test_group(tui, workspace, true);
+        }
+        Command::PrevFailInTestGroup => {
+            jump_to_fail_in_test_group(tui, workspace, false);
+        }
     }
     ProcessKeyResult::Continue
 }
@@ -1003,6 +1008,57 @@ impl std::ops::BitOrAssign for Has {
     fn bitor_assign(&mut self, rhs: Self) {
         *self = Has(self.0 | rhs.0)
     }
+}
+
+fn jump_to_fail_in_test_group(tui: &mut TuiState, workspace: &Workspace, forward: bool) {
+    let ws = workspace.state();
+    let Some(test_group) = &ws.last_test_group else {
+        tui.status_message = Some(StatusMessage::error("No test group"));
+        return;
+    };
+
+    let failed_indices: Vec<usize> = test_group
+        .job_indices
+        .iter()
+        .enumerate()
+        .filter(|&(_, ji)| {
+            let Some(job) = ws.jobs.get(ji.idx()) else { return false };
+            matches!(&job.process_status, crate::workspace::JobStatus::Exited { status, .. } if *status != 0)
+                || matches!(&job.process_status, crate::workspace::JobStatus::Cancelled)
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    if failed_indices.is_empty() {
+        tui.status_message = Some(StatusMessage::error("No failures in test group"));
+        return;
+    }
+
+    let current_job = tui.task_tree.selection_state_readonly(&ws).and_then(|s| s.job);
+    let current_pos = current_job.and_then(|cj| test_group.job_indices.iter().position(|&ji| ji == cj));
+
+    let next_fail_idx = if forward {
+        match current_pos {
+            Some(pos) => failed_indices.iter().find(|&&i| i > pos).or(failed_indices.first()),
+            None => failed_indices.first(),
+        }
+    } else {
+        match current_pos {
+            Some(pos) => failed_indices.iter().rev().find(|&&i| i < pos).or(failed_indices.last()),
+            None => failed_indices.last(),
+        }
+    };
+
+    let Some(&fail_idx) = next_fail_idx else {
+        tui.status_message = Some(StatusMessage::error("No failures in test group"));
+        return;
+    };
+
+    let job_index = test_group.job_indices[fail_idx];
+    tui.task_tree.select_test_group_job(job_index, &ws);
+
+    let fail_num = failed_indices.iter().position(|&i| i == fail_idx).unwrap_or(0) + 1;
+    tui.status_message = Some(StatusMessage::info(format!("Failure {}/{}", fail_num, failed_indices.len())));
 }
 
 fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {

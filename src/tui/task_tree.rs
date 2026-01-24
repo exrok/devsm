@@ -47,6 +47,7 @@ enum StatusKind {
     Done,
     Dead,
     Fail,
+    Pass,
 }
 
 impl StatusKind {
@@ -60,7 +61,8 @@ impl StatusKind {
                 if *status == 0 {
                     match kind {
                         TaskKind::Service => StatusKind::Dead,
-                        TaskKind::Action | TaskKind::Test => StatusKind::Done,
+                        TaskKind::Action => StatusKind::Done,
+                        TaskKind::Test => StatusKind::Pass,
                     }
                 } else {
                     StatusKind::Fail
@@ -75,13 +77,12 @@ impl StatusKind {
         match self {
             Null => Color::Grey[17],
             Wait => Color::Violet,
-            // Live => Color::SpringGreen,
             Live => Color::DarkOliveGreen,
             Skip => Color::LightGoldenrod2,
             Done => Color(110),
-            // Dead => Color::LightGoldenrod2,
             Dead => Color(215),
             Fail => Color::NeonRed,
+            Pass => Color::SpringGreen,
         }
     }
     fn light_bg(self) -> Color {
@@ -94,6 +95,7 @@ impl StatusKind {
             Done => Color(153),
             Dead => Color(223),
             Fail => Color::MistyRose,
+            Pass => Color(157),
         }
     }
     fn padded_text(&self) -> &str {
@@ -106,6 +108,7 @@ impl StatusKind {
             Done => " Done ",
             Fail => " Fail ",
             Dead => " Dead ",
+            Pass => " Pass ",
         }
     }
 }
@@ -427,6 +430,27 @@ impl TaskTreeState {
             None => return,
         };
         let jobs = self.get_job_list(ws, entry);
+        for (i, &ji) in jobs.iter().enumerate() {
+            if ji == job_index {
+                self.job_list_index = i;
+                self.job_index = Some(job_index);
+                return;
+            }
+        }
+    }
+
+    pub fn select_test_group_job(&mut self, job_index: JobIndex, ws: &WorkspaceState) {
+        if self.selected_entry != Some(PrimaryEntry::MetaGroup(MetaGroupKind::Tests)) {
+            for (i, entry) in self.primary_list.iter().enumerate() {
+                if *entry == PrimaryEntry::MetaGroup(MetaGroupKind::Tests) {
+                    self.primary_index = i;
+                    self.selected_entry = Some(*entry);
+                    break;
+                }
+            }
+        }
+
+        let jobs = ws.jobs_by_kind(crate::config::TaskKind::Test);
         for (i, &ji) in jobs.iter().enumerate() {
             if ji == job_index {
                 self.job_list_index = i;
