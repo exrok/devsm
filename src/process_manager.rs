@@ -1,10 +1,7 @@
-use crate::config::FunctionDefAction;
-use crate::function::FunctionAction;
 use crate::rpc::{DecodeResult, DecodingState, RpcMessageKind};
 use crate::workspace::{self, ExitCause, JobIndex, JobStatus, Workspace, WorkspaceState};
 use crate::{
     config::{Command, TaskConfigRc, TaskKind},
-    daemon::WorkspaceCommand,
     line_width::{Segment, apply_raw_display_mode_vt_to_style},
     log_storage::{LogGroup, LogWriter},
 };
@@ -501,11 +498,20 @@ pub(crate) enum AttachKind {
     Logs { query: Vec<u8> },
 }
 
+pub(crate) enum ReceivedFds {
+    None,
+    Pair([File; 2]),
+    Single(File),
+}
+
 pub(crate) enum ProcessRequest {
-    WorkspaceCommand {
-        workspace_config: PathBuf,
+    RpcMessage {
         socket: UnixStream,
-        command: Vec<u8>,
+        fds: ReceivedFds,
+        kind: crate::rpc::RpcMessageKind,
+        correlation: u16,
+        one_shot: bool,
+        payload: Vec<u8>,
     },
     Spawn {
         task: TaskConfigRc,
@@ -664,282 +670,8 @@ impl ProcessManager {
         self.workspace_map.insert(workspace_config.to_path_buf().into_boxed_path(), index);
         Ok(index)
     }
-    fn handle_workspace_command(&mut self, ws_index: u32, cmd: &[u8], mut socket: UnixStream) {
-        match jsony::from_binary::<WorkspaceCommand>(cmd).unwrap() {
-            WorkspaceCommand::RestartSelected => {
-                let ws = &self.workspaces[ws_index as usize];
-                let mut found_client = false;
-                let mut error: Option<&str> = None;
-                for (_, client) in &self.clients {
-                    if client.workspace != ws_index {
-                        continue;
-                    }
-                    found_client = true;
-                    let selected = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
-                    if selected & SELECTED_META_GROUP_FLAG != 0 {
-                        let kind = match selected {
-                            SELECTED_META_GROUP_TESTS => TaskKind::Test,
-                            SELECTED_META_GROUP_ACTIONS => TaskKind::Action,
-                            _ => {
-                                error = Some("invalid meta-group selection");
-                                break;
-                            }
-                        };
-                        let ws_state = ws.handle.state();
-                        let jobs = ws_state.jobs_by_kind(kind);
-                        let Some(&last_ji) = jobs.last() else {
-                            error = Some("no jobs in selected meta-group");
-                            break;
-                        };
-                        let job = &ws_state[last_ji];
-                        let bti = job.log_group.base_task_index();
-                        let params = job.spawn_params.clone();
-                        let profile = job.spawn_profile.clone();
-                        drop(ws_state);
-                        ws.handle.restart_task(bti, params, &profile);
-                    } else {
-                        let bti = workspace::BaseTaskIndex(selected as u32);
-                        let ws_state = ws.handle.state();
-                        let Some(bt) = ws_state.base_tasks.get(bti.idx()) else {
-                            error = Some("selected task no longer exists");
-                            break;
-                        };
-                        if let Some(&last_ji) = bt.jobs.all().last() {
-                            let job = &ws_state[last_ji];
-                            let params = job.spawn_params.clone();
-                            let profile = job.spawn_profile.clone();
-                            drop(ws_state);
-                            ws.handle.restart_task(bti, params, &profile);
-                        } else {
-                            drop(ws_state);
-                            ws.handle.restart_task(bti, ValueMap::new(), "");
-                        }
-                    }
-                    break;
-                }
-                let response = if let Some(err) = error {
-                    format!("{{\"error\":\"{err}\"}}")
-                } else if !found_client {
-                    "{\"error\":\"no active TUI session\"}".to_string()
-                } else {
-                    "{}".to_string()
-                };
-                let _ = socket.write_all(response.as_bytes());
-            }
-            WorkspaceCommand::GetPanicLocation => {
-                let response = jsony::to_json(&self.workspaces[ws_index as usize].handle.last_rust_panic());
-                let _ = socket.write_all(response.as_bytes());
-            }
-            WorkspaceCommand::GetLoggedRustPanics => {
-                let response = jsony::to_json(&self.workspaces[ws_index as usize].handle.logged_rust_panics());
-                let _ = socket.write_all(response.as_bytes());
-            }
-            WorkspaceCommand::Run { name, params, as_test } => {
-                let ws = &self.workspaces[ws_index as usize];
-                let mut state = ws.handle.state.write().unwrap();
-                let (name, profile) = name.rsplit_once(":").unwrap_or((&*name, ""));
-                let Some(base_index) = state.base_index_by_name(name) else {
-                    let _ = socket.write_all(format!("error: task '{}' not found\n", name).as_bytes());
-                    return;
-                };
-                drop(state);
-                let job_index = ws.handle.restart_task(base_index, params, profile);
-                if as_test {
-                    let mut state = ws.handle.state.write().unwrap();
-                    let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
-                    state.last_test_group = Some(workspace::TestGroup {
-                        group_id,
-                        base_tasks: vec![base_index],
-                        job_indices: vec![job_index],
-                    });
-                }
-            }
-            WorkspaceCommand::CallFunction { name } => {
-                let ws = &self.workspaces[ws_index as usize];
-                let mut state = ws.handle.state.write().unwrap();
-
-                if let Some(FunctionAction::RestartCaptured { task_name, profile }) =
-                    state.session_functions.get(&*name).cloned()
-                {
-                    if let Some(index) = state.base_index_by_name(&task_name) {
-                        drop(state);
-                        ws.handle.restart_task(index, ValueMap::new(), &profile);
-                        let _ = socket.write_all(b"ok\n");
-                    } else {
-                        let _ = socket.write_all(format!("error: task '{}' not found\n", task_name).as_bytes());
-                    }
-                    return;
-                }
-
-                for func_def in state.config.current.functions {
-                    if func_def.name == &*name {
-                        match &func_def.action {
-                            FunctionDefAction::Restart { task } => {
-                                let task_name = *task;
-                                if let Some(index) = state.base_index_by_name(task_name) {
-                                    drop(state);
-                                    ws.handle.restart_task(index, ValueMap::new(), "");
-                                    let _ = socket.write_all(b"ok\n");
-                                } else {
-                                    let _ =
-                                        socket.write_all(format!("error: task '{}' not found\n", task_name).as_bytes());
-                                }
-                            }
-                            FunctionDefAction::Kill { task } => {
-                                let task_name = *task;
-                                if let Some(index) = state.base_index_by_name(task_name) {
-                                    drop(state);
-                                    ws.handle.terminate_tasks(index);
-                                    let _ = socket.write_all(b"ok\n");
-                                } else {
-                                    let _ =
-                                        socket.write_all(format!("error: task '{}' not found\n", task_name).as_bytes());
-                                }
-                            }
-                            FunctionDefAction::Spawn { tasks } => {
-                                drop(state);
-                                for call in *tasks {
-                                    let mut state = ws.handle.state.write().unwrap();
-                                    if let Some(index) = state.base_index_by_name(&*call.name) {
-                                        let profile = call.profile.unwrap_or("");
-                                        drop(state);
-                                        ws.handle.restart_task(index, call.vars.clone(), profile);
-                                    }
-                                }
-                                let _ = socket.write_all(b"ok\n");
-                            }
-                        }
-                        return;
-                    }
-                }
-
-                if let Some(FunctionAction::RestartSelected) = state.session_functions.get(&*name) {
-                    drop(state);
-                    let mut found_client = false;
-                    let mut error: Option<&str> = None;
-                    for (_, client) in &self.clients {
-                        if client.workspace != ws_index {
-                            continue;
-                        }
-                        found_client = true;
-                        let selected = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
-                        if selected & SELECTED_META_GROUP_FLAG != 0 {
-                            let kind = match selected {
-                                SELECTED_META_GROUP_TESTS => TaskKind::Test,
-                                SELECTED_META_GROUP_ACTIONS => TaskKind::Action,
-                                _ => {
-                                    error = Some("invalid meta-group selection");
-                                    break;
-                                }
-                            };
-                            let ws_state = ws.handle.state();
-                            let jobs = ws_state.jobs_by_kind(kind);
-                            let Some(&last_ji) = jobs.last() else {
-                                error = Some("no jobs in selected meta-group");
-                                break;
-                            };
-                            let job = &ws_state[last_ji];
-                            let bti = job.log_group.base_task_index();
-                            let params = job.spawn_params.clone();
-                            let profile = job.spawn_profile.clone();
-                            drop(ws_state);
-                            ws.handle.restart_task(bti, params, &profile);
-                        } else {
-                            let bti = workspace::BaseTaskIndex(selected as u32);
-                            let ws_state = ws.handle.state();
-                            let Some(bt) = ws_state.base_tasks.get(bti.idx()) else {
-                                error = Some("selected task no longer exists");
-                                break;
-                            };
-                            if let Some(&last_ji) = bt.jobs.all().last() {
-                                let job = &ws_state[last_ji];
-                                let params = job.spawn_params.clone();
-                                let profile = job.spawn_profile.clone();
-                                drop(ws_state);
-                                ws.handle.restart_task(bti, params, &profile);
-                            } else {
-                                drop(ws_state);
-                                ws.handle.restart_task(bti, ValueMap::new(), "");
-                            }
-                        }
-                        break;
-                    }
-                    if let Some(err) = error {
-                        let _ = socket.write_all(format!("error: {}\n", err).as_bytes());
-                    } else if !found_client {
-                        let _ = socket.write_all(b"error: no active TUI session\n");
-                    } else {
-                        let _ = socket.write_all(b"ok\n");
-                    }
-                    return;
-                }
-
-                let _ = socket.write_all(format!("error: function '{}' not configured\n", name).as_bytes());
-            }
-            WorkspaceCommand::Kill { name } => {
-                let ws = &self.workspaces[ws_index as usize];
-                let mut state = ws.handle.state.write().unwrap();
-
-                let index = if let Ok(job_index) = name.parse::<u32>() {
-                    let bti = workspace::BaseTaskIndex(job_index);
-                    if state.base_tasks.get(bti.idx()).is_some() { Some(bti) } else { None }
-                } else {
-                    state.base_index_by_name(&name)
-                };
-
-                let Some(index) = index else {
-                    let _ = socket.write_all(format!("error: task '{}' not found\n", name).as_bytes());
-                    return;
-                };
-
-                let bt = &state.base_tasks[index.idx()];
-                let has_non_terminal = bt
-                    .jobs
-                    .non_terminal()
-                    .iter()
-                    .any(|ji| matches!(state.jobs[ji.idx()].process_status, JobStatus::Running { .. }));
-
-                if !has_non_terminal {
-                    let _ = socket.write_all(format!("Task '{}' was already finished\n", bt.name).as_bytes());
-                    return;
-                }
-
-                let task_name = bt.name.to_string();
-                drop(state);
-                ws.handle.terminate_tasks(index);
-                let _ = socket.write_all(format!("Task '{}' terminated\n", task_name).as_bytes());
-            }
-            WorkspaceCommand::RerunTests { only_failed } => {
-                let ws = &self.workspaces[ws_index as usize];
-                match ws.handle.rerun_test_group(only_failed) {
-                    Ok(_) => {
-                        let _ = socket.write_all(b"Rerunning tests\n");
-                    }
-                    Err(e) => {
-                        let _ = socket.write_all(format!("error: {}\n", e).as_bytes());
-                    }
-                }
-            }
-        }
-    }
     fn handle_request(&mut self, req: ProcessRequest) -> bool {
         match req {
-            ProcessRequest::WorkspaceCommand { workspace_config, mut socket, command } => {
-                let ws_index = match self.workspace_index(workspace_config) {
-                    Ok(ws) => ws,
-                    Err(err) => {
-                        kvlog::info!("Error spawning workspace", %err);
-                        if let Some(config_err) = err.downcast_ref::<crate::config::ConfigError>() {
-                            let _ = socket.write_all(config_err.message.as_bytes());
-                        } else {
-                            let _ = socket.write_all(format!("error: {}\n", err).as_bytes());
-                        }
-                        return false;
-                    }
-                };
-                self.handle_workspace_command(ws_index, &command, socket);
-                false
-            }
             ProcessRequest::TerminateJob { job_id, process_index, exit_cause } => {
                 let Some(process) = self.processes.get_mut(process_index) else {
                     return false;
@@ -1171,7 +903,334 @@ impl ProcessManager {
                 }
                 false
             }
+            ProcessRequest::RpcMessage { socket, fds, kind, correlation, one_shot, payload } => {
+                self.handle_rpc_request(socket, fds, kind, correlation, one_shot, &payload);
+                false
+            }
         }
+    }
+
+    fn handle_rpc_request(
+        &mut self,
+        mut socket: UnixStream,
+        fds: ReceivedFds,
+        kind: crate::rpc::RpcMessageKind,
+        correlation: u16,
+        one_shot: bool,
+        payload: &[u8],
+    ) {
+        use crate::rpc::{self, CommandBody, CommandResponse, RpcMessageKind, WorkspaceRef};
+
+        let mut encoder = rpc::Encoder::new();
+        let persist_ws: WorkspaceIndex;
+
+        macro_rules! respond {
+            ($ws:expr, $body:expr) => {{
+                encoder.encode_response(
+                    RpcMessageKind::CommandAck,
+                    correlation,
+                    &CommandResponse { workspace_id: $ws, body: $body },
+                );
+                let _ = socket.write_all(encoder.output());
+                #[allow(unused_assignments)]
+                {
+                    persist_ws = $ws;
+                }
+            }};
+        }
+
+        macro_rules! respond_ok {
+            ($ws:expr) => {
+                respond!($ws, CommandBody::Empty)
+            };
+            ($ws:expr, $msg:expr) => {
+                respond!($ws, CommandBody::Message($msg.into()))
+            };
+        }
+
+        macro_rules! respond_err {
+            ($ws:expr, $err:expr) => {
+                respond!($ws, CommandBody::Error($err.into()))
+            };
+        }
+
+        macro_rules! parse {
+            ($kind:ident) => {
+                match jsony::from_binary::<rpc::$kind>(payload) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        respond_err!(0, format!("Invalid request payload: {:?}", err));
+                        return;
+                    }
+                }
+            };
+        }
+
+        macro_rules! resolve {
+            ($ws_ref:expr) => {
+                match &$ws_ref {
+                    WorkspaceRef::Id(id) => {
+                        if (*id as usize) < self.workspaces.len() {
+                            *id
+                        } else {
+                            respond_err!(0, format!("Invalid workspace ID: {}", id));
+                            return;
+                        }
+                    }
+                    WorkspaceRef::Path { config } => match self.workspace_index(config.to_path_buf()) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            respond_err!(0, e.to_string());
+                            return;
+                        }
+                    },
+                }
+            };
+        }
+
+        match kind {
+            RpcMessageKind::RestartTask => {
+                let req = parse!(RestartTaskRequest);
+                let ws_index = resolve!(req.workspace);
+                let ws = &self.workspaces[ws_index as usize];
+                let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
+
+                let result = if req.as_test {
+                    ws.handle.restart_task_as_test(req.task_name, params, req.profile)
+                } else {
+                    ws.handle.restart_task_by_name(req.task_name, params, req.profile).map(|_| ())
+                };
+
+                match result {
+                    Ok(()) => respond_ok!(ws_index),
+                    Err(e) => respond_err!(ws_index, e),
+                }
+            }
+            RpcMessageKind::KillTask => {
+                let req = parse!(KillTaskRequest);
+                let ws_index = resolve!(req.workspace);
+                let ws = &self.workspaces[ws_index as usize];
+
+                match ws.handle.terminate_task_by_name(req.task_name) {
+                    Ok(msg) => respond_ok!(ws_index, msg),
+                    Err(e) => respond_err!(ws_index, e),
+                }
+            }
+            RpcMessageKind::RerunTests => {
+                let req = parse!(RerunTestsRequest);
+                let ws_index = resolve!(req.workspace);
+
+                let ws = &self.workspaces[ws_index as usize];
+                match ws.handle.rerun_test_group(req.only_failed) {
+                    Ok(_) => respond_ok!(ws_index, "Rerunning tests"),
+                    Err(e) => respond_err!(ws_index, e.to_string()),
+                }
+            }
+            RpcMessageKind::CallFunction => {
+                let req = parse!(CallFunctionRequest);
+                let ws_index = resolve!(req.workspace);
+                let ws = &self.workspaces[ws_index as usize];
+
+                match ws.handle.call_function(req.function_name) {
+                    Ok(msg) => respond_ok!(ws_index, msg),
+                    Err(e) => respond_err!(ws_index, e),
+                }
+            }
+            RpcMessageKind::RestartSelected => {
+                let req = parse!(RestartSelectedRequest);
+                let ws_index = resolve!(req.workspace);
+
+                let ws = &self.workspaces[ws_index as usize];
+                let mut found_client = false;
+                let mut error: Option<&str> = None;
+
+                for (_, client) in &self.clients {
+                    if client.workspace != ws_index {
+                        continue;
+                    }
+                    found_client = true;
+                    let selected = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
+                    if selected & SELECTED_META_GROUP_FLAG != 0 {
+                        let kind = match selected {
+                            SELECTED_META_GROUP_TESTS => TaskKind::Test,
+                            SELECTED_META_GROUP_ACTIONS => TaskKind::Action,
+                            _ => {
+                                error = Some("invalid meta-group selection");
+                                break;
+                            }
+                        };
+                        let ws_state = ws.handle.state();
+                        let jobs = ws_state.jobs_by_kind(kind);
+                        let Some(&last_ji) = jobs.last() else {
+                            error = Some("no jobs in selected meta-group");
+                            break;
+                        };
+                        let job = &ws_state[last_ji];
+                        let bti = job.log_group.base_task_index();
+                        let params = job.spawn_params.clone();
+                        let profile = job.spawn_profile.clone();
+                        drop(ws_state);
+                        ws.handle.restart_task(bti, params, &profile);
+                    } else {
+                        let bti = workspace::BaseTaskIndex(selected as u32);
+                        let ws_state = ws.handle.state();
+                        let Some(bt) = ws_state.base_tasks.get(bti.idx()) else {
+                            error = Some("selected task no longer exists");
+                            break;
+                        };
+                        if let Some(&last_ji) = bt.jobs.all().last() {
+                            let job = &ws_state[last_ji];
+                            let params = job.spawn_params.clone();
+                            let profile = job.spawn_profile.clone();
+                            drop(ws_state);
+                            ws.handle.restart_task(bti, params, &profile);
+                        } else {
+                            drop(ws_state);
+                            ws.handle.restart_task(bti, ValueMap::new(), "");
+                        }
+                    }
+                    break;
+                }
+
+                if let Some(err) = error {
+                    respond_err!(ws_index, err);
+                } else if !found_client {
+                    respond_err!(ws_index, "no active TUI session");
+                } else {
+                    respond_ok!(ws_index);
+                }
+            }
+            RpcMessageKind::GetLoggedRustPanics => {
+                let req = parse!(GetLoggedRustPanicsRequest);
+                let ws_index = resolve!(req.workspace);
+
+                let response = jsony::to_json(&self.workspaces[ws_index as usize].handle.logged_rust_panics());
+                respond_ok!(ws_index, response);
+            }
+            RpcMessageKind::AttachTui => {
+                let Ok(req) = jsony::from_binary::<rpc::AttachTuiRequest>(payload) else {
+                    kvlog::error!("Invalid AttachTui request payload");
+                    return;
+                };
+                let ws_index = resolve!(req.workspace);
+
+                let ReceivedFds::Pair([stdin, stdout]) = fds else {
+                    kvlog::error!("TUI client requires 2 FDs");
+                    return;
+                };
+
+                self.attach_tui_client(stdin, stdout, socket, ws_index);
+                return;
+            }
+            RpcMessageKind::AttachRun => {
+                let Ok(req) = jsony::from_binary::<rpc::AttachRunRequest>(payload) else {
+                    kvlog::error!("Invalid AttachRun request payload");
+                    return;
+                };
+                let ws_index = resolve!(req.workspace);
+
+                let ReceivedFds::Pair([stdin, stdout]) = fds else {
+                    kvlog::error!("Run client requires 2 FDs");
+                    return;
+                };
+
+                self.attach_run_client(
+                    stdin,
+                    stdout,
+                    socket,
+                    ws_index,
+                    req.task_name,
+                    req.params.to_vec(),
+                    req.as_test,
+                );
+                return;
+            }
+            RpcMessageKind::AttachTests => {
+                let Ok(req) = jsony::from_binary::<rpc::AttachTestsRequest>(payload) else {
+                    kvlog::error!("Invalid AttachTests request payload");
+                    return;
+                };
+                let ws_index = resolve!(req.workspace);
+
+                let ReceivedFds::Pair([stdin, stdout]) = fds else {
+                    kvlog::error!("Test client requires 2 FDs");
+                    return;
+                };
+
+                self.attach_test_run_client(stdin, stdout, socket, ws_index, jsony::to_binary(&req.filters));
+                return;
+            }
+            RpcMessageKind::AttachLogs => {
+                let Ok(req) = jsony::from_binary::<rpc::AttachLogsRequest>(payload) else {
+                    kvlog::error!("Invalid AttachLogs request payload");
+                    return;
+                };
+                let ws_index = resolve!(req.workspace);
+
+                let ReceivedFds::Pair([stdin, stdout]) = fds else {
+                    kvlog::error!("Logs client requires 2 FDs");
+                    return;
+                };
+
+                self.attach_logs_client(stdin, stdout, socket, ws_index, jsony::to_binary(&req.query));
+                return;
+            }
+            RpcMessageKind::GetSelfLogs => {
+                let Ok(req) = jsony::from_binary::<rpc::GetSelfLogsRequest>(payload) else {
+                    kvlog::error!("Invalid GetSelfLogs request payload");
+                    return;
+                };
+
+                if req.follow {
+                    let ReceivedFds::Single(stdout) = fds else {
+                        kvlog::error!("GetSelfLogs follow requires 1 FD");
+                        return;
+                    };
+                    self.attach_self_logs_client(stdout, socket);
+                    return;
+                }
+
+                let logs = crate::self_log::get_daemon_logs().unwrap_or_default();
+                let _ = socket.write_all(&logs);
+                return;
+            }
+            _ => {
+                kvlog::warn!("Unhandled RPC message kind in handle_rpc_request", ?kind);
+                respond_err!(0, "Unsupported command");
+                return;
+            }
+        }
+
+        // For non-Attach commands that didn't consume the socket, check if we should keep it open
+        // Attach* commands move the socket and return early, so this code won't run for them
+        if !one_shot {
+            self.register_rpc_client(socket, persist_ws);
+        }
+    }
+
+    fn register_rpc_client(&mut self, socket: UnixStream, ws_index: WorkspaceIndex) {
+        let channel = Arc::new(ClientChannel {
+            waker: extui::event::polling::Waker::new().unwrap(),
+            events: Mutex::new(Vec::new()),
+            selected: AtomicU64::new(0),
+            state: AtomicU64::new(0),
+        });
+        let next = self.clients.vacant_key();
+        let _ = self.poll.registry().register(
+            &mut SourceFd(&socket.as_raw_fd()),
+            TokenHandle::Client(next as u32).into(),
+            Interest::READABLE,
+        );
+        let _ = socket.set_nonblocking(true);
+        let client_entry = ClientEntry {
+            channel,
+            workspace: ws_index,
+            socket,
+            kind: ClientKind::Rpc { subscriptions: RpcSubscriptions::default() },
+            partial_rpc_read: None,
+        };
+        self.clients.insert(client_entry);
+        kvlog::info!("Registered persistent RPC client", ws_index);
     }
 
     fn attach_tui_client(&mut self, stdin: File, stdout: File, socket: UnixStream, ws_index: WorkspaceIndex) {
@@ -1571,7 +1630,7 @@ impl ProcessManager {
 
         loop {
             match state.decode(&buffer) {
-                DecodeResult::Message { kind, correlation, payload } => {
+                DecodeResult::Message { kind, correlation, payload, .. } => {
                     self.handle_rpc_message(client_index, ws_index, kind, correlation, payload, &mut encoder);
                 }
                 DecodeResult::MissingData { .. } => break,
@@ -1686,10 +1745,186 @@ impl ProcessManager {
                     &crate::rpc::OpenWorkspaceResponse { success: true, error: None },
                 );
             }
+            RpcMessageKind::RestartTask => {
+                self.handle_rpc_restart_task(ws_index, correlation, payload, encoder);
+            }
+            RpcMessageKind::KillTask => {
+                self.handle_rpc_kill_task(ws_index, correlation, payload, encoder);
+            }
+            RpcMessageKind::RerunTests => {
+                self.handle_rpc_rerun_tests(ws_index, correlation, payload, encoder);
+            }
+            RpcMessageKind::CallFunction => {
+                self.handle_rpc_call_function(ws_index, correlation, payload, encoder);
+            }
+            RpcMessageKind::GetLoggedRustPanics => {
+                self.handle_rpc_get_logged_rust_panics(ws_index, correlation, payload, encoder);
+            }
             _ => {
                 kvlog::warn!("Unexpected RPC message kind from client", ?kind);
             }
         }
+    }
+
+    fn handle_rpc_restart_task(
+        &mut self,
+        ws_index: WorkspaceIndex,
+        correlation: u16,
+        payload: &[u8],
+        encoder: &mut crate::rpc::Encoder,
+    ) {
+        use crate::rpc::{CommandBody, CommandResponse, RestartTaskRequest, RpcMessageKind};
+
+        let Ok(req) = jsony::from_binary::<RestartTaskRequest>(payload) else {
+            encoder.encode_response(
+                RpcMessageKind::CommandAck,
+                correlation,
+                &CommandResponse { workspace_id: ws_index, body: CommandBody::Error("Invalid request payload".into()) },
+            );
+            return;
+        };
+
+        let ws = &self.workspaces[ws_index as usize];
+        let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
+
+        let result = if req.as_test {
+            ws.handle.restart_task_as_test(req.task_name, params, req.profile)
+        } else {
+            ws.handle.restart_task_by_name(req.task_name, params, req.profile).map(|_| ())
+        };
+
+        let body = match result {
+            Ok(()) => CommandBody::Empty,
+            Err(e) => CommandBody::Error(e.into()),
+        };
+        encoder.encode_response(
+            RpcMessageKind::CommandAck,
+            correlation,
+            &CommandResponse { workspace_id: ws_index, body },
+        );
+    }
+
+    fn handle_rpc_kill_task(
+        &mut self,
+        ws_index: WorkspaceIndex,
+        correlation: u16,
+        payload: &[u8],
+        encoder: &mut crate::rpc::Encoder,
+    ) {
+        use crate::rpc::{CommandBody, CommandResponse, KillTaskRequest, RpcMessageKind};
+
+        let Ok(req) = jsony::from_binary::<KillTaskRequest>(payload) else {
+            encoder.encode_response(
+                RpcMessageKind::CommandAck,
+                correlation,
+                &CommandResponse { workspace_id: ws_index, body: CommandBody::Error("Invalid request payload".into()) },
+            );
+            return;
+        };
+
+        let ws = &self.workspaces[ws_index as usize];
+        let body = match ws.handle.terminate_task_by_name(req.task_name) {
+            Ok(msg) => CommandBody::Message(msg.into()),
+            Err(e) => CommandBody::Error(e.into()),
+        };
+        encoder.encode_response(
+            RpcMessageKind::CommandAck,
+            correlation,
+            &CommandResponse { workspace_id: ws_index, body },
+        );
+    }
+
+    fn handle_rpc_rerun_tests(
+        &mut self,
+        ws_index: WorkspaceIndex,
+        correlation: u16,
+        payload: &[u8],
+        encoder: &mut crate::rpc::Encoder,
+    ) {
+        use crate::rpc::{CommandBody, CommandResponse, RerunTestsRequest, RpcMessageKind};
+
+        let Ok(req) = jsony::from_binary::<RerunTestsRequest>(payload) else {
+            encoder.encode_response(
+                RpcMessageKind::CommandAck,
+                correlation,
+                &CommandResponse { workspace_id: ws_index, body: CommandBody::Error("Invalid request payload".into()) },
+            );
+            return;
+        };
+
+        let ws = &self.workspaces[ws_index as usize];
+        match ws.handle.rerun_test_group(req.only_failed) {
+            Ok(_) => {
+                encoder.encode_response(
+                    RpcMessageKind::CommandAck,
+                    correlation,
+                    &CommandResponse { workspace_id: ws_index, body: CommandBody::Message("Rerunning tests".into()) },
+                );
+            }
+            Err(e) => {
+                encoder.encode_response(
+                    RpcMessageKind::CommandAck,
+                    correlation,
+                    &CommandResponse { workspace_id: ws_index, body: CommandBody::Error(e.to_string().into()) },
+                );
+            }
+        }
+    }
+
+    fn handle_rpc_call_function(
+        &mut self,
+        ws_index: WorkspaceIndex,
+        correlation: u16,
+        payload: &[u8],
+        encoder: &mut crate::rpc::Encoder,
+    ) {
+        use crate::rpc::{CallFunctionRequest, CommandBody, CommandResponse, RpcMessageKind};
+
+        let Ok(req) = jsony::from_binary::<CallFunctionRequest>(payload) else {
+            encoder.encode_response(
+                RpcMessageKind::CommandAck,
+                correlation,
+                &CommandResponse { workspace_id: ws_index, body: CommandBody::Error("Invalid request payload".into()) },
+            );
+            return;
+        };
+
+        let ws = &self.workspaces[ws_index as usize];
+        let body = match ws.handle.call_function(req.function_name) {
+            Ok(msg) => CommandBody::Message(msg.into()),
+            Err(e) => CommandBody::Error(e.into()),
+        };
+        encoder.encode_response(
+            RpcMessageKind::CommandAck,
+            correlation,
+            &CommandResponse { workspace_id: ws_index, body },
+        );
+    }
+
+    fn handle_rpc_get_logged_rust_panics(
+        &mut self,
+        ws_index: WorkspaceIndex,
+        correlation: u16,
+        payload: &[u8],
+        encoder: &mut crate::rpc::Encoder,
+    ) {
+        use crate::rpc::{CommandBody, CommandResponse, GetLoggedRustPanicsRequest, RpcMessageKind};
+
+        let Ok(_req) = jsony::from_binary::<GetLoggedRustPanicsRequest>(payload) else {
+            encoder.encode_response(
+                RpcMessageKind::CommandAck,
+                correlation,
+                &CommandResponse { workspace_id: ws_index, body: CommandBody::Error("Invalid request payload".into()) },
+            );
+            return;
+        };
+
+        let response = jsony::to_json(&self.workspaces[ws_index as usize].handle.logged_rust_panics());
+        encoder.encode_response(
+            RpcMessageKind::CommandAck,
+            correlation,
+            &CommandResponse { workspace_id: ws_index, body: CommandBody::Message(response.into()) },
+        );
     }
 
     fn terminate_client(&mut self, client_index: ClientIndex) {

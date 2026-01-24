@@ -7,6 +7,17 @@
 
 use jsony::Jsony;
 
+pub(crate) mod unix_path {
+    use jsony::{BytesWriter, FromBinary, ToBinary};
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::Path};
+    pub fn encode_binary(value: &Path, output: &mut BytesWriter) {
+        value.as_os_str().as_bytes().encode_binary(output);
+    }
+    pub fn decode_binary<'a>(decoder: &mut jsony::binary::Decoder<'a>) -> &'a Path {
+        Path::new(OsStr::from_bytes(<&'a [u8]>::decode_binary(decoder)))
+    }
+}
+
 /// Protocol magic number identifying devsm RPC messages.
 pub const MAGIC: u32 = 0xDE75_0001;
 
@@ -16,9 +27,22 @@ pub const HEAD_SIZE: usize = 12;
 /// Default maximum payload size (64KB).
 pub const DEFAULT_MAX_PAYLOAD: usize = 64 * 1024;
 
+/// Flag bit in correlation field indicating one-shot mode.
+///
+/// When set, the command executes synchronously without mio registration,
+/// and the socket closes immediately after the response.
+pub const ONE_SHOT_FLAG: u16 = 1 << 15;
+
+/// Mask for extracting correlation ID (bits 0-14).
+pub const CORRELATION_MASK: u16 = 0x7FFF;
+
 /// Message header for the RPC protocol.
 ///
 /// The header is 12 bytes in little-endian format and precedes every message.
+///
+/// The correlation field uses bit 15 as a one-shot flag:
+/// - Bit 15 = 1: One-shot mode (fast path, no mio registration)
+/// - Bits 0-14: Correlation ID (0-32767)
 ///
 /// # Examples
 ///
@@ -26,6 +50,7 @@ pub const DEFAULT_MAX_PAYLOAD: usize = 64 * 1024;
 /// let head = Head {
 ///     magic: MAGIC,
 ///     kind: RpcMessageKind::Resize as u16,
+///     one_shot: false,
 ///     correlation: 1,
 ///     len: 4,
 /// };
@@ -36,6 +61,7 @@ pub const DEFAULT_MAX_PAYLOAD: usize = 64 * 1024;
 pub struct Head {
     pub magic: u32,
     pub kind: u16,
+    pub one_shot: bool,
     pub correlation: u16,
     pub len: u32,
 }
@@ -51,10 +77,12 @@ impl Head {
         if magic != MAGIC {
             return Err(ProtocolError::InvalidMagic(magic));
         }
+        let flags_correlation = u16::from_le_bytes([bytes[6], bytes[7]]);
         Ok(Self {
             magic,
             kind: u16::from_le_bytes([bytes[4], bytes[5]]),
-            correlation: u16::from_le_bytes([bytes[6], bytes[7]]),
+            one_shot: (flags_correlation & ONE_SHOT_FLAG) != 0,
+            correlation: flags_correlation & CORRELATION_MASK,
             len: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
         })
     }
@@ -64,7 +92,8 @@ impl Head {
         let mut buf = [0u8; HEAD_SIZE];
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
         buf[4..6].copy_from_slice(&self.kind.to_le_bytes());
-        buf[6..8].copy_from_slice(&self.correlation.to_le_bytes());
+        let flags_correlation = self.correlation | if self.one_shot { ONE_SHOT_FLAG } else { 0 };
+        buf[6..8].copy_from_slice(&flags_correlation.to_le_bytes());
         buf[8..12].copy_from_slice(&self.len.to_le_bytes());
         buf
     }
@@ -79,16 +108,37 @@ impl Head {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum RpcMessageKind {
+    // Legacy (kept for backward compat during migration)
     OpenWorkspace = 0x0100,
     Subscribe = 0x0101,
     RunTask = 0x0103,
     Resize = 0x0120,
     Terminate = 0x0121,
+
+    // Commands (0x01xx) - new unified protocol
+    RestartTask = 0x0110,
+    KillTask = 0x0111,
+    RerunTests = 0x0112,
+    CallFunction = 0x0113,
+    AttachTui = 0x0114,
+    AttachRun = 0x0115,
+    AttachTests = 0x0116,
+    AttachLogs = 0x0117,
+    GetSelfLogs = 0x0118,
+    RestartSelected = 0x0119,
+    GetLoggedRustPanics = 0x011A,
+
+    // Legacy responses
     OpenWorkspaceAck = 0x0200,
     SubscribeAck = 0x0201,
     RunTaskAck = 0x0203,
     ErrorResponse = 0x02FF,
     TerminateAck = 0x0220,
+
+    // Responses (0x02xx) - new unified protocol
+    CommandAck = 0x0210,
+
+    // Events (0x03xx)
     JobStatus = 0x0301,
     JobExited = 0x0302,
     Disconnect = 0x03FF,
@@ -105,16 +155,41 @@ impl RpcMessageKind {
             0x0103 => Some(Self::RunTask),
             0x0120 => Some(Self::Resize),
             0x0121 => Some(Self::Terminate),
+            0x0110 => Some(Self::RestartTask),
+            0x0111 => Some(Self::KillTask),
+            0x0112 => Some(Self::RerunTests),
+            0x0113 => Some(Self::CallFunction),
+            0x0114 => Some(Self::AttachTui),
+            0x0115 => Some(Self::AttachRun),
+            0x0116 => Some(Self::AttachTests),
+            0x0117 => Some(Self::AttachLogs),
+            0x0118 => Some(Self::GetSelfLogs),
+            0x0119 => Some(Self::RestartSelected),
+            0x011A => Some(Self::GetLoggedRustPanics),
             0x0200 => Some(Self::OpenWorkspaceAck),
             0x0201 => Some(Self::SubscribeAck),
             0x0203 => Some(Self::RunTaskAck),
             0x02FF => Some(Self::ErrorResponse),
             0x0220 => Some(Self::TerminateAck),
+            0x0210 => Some(Self::CommandAck),
             0x0301 => Some(Self::JobStatus),
             0x0302 => Some(Self::JobExited),
             0x03FF => Some(Self::Disconnect),
             _ => None,
         }
+    }
+
+    /// Returns true if this message kind supports one-shot mode.
+    pub fn is_one_shot_capable(&self) -> bool {
+        matches!(
+            self,
+            Self::RestartTask
+                | Self::KillTask
+                | Self::RerunTests
+                | Self::CallFunction
+                | Self::RestartSelected
+                | Self::GetLoggedRustPanics
+        )
     }
 }
 
@@ -183,7 +258,7 @@ impl Default for DecodingState {
 /// Result of attempting to decode a message.
 pub enum DecodeResult<'a> {
     /// A complete message was decoded.
-    Message { correlation: u16, kind: RpcMessageKind, payload: &'a [u8] },
+    Message { correlation: u16, one_shot: bool, kind: RpcMessageKind, payload: &'a [u8] },
     /// More data is needed to complete the message.
     MissingData {
         /// Minimum additional bytes needed.
@@ -243,7 +318,7 @@ impl DecodingState {
         let payload = &remaining[HEAD_SIZE..total_size];
         self.offset += total_size;
 
-        DecodeResult::Message { correlation: head.correlation, kind, payload }
+        DecodeResult::Message { correlation: head.correlation, one_shot: head.one_shot, kind, payload }
     }
 
     /// Compacts the buffer by removing already-processed bytes.
@@ -315,11 +390,32 @@ impl Encoder {
 
     /// Encodes a message with no payload.
     pub fn encode_empty(&mut self, kind: RpcMessageKind, correlation: u16) {
-        let head = Head { magic: MAGIC, kind: kind as u16, correlation, len: 0 };
+        let head = Head { magic: MAGIC, kind: kind as u16, one_shot: false, correlation, len: 0 };
+        self.buf.extend_from_slice(&head.to_bytes());
+    }
+
+    /// Encodes a one-shot message with no payload.
+    pub fn encode_empty_one_shot(&mut self, kind: RpcMessageKind, correlation: u16) {
+        let head = Head { magic: MAGIC, kind: kind as u16, one_shot: true, correlation, len: 0 };
         self.buf.extend_from_slice(&head.to_bytes());
     }
 
     fn encode_with_correlation<T: jsony::ToBinary>(&mut self, kind: RpcMessageKind, correlation: u16, payload: &T) {
+        self.encode_internal(kind, correlation, false, payload);
+    }
+
+    /// Encodes a one-shot request message.
+    pub fn encode_one_shot<T: jsony::ToBinary>(&mut self, kind: RpcMessageKind, correlation: u16, payload: &T) {
+        self.encode_internal(kind, correlation, true, payload);
+    }
+
+    fn encode_internal<T: jsony::ToBinary>(
+        &mut self,
+        kind: RpcMessageKind,
+        correlation: u16,
+        one_shot: bool,
+        payload: &T,
+    ) {
         let header_start = self.buf.len();
         self.buf.extend_from_slice(&[0u8; HEAD_SIZE]);
 
@@ -327,7 +423,7 @@ impl Encoder {
         jsony::to_binary_into(payload, &mut self.buf);
         let payload_len = self.buf.len() - payload_start;
 
-        let head = Head { magic: MAGIC, kind: kind as u16, correlation, len: payload_len as u32 };
+        let head = Head { magic: MAGIC, kind: kind as u16, one_shot, correlation, len: payload_len as u32 };
         self.buf[header_start..header_start + HEAD_SIZE].copy_from_slice(&head.to_bytes());
     }
 }
@@ -436,6 +532,171 @@ pub struct RunTaskResponse {
 pub struct ErrorResponsePayload {
     pub code: u32,
     pub message: Box<str>,
+}
+
+/// Workspace reference for RPC commands.
+///
+/// Commands can reference workspaces either by ID (efficient for repeated calls)
+/// or by config path (for first-time setup).
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub enum WorkspaceRef<'a> {
+    Id(u32),
+    Path {
+        #[jsony(with = unix_path)]
+        config: &'a std::path::Path,
+    },
+}
+
+/// Request to restart a task.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct RestartTaskRequest<'a> {
+    pub workspace: WorkspaceRef<'a>,
+    pub task_name: &'a str,
+    pub profile: &'a str,
+    pub params: &'a [u8],
+    pub as_test: bool,
+}
+
+/// Request to kill a task.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct KillTaskRequest<'a> {
+    pub workspace: WorkspaceRef<'a>,
+    pub task_name: &'a str,
+}
+
+/// Request to rerun tests.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct RerunTestsRequest<'a> {
+    pub workspace: WorkspaceRef<'a>,
+    pub only_failed: bool,
+}
+
+/// Request to call a function.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct CallFunctionRequest<'a> {
+    pub workspace: WorkspaceRef<'a>,
+    pub function_name: &'a str,
+}
+
+/// Request to attach a TUI client.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct AttachTuiRequest<'a> {
+    pub workspace: WorkspaceRef<'a>,
+}
+
+/// Request to attach a run client.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct AttachRunRequest<'a> {
+    pub workspace: WorkspaceRef<'a>,
+    pub task_name: &'a str,
+    pub params: &'a [u8],
+    pub as_test: bool,
+}
+
+/// Filters for test selection (serializable for IPC).
+#[derive(Jsony, Debug, Clone, Default)]
+#[jsony(Binary)]
+pub struct TestFilters<'a> {
+    pub include_tags: Vec<&'a str>,
+    pub exclude_tags: Vec<&'a str>,
+    pub include_names: Vec<&'a str>,
+}
+
+/// Request to attach a test run client.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct AttachTestsRequest<'a> {
+    pub workspace: WorkspaceRef<'a>,
+    pub filters: TestFilters<'a>,
+}
+
+/// Task filter for log queries.
+#[derive(Jsony, Debug, Clone)]
+#[jsony(Binary)]
+pub struct TaskFilter<'a> {
+    pub name: &'a str,
+    pub latest: bool,
+}
+
+/// Kind filter for log queries.
+#[derive(Jsony, Debug, Clone)]
+#[jsony(Binary)]
+pub struct KindFilter<'a> {
+    pub kind: &'a str,
+    pub latest: bool,
+}
+
+/// Query parameters for the logs command.
+#[derive(Jsony, Debug, Clone, Default)]
+#[jsony(Binary)]
+pub struct LogsQuery<'a> {
+    pub max_age_secs: Option<u32>,
+    pub task_filters: Vec<TaskFilter<'a>>,
+    pub job_index: Option<u32>,
+    pub kind_filters: Vec<KindFilter<'a>>,
+    pub pattern: &'a str,
+    pub follow: bool,
+    pub retry: bool,
+    pub oldest: Option<u32>,
+    pub newest: Option<u32>,
+    pub without_taskname: bool,
+    pub is_tty: bool,
+}
+
+/// Request to attach a logs client.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct AttachLogsRequest<'a> {
+    pub workspace: WorkspaceRef<'a>,
+    pub query: LogsQuery<'a>,
+}
+
+/// Request to get daemon self-logs.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct GetSelfLogsRequest {
+    pub follow: bool,
+}
+
+/// Request to restart the currently selected task in TUI.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct RestartSelectedRequest<'a> {
+    pub workspace: WorkspaceRef<'a>,
+}
+
+/// Request to get logged Rust panics.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct GetLoggedRustPanicsRequest<'a> {
+    pub workspace: WorkspaceRef<'a>,
+}
+
+/// Body of a command response.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub enum CommandBody {
+    /// Success with no additional information.
+    Empty,
+    /// Success with an informational message.
+    Message(Box<str>),
+    /// Failure with an error message.
+    Error(Box<str>),
+}
+
+/// Generic response for commands.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct CommandResponse {
+    pub workspace_id: u32,
+    pub body: CommandBody,
 }
 
 /// Client-side protocol with encoder and decoder state.
@@ -557,8 +818,9 @@ pub fn encode_attach_rpc(cwd: &std::path::Path, config: &std::path::Path, subscr
     let cwd_bytes = cwd.as_os_str().as_bytes();
     cwd_bytes.encode_binary(&mut out);
 
-    // Encode Request enum discriminant (AttachRpc = variant index 4)
-    out.push(4);
+    // Encode Request enum discriminant (AttachRpc = variant index 3)
+    // Note: variant indices are: AttachTui=0, AttachRun=1, AttachTests=2, AttachRpc=3, AttachLogs=4, GetSelfLogs=5
+    out.push(3);
 
     // Encode AttachRpc fields:
     // - config path (length-prefixed bytes)
@@ -577,9 +839,21 @@ mod tests {
 
     #[test]
     fn head_round_trip() {
-        let head = Head { magic: MAGIC, kind: RpcMessageKind::Resize as u16, correlation: 42, len: 100 };
+        let head =
+            Head { magic: MAGIC, kind: RpcMessageKind::Resize as u16, one_shot: false, correlation: 42, len: 100 };
         let bytes = head.to_bytes();
         let parsed = Head::from_bytes(&bytes).unwrap();
+        assert_eq!(head, parsed);
+    }
+
+    #[test]
+    fn head_one_shot_flag() {
+        let head =
+            Head { magic: MAGIC, kind: RpcMessageKind::RestartTask as u16, one_shot: true, correlation: 123, len: 0 };
+        let bytes = head.to_bytes();
+        let parsed = Head::from_bytes(&bytes).unwrap();
+        assert!(parsed.one_shot);
+        assert_eq!(parsed.correlation, 123);
         assert_eq!(head, parsed);
     }
 
@@ -599,7 +873,7 @@ mod tests {
         let data = encoder.output().to_vec();
 
         let mut state = DecodingState::new();
-        let DecodeResult::Message { correlation, kind, payload: msg_payload } = state.decode(&data) else {
+        let DecodeResult::Message { correlation, kind, payload: msg_payload, .. } = state.decode(&data) else {
             panic!("expected message");
         };
         assert_eq!(kind, RpcMessageKind::Resize);
@@ -635,7 +909,7 @@ mod tests {
         let data = encoder.output().to_vec();
 
         let mut state = DecodingState::new();
-        let DecodeResult::Message { kind, correlation, payload } = state.decode(&data) else {
+        let DecodeResult::Message { kind, correlation, payload, .. } = state.decode(&data) else {
             panic!("expected message");
         };
         assert_eq!(kind, RpcMessageKind::Terminate);

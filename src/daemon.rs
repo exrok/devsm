@@ -18,6 +18,7 @@ use jsony_value::ValueMap;
 use sendfd::RecvWithFd;
 
 use crate::process_manager::ProcessManagerHandle;
+use crate::rpc::{HEAD_SIZE, Head, MAGIC, RpcMessageKind};
 
 static SOCKET_PATH: OnceLock<String> = OnceLock::new();
 
@@ -69,18 +70,6 @@ pub struct RequestMessage<'a> {
     pub request: Request<'a>,
 }
 
-#[derive(Jsony, Debug)]
-#[jsony(Binary)]
-pub enum WorkspaceCommand<'a> {
-    RestartSelected,
-    GetPanicLocation,
-    GetLoggedRustPanics,
-    Run { name: Box<str>, params: ValueMap<'a>, as_test: bool },
-    CallFunction { name: Box<str> },
-    Kill { name: Box<str> },
-    RerunTests { only_failed: bool },
-}
-
 /// Filters for test selection (serializable for IPC).
 #[derive(Jsony, Debug, Clone, Default)]
 #[jsony(Binary)]
@@ -124,11 +113,6 @@ pub struct KindFilter<'a> {
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub enum Request<'a> {
-    WorkspaceCommand {
-        #[jsony(with = unix_path)]
-        config: &'a Path,
-        command: WorkspaceCommand<'a>,
-    },
     AttachTui {
         #[jsony(with = unix_path)]
         config: &'a Path,
@@ -160,35 +144,23 @@ pub enum Request<'a> {
     },
 }
 
-struct FdSet<'a>(&'a [i32]);
+use crate::process_manager::ReceivedFds;
 
-impl<'a> FdSet<'a> {
-    unsafe fn new(fds: &'a [i32]) -> Self {
-        for fd in fds {
-            let _ = unsafe { libc::fcntl(*fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        }
-        FdSet(fds)
+unsafe fn convert_received_fds(raw_fds: &[i32], fd_count: usize) -> Option<ReceivedFds> {
+    for &fd in &raw_fds[..fd_count] {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     }
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-    pub fn pop_front(&mut self) -> Option<File> {
-        if self.0.is_empty() {
-            None
-        } else {
-            let fd = self.0[0];
-            self.0 = &self.0[1..];
-            Some(unsafe { File::from_raw_fd(fd) })
-        }
-    }
-}
 
-impl<'a> Drop for FdSet<'a> {
-    fn drop(&mut self) {
-        for &fd in self.0 {
-            unsafe {
-                libc::close(fd);
+    match fd_count {
+        0 => Some(ReceivedFds::None),
+        1 => Some(ReceivedFds::Single(unsafe { File::from_raw_fd(raw_fds[0]) })),
+        2 => unsafe { Some(ReceivedFds::Pair([File::from_raw_fd(raw_fds[0]), File::from_raw_fd(raw_fds[1])])) },
+        _ => {
+            kvlog::error!("Unexpected FD count", fd_count);
+            for &fd in &raw_fds[..fd_count] {
+                unsafe { libc::close(fd) };
             }
+            None
         }
     }
 }
@@ -197,26 +169,17 @@ fn handle_request(
     pm: &ProcessManagerHandle,
     socket: UnixStream,
     message: RequestMessage,
-    mut fds: FdSet,
+    fds: ReceivedFds,
 ) -> anyhow::Result<()> {
     match message.request {
-        Request::WorkspaceCommand { config, command } => {
-            kvlog::info!("Restarting selected processes");
-            pm.request.send(crate::process_manager::ProcessRequest::WorkspaceCommand {
-                socket,
-                // hack for now.
-                command: jsony::to_binary(&command),
-                workspace_config: config.into(),
-            });
-        }
         Request::AttachTui { config } => {
             kvlog::info!("Receiving FD");
-            if fds.len() != 2 {
-                bail!("Expected 2 FD's found only one");
-            }
+            let ReceivedFds::Pair([stdin, stdout]) = fds else {
+                bail!("Expected 2 FDs");
+            };
             pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
-                stdin: Some(fds.pop_front().unwrap()),
-                stdout: Some(fds.pop_front().unwrap()),
+                stdin: Some(stdin),
+                stdout: Some(stdout),
                 socket,
                 workspace_config: config.into(),
                 kind: crate::process_manager::AttachKind::Tui,
@@ -224,12 +187,12 @@ fn handle_request(
         }
         Request::AttachRun { config, name, params, as_test } => {
             kvlog::info!("Receiving FD for run command", as_test);
-            if fds.len() != 2 {
-                bail!("Expected 2 FD's found only one");
-            }
+            let ReceivedFds::Pair([stdin, stdout]) = fds else {
+                bail!("Expected 2 FDs");
+            };
             pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
-                stdin: Some(fds.pop_front().unwrap()),
-                stdout: Some(fds.pop_front().unwrap()),
+                stdin: Some(stdin),
+                stdout: Some(stdout),
                 socket,
                 workspace_config: config.into(),
                 kind: crate::process_manager::AttachKind::Run {
@@ -241,12 +204,12 @@ fn handle_request(
         }
         Request::AttachTests { config, filters } => {
             kvlog::info!("Receiving FD for test command");
-            if fds.len() != 2 {
-                bail!("Expected 2 FD's found only one");
-            }
+            let ReceivedFds::Pair([stdin, stdout]) = fds else {
+                bail!("Expected 2 FDs");
+            };
             pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
-                stdin: Some(fds.pop_front().unwrap()),
-                stdout: Some(fds.pop_front().unwrap()),
+                stdin: Some(stdin),
+                stdout: Some(stdout),
                 socket,
                 workspace_config: config.into(),
                 kind: crate::process_manager::AttachKind::TestRun { filters: jsony::to_binary(&filters) },
@@ -264,12 +227,12 @@ fn handle_request(
         }
         Request::AttachLogs { config, query } => {
             kvlog::info!("Receiving FD for logs command");
-            if fds.len() != 2 {
-                bail!("Expected 2 FD's for logs");
-            }
+            let ReceivedFds::Pair([stdin, stdout]) = fds else {
+                bail!("Expected 2 FDs for logs");
+            };
             pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
-                stdin: Some(fds.pop_front().unwrap()),
-                stdout: Some(fds.pop_front().unwrap()),
+                stdin: Some(stdin),
+                stdout: Some(stdout),
                 socket,
                 workspace_config: config.into(),
                 kind: crate::process_manager::AttachKind::Logs { query: jsony::to_binary(&query) },
@@ -277,13 +240,10 @@ fn handle_request(
         }
         Request::GetSelfLogs { follow } => {
             if follow {
-                if fds.len() != 1 {
+                let ReceivedFds::Single(stdout) = fds else {
                     bail!("Expected 1 FD for self-logs follow");
-                }
-                pm.request.send(crate::process_manager::ProcessRequest::AttachSelfLogsClient {
-                    stdout: fds.pop_front().unwrap(),
-                    socket,
-                });
+                };
+                pm.request.send(crate::process_manager::ProcessRequest::AttachSelfLogsClient { stdout, socket });
             } else {
                 let logs = crate::self_log::get_daemon_logs().unwrap_or_default();
                 let mut socket = socket;
@@ -292,6 +252,52 @@ fn handle_request(
         }
     }
     Ok(())
+}
+
+fn is_rpc_message(buffer: &[u8]) -> bool {
+    if buffer.len() < 4 {
+        return false;
+    }
+    let magic = u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]);
+    magic == MAGIC
+}
+
+fn handle_rpc_connection(pm: &ProcessManagerHandle, socket: UnixStream, buffer: &[u8], fds: ReceivedFds) {
+    if buffer.len() < HEAD_SIZE {
+        kvlog::error!("RPC message too short");
+        return;
+    }
+
+    let header_bytes: &[u8; HEAD_SIZE] = buffer[..HEAD_SIZE].try_into().unwrap();
+    let head = match Head::from_bytes(header_bytes) {
+        Ok(h) => h,
+        Err(e) => {
+            kvlog::error!("Failed to parse RPC header", ?e);
+            return;
+        }
+    };
+
+    let Some(kind) = RpcMessageKind::from_u16(head.kind) else {
+        kvlog::error!("Unknown RPC message kind", kind = head.kind);
+        return;
+    };
+
+    let total_len = HEAD_SIZE + head.len as usize;
+    if buffer.len() < total_len {
+        kvlog::error!("RPC payload incomplete", expected = total_len, actual = buffer.len());
+        return;
+    }
+
+    let payload = &buffer[HEAD_SIZE..total_len];
+
+    pm.request.send(crate::process_manager::ProcessRequest::RpcMessage {
+        socket,
+        fds,
+        kind,
+        correlation: head.correlation,
+        one_shot: head.one_shot,
+        payload: payload.to_vec(),
+    });
 }
 
 pub fn worker() -> anyhow::Result<()> {
@@ -334,20 +340,29 @@ pub fn worker() -> anyhow::Result<()> {
                     }
                 }
             };
-            let mut fds = [0; 2];
-            match socket.recv_with_fd(&mut buffer, &mut fds) {
+            let mut raw_fds = [0; 2];
+            match socket.recv_with_fd(&mut buffer, &mut raw_fds) {
                 Ok((amount, fd_count)) => {
-                    let fds = unsafe { FdSet::new(&fds[..fd_count]) };
-                    match jsony::from_binary::<RequestMessage>(&buffer[..amount]) {
-                        Ok(message) => {
-                            if let Err(err) = handle_request(&pm, socket, message, fds) {
-                                kvlog::error!("Failed to handle message", ?err);
-                            }
-                        }
-                        Err(err) => {
-                            kvlog::error!("Failed to parse message", ?err);
-                        }
+                    // Safety - raw_fds are valid FDs received from recvmsg.
+                    let fds = unsafe { convert_received_fds(&raw_fds, fd_count) };
+                    let Some(fds) = fds else {
+                        continue;
                     };
+
+                    if is_rpc_message(&buffer[..amount]) {
+                        handle_rpc_connection(&pm, socket, &buffer[..amount], fds);
+                    } else {
+                        match jsony::from_binary::<RequestMessage>(&buffer[..amount]) {
+                            Ok(message) => {
+                                if let Err(err) = handle_request(&pm, socket, message, fds) {
+                                    kvlog::error!("Failed to handle message", ?err);
+                                }
+                            }
+                            Err(err) => {
+                                kvlog::error!("Failed to parse message", ?err);
+                            }
+                        };
+                    }
                 }
                 Err(err) => {
                     kvlog::error!("Failed to read message", ?err)

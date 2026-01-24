@@ -8,9 +8,10 @@ use std::{
 use anyhow::bail;
 use sendfd::SendWithFd;
 
-use crate::daemon::{WorkspaceCommand, socket_path};
+use crate::daemon::socket_path;
 use crate::rpc::{
-    ClientProtocol, DecodeResult, JobExitedEvent, JobStatusEvent, JobStatusKind, ResizeNotification, RpcMessageKind,
+    ClientProtocol, CommandBody, CommandResponse, DecodeResult, Encoder, JobExitedEvent, JobStatusEvent, JobStatusKind,
+    ONE_SHOT_FLAG, ResizeNotification, RpcMessageKind, WorkspaceRef,
 };
 
 mod cli;
@@ -74,7 +75,7 @@ fn main() {
             }
         }
         cli::Command::Restart { job, value_map, as_test } => {
-            if let Err(err) = workspace_command(WorkspaceCommand::Run { name: job.into(), params: value_map, as_test }) {
+            if let Err(err) = restart_task_command(job, value_map, as_test) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -93,7 +94,7 @@ fn main() {
             }
         }
         cli::Command::Kill { job } => {
-            if let Err(err) = workspace_command(WorkspaceCommand::Kill { name: job.into() }) {
+            if let Err(err) = kill_task_command(job) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -106,7 +107,7 @@ fn main() {
             }
         }
         cli::Command::RerunTests { only_failed } => {
-            if let Err(err) = workspace_command(WorkspaceCommand::RerunTests { only_failed }) {
+            if let Err(err) = rerun_tests_command(only_failed) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -162,14 +163,14 @@ fn main() {
                 print!("{}", user_config::default_user_config_toml());
             }
             cli::GetResource::LoggedRustPanics => {
-                if let Err(err) = workspace_command(WorkspaceCommand::GetLoggedRustPanics) {
+                if let Err(err) = get_logged_rust_panics_command() {
                     eprintln!("error: {}", err);
                     std::process::exit(1);
                 }
             }
         },
         cli::Command::FunctionCall { name } => {
-            if let Err(err) = workspace_command(WorkspaceCommand::CallFunction { name: name.into() }) {
+            if let Err(err) = call_function_command(name) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -351,18 +352,42 @@ fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
     connect_with_retry(default_connect_timeout_ms())
 }
 
-fn workspace_command(command: WorkspaceCommand) -> anyhow::Result<()> {
-    let cwd = std::env::current_dir()?;
-    let config = config::find_config_path_from(&cwd)
-        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
-
+fn rpc_command<T: jsony::ToBinary>(kind: RpcMessageKind, payload: &T) -> anyhow::Result<CommandResponse> {
     let mut socket = connect_or_spawn_daemon()?;
-    socket.write_all(&jsony::to_binary(&daemon::RequestMessage {
-        cwd: &cwd,
-        request: daemon::Request::WorkspaceCommand { config: &config, command },
-    }))?;
-    std::io::copy(&mut socket, &mut std::io::stdout())?;
-    Ok(())
+
+    let mut encoder = Encoder::new();
+    encoder.encode_one_shot(kind, 1 | ONE_SHOT_FLAG, payload);
+    socket.write_all(encoder.output())?;
+
+    let mut protocol = ClientProtocol::new();
+    let mut read_buf = Vec::with_capacity(1024);
+
+    loop {
+        read_buf.reserve(1024);
+        let spare = read_buf.spare_capacity_mut();
+        let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
+
+        match socket.read(read_slice) {
+            Ok(0) => bail!("Connection closed unexpectedly"),
+            Ok(n) => {
+                unsafe { read_buf.set_len(read_buf.len() + n) };
+                match protocol.decode(&read_buf) {
+                    DecodeResult::Message { kind: RpcMessageKind::CommandAck, payload, .. } => {
+                        let response: CommandResponse = jsony::from_binary(payload)?;
+                        return Ok(response);
+                    }
+                    DecodeResult::Message { kind, .. } => {
+                        bail!("Unexpected response kind: {:?}", kind);
+                    }
+                    DecodeResult::MissingData { .. } => continue,
+                    DecodeResult::Empty => continue,
+                    DecodeResult::Error(e) => bail!("RPC error: {:?}", e),
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => bail!("Socket read failed: {}", e),
+        }
+    }
 }
 
 fn restart_selected_command() -> anyhow::Result<()> {
@@ -370,26 +395,83 @@ fn restart_selected_command() -> anyhow::Result<()> {
     let config = config::find_config_path_from(&cwd)
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
-    let mut socket = connect_or_spawn_daemon()?;
-    socket.write_all(&jsony::to_binary(&daemon::RequestMessage {
-        cwd: &cwd,
-        request: daemon::Request::WorkspaceCommand { config: &config, command: WorkspaceCommand::RestartSelected },
-    }))?;
+    let req = rpc::RestartSelectedRequest { workspace: WorkspaceRef::Path { config: &config } };
+    let response = rpc_command(RpcMessageKind::RestartSelected, &req)?;
 
-    let mut response = String::new();
-    socket.read_to_string(&mut response)?;
-
-    #[derive(jsony::Jsony)]
-    struct Response<'a> {
-        #[jsony(default)]
-        error: Option<&'a str>,
-    }
-
-    let parsed: Response = jsony::from_json(&response)?;
-    if let Some(err) = parsed.error {
+    if let CommandBody::Error(err) = response.body {
         bail!("{err}");
     }
     Ok(())
+}
+
+fn restart_task_command(job: &str, value_map: jsony_value::ValueMap, as_test: bool) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    let (task_name, profile) = job.rsplit_once(':').unwrap_or((job, ""));
+    let params_bytes = jsony::to_binary(&value_map);
+
+    let req = rpc::RestartTaskRequest {
+        workspace: WorkspaceRef::Path { config: &config },
+        task_name,
+        profile,
+        params: &params_bytes,
+        as_test,
+    };
+    let response = rpc_command(RpcMessageKind::RestartTask, &req)?;
+    handle_command_response(response)
+}
+
+fn kill_task_command(job: &str) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    let req = rpc::KillTaskRequest { workspace: WorkspaceRef::Path { config: &config }, task_name: job };
+    let response = rpc_command(RpcMessageKind::KillTask, &req)?;
+    handle_command_response(response)
+}
+
+fn rerun_tests_command(only_failed: bool) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    let req = rpc::RerunTestsRequest { workspace: WorkspaceRef::Path { config: &config }, only_failed };
+    let response = rpc_command(RpcMessageKind::RerunTests, &req)?;
+    handle_command_response(response)
+}
+
+fn call_function_command(name: &str) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    let req = rpc::CallFunctionRequest { workspace: WorkspaceRef::Path { config: &config }, function_name: name };
+    let response = rpc_command(RpcMessageKind::CallFunction, &req)?;
+    handle_command_response(response)
+}
+
+fn get_logged_rust_panics_command() -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    let req = rpc::GetLoggedRustPanicsRequest { workspace: WorkspaceRef::Path { config: &config } };
+    let response = rpc_command(RpcMessageKind::GetLoggedRustPanics, &req)?;
+    handle_command_response(response)
+}
+
+fn handle_command_response(response: CommandResponse) -> anyhow::Result<()> {
+    match response.body {
+        CommandBody::Empty => Ok(()),
+        CommandBody::Message(msg) => {
+            println!("{}", msg);
+            Ok(())
+        }
+        CommandBody::Error(err) => bail!("{err}"),
+    }
 }
 
 fn client() -> anyhow::Result<()> {

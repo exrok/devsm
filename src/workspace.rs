@@ -1005,6 +1005,78 @@ impl WorkspaceState {
 
         Some(summary)
     }
+
+    /// Layer 2: Lookup task by name and spawn it in one operation.
+    ///
+    /// Refreshes config, increments change_number, and spawns the task.
+    /// Returns the base task index and job index on success.
+    pub fn lookup_and_spawn_task(
+        &mut self,
+        workspace_id: u32,
+        channel: &MioChannel,
+        name: &str,
+        log_start: LogId,
+        params: ValueMap,
+        profile: &str,
+    ) -> Result<(BaseTaskIndex, JobIndex), String> {
+        let Some(base_index) = self.base_index_by_name(name) else {
+            return Err(format!("Task '{}' not found", name));
+        };
+        self.change_number = self.change_number.wrapping_add(1);
+        self.refresh_config();
+        let job_index = self.spawn_task(workspace_id, channel, base_index, log_start, params, profile);
+        Ok((base_index, job_index))
+    }
+
+    /// Layer 2: Find task by name and terminate all running instances.
+    ///
+    /// Accepts task name or numeric index. Returns a message describing the result.
+    pub fn lookup_and_terminate_task(&mut self, channel: &MioChannel, name: &str) -> Result<String, String> {
+        let index = if let Ok(idx) = name.parse::<u32>() {
+            let bti = BaseTaskIndex(idx);
+            if self.base_tasks.get(bti.idx()).is_some() { Some(bti) } else { None }
+        } else {
+            self.base_index_by_name(name)
+        };
+
+        let Some(index) = index else {
+            return Err(format!("Task '{}' not found", name));
+        };
+
+        let bt = &self.base_tasks[index.idx()];
+
+        let has_running = bt
+            .jobs
+            .non_terminal()
+            .iter()
+            .any(|ji| matches!(self.jobs[ji.idx()].process_status, JobStatus::Running { .. }));
+
+        if !has_running {
+            return Ok(format!("Task '{}' was already finished", bt.name));
+        }
+
+        let task_name = bt.name.to_string();
+        self.change_number = self.change_number.wrapping_add(1);
+
+        for job_index in bt.jobs.non_terminal() {
+            let job = &self.jobs[job_index.idx()];
+            if let JobStatus::Running { process_index, .. } = &job.process_status {
+                channel.send(crate::process_manager::ProcessRequest::TerminateJob {
+                    job_id: job.log_group,
+                    process_index: *process_index,
+                    exit_cause: ExitCause::Killed,
+                });
+            }
+        }
+
+        Ok(format!("Task '{}' terminated", task_name))
+    }
+
+    /// Layer 2: Record a single task spawn as a test group.
+    pub fn record_test_group(&mut self, base_index: BaseTaskIndex, job_index: JobIndex) {
+        let group_id = self.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
+        self.last_test_group = Some(TestGroup { group_id, base_tasks: vec![base_index], job_indices: vec![job_index] });
+    }
 }
 impl std::ops::IndexMut<JobIndex> for WorkspaceState {
     fn index_mut(&mut self, index: JobIndex) -> &mut Self::Output {
@@ -1311,21 +1383,8 @@ pub fn extract_rust_panic_from_line(line: &str) -> Option<(&str, &str, u64, u64)
     let col = col_str.parse::<u64>().ok()?;
     Some((thread, file, line, col))
 }
-impl Workspace {
-    pub fn last_rust_panic(&self) -> Option<(String, u64)> {
-        let logs = self.logs.read().unwrap();
-        let (a, b) = logs.slices();
-        for s in [b, a] {
-            for entry in s {
-                let text = unsafe { entry.text(&logs) };
-                if let Some((_thread, file, line, _col)) = extract_rust_panic_from_line(text) {
-                    return Some((file.to_string(), line));
-                }
-            }
-        }
-        None
-    }
 
+impl Workspace {
     pub fn logged_rust_panics(&self) -> Vec<LoggedPanic> {
         struct PanicFromLog {
             age: u32,
@@ -1439,6 +1498,102 @@ impl Workspace {
                 exit_cause: ExitCause::Killed,
             });
         }
+    }
+
+    /// Layer 1: Restart task by name.
+    ///
+    /// Acquires state lock, looks up task, and spawns it.
+    pub fn restart_task_by_name(&self, name: &str, params: ValueMap, profile: &str) -> Result<JobIndex, String> {
+        let log_start = self.logs.read().unwrap().tail();
+        let state = &mut *self.state.write().unwrap();
+        let (_, job_index) =
+            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, log_start, params, profile)?;
+        Ok(job_index)
+    }
+
+    /// Layer 1: Restart task by name and mark as test.
+    ///
+    /// Acquires state lock, looks up task, spawns it, and records it as a test group.
+    pub fn restart_task_as_test(&self, name: &str, params: ValueMap, profile: &str) -> Result<(), String> {
+        let log_start = self.logs.read().unwrap().tail();
+        let state = &mut *self.state.write().unwrap();
+        let (base_index, job_index) =
+            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, log_start, params, profile)?;
+        state.record_test_group(base_index, job_index);
+        Ok(())
+    }
+
+    /// Layer 1: Terminate task by name.
+    ///
+    /// Acquires state lock, looks up task, and terminates all running instances.
+    pub fn terminate_task_by_name(&self, name: &str) -> Result<String, String> {
+        let state = &mut *self.state.write().unwrap();
+        state.lookup_and_terminate_task(&self.process_channel, name)
+    }
+
+    /// Layer 1: Execute a function by name.
+    ///
+    /// Looks up function from session_functions or config.functions, then executes its action.
+    pub fn call_function(&self, name: &str) -> Result<String, String> {
+        use crate::config::FunctionDefAction;
+        use crate::function::FunctionAction;
+
+        let log_start = self.logs.read().unwrap().tail();
+        let state = &mut *self.state.write().unwrap();
+
+        if let Some(action) = state.session_functions.get(name).cloned() {
+            match action {
+                FunctionAction::RestartCaptured { task_name, profile } => {
+                    state.lookup_and_spawn_task(
+                        self.workspace_id,
+                        &self.process_channel,
+                        &task_name,
+                        log_start,
+                        ValueMap::new(),
+                        &profile,
+                    )?;
+                    return Ok("ok".to_string());
+                }
+                FunctionAction::RestartSelected => {
+                    return Err("RestartSelected requires TUI context".to_string());
+                }
+            }
+        }
+
+        for func_def in state.config.current.functions {
+            if func_def.name == name {
+                match &func_def.action {
+                    FunctionDefAction::Restart { task } => {
+                        state.lookup_and_spawn_task(
+                            self.workspace_id,
+                            &self.process_channel,
+                            task,
+                            log_start,
+                            ValueMap::new(),
+                            "",
+                        )?;
+                    }
+                    FunctionDefAction::Kill { task } => {
+                        state.lookup_and_terminate_task(&self.process_channel, task)?;
+                    }
+                    FunctionDefAction::Spawn { tasks } => {
+                        for task_call in *tasks {
+                            state.lookup_and_spawn_task(
+                                self.workspace_id,
+                                &self.process_channel,
+                                &task_call.name,
+                                log_start,
+                                task_call.vars.clone(),
+                                task_call.profile.unwrap_or(""),
+                            )?;
+                        }
+                    }
+                }
+                return Ok("ok".to_string());
+            }
+        }
+
+        Err(format!("Function '{}' not configured", name))
     }
 
     /// Starts a test run with the given filters.
