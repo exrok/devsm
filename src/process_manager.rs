@@ -432,19 +432,24 @@ impl ProcessManager {
         };
 
         command.env("CARGO_TERM_COLOR", "always").current_dir(path).envs(tc.envvar.iter().copied());
-        unsafe {
-            command.pre_exec(|| {
-                // Create process group to allow nested cleanup
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                #[cfg(target_os = "linux")]
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        command.process_group(0);
+        // PR_SET_PDEATHSIG is a nice fallback for auto termination, however pre_exec
+        // causes spawn to use a custom spawn that has a bug that introduces a panic:
+        // https://github.com/rust-lang/rust/issues/110317
+        //
+        // unsafe {
+        //     command.pre_exec(|| {
+        //         // Create process group to allow nested cleanup
+        //         if libc::setpgid(0, 0) != 0 {
+        //             return Err(std::io::Error::last_os_error());
+        //         }
+        //         #[cfg(target_os = "linux")]
+        //         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+        //             return Err(std::io::Error::last_os_error());
+        //         }
+        //         Ok(())
+        //     });
+        // }
 
         let stdin = if sh_script.is_some() { Stdio::piped() } else { Stdio::null() };
         command.stdin(stdin);
