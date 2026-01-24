@@ -75,7 +75,7 @@ pub enum WorkspaceCommand<'a> {
     RestartSelected,
     GetPanicLocation,
     GetLoggedRustPanics,
-    Run { name: Box<str>, params: ValueMap<'a> },
+    Run { name: Box<str>, params: ValueMap<'a>, as_test: bool },
     CallFunction { name: Box<str> },
     Kill { name: Box<str> },
     RerunTests { only_failed: bool },

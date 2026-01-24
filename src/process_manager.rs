@@ -734,13 +734,24 @@ impl ProcessManager {
                 let response = jsony::to_json(&self.workspaces[ws_index as usize].handle.logged_rust_panics());
                 let _ = socket.write_all(response.as_bytes());
             }
-            WorkspaceCommand::Run { name, params } => {
+            WorkspaceCommand::Run { name, params, as_test } => {
                 let ws = &self.workspaces[ws_index as usize];
                 let mut state = ws.handle.state.write().unwrap();
                 let (name, profile) = name.rsplit_once(":").unwrap_or((&*name, ""));
-                if let Some(index) = state.base_index_by_name(name) {
-                    drop(state);
-                    ws.handle.restart_task(index, params, profile);
+                let Some(base_index) = state.base_index_by_name(name) else {
+                    let _ = socket.write_all(format!("error: task '{}' not found\n", name).as_bytes());
+                    return;
+                };
+                drop(state);
+                let job_index = ws.handle.restart_task(base_index, params, profile);
+                if as_test {
+                    let mut state = ws.handle.state.write().unwrap();
+                    let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
+                    state.last_test_group = Some(workspace::TestGroup {
+                        group_id,
+                        base_tasks: vec![base_index],
+                        job_indices: vec![job_index],
+                    });
                 }
             }
             WorkspaceCommand::CallFunction { name } => {

@@ -73,8 +73,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Restart { job, value_map } => {
-            if let Err(err) = workspace_command(WorkspaceCommand::Run { name: job.into(), params: value_map }) {
+        cli::Command::Restart { job, value_map, as_test } => {
+            if let Err(err) = workspace_command(WorkspaceCommand::Run { name: job.into(), params: value_map, as_test }) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }

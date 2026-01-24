@@ -82,7 +82,7 @@ pub enum Command<'a> {
     Tui,
     Server,
     RestartSelected,
-    Restart { job: &'a str, value_map: ValueMap<'a> },
+    Restart { job: &'a str, value_map: ValueMap<'a>, as_test: bool },
     Exec { job: &'a str, value_map: ValueMap<'a> },
     Run { job: &'a str, value_map: ValueMap<'a>, as_test: bool },
     Kill { job: &'a str },
@@ -194,8 +194,47 @@ fn parse_job_args<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<(&'a str, Va
 }
 
 fn parse_restart<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
-    let (job, value_map) = parse_job_args(parser)?;
-    Ok(Command::Restart { job, value_map })
+    let mut as_test = false;
+    let mut job = None;
+    let mut value_map = ValueMap::new();
+
+    while let Some(component) = parser.next() {
+        match component {
+            Component::Long(long) if long == "as-test" => {
+                as_test = true;
+            }
+            Component::Long(key) => {
+                let Some(val) = parser.next_value() else {
+                    bail!("Flag --{} requires a value (use --{}=value)", key, key);
+                };
+                value_map.insert(key.into(), parse_flag_value(val));
+            }
+            Component::Term(arg) => {
+                if job.is_none() {
+                    job = Some(arg);
+                } else {
+                    let parsed: ValueMap = jsony::from_json(arg).context("Parsing job parameters")?;
+                    for (k, v) in parsed.entries() {
+                        value_map.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            Component::Flags(flags) => {
+                if let Some(flag) = flags.chars().next() {
+                    bail!("Unknown flag -{}", flag);
+                }
+            }
+            Component::Value(val) => {
+                bail!("Unexpected value: {:?}", val);
+            }
+        }
+    }
+
+    let Some(job) = job else {
+        bail!("Missing name of job");
+    };
+
+    Ok(Command::Restart { job, value_map, as_test })
 }
 
 fn parse_exec<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
