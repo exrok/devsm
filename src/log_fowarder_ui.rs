@@ -512,6 +512,7 @@ fn forward_new_logs(
                         ExitCause::Restarted => (-1, RpcExitCause::Restarted),
                         ExitCause::Unknown => (*status as i32, RpcExitCause::Unknown),
                         ExitCause::SpawnFailed => (*status as i32, RpcExitCause::SpawnFailed),
+                        ExitCause::ProfileConflict => (-1, RpcExitCause::ProfileConflict),
                     };
                     return Ok((true, Some(code), Some(rpc_cause)));
                 }
@@ -562,6 +563,7 @@ fn forward_new_logs(
                     ExitCause::Restarted => (-1, RpcExitCause::Restarted),
                     ExitCause::Unknown => (*status as i32, RpcExitCause::Unknown),
                     ExitCause::SpawnFailed => (*status as i32, RpcExitCause::SpawnFailed),
+                    ExitCause::ProfileConflict => (-1, RpcExitCause::ProfileConflict),
                 };
                 return Ok((true, Some(code), Some(rpc_cause)));
             }

@@ -631,7 +631,7 @@ fn process_key(
         tui.status_message = Some(StatusMessage::error(format!("No binding for input: {}", input)));
         return ProcessKeyResult::Continue;
     };
-    kvlog::info!("input", ?input, ?command);
+    kvlog::info!("Processed Input Event", %input, ?command);
 
     match command {
         Command::Quit => return ProcessKeyResult::Quit,
@@ -1198,7 +1198,7 @@ pub fn run(
             (w, h) = if let Some(terminal) = &terminal { terminal.size()? } else { (150, 80) };
         }
         let data = render(w, h, &mut tui, workspace, &keybinds, delta);
-        kvlog::info!("Rendered TUI", tty_render_byte_count = data.len());
+        kvlog::debug!("Rendered TUI", tty_render_byte_count = data.len());
         if let Some(terminal) = &mut terminal {
             terminal.write_all(data)?;
         } else {

@@ -39,6 +39,12 @@ impl BaseTaskIndex {
 #[repr(transparent)]
 pub struct JobIndex(u32);
 
+impl kvlog::Encode for JobIndex {
+    fn encode_log_value_into(&self, output: kvlog::ValueEncoder<'_>) {
+        self.0.encode_log_value_into(output);
+    }
+}
+
 impl JobIndex {
     pub fn idx(self) -> usize {
         self.0 as usize
@@ -59,6 +65,19 @@ pub enum ExitCause {
     Killed,
     Restarted,
     SpawnFailed,
+    ProfileConflict,
+}
+
+impl ExitCause {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ExitCause::Unknown => "unknown",
+            ExitCause::Killed => "killed",
+            ExitCause::Restarted => "restarted",
+            ExitCause::SpawnFailed => "spawn_failed",
+            ExitCause::ProfileConflict => "profile_conflict",
+        }
+    }
 }
 
 pub struct Job {
@@ -135,6 +154,25 @@ impl ScheduleRequirement {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ScheduleReason {
+    Requested,
+    Dependency,
+    ProfileConflict,
+    TestRun,
+}
+
+impl ScheduleReason {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ScheduleReason::Requested => "requested",
+            ScheduleReason::Dependency => "dependency",
+            ScheduleReason::ProfileConflict => "profile_conflict",
+            ScheduleReason::TestRun => "test_run",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum JobStatus {
     Scheduled {
@@ -159,6 +197,16 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
+    pub fn name(&self) -> &'static str {
+        match self {
+            JobStatus::Scheduled { .. } => "Scheduled",
+            JobStatus::Starting => "Starting",
+            JobStatus::Running { .. } => "Running",
+            JobStatus::Exited { .. } => "Exited",
+            JobStatus::Cancelled => "Cancelled",
+        }
+    }
+
     pub fn is_pending_completion(&self) -> bool {
         match self {
             JobStatus::Scheduled { .. } => true,
@@ -737,33 +785,39 @@ impl WorkspaceState {
         log_start: LogId,
         params: ValueMap,
         profile: &str,
+        reason: ScheduleReason,
     ) -> JobIndex {
         let bt = &mut self.base_tasks[base_task.idx()];
         bt.update_profile_tracking(profile);
         let mut pred = Vec::new();
 
-        for job_index in bt.jobs.terminate_scheduled() {
-            let job = &mut self.jobs[job_index.idx()];
-            match &job.process_status {
-                JobStatus::Scheduled { .. } => {
-                    job.process_status = JobStatus::Cancelled;
-                }
-                unexpected => panic!("Unexpected job status when terminating scheduled job: {:?}", unexpected),
+        let task_kind = bt.config.kind;
+        let task_name = bt.name;
+
+        for &job_index in bt.jobs.terminate_scheduled() {
+            self.jobs[job_index.idx()].process_status = JobStatus::Cancelled;
+            match task_kind {
+                TaskKind::Action => self.action_jobs.set_terminal(job_index),
+                TaskKind::Test => self.test_jobs.set_terminal(job_index),
+                TaskKind::Service => self.service_jobs.set_terminal(job_index),
             }
+            self.service_dependents.remove_from_all(job_index);
         }
 
-        for job_index in bt.jobs.running() {
+        for &job_index in bt.jobs.running() {
             let job = &mut self.jobs[job_index.idx()];
             let JobStatus::Running { process_index, .. } = &job.process_status else {
                 continue;
             };
-            pred.push(ScheduleRequirement { job: *job_index, predicate: JobPredicate::Terminated });
+            pred.push(ScheduleRequirement { job: job_index, predicate: JobPredicate::Terminated });
             channel.send(crate::process_manager::ProcessRequest::TerminateJob {
                 job_id: job.log_group,
                 process_index: *process_index,
                 exit_cause: ExitCause::Restarted,
             });
         }
+
+        let bt = &mut self.base_tasks[base_task.idx()];
         let task = bt.config.eval(&Environment { profile, param: params.clone(), vars: bt.config.vars }).unwrap();
 
         'outer: for dep_call in task.config().require {
@@ -787,6 +841,7 @@ impl WorkspaceState {
                             log_start,
                             dep_params.clone(),
                             dep_profile,
+                            ScheduleReason::Dependency,
                         );
                         pred.push(ScheduleRequirement {
                             job: new_job,
@@ -796,8 +851,15 @@ impl WorkspaceState {
                     };
 
                     if cache_config.never {
-                        let new_job =
-                            self.spawn_task(workspace_id, channel, dep_base_task, log_start, dep_params, dep_profile);
+                        let new_job = self.spawn_task(
+                            workspace_id,
+                            channel,
+                            dep_base_task,
+                            log_start,
+                            dep_params,
+                            dep_profile,
+                            ScheduleReason::Dependency,
+                        );
                         pred.push(ScheduleRequirement {
                             job: new_job,
                             predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
@@ -836,8 +898,15 @@ impl WorkspaceState {
                         });
                         continue 'outer;
                     }
-                    let new_job =
-                        self.spawn_task(workspace_id, channel, dep_base_task, log_start, dep_params, dep_profile);
+                    let new_job = self.spawn_task(
+                        workspace_id,
+                        channel,
+                        dep_base_task,
+                        log_start,
+                        dep_params,
+                        dep_profile,
+                        ScheduleReason::Dependency,
+                    );
                     pred.push(ScheduleRequirement {
                         job: new_job,
                         predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
@@ -855,8 +924,15 @@ impl WorkspaceState {
                             }
                         }
                     }
-                    let new_job =
-                        self.spawn_task(workspace_id, channel, dep_base_task, log_start, dep_params, dep_profile);
+                    let new_job = self.spawn_task(
+                        workspace_id,
+                        channel,
+                        dep_base_task,
+                        log_start,
+                        dep_params,
+                        dep_profile,
+                        ScheduleReason::Dependency,
+                    );
                     pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
                 }
                 TaskKind::Test => {}
@@ -916,6 +992,8 @@ impl WorkspaceState {
         });
         if spawn {
             spawn_job(channel, job_index, task, workspace_id, job_id);
+        } else {
+            kvlog::info!("Job scheduled", task_name, job_index, reason = reason.name());
         }
         job_index
     }
@@ -934,6 +1012,7 @@ impl WorkspaceState {
         blocked_by: JobIndex,
     ) -> JobIndex {
         let spawner = &self.base_tasks[base_task.idx()];
+        let task_name = spawner.name;
         let env = Environment { profile, param: params.clone(), vars: spawner.config.vars };
         let task = spawner.config.eval(&env).expect("Failed to eval queued service config");
 
@@ -959,6 +1038,8 @@ impl WorkspaceState {
             spawn_profile: profile.to_string(),
             spawn_params: params.to_owned(),
         });
+
+        kvlog::info!("Job scheduled", task_name, job_index, reason = ScheduleReason::ProfileConflict.name());
 
         job_index
     }
@@ -1024,7 +1105,8 @@ impl WorkspaceState {
         };
         self.change_number = self.change_number.wrapping_add(1);
         self.refresh_config();
-        let job_index = self.spawn_task(workspace_id, channel, base_index, log_start, params, profile);
+        let job_index =
+            self.spawn_task(workspace_id, channel, base_index, log_start, params, profile, ScheduleReason::Requested);
         Ok((base_index, job_index))
     }
 
@@ -1096,8 +1178,11 @@ impl WorkspaceState {
         let job = &mut self.jobs[job_index.idx()];
         let job_id = job.log_group;
         let base_task = &mut self.base_tasks[job_id.base_task_index().idx()];
+        let task_name = base_task.name;
         let task_kind = base_task.config.kind;
         let jobs_list = &mut base_task.jobs;
+
+        kvlog::info!("Job status changed", job_index, task_name, status = status.name());
 
         use JobStatus as S;
         match (&job.process_status, &status) {
@@ -1325,7 +1410,15 @@ impl WorkspaceState {
                         continue;
                     }
 
-                    let new_job = self.spawn_task(workspace_id, channel, base_task, log_start, params, &profile);
+                    let new_job = self.spawn_task(
+                        workspace_id,
+                        channel,
+                        base_task,
+                        log_start,
+                        params,
+                        &profile,
+                        ScheduleReason::Dependency,
+                    );
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Service => {
@@ -1353,7 +1446,15 @@ impl WorkspaceState {
                         }
                     }
 
-                    let new_job = self.spawn_task(workspace_id, channel, base_task, log_start, params, &profile);
+                    let new_job = self.spawn_task(
+                        workspace_id,
+                        channel,
+                        base_task,
+                        log_start,
+                        params,
+                        &profile,
+                        ScheduleReason::Dependency,
+                    );
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Test => {
@@ -1480,6 +1581,7 @@ impl Workspace {
             self.logs.read().unwrap().tail(),
             params,
             profile,
+            ScheduleReason::Requested,
         )
     }
 
@@ -1759,6 +1861,7 @@ impl Workspace {
 
             let job_index = JobIndex(state.jobs.len() as u32);
             let base_task = &mut state.base_tasks[task.task_data.base_task_idx.idx()];
+            let task_name = base_task.name;
             let pc = base_task.jobs.len();
             let job_id = LogGroup::new(task.task_data.base_task_idx, pc);
 
@@ -1787,6 +1890,10 @@ impl Workspace {
                 spawn_profile: String::new(),
                 spawn_params: ValueMap::new(),
             });
+
+            if !spawn {
+                kvlog::info!("Job scheduled", task_name, job_index, reason = ScheduleReason::TestRun.name());
+            }
 
             test_jobs.push(TestJob {
                 base_task_index: task.task_data.base_task_idx,
@@ -1980,6 +2087,7 @@ impl Workspace {
 
             let job_index = JobIndex(state.jobs.len() as u32);
             let base_task = &mut state.base_tasks[task.task_data.base_task_idx.idx()];
+            let task_name = base_task.name;
             let pc = base_task.jobs.len();
             let job_id = LogGroup::new(task.task_data.base_task_idx, pc);
 
@@ -2008,6 +2116,10 @@ impl Workspace {
                 spawn_profile,
                 spawn_params,
             });
+
+            if !spawn {
+                kvlog::info!("Job scheduled", task_name, job_index, reason = ScheduleReason::TestRun.name());
+            }
 
             test_jobs.push(TestJob {
                 base_task_index: task.task_data.base_task_idx,

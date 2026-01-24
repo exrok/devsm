@@ -152,6 +152,25 @@ pub(crate) enum ReadResult {
     OtherError(std::io::ErrorKind),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SocketTerminationReason {
+    Eof,
+    ReadError,
+    ProtocolError,
+    ClientRequestedTerminate,
+}
+
+impl SocketTerminationReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eof => "socket_eof",
+            Self::ReadError => "socket_read_error",
+            Self::ProtocolError => "protocol_error",
+            Self::ClientRequestedTerminate => "client_requested_terminate",
+        }
+    }
+}
+
 pub(crate) fn try_read(fd: RawFd, buffer: &mut Vec<u8>) -> ReadResult {
     let mut target = buffer.spare_capacity_mut();
     if target.len() < 1024 {
@@ -187,7 +206,7 @@ pub(crate) fn try_read(fd: RawFd, buffer: &mut Vec<u8>) -> ReadResult {
 
 impl ProcessManager {
     pub(crate) fn read(&mut self, index: ProcessIndex, pipe: Pipe) -> anyhow::Result<()> {
-        kvlog::info!("Read");
+        kvlog::debug!("Read process", index, pipe= ?pipe);
         let process = self.processes.get_mut(index).context("Invalid process index")?;
         let (fd, mut buffer) = match pipe {
             Pipe::Stdout => (
@@ -212,7 +231,7 @@ impl ProcessManager {
                 ReadResult::More => continue,
                 ReadResult::EOF => {
                     if let Err(err) = self.poll.registry().deregister(&mut SourceFd(&fd)) {
-                        kvlog::error!("Failed to unregister fd", ?err);
+                        kvlog::error!("Failed to unregister fd", ?err, ?pipe, job_index = process.job_index);
                     }
                     match pipe {
                         Pipe::Stdout => {
@@ -224,12 +243,12 @@ impl ProcessManager {
                             process.stderr_buffer = None;
                         }
                     }
-                    kvlog::info!("EOF");
+                    kvlog::debug!("Process pipe EOF found, closing", ?pipe, job_index = process.job_index);
                     expecting_more = false;
                     break;
                 }
                 ReadResult::OtherError(err) => {
-                    kvlog::error!("Read failed with unexpected error", ?err, ?pipe);
+                    kvlog::warn!("Read failed with unexpected error", ?err, ?pipe, job_index = process.job_index);
                     break;
                 }
             }
@@ -309,8 +328,13 @@ impl ProcessManager {
 
                     if let Some(process) = self.processes.get_mut(process_index) {
                         if process.log_group == job_id && process.alive {
-                            kvlog::info!("Terminating service to allow queued service", ?service_to_kill);
-                            process.pending_exit_cause = Some(ExitCause::Restarted);
+                            kvlog::info!(
+                                "Process killed",
+                                job_index = service_to_kill,
+                                base_task_index = job_id.base_task_index().0,
+                                reason = ExitCause::ProfileConflict.name()
+                            );
+                            process.pending_exit_cause = Some(ExitCause::ProfileConflict);
                             let child_pid = process.child.id();
                             let pgid_to_kill = -(child_pid as i32);
                             unsafe {
@@ -324,7 +348,6 @@ impl ProcessManager {
 
                 match state.next_scheduled() {
                     workspace::Scheduled::Ready(job_index) => {
-                        kvlog::info!("Scheduled task is ready");
                         let job = &state.jobs[job_index.idx()];
                         let job_correlation = job.log_group;
                         let job_task = job.task.clone();
@@ -333,7 +356,7 @@ impl ProcessManager {
                         continue 'outer;
                     }
                     workspace::Scheduled::Never(job_index) => {
-                        kvlog::info!("Scheduled task is never");
+                        kvlog::info!("Scheduled task will never be ready cancelling", job_index);
                         drop(state);
                         let mut ws_state = ws.handle.state.write().unwrap();
                         ws_state.update_job_status(job_index, JobStatus::Cancelled);
@@ -688,6 +711,13 @@ impl ProcessManager {
                 let child_pid = process.child.id();
                 let pgid_to_kill = -(child_pid as i32);
 
+                kvlog::info!(
+                    "Process killed",
+                    job_index = process.job_index,
+                    base_task_index = job_id.base_task_index().0,
+                    reason = exit_cause.name()
+                );
+
                 unsafe {
                     if libc::kill(pgid_to_kill, libc::SIGINT) == -1 {
                         let err = std::io::Error::last_os_error();
@@ -695,12 +725,6 @@ impl ProcessManager {
                     }
                 }
                 process.alive = false;
-                // if let Some(workspace) = self.workspaces.get(workspace_id as usize) {
-                //     let mut ws = workspace.handle.state.write().unwrap();
-                //     // if let Some(task) = ws.get_job_mut(job_id) {
-                //     //     task.status = JobStatus::Terminating;
-                //     // }
-                // }
                 false
             }
             ProcessRequest::AttachClient { stdin, stdout, socket, workspace_config, kind } => {
@@ -783,7 +807,7 @@ impl ProcessManager {
                     if process.child.id() != pid {
                         continue;
                     }
-                    kvlog::info!("Found ProcessExited");
+                    kvlog::info!("Process Exited", pid, status, job_index = process.job_index);
                     if let Some(stdin) = process.child.stdout.take() {
                         let mut buffer = process
                             .stdout_buffer
@@ -859,6 +883,7 @@ impl ProcessManager {
                         ExitCause::Killed => crate::rpc::ExitCause::Killed,
                         ExitCause::Restarted => crate::rpc::ExitCause::Restarted,
                         ExitCause::SpawnFailed => crate::rpc::ExitCause::SpawnFailed,
+                        ExitCause::ProfileConflict => crate::rpc::ExitCause::ProfileConflict,
                     };
                     if let Some(workspace) = self.workspaces.get(ws_idx as usize) {
                         let mut ws = workspace.handle.state.write().unwrap();
@@ -1266,12 +1291,25 @@ impl ProcessManager {
             crate::tui::OutputMode::Terminal
         };
         std::thread::spawn(move || {
-            let _ = std::panic::catch_unwind(|| {
-                if let Err(err) = crate::tui::run(stdin, stdout, &ws_handle, channel_clone, keybinds, output_mode) {
-                    kvlog::error!("TUI exited with error", %err);
-                }
+            kvlog::debug!("TUI thread started", index);
+            let result = std::panic::catch_unwind(|| {
+                crate::tui::run(stdin, stdout, &ws_handle, channel_clone, keybinds, output_mode)
             });
-            kvlog::info!("Terminating Client");
+            match result {
+                Ok(Ok(())) => {
+                    if channel.is_terminated() {
+                        kvlog::info!("TUI thread exiting", index, reason = "signaled_to_terminate");
+                    } else {
+                        kvlog::info!("TUI thread exiting", index, reason = "completed_normally");
+                    }
+                }
+                Ok(Err(err)) => {
+                    kvlog::error!("TUI thread exiting with error", index, %err);
+                }
+                Err(_) => {
+                    kvlog::error!("TUI thread panicked", index);
+                }
+            }
             ws_handle.process_channel.send(ProcessRequest::ClientExited { index });
         });
     }
@@ -1346,14 +1384,21 @@ impl ProcessManager {
         let ws_handle = ws.handle.clone();
         let request_channel = self.request.clone();
         std::thread::spawn(move || {
-            let _ = std::panic::catch_unwind(|| {
-                if let Err(err) =
-                    crate::log_fowarder_ui::run(stdin, stdout, forwarder_socket, &ws_handle, job_id, channel)
-                {
-                    kvlog::error!("Forwarder exited with error", %err);
-                }
+            kvlog::debug!("Run client thread started", index);
+            let result = std::panic::catch_unwind(|| {
+                crate::log_fowarder_ui::run(stdin, stdout, forwarder_socket, &ws_handle, job_id, channel)
             });
-            kvlog::info!("Terminating run client");
+            match result {
+                Ok(Ok(())) => {
+                    kvlog::info!("Run client thread exiting", index, reason = "completed");
+                }
+                Ok(Err(err)) => {
+                    kvlog::error!("Run client thread exiting with error", index, %err);
+                }
+                Err(_) => {
+                    kvlog::error!("Run client thread panicked", index);
+                }
+            }
             request_channel.send(ProcessRequest::ClientExited { index });
         });
     }
@@ -1434,14 +1479,21 @@ impl ProcessManager {
         let ws_handle = ws.handle.clone();
         let request_channel = self.request.clone();
         std::thread::spawn(move || {
-            let _ = std::panic::catch_unwind(|| {
-                if let Err(err) =
-                    crate::test_summary_ui::run(stdin, stdout, forwarder_socket, &ws_handle, test_run, channel)
-                {
-                    kvlog::error!("Test forwarder exited with error", %err);
-                }
+            kvlog::debug!("Test run client thread started", index);
+            let result = std::panic::catch_unwind(|| {
+                crate::test_summary_ui::run(stdin, stdout, forwarder_socket, &ws_handle, test_run, channel)
             });
-            kvlog::info!("Terminating test run client");
+            match result {
+                Ok(Ok(())) => {
+                    kvlog::info!("Test run client thread exiting", index, reason = "completed");
+                }
+                Ok(Err(err)) => {
+                    kvlog::error!("Test run client thread exiting with error", index, %err);
+                }
+                Err(_) => {
+                    kvlog::error!("Test run client thread panicked", index);
+                }
+            }
             request_channel.send(ProcessRequest::ClientExited { index });
         });
     }
@@ -1529,14 +1581,21 @@ impl ProcessManager {
         let config = crate::log_fowarder_ui::LogForwarderConfig::from_query(&query, &ws_handle);
 
         std::thread::spawn(move || {
-            let _ = std::panic::catch_unwind(|| {
-                if let Err(err) =
-                    crate::log_fowarder_ui::run_logs(stdin, stdout, forwarder_socket, &ws_handle, config, channel)
-                {
-                    kvlog::error!("Logs forwarder exited with error", %err);
-                }
+            kvlog::debug!("Logs client thread started", index);
+            let result = std::panic::catch_unwind(|| {
+                crate::log_fowarder_ui::run_logs(stdin, stdout, forwarder_socket, &ws_handle, config, channel)
             });
-            kvlog::info!("Terminating logs client");
+            match result {
+                Ok(Ok(())) => {
+                    kvlog::info!("Logs client thread exiting", index, reason = "completed");
+                }
+                Ok(Err(err)) => {
+                    kvlog::error!("Logs client thread exiting with error", index, %err);
+                }
+                Err(_) => {
+                    kvlog::error!("Logs client thread panicked", index);
+                }
+            }
             request_channel.send(ProcessRequest::ClientExited { index });
         });
 
@@ -1570,7 +1629,13 @@ impl ProcessManager {
         let request_channel = self.request.clone();
 
         std::thread::spawn(move || {
-            run_self_logs_forwarder(stdout, channel, request_channel, index);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_self_logs_forwarder(stdout, channel, request_channel.clone(), index);
+            }));
+            if result.is_err() {
+                kvlog::error!("Self-logs forwarder thread panicked", index);
+                request_channel.send(ProcessRequest::ClientExited { index });
+            }
         });
 
         kvlog::info!("Self-logs client attached");
@@ -1586,12 +1651,13 @@ impl ProcessManager {
             match try_read(client.socket.as_raw_fd(), &mut buffer) {
                 ReadResult::More => continue,
                 ReadResult::EOF => {
-                    self.terminate_client(client_index);
+                    self.signal_threaded_client_exit(client_index, SocketTerminationReason::Eof);
                     return;
                 }
                 ReadResult::Done | ReadResult::WouldBlock => return,
-                ReadResult::OtherError(_) => {
-                    self.terminate_client(client_index);
+                ReadResult::OtherError(err) => {
+                    kvlog::error!("Self-logs client read failed", ?err, index = client_index as usize);
+                    self.signal_threaded_client_exit(client_index, SocketTerminationReason::ReadError);
                     return;
                 }
             }
@@ -1609,18 +1675,18 @@ impl ProcessManager {
             .take()
             .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
 
-        let mut terminate = false;
+        let mut termination_reason: Option<SocketTerminationReason> = None;
         loop {
             match try_read(client.socket.as_raw_fd(), &mut buffer) {
                 ReadResult::More => continue,
                 ReadResult::EOF => {
-                    terminate = true;
+                    termination_reason = Some(SocketTerminationReason::Eof);
                     break;
                 }
                 ReadResult::Done | ReadResult::WouldBlock => break,
                 ReadResult::OtherError(err) => {
-                    kvlog::error!("RPC client read error", ?err);
-                    terminate = true;
+                    kvlog::error!("RPC client read error", ?err, index = client_index as usize);
+                    termination_reason = Some(SocketTerminationReason::ReadError);
                     break;
                 }
             }
@@ -1639,8 +1705,8 @@ impl ProcessManager {
                     break;
                 }
                 DecodeResult::Error(e) => {
-                    kvlog::error!("RPC protocol decode error", ?e);
-                    terminate = true;
+                    kvlog::error!("RPC client protocol decode error", ?e, index = client_index as usize);
+                    termination_reason = Some(SocketTerminationReason::ProtocolError);
                     break;
                 }
             }
@@ -1656,7 +1722,8 @@ impl ProcessManager {
             let _ = client.socket.write_all(encoder.output());
         }
 
-        if terminate {
+        if let Some(reason) = termination_reason {
+            kvlog::info!("RPC client terminated", index = client_index as usize, reason = reason.as_str());
             self.buffer_pool.push(buffer);
             self.terminate_client(client_index);
         } else if buffer.is_empty() {
@@ -1929,9 +1996,28 @@ impl ProcessManager {
 
     fn terminate_client(&mut self, client_index: ClientIndex) {
         let Some(client) = self.clients.try_remove(client_index as usize) else {
-            kvlog::error!("Terminate for missing client", index = client_index as usize);
+            kvlog::debug!("Client already removed", index = client_index as usize);
             return;
         };
+        client.channel.set_terminated();
+        let _ = client.channel.wake();
+        let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
+        kvlog::info!("Client terminated", index = client_index as usize);
+    }
+
+    fn signal_threaded_client_exit(&mut self, client_index: ClientIndex, reason: SocketTerminationReason) {
+        let Some(client) = self.clients.get(client_index as usize) else {
+            return;
+        };
+        if client.channel.is_terminated() {
+            kvlog::debug!(
+                "Client already signaled for termination",
+                index = client_index as usize,
+                reason = reason.as_str()
+            );
+            return;
+        }
+        kvlog::info!("Signaling threaded client exit", index = client_index as usize, reason = reason.as_str());
         client.channel.set_terminated();
         let _ = client.channel.wake();
         let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
@@ -1965,19 +2051,19 @@ impl ProcessManager {
             .take()
             .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
 
-        let mut terminate = false;
+        let mut termination_reason: Option<SocketTerminationReason> = None;
         loop {
             match try_read(client.socket.as_raw_fd(), &mut buffer) {
                 ReadResult::More => continue,
                 ReadResult::EOF => {
-                    terminate = true;
+                    termination_reason = Some(SocketTerminationReason::Eof);
                     break;
                 }
                 ReadResult::Done => break,
                 ReadResult::WouldBlock => break,
                 ReadResult::OtherError(err) => {
-                    kvlog::error!("Read failed with unexpected error", ?err);
-                    terminate = true;
+                    kvlog::error!("TUI client read failed", ?err, index = client_index as usize);
+                    termination_reason = Some(SocketTerminationReason::ReadError);
                     break;
                 }
             }
@@ -1992,7 +2078,7 @@ impl ProcessManager {
                         wake = true;
                     }
                     RpcMessageKind::Terminate => {
-                        terminate = true;
+                        termination_reason = Some(SocketTerminationReason::ClientRequestedTerminate);
                     }
                     _ => {
                         kvlog::error!("Unexpected message kind from TUI client", ?kind);
@@ -2004,8 +2090,8 @@ impl ProcessManager {
                     break;
                 }
                 DecodeResult::Error(e) => {
-                    kvlog::error!("Protocol decode error", ?e);
-                    terminate = true;
+                    kvlog::error!("TUI client protocol decode error", ?e, index = client_index as usize);
+                    termination_reason = Some(SocketTerminationReason::ProtocolError);
                     break;
                 }
             }
@@ -2013,9 +2099,9 @@ impl ProcessManager {
 
         state.compact(&mut buffer, 4096);
 
-        if terminate {
+        if let Some(reason) = termination_reason {
             self.buffer_pool.push(buffer);
-            self.terminate_client(client_index);
+            self.signal_threaded_client_exit(client_index, reason);
         } else {
             if buffer.is_empty() {
                 self.buffer_pool.push(buffer);
@@ -2039,20 +2125,21 @@ impl ProcessManager {
             .take()
             .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
 
-        let mut terminate = false;
+        let mut termination_reason: Option<SocketTerminationReason> = None;
         let mut kill_task = false;
 
         loop {
             match try_read(client.socket.as_raw_fd(), &mut buffer) {
                 ReadResult::More => continue,
                 ReadResult::EOF => {
-                    terminate = true;
+                    termination_reason = Some(SocketTerminationReason::Eof);
                     break;
                 }
                 ReadResult::Done => break,
                 ReadResult::WouldBlock => break,
-                ReadResult::OtherError(_) => {
-                    terminate = true;
+                ReadResult::OtherError(err) => {
+                    kvlog::error!("Run client read failed", ?err, index = client_index as usize);
+                    termination_reason = Some(SocketTerminationReason::ReadError);
                     break;
                 }
             }
@@ -2063,7 +2150,7 @@ impl ProcessManager {
                 DecodeResult::Message { kind, .. } => match kind {
                     RpcMessageKind::Terminate => {
                         kill_task = true;
-                        terminate = true;
+                        termination_reason = Some(SocketTerminationReason::ClientRequestedTerminate);
                     }
                     _ => {
                         kvlog::error!("Unexpected message kind from run client", ?kind);
@@ -2075,8 +2162,8 @@ impl ProcessManager {
                     break;
                 }
                 DecodeResult::Error(e) => {
-                    kvlog::error!("Protocol decode error", ?e);
-                    terminate = true;
+                    kvlog::error!("Run client protocol decode error", ?e, index = client_index as usize);
+                    termination_reason = Some(SocketTerminationReason::ProtocolError);
                     break;
                 }
             }
@@ -2097,9 +2184,9 @@ impl ProcessManager {
             }
         }
 
-        if terminate {
+        if let Some(reason) = termination_reason {
             self.buffer_pool.push(buffer);
-            self.terminate_client(client_index);
+            self.signal_threaded_client_exit(client_index, reason);
         } else if buffer.is_empty() {
             self.buffer_pool.push(buffer);
         } else {
@@ -2117,19 +2204,20 @@ impl ProcessManager {
             .take()
             .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
 
-        let mut terminate = false;
+        let mut termination_reason: Option<SocketTerminationReason> = None;
 
         loop {
             match try_read(client.socket.as_raw_fd(), &mut buffer) {
                 ReadResult::More => continue,
                 ReadResult::EOF => {
-                    terminate = true;
+                    termination_reason = Some(SocketTerminationReason::Eof);
                     break;
                 }
                 ReadResult::Done => break,
                 ReadResult::WouldBlock => break,
-                ReadResult::OtherError(_) => {
-                    terminate = true;
+                ReadResult::OtherError(err) => {
+                    kvlog::error!("Test run client read failed", ?err, index = client_index as usize);
+                    termination_reason = Some(SocketTerminationReason::ReadError);
                     break;
                 }
             }
@@ -2139,7 +2227,7 @@ impl ProcessManager {
             match state.decode(&buffer) {
                 DecodeResult::Message { kind, .. } => match kind {
                     RpcMessageKind::Terminate => {
-                        terminate = true;
+                        termination_reason = Some(SocketTerminationReason::ClientRequestedTerminate);
                     }
                     _ => {
                         kvlog::error!("Unexpected message kind from test client", ?kind);
@@ -2151,8 +2239,8 @@ impl ProcessManager {
                     break;
                 }
                 DecodeResult::Error(e) => {
-                    kvlog::error!("Protocol decode error", ?e);
-                    terminate = true;
+                    kvlog::error!("Test run client protocol decode error", ?e, index = client_index as usize);
+                    termination_reason = Some(SocketTerminationReason::ProtocolError);
                     break;
                 }
             }
@@ -2160,9 +2248,9 @@ impl ProcessManager {
 
         state.compact(&mut buffer, 4096);
 
-        if terminate {
+        if let Some(reason) = termination_reason {
             self.buffer_pool.push(buffer);
-            self.terminate_client(client_index);
+            self.signal_threaded_client_exit(client_index, reason);
         } else if buffer.is_empty() {
             self.buffer_pool.push(buffer);
         } else {
@@ -2180,19 +2268,20 @@ impl ProcessManager {
             .take()
             .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
 
-        let mut terminate = false;
+        let mut termination_reason: Option<SocketTerminationReason> = None;
 
         loop {
             match try_read(client.socket.as_raw_fd(), &mut buffer) {
                 ReadResult::More => continue,
                 ReadResult::EOF => {
-                    terminate = true;
+                    termination_reason = Some(SocketTerminationReason::Eof);
                     break;
                 }
                 ReadResult::Done => break,
                 ReadResult::WouldBlock => break,
-                ReadResult::OtherError(_) => {
-                    terminate = true;
+                ReadResult::OtherError(err) => {
+                    kvlog::error!("Logs client read failed", ?err, index = client_index as usize);
+                    termination_reason = Some(SocketTerminationReason::ReadError);
                     break;
                 }
             }
@@ -2202,7 +2291,7 @@ impl ProcessManager {
             match state.decode(&buffer) {
                 DecodeResult::Message { kind, .. } => match kind {
                     RpcMessageKind::Terminate => {
-                        terminate = true;
+                        termination_reason = Some(SocketTerminationReason::ClientRequestedTerminate);
                     }
                     _ => {
                         kvlog::error!("Unexpected message kind from logs client", ?kind);
@@ -2214,8 +2303,8 @@ impl ProcessManager {
                     break;
                 }
                 DecodeResult::Error(e) => {
-                    kvlog::error!("Protocol decode error", ?e);
-                    terminate = true;
+                    kvlog::error!("Logs client protocol decode error", ?e, index = client_index as usize);
+                    termination_reason = Some(SocketTerminationReason::ProtocolError);
                     break;
                 }
             }
@@ -2223,9 +2312,9 @@ impl ProcessManager {
 
         state.compact(&mut buffer, 4096);
 
-        if terminate {
+        if let Some(reason) = termination_reason {
             self.buffer_pool.push(buffer);
-            self.terminate_client(client_index);
+            self.signal_threaded_client_exit(client_index, reason);
         } else if buffer.is_empty() {
             self.buffer_pool.push(buffer);
         } else {
@@ -2502,7 +2591,10 @@ fn run_self_logs_forwarder(
     request_channel: Arc<MioChannel>,
     index: usize,
 ) {
+    kvlog::debug!("Self-logs forwarder thread started", index);
+
     let Some(log_state) = crate::self_log::daemon_log_state() else {
+        kvlog::info!("Self-logs forwarder exiting", index, reason = "no_log_state");
         request_channel.send(ProcessRequest::ClientExited { index });
         return;
     };
@@ -2511,6 +2603,7 @@ fn run_self_logs_forwarder(
     let mut logs = Vec::new();
     let mut fmt_buf = Vec::new();
     let mut parents = kvlog::collector::ParentSpanSuffixCache::new_boxed();
+    let mut exit_reason = "signaled_to_terminate";
 
     loop {
         if channel.is_terminated() {
@@ -2533,6 +2626,7 @@ fn run_self_logs_forwarder(
             }
             if stdout.write_all(&fmt_buf).is_err() {
                 log_state.lock().unwrap().unregister_follower(follower_id);
+                exit_reason = "stdout_write_error";
                 break;
             }
         }
@@ -2547,5 +2641,6 @@ fn run_self_logs_forwarder(
         log_state.lock().unwrap().unregister_follower(follower_id);
     }
 
+    kvlog::info!("Self-logs forwarder exiting", index, reason = exit_reason);
     request_channel.send(ProcessRequest::ClientExited { index });
 }
