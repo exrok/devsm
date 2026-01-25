@@ -11,7 +11,6 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::net::UnixStream,
     },
-    path::Path,
     sync::Arc,
     time::Instant,
 };
@@ -22,35 +21,19 @@ use extui::{
 };
 
 use crate::config::Command;
+use crate::line_width::strip_ansi_to_buffer_preserve_case;
 use crate::log_storage::LogGroup;
 use crate::rpc::{Encoder, RpcMessageKind};
 use crate::{
     process_manager::ClientChannel,
-    workspace::{BaseTask, BaseTaskIndex, Job, JobIndex, JobStatus, TestJob, TestJobStatus, TestRun, Workspace},
+    workspace::{BaseTask, BaseTaskIndex, JobIndex, JobStatus, TestJob, TestJobStatus, TestRun, Workspace},
 };
 
 fn format_command(cmd: &Command) -> String {
     match cmd {
         Command::Cmd(args) => args.join(" "),
-        Command::Sh(script) => format!("sh -c '{}'", script),
+        Command::Sh(script) => format!("sh -c '{}'", script.trim()),
     }
-}
-
-fn relative_path(pwd: &str, base_path: &Path) -> String {
-    Path::new(pwd)
-        .strip_prefix(base_path)
-        .map(|p| {
-            let s = p.display().to_string();
-            if s.is_empty() { ".".to_string() } else { format!("./{}", s) }
-        })
-        .unwrap_or_else(|_| pwd.to_string())
-}
-
-fn format_job_details(job: &Job, job_index: usize, base_path: &Path) -> String {
-    let config = job.task.config();
-    let rel_path = relative_path(config.pwd, base_path);
-    let cmd = format_command(&config.command);
-    format!("# {:04} @ {} \n     {}", job_index, rel_path, cmd)
 }
 
 fn send_termination(encoder: &mut Encoder, socket: &mut Option<UnixStream>) {
@@ -61,7 +44,7 @@ fn send_termination(encoder: &mut Encoder, socket: &mut Option<UnixStream>) {
 }
 
 const MAX_RECENT_LOGS: usize = 3;
-const MAX_SUMMARY_LOGS: usize = 12;
+const MAX_SUMMARY_LOGS: usize = 24;
 
 struct TestDisplay {
     #[expect(unused, reason = "May be useful for future features")]
@@ -114,8 +97,12 @@ fn run_simple_mode(
     channel: Arc<ClientChannel>,
 ) -> anyhow::Result<()> {
     let mut encoder = Encoder::new();
+    let strip_ansi = std::env::var("FORCE_COLOR").is_err();
+    let mut buf = Vec::with_capacity(4096);
 
-    let _ = writeln!(stdout, "Running {} test(s)...\n", test_run.test_jobs.len());
+    writeln!(buf, "Running {} test(s)...\n", test_run.test_jobs.len()).ok();
+    stdout.write_all(&buf)?;
+    buf.clear();
 
     let mut pipe_fds = [0i32; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == -1 {
@@ -130,11 +117,16 @@ fn run_simple_mode(
             break;
         }
 
-        let all_done = update_test_statuses(&mut stdout, workspace, &mut test_run)?;
+        let all_done = update_test_statuses(&mut buf, workspace, &mut test_run, strip_ansi)?;
+        if !buf.is_empty() {
+            stdout.write_all(&buf)?;
+            buf.clear();
+        }
 
         if all_done {
             let state = workspace.state.read().unwrap();
-            print_summary(&mut stdout, &test_run, &state.base_tasks);
+            print_summary(&mut buf, &test_run, &state.base_tasks);
+            stdout.write_all(&buf)?;
             drop(state);
             send_termination(&mut encoder, &mut socket);
             break;
@@ -534,11 +526,13 @@ fn write_cancelled_summary(buf: &mut Vec<u8>, state: &TuiState) {
 }
 
 fn update_test_statuses(
-    file: &mut std::fs::File,
+    buf: &mut Vec<u8>,
     workspace: &Workspace,
     test_run: &mut TestRun,
+    strip_ansi: bool,
 ) -> anyhow::Result<bool> {
     let state = workspace.state.read().unwrap();
+    let logs = workspace.logs.read().unwrap();
     let mut all_done = true;
 
     for test_job in &mut test_run.test_jobs {
@@ -570,14 +564,52 @@ fn update_test_statuses(
             test_job.status = new_status;
 
             let display_name = format_test_name(test_job, &state.base_tasks);
-            let base_path = state.config.current.base_path;
-            let details = format_job_details(job, test_job.job_index.idx(), base_path);
             match new_status {
                 TestJobStatus::Passed => {
-                    let _ = writeln!(file, "PASS {} {}", display_name, details);
+                    writeln!(buf, "=== PASS {}", display_name).ok();
                 }
                 TestJobStatus::Failed(code) => {
-                    let _ = writeln!(file, "FAIL {} {} (exit code {})", display_name, details, code);
+                    let base_path = state.config.current.base_path;
+                    let config = job.task.config();
+                    let mut path = base_path.join(config.pwd);
+                    if let Ok(rel_path) = path.canonicalize() {
+                        path = rel_path;
+                    }
+
+                    writeln!(buf, "=== FAIL {}", display_name).ok();
+                    writeln!(buf, "exit_code: {}", code).ok();
+                    writeln!(buf, "pwd: {}", path.display()).ok();
+                    match &config.command {
+                        Command::Cmd(items) => {
+                            writeln!(buf, "command: {}", items.join(" ")).ok();
+                        }
+                        Command::Sh(script) => {
+                            writeln!(buf, "sh: {}", script.trim()).ok();
+                        }
+                    }
+
+                    let recent = collect_recent_logs(&logs, job.log_group, MAX_SUMMARY_LOGS);
+                    if !recent.is_empty() {
+                        let mut first = true;
+                        writeln!(buf, "<logs>").ok();
+                        for line in &recent {
+                            if first && line.trim().is_empty() {
+                                continue;
+                            }
+                            first = false;
+                            if strip_ansi {
+                                let mut stripped = Vec::new();
+                                strip_ansi_to_buffer_preserve_case(line, &mut stripped);
+                                writeln!(buf, "{}", String::from_utf8_lossy(&stripped)).ok();
+                            } else {
+                                writeln!(buf, "{}", line).ok();
+                            }
+                        }
+                        writeln!(buf, "</logs>").ok();
+
+                        writeln!(buf, "hint: `devsm logs --job={}` for full logs", test_job.job_index.idx()).ok();
+                    }
+                    writeln!(buf).ok();
                 }
                 _ => {}
             }
@@ -604,22 +636,11 @@ fn format_test_name(test_job: &TestJob, base_tasks: &[BaseTask]) -> String {
     }
 }
 
-fn print_summary(file: &mut std::fs::File, test_run: &TestRun, base_tasks: &[BaseTask]) {
+fn print_summary(buf: &mut Vec<u8>, test_run: &TestRun, _base_tasks: &[BaseTask]) {
     let elapsed = test_run.started_at.elapsed();
     let passed = test_run.test_jobs.iter().filter(|j| matches!(j.status, TestJobStatus::Passed)).count();
-    let failed: Vec<&TestJob> =
-        test_run.test_jobs.iter().filter(|j| matches!(j.status, TestJobStatus::Failed(_))).collect();
+    let failed = test_run.test_jobs.iter().filter(|j| matches!(j.status, TestJobStatus::Failed(_))).count();
 
-    let _ = writeln!(file);
-    let _ = writeln!(file, "Tests: {} passed, {} failed ({:.1}s)", passed, failed.len(), elapsed.as_secs_f64());
-
-    if !failed.is_empty() {
-        let _ = writeln!(file, "\nFailed:");
-        for test_job in &failed {
-            let name = format_test_name(test_job, base_tasks);
-            if let TestJobStatus::Failed(code) = test_job.status {
-                let _ = writeln!(file, "  {} (exit code {})", name, code);
-            }
-        }
-    }
+    writeln!(buf).ok();
+    writeln!(buf, "Tests: {} passed, {} failed ({:.1}s)", passed, failed, elapsed.as_secs_f64()).ok();
 }

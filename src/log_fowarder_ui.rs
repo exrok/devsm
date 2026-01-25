@@ -47,20 +47,60 @@ pub struct LogForwarderConfig {
 pub enum LogForwarderFilter {
     All,
     BaseTasks(BaseTaskSet),
+    Job(LogGroup),
 }
 
 impl LogForwarderConfig {
     pub fn from_query(query: &LogsQuery, workspace: &Workspace) -> Self {
-        let mut state = workspace.state.write().unwrap();
-
         let pattern = query.pattern.to_string();
         let case_sensitive = pattern.chars().any(|c| c.is_uppercase());
         let pattern_lower = if case_sensitive { pattern.clone() } else { pattern.to_lowercase() };
 
         let strip_ansi = !query.is_tty;
 
-        let mut base_tasks = BaseTaskSet::new();
         let mut task_names = Vec::new();
+
+        if let Some(job_idx) = query.job_index {
+            let state = workspace.state.read().unwrap();
+            let job_index = JobIndex::from_usize(job_idx as usize);
+            let Some(job) = state.jobs.get(job_index.idx()) else {
+                return Self {
+                    filter: LogForwarderFilter::All,
+                    pattern: pattern_lower,
+                    case_sensitive,
+                    max_age_secs: query.max_age_secs,
+                    strip_ansi,
+                    with_taskname: false,
+                    task_names,
+                    follow: query.follow,
+                    oldest: query.oldest,
+                    newest: query.newest,
+                };
+            };
+            let log_group = job.log_group;
+            let bti = log_group.base_task_index();
+            while task_names.len() <= bti.idx() {
+                task_names.push(String::new());
+            }
+            task_names[bti.idx()] = state.base_tasks[bti.idx()].name.to_string();
+
+            return Self {
+                filter: LogForwarderFilter::Job(log_group),
+                pattern: pattern_lower,
+                case_sensitive,
+                max_age_secs: query.max_age_secs,
+                strip_ansi,
+                with_taskname: false,
+                task_names,
+                follow: query.follow,
+                oldest: query.oldest,
+                newest: query.newest,
+            };
+        }
+
+        let mut state = workspace.state.write().unwrap();
+
+        let mut base_tasks = BaseTaskSet::new();
         let mut task_count = 0usize;
 
         if !query.task_filters.is_empty() {
@@ -238,6 +278,7 @@ fn dump_logs(
     let filter = match &config.filter {
         LogForwarderFilter::All => LogFilter::All,
         LogForwarderFilter::BaseTasks(set) => LogFilter::IsInSet(set.clone()),
+        LogForwarderFilter::Job(log_group) => LogFilter::IsGroup(*log_group),
     };
 
     let view = logs.view(filter);
@@ -323,6 +364,7 @@ fn forward_logs_filtered(
     let filter = match &config.filter {
         LogForwarderFilter::All => LogFilter::All,
         LogForwarderFilter::BaseTasks(set) => LogFilter::IsInSet(set.clone()),
+        LogForwarderFilter::Job(log_group) => LogFilter::IsGroup(*log_group),
     };
 
     let view = logs.view(filter);

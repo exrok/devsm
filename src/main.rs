@@ -18,7 +18,7 @@ mod cache_key;
 mod cli;
 mod collection;
 mod config;
-pub mod daemon;
+mod daemon;
 mod diagnostic;
 mod function;
 mod keybinds;
