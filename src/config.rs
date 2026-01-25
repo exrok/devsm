@@ -67,8 +67,9 @@ pub enum ServiceHidden {
 /// A single cache key input that contributes to cache invalidation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheKeyInput<'a> {
-    /// Invalidate cache when the file's modification time changes.
-    Modified(&'a str),
+    /// Invalidate cache when file(s) modification times change.
+    /// Supports directories (recursively walked) and ignore patterns.
+    Modified { paths: &'a [&'a str], ignore: &'a [&'a str] },
     /// Invalidate cache when the referenced task's profile changes.
     ProfileChanged(&'a str),
 }

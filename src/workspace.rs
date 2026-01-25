@@ -1,4 +1,5 @@
 use crate::{
+    cache_key::CacheKeyHasher,
     cli::TestFilter,
     config::{
         CARGO_AUTO_EXPR, CacheKeyInput, Command, Environment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig,
@@ -649,6 +650,7 @@ pub struct WorkspaceState {
     pub session_functions: hashbrown::HashMap<String, FunctionAction>,
     /// The most recent test group (persists across runs for rerun functionality).
     pub last_test_group: Option<TestGroup>,
+    cache_key_hasher: CacheKeyHasher,
 }
 
 impl WorkspaceState {
@@ -670,76 +672,83 @@ impl WorkspaceState {
 
         total != non_scheduled
     }
-    /// Computes a cache key from the cache configuration.
-    ///
-    /// The key is a concatenation of all key inputs, formatted as:
-    /// - `modified:<path>=<mtime_nanos>;` for file modification times
-    /// - `profile_changed:<task>=<counter>;` for profile change counters
-    ///
-    /// Returns an empty string if there are no key inputs.
-    fn compute_cache_key(&self, cache_key_inputs: &[CacheKeyInput]) -> String {
+    fn compute_cache_key(&mut self, cache_key_inputs: &[CacheKeyInput]) -> String {
         if cache_key_inputs.is_empty() {
             return String::new();
         }
-        let mut key = String::new();
+        self.cache_key_hasher.reset();
+
         for input in cache_key_inputs {
             match input {
-                CacheKeyInput::Modified(path) => {
-                    let full_path = self.config.current.base_path.join(path);
-                    let mtime = match std::fs::metadata(&full_path).and_then(|m| m.modified()) {
-                        Ok(time) => time.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos()),
-                        Err(_) => 0,
-                    };
-                    key.push_str("modified:");
-                    key.push_str(path);
-                    key.push('=');
-                    key.push_str(&mtime.to_string());
-                    key.push(';');
+                CacheKeyInput::Modified { paths, ignore } => {
+                    self.cache_key_hasher.update(b"modified:");
+                    for path in *paths {
+                        let full_path = self.config.current.base_path.join(path);
+                        self.cache_key_hasher.hash_path(&full_path, ignore);
+                    }
                 }
                 CacheKeyInput::ProfileChanged(task_name) => {
                     let counter = self
                         .name_map
                         .get(*task_name)
                         .map_or(0, |&bti| self.base_tasks[bti.idx()].profile_change_counter);
-                    key.push_str("profile_changed:");
-                    key.push_str(task_name);
-                    key.push('=');
-                    key.push_str(&counter.to_string());
-                    key.push(';');
+                    self.cache_key_hasher.update(b"profile_changed:");
+                    self.cache_key_hasher.update(task_name.as_bytes());
+                    self.cache_key_hasher.update(b"=");
+                    self.cache_key_hasher.update_u32(counter);
                 }
             }
         }
-        key
+        self.cache_key_hasher.finalize_hex()
     }
 
-    /// Computes a cache key that includes profile and parameters from require.
-    ///
-    /// Extends [`compute_cache_key`] by appending the profile and parameters
-    /// used to spawn this dependency, ensuring different profile/param
-    /// combinations result in different cache keys.
     fn compute_cache_key_with_require(
-        &self,
+        &mut self,
         cache_key_inputs: &[CacheKeyInput],
         profile: &str,
         params: &ValueMap,
     ) -> String {
-        let mut key = self.compute_cache_key(cache_key_inputs);
+        if cache_key_inputs.is_empty() && profile.is_empty() && params.entries().is_empty() {
+            return String::new();
+        }
+
+        self.cache_key_hasher.reset();
+
+        for input in cache_key_inputs {
+            match input {
+                CacheKeyInput::Modified { paths, ignore } => {
+                    self.cache_key_hasher.update(b"modified:");
+                    for path in *paths {
+                        let full_path = self.config.current.base_path.join(path);
+                        self.cache_key_hasher.hash_path(&full_path, ignore);
+                    }
+                }
+                CacheKeyInput::ProfileChanged(task_name) => {
+                    let counter = self
+                        .name_map
+                        .get(*task_name)
+                        .map_or(0, |&bti| self.base_tasks[bti.idx()].profile_change_counter);
+                    self.cache_key_hasher.update(b"profile_changed:");
+                    self.cache_key_hasher.update(task_name.as_bytes());
+                    self.cache_key_hasher.update(b"=");
+                    self.cache_key_hasher.update_u32(counter);
+                }
+            }
+        }
+
         if !profile.is_empty() {
-            key.push_str("require_profile:");
-            key.push_str(profile);
-            key.push(';');
+            self.cache_key_hasher.update(b"require_profile:");
+            self.cache_key_hasher.update(profile.as_bytes());
         }
         if !params.entries().is_empty() {
-            key.push_str("require_params:");
+            self.cache_key_hasher.update(b"require_params:");
             for (k, v) in params.entries() {
-                key.push_str(k);
-                key.push('=');
-                key.push_str(&v.to_string());
-                key.push(',');
+                self.cache_key_hasher.update(k.as_bytes());
+                self.cache_key_hasher.update(b"=");
+                self.cache_key_hasher.update(v.to_string().as_bytes());
             }
-            key.push(';');
         }
-        key
+        self.cache_key_hasher.finalize_hex()
     }
 
     pub fn base_index_by_name(&mut self, name: &str) -> Option<BaseTaskIndex> {
@@ -1011,15 +1020,16 @@ impl WorkspaceState {
         profile: &str,
         blocked_by: JobIndex,
     ) -> JobIndex {
-        let spawner = &self.base_tasks[base_task.idx()];
-        let task_name = spawner.name;
-        let env = Environment { profile, param: params.clone(), vars: spawner.config.vars };
-        let task = spawner.config.eval(&env).expect("Failed to eval queued service config");
+        let (task_name, task, pc) = {
+            let spawner = &self.base_tasks[base_task.idx()];
+            let env = Environment { profile, param: params.clone(), vars: spawner.config.vars };
+            let task = spawner.config.eval(&env).expect("Failed to eval queued service config");
+            (spawner.name, task, spawner.jobs.len())
+        };
 
         let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
 
         let job_index = JobIndex(self.jobs.len() as u32);
-        let pc = spawner.jobs.len();
         let job_id = LogGroup::new(base_task, pc);
 
         let after = vec![ScheduleRequirement { job: blocked_by, predicate: JobPredicate::Terminated }];
@@ -1268,6 +1278,7 @@ impl WorkspaceState {
                 ("fn2".to_string(), FunctionAction::RestartSelected),
             ]),
             last_test_group: None,
+            cache_key_hasher: CacheKeyHasher::new(),
         })
     }
 

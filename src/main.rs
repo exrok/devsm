@@ -14,6 +14,7 @@ use crate::rpc::{
     ONE_SHOT_FLAG, ResizeNotification, RpcMessageKind, WorkspaceRef,
 };
 
+mod cache_key;
 mod cli;
 mod collection;
 mod config;

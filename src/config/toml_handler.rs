@@ -186,6 +186,35 @@ fn parse_string_list_expr<'a>(
     }
 }
 
+fn parse_string_or_array<'a>(
+    alloc: &'a Bump,
+    value: &TomlValue<'a>,
+    field_name: &str,
+    re: &mut dyn FnMut(Diagnostic),
+) -> Result<&'a [&'a str], ()> {
+    match &value.value {
+        ValueInner::String(s) => {
+            let s: &'a str = alloc.alloc_str(as_str(s));
+            Ok(alloc.alloc_slice_copy(&[s]))
+        }
+        ValueInner::Array(arr) => {
+            let mut items = bumpalo::collections::Vec::new_in(alloc);
+            for item in arr {
+                let Some(s) = item.as_str() else {
+                    mismatched_in_object(re, "string", item, field_name);
+                    return Err(());
+                };
+                items.push(alloc.alloc_str(s) as &str);
+            }
+            Ok(items.into_bump_slice())
+        }
+        _ => {
+            mismatched_in_object(re, "string or array", value, field_name);
+            Err(())
+        }
+    }
+}
+
 fn parse_task<'a>(
     alloc: &'a Bump,
     task_table: &Table<'a>,
@@ -289,11 +318,13 @@ fn parse_task<'a>(
                             return Err(());
                         };
                         if let Some(modified_val) = item_table.get("modified") {
-                            let Some(path) = modified_val.as_str() else {
-                                mismatched_in_object(re, "string", modified_val, "modified");
-                                return Err(());
+                            let paths = parse_string_or_array(alloc, modified_val, "modified", re)?;
+                            let ignore = if let Some(ignore_val) = item_table.get("ignore") {
+                                parse_string_or_array(alloc, ignore_val, "ignore", re)?
+                            } else {
+                                &[]
                             };
-                            key_inputs.push(CacheKeyInput::Modified(alloc.alloc_str(path)));
+                            key_inputs.push(CacheKeyInput::Modified { paths, ignore });
                         } else if let Some(profile_val) = item_table.get("profile_changed") {
                             let Some(task_name) = profile_val.as_str() else {
                                 mismatched_in_object(re, "string", profile_val, "profile_changed");
@@ -490,11 +521,13 @@ fn parse_cache_config<'a>(
                 return Err(());
             };
             if let Some(modified_val) = item_table.get("modified") {
-                let Some(path) = modified_val.as_str() else {
-                    mismatched_in_object(re, "string", modified_val, "modified");
-                    return Err(());
+                let paths = parse_string_or_array(alloc, modified_val, "modified", re)?;
+                let ignore = if let Some(ignore_val) = item_table.get("ignore") {
+                    parse_string_or_array(alloc, ignore_val, "ignore", re)?
+                } else {
+                    &[]
                 };
-                key_inputs.push(CacheKeyInput::Modified(alloc.alloc_str(path)));
+                key_inputs.push(CacheKeyInput::Modified { paths, ignore });
             } else if let Some(profile_val) = item_table.get("profile_changed") {
                 let Some(task_name) = profile_val.as_str() else {
                     mismatched_in_object(re, "string", profile_val, "profile_changed");
@@ -1145,7 +1178,11 @@ cache.key = [
         assert_eq!(cache.key.len(), 2);
 
         match &cache.key[0] {
-            CacheKeyInput::Modified(path) => assert_eq!(*path, "./backend/database/schema.sql"),
+            CacheKeyInput::Modified { paths, ignore } => {
+                assert_eq!(paths.len(), 1);
+                assert_eq!(paths[0], "./backend/database/schema.sql");
+                assert!(ignore.is_empty());
+            }
             _ => panic!("Expected Modified cache key input"),
         }
         match &cache.key[1] {

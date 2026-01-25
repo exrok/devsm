@@ -2316,3 +2316,103 @@ while true; do sleep 1; done
         resp5.body
     );
 }
+
+#[test]
+fn cache_invalidates_on_deeply_nested_file_modified() {
+    let mut harness = TestHarness::new("cache_nested");
+    let counter = harness.temp_dir.join("counter.txt");
+    let nested_dir = harness.temp_dir.join("a/b/c/d/e");
+    let nested_file = nested_dir.join("nested.txt");
+
+    fs::create_dir_all(&nested_dir).unwrap();
+    fs::write(&nested_file, "initial").unwrap();
+    fs::write(&counter, "0").unwrap();
+
+    let a_dir = harness.temp_dir.join("a");
+    harness.write_config(&format!(
+        r#"
+[action.gen]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+'''
+cache.key = [{{ modified = "{a_dir}" }}]
+
+[action.consumer]
+sh = "cat {counter}"
+require = ["gen"]
+"#,
+        counter = counter.display(),
+        a_dir = a_dir.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success on first run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "gen should run first time");
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success on second run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "gen should be cached");
+
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&nested_file, "modified").unwrap();
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success on third run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "gen should run after nested file modified");
+}
+
+#[test]
+fn cache_ignores_patterns() {
+    let mut harness = TestHarness::new("cache_ignore");
+    let counter = harness.temp_dir.join("counter.txt");
+    let src_dir = harness.temp_dir.join("src");
+    let main_file = src_dir.join("main.rs");
+    let readme_file = src_dir.join("README.md");
+
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(&main_file, "fn main() {}").unwrap();
+    fs::write(&readme_file, "# Readme").unwrap();
+    fs::write(&counter, "0").unwrap();
+
+    harness.write_config(&format!(
+        r#"
+[action.gen]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+'''
+cache.key = [{{ modified = "{src_dir}", ignore = "*.md" }}]
+
+[action.consumer]
+sh = "cat {counter}"
+require = ["gen"]
+"#,
+        counter = counter.display(),
+        src_dir = src_dir.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success on first run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "gen should run first time");
+
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&readme_file, "# Updated Readme").unwrap();
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success on second run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "gen should be cached (*.md ignored)");
+
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&main_file, "fn main() { println!(\"updated\"); }").unwrap();
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success on third run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "gen should run after main.rs modified");
+}
