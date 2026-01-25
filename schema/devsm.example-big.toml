@@ -13,6 +13,7 @@ cmd = ["echo", "hello"]
 [action.simple_sh]
 sh = "echo hello"
 
+
 # Action with multiline shell script
 [action.multiline_sh]
 sh = '''
@@ -146,8 +147,8 @@ cache.key = [{ profile_changed = "full_basic" }]
 [action.with_cache_multiple]
 cmd = ["./compile.sh"]
 cache.key = [
-    { modified = "Cargo.toml" },
-    { modified = "Cargo.lock" },
+    { modified = ["Cargo.toml", "Cargo.lock", "src"], ignore = "*.md" },
+    { modified = ["docs/"], ignore = ["*.png", "*.jpg"] },
     { modified = "src/lib.rs" },
     { profile_changed = "simple_cmd" },
     { profile_changed = "full_basic" },

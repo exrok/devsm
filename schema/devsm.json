@@ -191,8 +191,34 @@
           "required": [ "modified" ],
           "properties": {
             "modified": {
-              "type": "string",
-              "description": "Path to file or directory to watch"
+              "oneOf": [
+                {
+                  "type": "string",
+                  "description": "Path to file or directory to watch"
+                },
+                {
+                  "type": "array",
+                  "description": "Paths to files or directories to watch",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "ignore": {
+              "oneOf": [
+                {
+                  "type": "string",
+                  "description": "Glob pattern to ignore when watching"
+                },
+                {
+                  "type": "array",
+                  "description": "Glob patterns to ignore when watching",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
             }
           }
         },
