@@ -5,12 +5,15 @@ use std::path::Path;
 
 use super::Entry;
 
+#[repr(C, align(8))]
+struct AlignedGetdentsBuf([u8; CacheKeyHasherLinux::GETDENTS_BUF_SIZE]);
+
 pub struct CacheKeyHasherLinux {
     hasher: blake3::Hasher,
     rel_path_buf: Vec<u8>,
     names_buf: Vec<u8>,
     entries: Vec<Entry>,
-    getdents_buf: Box<[u8; Self::GETDENTS_BUF_SIZE]>,
+    getdents_buf: Box<AlignedGetdentsBuf>,
 }
 
 impl CacheKeyHasherLinux {
@@ -22,7 +25,8 @@ impl CacheKeyHasherLinux {
             rel_path_buf: Vec::with_capacity(4096),
             names_buf: Vec::with_capacity(8192),
             entries: Vec::with_capacity(1024),
-            getdents_buf: vec![0u8; Self::GETDENTS_BUF_SIZE].into_boxed_slice().try_into().unwrap(),
+            // SAFETY: [u8; N] is valid when zero-initialized.
+            getdents_buf: unsafe { Box::<AlignedGetdentsBuf>::new_zeroed().assume_init() },
         }
     }
 
@@ -90,7 +94,7 @@ impl CacheKeyHasherLinux {
         hasher.update(&mtime_ns.to_le_bytes());
     }
 
-    const MAX_RECURSION_DEPTH: u32 = 256;
+    const MAX_RECURSION_DEPTH: u32 = 32;
 
     fn hash_directory(&mut self, dirfd: libc::c_int, ignore: &[&str], depth: u32) {
         if depth >= Self::MAX_RECURSION_DEPTH {
@@ -110,6 +114,7 @@ impl CacheKeyHasherLinux {
 
         self.entries[entries_start..entries_end].sort_unstable_by_key(|e| e.ino);
 
+        let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
         for i in entries_start..entries_end {
             let entry = self.entries[i];
             let name_start = entry.name_offset as usize;
@@ -133,7 +138,6 @@ impl CacheKeyHasherLinux {
             // SAFETY: stat_buf is valid mutable memory. name_ptr is a valid null-terminated
             // filename within the directory referenced by dirfd.
             unsafe {
-                let mut stat_buf: libc::stat = std::mem::zeroed();
                 let mut d_type = entry.d_type;
 
                 if d_type == libc::DT_UNKNOWN || d_type == libc::DT_LNK {
@@ -187,7 +191,7 @@ impl CacheKeyHasherLinux {
                 libc::syscall(
                     libc::SYS_getdents64,
                     dirfd,
-                    self.getdents_buf.as_mut_ptr(),
+                    self.getdents_buf.0.as_mut_ptr(),
                     Self::GETDENTS_BUF_SIZE as libc::c_int,
                 )
             };
@@ -198,10 +202,9 @@ impl CacheKeyHasherLinux {
 
             let mut offset = 0usize;
             while offset < nread as usize {
-                // SAFETY: The global allocator returns memory with at least 8-byte alignment
-                // for allocations of this size. The kernel's getdents64 syscall aligns entries
-                // within the buffer to the natural alignment of dirent64.
-                let dirent = unsafe { &*(self.getdents_buf.as_ptr().add(offset) as *const libc::dirent64) };
+                // SAFETY: AlignedGetdentsBuf has align(8), matching dirent64's alignment requirement.
+                // The kernel's getdents64 syscall aligns entries within the buffer accordingly.
+                let dirent = unsafe { &*(self.getdents_buf.0.as_ptr().add(offset) as *const libc::dirent64) };
 
                 let reclen = dirent.d_reclen as usize;
                 if reclen == 0 {
@@ -210,20 +213,18 @@ impl CacheKeyHasherLinux {
 
                 // SAFETY: dirent64 layout is stable kernel ABI. d_name follows the fixed fields.
                 // The kernel guarantees d_name is null-terminated within the d_reclen bounds.
-                let name_ptr = unsafe { self.getdents_buf.as_ptr().add(offset + offset_of!(libc::dirent64, d_name)) };
+                let name_ptr = unsafe { self.getdents_buf.0.as_ptr().add(offset + offset_of!(libc::dirent64, d_name)) };
                 let name_cstr = unsafe { CStr::from_ptr(name_ptr as *const libc::c_char) };
-                let name_bytes = name_cstr.to_bytes();
+                let name = name_cstr.to_bytes();
 
-                if !((name_bytes.len() == 1 && name_bytes[0] == b'.')
-                    || (name_bytes.len() == 2 && name_bytes[0] == b'.' && name_bytes[1] == b'.'))
-                {
+                if name != b"." && name != b".." {
                     let name_offset = self.names_buf.len() as u32;
-                    self.names_buf.extend_from_slice(name_bytes);
+                    self.names_buf.extend_from_slice(name);
                     self.names_buf.push(0);
 
                     self.entries.push(Entry {
                         name_offset,
-                        name_len: name_bytes.len() as u16,
+                        name_len: name.len() as u16,
                         d_type: dirent.d_type,
                         ino: dirent.d_ino,
                     });
