@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::rpc::{
     CommandBody, CommandResponse, DecodeResult, DecodingState, Encoder, ExitCause, JobExitedEvent, JobStatusKind,
-    KillTaskRequest, RestartTaskRequest, RpcMessageKind, SubscribeAck, SubscriptionFilter, WorkspaceRef,
+    KillTaskRequest, RpcMessageKind, SpawnTaskRequest, SubscribeAck, SubscriptionFilter, WorkspaceRef,
 };
 use harness::{RpcEvent, RpcSubscriber, TestHarness, cargo_bin_path};
 
@@ -2204,25 +2204,26 @@ while true; do sleep 1; done
     let mut buffer = Vec::with_capacity(4096);
     let mut correlation: u16 = 1;
 
-    // Command 1: RestartTask (starts the action) - with one_shot=false to keep connection open
-    let req1 = RestartTaskRequest {
+    // Command 1: SpawnTask (starts the action) - with one_shot=false to keep connection open
+    let req1 = SpawnTaskRequest {
         workspace: WorkspaceRef::Path { config: &config_path },
         task_name: "my_action",
         profile: "",
         params: &[],
         as_test: false,
+        cached: false,
     };
     let resp1 = rpc_send_recv(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
-        RpcMessageKind::RestartTask,
+        RpcMessageKind::SpawnTask,
         correlation,
         &req1,
     );
     correlation += 1;
-    assert!(matches!(resp1.body, CommandBody::Empty), "RestartTask should succeed with Empty, got {:?}", resp1.body);
+    assert!(matches!(resp1.body, CommandBody::Empty), "SpawnTask should succeed with Empty, got {:?}", resp1.body);
 
     assert!(harness.wait_for_file(&action_marker, Duration::from_secs(3)), "Action should complete");
 
@@ -2231,25 +2232,26 @@ while true; do sleep 1; done
     rpc_subscribe(&mut socket, &mut encoder, &mut decoder, &mut buffer, &filter, correlation);
     correlation += 1;
 
-    // Command 2: RestartTask (starts the service) - connection still open
-    let req2 = RestartTaskRequest {
+    // Command 2: SpawnTask (starts the service) - connection still open
+    let req2 = SpawnTaskRequest {
         workspace: WorkspaceRef::Path { config: &config_path },
         task_name: "my_service",
         profile: "",
         params: &[],
         as_test: false,
+        cached: false,
     };
     let resp2 = rpc_send_recv(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
-        RpcMessageKind::RestartTask,
+        RpcMessageKind::SpawnTask,
         correlation,
         &req2,
     );
     correlation += 1;
-    assert!(matches!(resp2.body, CommandBody::Empty), "RestartTask for service should succeed, got {:?}", resp2.body);
+    assert!(matches!(resp2.body, CommandBody::Empty), "SpawnTask for service should succeed, got {:?}", resp2.body);
 
     assert!(harness.wait_for_file(&service_marker, Duration::from_secs(3)), "Service should start");
 
@@ -2292,27 +2294,28 @@ while true; do sleep 1; done
         resp4.body
     );
 
-    // Command 5: RestartTask on nonexistent task (should error)
-    let req5 = RestartTaskRequest {
+    // Command 5: SpawnTask on nonexistent task (should error)
+    let req5 = SpawnTaskRequest {
         workspace: WorkspaceRef::Path { config: &config_path },
         task_name: "nonexistent_task",
         profile: "",
         params: &[],
         as_test: false,
+        cached: false,
     };
     let resp5 = rpc_send_recv(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
-        RpcMessageKind::RestartTask,
+        RpcMessageKind::SpawnTask,
         correlation,
         &req5,
     );
     let _ = correlation;
     assert!(
         matches!(resp5.body, CommandBody::Error(ref err) if err.contains("not found")),
-        "RestartTask on nonexistent should error, got {:?}",
+        "SpawnTask on nonexistent should error, got {:?}",
         resp5.body
     );
 }
@@ -2415,4 +2418,129 @@ require = ["gen"]
     let result = harness.run_client(&["run", "consumer"]);
     assert!(result.success(), "Expected success on third run, got: {}", result.stderr);
     assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "gen should run after main.rs modified");
+}
+
+#[test]
+fn restart_cached_flag_skips_on_cache_hit() {
+    let mut harness = TestHarness::new("restart_cached");
+    let trigger = harness.temp_dir.join("trigger.txt");
+    let counter = harness.temp_dir.join("counter.txt");
+
+    fs::write(&trigger, "initial").unwrap();
+    fs::write(&counter, "0").unwrap();
+
+    harness.write_config(&format!(
+        r#"
+[action.cached_action]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+'''
+cache.key = [{{ modified = "{trigger}" }}]
+"#,
+        trigger = trigger.display(),
+        counter = counter.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+
+    let mut socket = UnixStream::connect(&harness.socket_path).expect("Failed to connect");
+    socket.set_read_timeout(Some(Duration::from_millis(100))).ok();
+    socket.set_nonblocking(true).ok();
+
+    let mut encoder = Encoder::new();
+    let mut decoder = DecodingState::default();
+    let mut buffer = Vec::with_capacity(4096);
+    let mut correlation: u16 = 1;
+
+    // First restart with cached=false: should run the action
+    let req1 = SpawnTaskRequest {
+        workspace: WorkspaceRef::Path { config: &config_path },
+        task_name: "cached_action",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    };
+    let resp1 = rpc_send_recv(
+        &mut socket,
+        &mut encoder,
+        &mut decoder,
+        &mut buffer,
+        RpcMessageKind::SpawnTask,
+        correlation,
+        &req1,
+    );
+    correlation += 1;
+    assert!(matches!(resp1.body, CommandBody::Empty), "First restart should succeed with Empty, got {:?}", resp1.body);
+
+    // Wait for action to complete
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "Action should have run once");
+
+    // Second restart with cached=true: should return cache hit message
+    let req2 = SpawnTaskRequest {
+        workspace: WorkspaceRef::Path { config: &config_path },
+        task_name: "cached_action",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: true,
+    };
+    let resp2 = rpc_send_recv(
+        &mut socket,
+        &mut encoder,
+        &mut decoder,
+        &mut buffer,
+        RpcMessageKind::SpawnTask,
+        correlation,
+        &req2,
+    );
+    correlation += 1;
+    assert!(
+        matches!(resp2.body, CommandBody::Message(ref msg) if msg.contains("cache hit")),
+        "Second restart with cached=true should return cache hit message, got {:?}",
+        resp2.body
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "Action should NOT have run again");
+
+    // Modify trigger file to invalidate cache
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&trigger, "modified").unwrap();
+
+    // Third restart with cached=true: cache invalidated, should run
+    let req3 = SpawnTaskRequest {
+        workspace: WorkspaceRef::Path { config: &config_path },
+        task_name: "cached_action",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: true,
+    };
+    let resp3 = rpc_send_recv(
+        &mut socket,
+        &mut encoder,
+        &mut decoder,
+        &mut buffer,
+        RpcMessageKind::SpawnTask,
+        correlation,
+        &req3,
+    );
+    let _ = correlation;
+    assert!(
+        matches!(resp3.body, CommandBody::Empty),
+        "Third restart should succeed (cache invalidated), got {:?}",
+        resp3.body
+    );
+
+    // Wait for action to complete
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        fs::read_to_string(&counter).unwrap().trim(),
+        "2",
+        "Action should have run again after cache invalidation"
+    );
 }

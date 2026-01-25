@@ -75,8 +75,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Restart { job, value_map, as_test } => {
-            if let Err(err) = restart_task_command(job, value_map, as_test) {
+        cli::Command::Spawn { job, value_map, as_test, cached } => {
+            if let Err(err) = spawn_task_command(job, value_map, as_test, cached) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -405,7 +405,7 @@ fn restart_selected_command() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn restart_task_command(job: &str, value_map: jsony_value::ValueMap, as_test: bool) -> anyhow::Result<()> {
+fn spawn_task_command(job: &str, value_map: jsony_value::ValueMap, as_test: bool, cached: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let config = config::find_config_path_from(&cwd)
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
@@ -413,14 +413,15 @@ fn restart_task_command(job: &str, value_map: jsony_value::ValueMap, as_test: bo
     let (task_name, profile) = job.rsplit_once(':').unwrap_or((job, ""));
     let params_bytes = jsony::to_binary(&value_map);
 
-    let req = rpc::RestartTaskRequest {
+    let req = rpc::SpawnTaskRequest {
         workspace: WorkspaceRef::Path { config: &config },
         task_name,
         profile,
         params: &params_bytes,
         as_test,
+        cached,
     };
-    let response = rpc_command(RpcMessageKind::RestartTask, &req)?;
+    let response = rpc_command(RpcMessageKind::SpawnTask, &req)?;
     handle_command_response(response)
 }
 
@@ -1038,7 +1039,7 @@ Commands:
   (default)          Launch the TUI interface
   run <job>          Run a job and display its output
   exec <job>         Execute a task directly, bypassing the daemon
-  restart <job>      Restart a job via the daemon
+  spawn <job>        Spawn a job via the daemon
   restart-selected   Restart the currently selected task in TUI
   kill <task>        Terminate a running task (by name or index)
   test [filters]     Run tests with optional filters
@@ -1065,6 +1066,9 @@ Test Filters:
 
 Validate Options:
   --skip-path-checks     Skip validation of pwd paths
+
+Spawn Options:
+  --cached               Skip restart if task has cache support and cache key matches
 
 Logs Options:
   --max-age=DURATION     Show logs since DURATION ago (5s, 10m, 1h)

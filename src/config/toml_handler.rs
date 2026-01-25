@@ -302,12 +302,6 @@ fn parse_task<'a>(
                 }
 
                 if let Some(key_value) = cache_table.get("key") {
-                    if kind == TaskKind::Service {
-                        re(Diagnostic::error()
-                            .with_message("`cache.key` is not valid for services, only `cache.never` is allowed")
-                            .with_label(DiagnosticLabel::primary(key_value.span.into())));
-                        return Err(());
-                    }
                     let Some(key_array) = key_value.as_array() else {
                         mismatched_in_object(re, "array", key_value, "key");
                         return Err(());
@@ -1034,7 +1028,7 @@ cache = {}
     }
 
     #[test]
-    fn test_cache_key_invalid_for_service() {
+    fn test_cache_key_valid_for_service() {
         let text = r#"
 [service.server]
 cmd = ["./server"]
@@ -1047,9 +1041,12 @@ cache.key = [{ modified = "/tmp/file" }]
         };
 
         let result = parse(Path::new("/"), &bump, text, &mut error);
-        assert!(result.is_err(), "Expected error for cache.key on service");
-        assert!(!errors.is_empty());
-        assert!(errors[0].message.contains("cache.key"));
+        assert!(result.is_ok(), "cache.key should be valid for services: {:?}", errors);
+        let config = result.unwrap();
+        let (name, task) = &config.tasks[0];
+        assert_eq!(*name, "server");
+        assert!(task.cache.is_some());
+        assert!(!task.cache.as_ref().unwrap().key.is_empty());
     }
 
     #[test]

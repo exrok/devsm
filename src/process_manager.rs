@@ -1019,20 +1019,21 @@ impl ProcessManager {
         }
 
         match kind {
-            RpcMessageKind::RestartTask => {
-                let req = parse!(RestartTaskRequest);
+            RpcMessageKind::SpawnTask => {
+                let req = parse!(SpawnTaskRequest);
                 let ws_index = resolve!(req.workspace);
                 let ws = &self.workspaces[ws_index as usize];
                 let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
 
                 let result = if req.as_test {
-                    ws.handle.restart_task_as_test(req.task_name, params, req.profile)
+                    ws.handle.spawn_task_as_test(req.task_name, params, req.profile).map(|()| None)
                 } else {
-                    ws.handle.restart_task_by_name(req.task_name, params, req.profile).map(|_| ())
+                    ws.handle.spawn_task_by_name_cached(req.task_name, params, req.profile, req.cached)
                 };
 
                 match result {
-                    Ok(()) => respond_ok!(ws_index),
+                    Ok(None) => respond_ok!(ws_index),
+                    Ok(Some(msg)) => respond_ok!(ws_index, msg),
                     Err(e) => respond_err!(ws_index, e),
                 }
             }
@@ -1817,7 +1818,7 @@ impl ProcessManager {
                     &crate::rpc::OpenWorkspaceResponse { success: true, error: None },
                 );
             }
-            RpcMessageKind::RestartTask => {
+            RpcMessageKind::SpawnTask => {
                 self.handle_rpc_restart_task(ws_index, correlation, payload, encoder);
             }
             RpcMessageKind::KillTask => {
@@ -1845,9 +1846,9 @@ impl ProcessManager {
         payload: &[u8],
         encoder: &mut crate::rpc::Encoder,
     ) {
-        use crate::rpc::{CommandBody, CommandResponse, RestartTaskRequest, RpcMessageKind};
+        use crate::rpc::{CommandBody, CommandResponse, RpcMessageKind, SpawnTaskRequest};
 
-        let Ok(req) = jsony::from_binary::<RestartTaskRequest>(payload) else {
+        let Ok(req) = jsony::from_binary::<SpawnTaskRequest>(payload) else {
             encoder.encode_response(
                 RpcMessageKind::CommandAck,
                 correlation,
@@ -1860,13 +1861,14 @@ impl ProcessManager {
         let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
 
         let result = if req.as_test {
-            ws.handle.restart_task_as_test(req.task_name, params, req.profile)
+            ws.handle.spawn_task_as_test(req.task_name, params, req.profile).map(|()| None)
         } else {
-            ws.handle.restart_task_by_name(req.task_name, params, req.profile).map(|_| ())
+            ws.handle.spawn_task_by_name_cached(req.task_name, params, req.profile, req.cached)
         };
 
         let body = match result {
-            Ok(()) => CommandBody::Empty,
+            Ok(None) => CommandBody::Empty,
+            Ok(Some(msg)) => CommandBody::Message(msg.into()),
             Err(e) => CommandBody::Error(e.into()),
         };
         encoder.encode_response(

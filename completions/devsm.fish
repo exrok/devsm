@@ -174,10 +174,11 @@ complete -c devsm -n __fish_devsm_needs_command -rfa '--from=' -d 'Run from DIR 
 # Subcommands
 complete -c devsm -n __fish_devsm_needs_command -a 'run' -d 'Run a task and display output'
 complete -c devsm -n __fish_devsm_needs_command -a 'exec' -d 'Execute task directly, bypassing daemon'
-complete -c devsm -n __fish_devsm_needs_command -a 'restart' -d 'Restart a task via daemon'
+complete -c devsm -n __fish_devsm_needs_command -a 'spawn' -d 'Spawn a task via daemon'
 complete -c devsm -n __fish_devsm_needs_command -a 'restart-selected' -d 'Restart selected task in TUI'
 complete -c devsm -n __fish_devsm_needs_command -a 'kill' -d 'Terminate a running task'
 complete -c devsm -n __fish_devsm_needs_command -a 'test' -d 'Run tests with optional filters'
+complete -c devsm -n __fish_devsm_needs_command -a 'rerun-tests' -d 'Rerun tests'
 complete -c devsm -n __fish_devsm_needs_command -a 'logs' -d 'View and stream logs'
 complete -c devsm -n __fish_devsm_needs_command -a 'validate' -d 'Validate config file'
 complete -c devsm -n __fish_devsm_needs_command -a 'get' -d 'Get information from daemon'
@@ -185,26 +186,32 @@ complete -c devsm -n __fish_devsm_needs_command -a 'function' -d 'Call a saved f
 complete -c devsm -n __fish_devsm_needs_command -a 'complete' -d 'Output completion data'
 complete -c devsm -n __fish_devsm_needs_command -a 'server' -d 'Start daemon process (internal)'
 
-# Task commands: run, exec, restart, kill - only show tasks when we need one
+# Task commands: run, exec, spawn, kill - only show tasks when we need one
 complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_needs_task' -xa '(__fish_devsm_tasks)'
 complete -c devsm -n '__fish_devsm_using_command exec; and __fish_devsm_needs_task' -xa '(__fish_devsm_tasks)'
-complete -c devsm -n '__fish_devsm_using_command restart; and __fish_devsm_needs_task' -xa '(__fish_devsm_tasks)'
+complete -c devsm -n '__fish_devsm_using_command spawn; and __fish_devsm_needs_task' -xa '(__fish_devsm_tasks)'
 complete -c devsm -n '__fish_devsm_using_command kill; and __fish_devsm_needs_task' -xa '(__fish_devsm_tasks)'
 
 # Task profiles (task:profile syntax) - when current token contains ':'
 complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_completing_profile' -xa '(__fish_devsm_profiles_for_token)'
 complete -c devsm -n '__fish_devsm_using_command exec; and __fish_devsm_completing_profile' -xa '(__fish_devsm_profiles_for_token)'
-complete -c devsm -n '__fish_devsm_using_command restart; and __fish_devsm_completing_profile' -xa '(__fish_devsm_profiles_for_token)'
+complete -c devsm -n '__fish_devsm_using_command spawn; and __fish_devsm_completing_profile' -xa '(__fish_devsm_profiles_for_token)'
 
 # Task variables (--var=value) - only after task is entered
 complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_needs_vars' -xa '(__fish_devsm_vars)'
 complete -c devsm -n '__fish_devsm_using_command exec; and __fish_devsm_needs_vars' -xa '(__fish_devsm_vars)'
-complete -c devsm -n '__fish_devsm_using_command restart; and __fish_devsm_needs_vars' -xa '(__fish_devsm_vars)'
+complete -c devsm -n '__fish_devsm_using_command spawn; and __fish_devsm_needs_vars' -xa '(__fish_devsm_vars)'
+
+# Spawn command options
+complete -c devsm -n '__fish_devsm_using_command spawn' -l cached -d 'Only spawn if not cached'
 
 # Test command
 complete -c devsm -n '__fish_devsm_using_command test' -xa '(__fish_devsm_tests)'
 complete -c devsm -n '__fish_devsm_using_command test' -xa '(for tag in (__fish_devsm_tags); printf "+%s\tInclude tag\n" $tag; end)'
 complete -c devsm -n '__fish_devsm_using_command test' -xa '(for tag in (__fish_devsm_tags); printf "-%s\tExclude tag\n" $tag; end)'
+
+# Rerun-tests command options
+complete -c devsm -n '__fish_devsm_using_command rerun-tests' -l only-failed -d 'Only rerun failed tests'
 
 # Logs command options (use -a with = suffix for flags requiring values, -rfa to disable space after)
 complete -c devsm -n '__fish_devsm_using_command logs' -rfa '--max-age=' -d 'Show logs since duration ago (5s, 10m, 1h)'

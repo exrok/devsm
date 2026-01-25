@@ -82,7 +82,7 @@ pub enum Command<'a> {
     Tui,
     Server,
     RestartSelected,
-    Restart { job: &'a str, value_map: ValueMap<'a>, as_test: bool },
+    Spawn { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
     Exec { job: &'a str, value_map: ValueMap<'a> },
     Run { job: &'a str, value_map: ValueMap<'a>, as_test: bool },
     Kill { job: &'a str },
@@ -193,8 +193,9 @@ fn parse_job_args<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<(&'a str, Va
     Ok((job, value_map))
 }
 
-fn parse_restart<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+fn parse_spawn<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     let mut as_test = false;
+    let mut cached = false;
     let mut job = None;
     let mut value_map = ValueMap::new();
 
@@ -202,6 +203,9 @@ fn parse_restart<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> 
         match component {
             Component::Long(long) if long == "as-test" => {
                 as_test = true;
+            }
+            Component::Long(long) if long == "cached" => {
+                cached = true;
             }
             Component::Long(key) => {
                 let Some(val) = parser.next_value() else {
@@ -234,7 +238,7 @@ fn parse_restart<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> 
         bail!("Missing name of job");
     };
 
-    Ok(Command::Restart { job, value_map, as_test })
+    Ok(Command::Spawn { job, value_map, as_test, cached })
 }
 
 fn parse_exec<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
@@ -562,7 +566,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
             Component::Term(command) => match command {
                 "server" => break 'command Command::Server,
                 "restart-selected" => break 'command Command::RestartSelected,
-                "restart" => break 'command parse_restart(&mut parser)?,
+                "spawn" => break 'command parse_spawn(&mut parser)?,
                 "exec" => break 'command parse_exec(&mut parser)?,
                 "run" => break 'command parse_run(&mut parser)?,
                 "kill" => {

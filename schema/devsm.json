@@ -238,7 +238,7 @@
     },
     "cacheConfig": {
       "type": "object",
-      "description": "Cache configuration for actions and tests",
+      "description": "Cache configuration for tasks",
       "additionalProperties": false,
       "properties": {
         "key": {
@@ -256,18 +256,6 @@
       },
       "x-taplo": {
         "initKeys": [ "key" ]
-      }
-    },
-    "serviceCacheConfig": {
-      "type": "object",
-      "description": "Cache configuration for services (only 'never' is allowed, not 'key')",
-      "additionalProperties": false,
-      "properties": {
-        "never": {
-          "type": "boolean",
-          "description": "When true, the service is never considered initially satisfied - always restarts when required, even if already running",
-          "default": false
-        }
       }
     },
     "readyPredicate": {
@@ -438,8 +426,8 @@
           "description": "Controls when the service is visible in the task list. 'never' (default) always shows the service, 'until_ran' hides it until it has been run at least once this session."
         },
         "cache": {
-          "$ref": "#/definitions/serviceCacheConfig",
-          "description": "Cache configuration - when 'never' is true, the service always restarts when required instead of reusing a running instance"
+          "$ref": "#/definitions/cacheConfig",
+          "description": "Cache configuration - caches running services within a session"
         },
         "var": {
           "type": "object",

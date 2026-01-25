@@ -116,7 +116,7 @@ pub enum RpcMessageKind {
     Terminate = 0x0121,
 
     // Commands (0x01xx) - new unified protocol
-    RestartTask = 0x0110,
+    SpawnTask = 0x0110,
     KillTask = 0x0111,
     RerunTests = 0x0112,
     CallFunction = 0x0113,
@@ -155,7 +155,7 @@ impl RpcMessageKind {
             0x0103 => Some(Self::RunTask),
             0x0120 => Some(Self::Resize),
             0x0121 => Some(Self::Terminate),
-            0x0110 => Some(Self::RestartTask),
+            0x0110 => Some(Self::SpawnTask),
             0x0111 => Some(Self::KillTask),
             0x0112 => Some(Self::RerunTests),
             0x0113 => Some(Self::CallFunction),
@@ -183,7 +183,7 @@ impl RpcMessageKind {
     pub fn is_one_shot_capable(&self) -> bool {
         matches!(
             self,
-            Self::RestartTask
+            Self::SpawnTask
                 | Self::KillTask
                 | Self::RerunTests
                 | Self::CallFunction
@@ -552,12 +552,13 @@ pub enum WorkspaceRef<'a> {
 /// Request to restart a task.
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
-pub struct RestartTaskRequest<'a> {
+pub struct SpawnTaskRequest<'a> {
     pub workspace: WorkspaceRef<'a>,
     pub task_name: &'a str,
     pub profile: &'a str,
     pub params: &'a [u8],
     pub as_test: bool,
+    pub cached: bool,
 }
 
 /// Request to kill a task.
@@ -850,7 +851,7 @@ mod tests {
     #[test]
     fn head_one_shot_flag() {
         let head =
-            Head { magic: MAGIC, kind: RpcMessageKind::RestartTask as u16, one_shot: true, correlation: 123, len: 0 };
+            Head { magic: MAGIC, kind: RpcMessageKind::SpawnTask as u16, one_shot: true, correlation: 123, len: 0 };
         let bytes = head.to_bytes();
         let parsed = Head::from_bytes(&bytes).unwrap();
         assert!(parsed.one_shot);

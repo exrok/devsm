@@ -20,6 +20,58 @@ pub mod scheduler_backend;
 
 pub use scheduler_backend::spawn_job;
 
+/// Info needed to compute a cache key outside the workspace lock.
+enum CacheKeyInfoItem {
+    Modified { paths: Vec<PathBuf>, ignore: &'static [&'static str] },
+    ProfileChanged { task_name: String, counter: u32 },
+}
+
+struct CacheKeyInfo {
+    base_index: BaseTaskIndex,
+    cache_key_inputs: Vec<CacheKeyInfoItem>,
+}
+
+/// Compute cache key without holding the workspace lock.
+/// This allows filesystem I/O to happen without blocking other operations.
+fn compute_cache_key_standalone(inputs: &[CacheKeyInfoItem], profile: &str, params: &ValueMap) -> String {
+    if inputs.is_empty() && profile.is_empty() && params.entries().is_empty() {
+        return String::new();
+    }
+
+    let mut hasher = CacheKeyHasher::new();
+
+    for input in inputs {
+        match input {
+            CacheKeyInfoItem::Modified { paths, ignore } => {
+                hasher.update(b"modified:");
+                for path in paths {
+                    hasher.hash_path(path, &ignore);
+                }
+            }
+            CacheKeyInfoItem::ProfileChanged { task_name, counter } => {
+                hasher.update(b"profile_changed:");
+                hasher.update(task_name.as_bytes());
+                hasher.update(b"=");
+                hasher.update_u32(*counter);
+            }
+        }
+    }
+
+    if !profile.is_empty() {
+        hasher.update(b"require_profile:");
+        hasher.update(profile.as_bytes());
+    }
+    if !params.entries().is_empty() {
+        hasher.update(b"require_params:");
+        for (k, v) in params.entries() {
+            hasher.update(k.as_bytes());
+            hasher.update(b"=");
+            hasher.update(v.to_string().as_bytes());
+        }
+    }
+    hasher.finalize_hex()
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(transparent)]
 pub struct BaseTaskIndex(pub u32);
@@ -1120,6 +1172,57 @@ impl WorkspaceState {
         Ok((base_index, job_index))
     }
 
+    /// Check if a task has a cache hit using a pre-computed cache key.
+    ///
+    /// Returns `Some(message)` if cache hit, `None` otherwise.
+    /// The cache key should be computed outside the lock to avoid blocking during filesystem I/O.
+    pub fn check_cache_hit_with_key(
+        &self,
+        name: &str,
+        base_index: BaseTaskIndex,
+        expected_cache_key: &str,
+    ) -> Option<String> {
+        if expected_cache_key.is_empty() {
+            return None;
+        }
+
+        let bt = &self.base_tasks[base_index.idx()];
+        let task_kind = bt.config.kind;
+
+        for ji in bt.jobs.all().iter().rev() {
+            let job = &self[*ji];
+            if matches!(job.process_status, JobStatus::Cancelled) {
+                continue;
+            }
+
+            if job.cache_key != expected_cache_key {
+                continue;
+            }
+
+            match task_kind {
+                TaskKind::Action => {
+                    if job.process_status.is_successful_completion() {
+                        return Some(format!("Task '{}' cache hit (already completed)", name));
+                    }
+                    if job.process_status.is_pending_completion() {
+                        return Some(format!("Task '{}' cache hit (already in progress)", name));
+                    }
+                }
+                TaskKind::Service => {
+                    if job.process_status.is_running() {
+                        return Some(format!("Task '{}' cache hit (already running)", name));
+                    }
+                    if job.process_status.is_pending_completion() && !job.process_status.is_running() {
+                        return Some(format!("Task '{}' cache hit (already scheduled)", name));
+                    }
+                }
+                TaskKind::Test => {}
+            }
+        }
+
+        None
+    }
+
     /// Layer 2: Find task by name and terminate all running instances.
     ///
     /// Accepts task name or numeric index. Returns a message describing the result.
@@ -1616,6 +1719,7 @@ impl Workspace {
     /// Layer 1: Restart task by name.
     ///
     /// Acquires state lock, looks up task, and spawns it.
+    #[expect(unused, reason = "public API for programmatic restart without cache checking")]
     pub fn restart_task_by_name(&self, name: &str, params: ValueMap, profile: &str) -> Result<JobIndex, String> {
         let log_start = self.logs.read().unwrap().tail();
         let state = &mut *self.state.write().unwrap();
@@ -1624,10 +1728,117 @@ impl Workspace {
         Ok(job_index)
     }
 
+    /// Layer 1: Restart task by name with cache checking.
+    ///
+    /// If `cached` is true and there's a cache hit (task already running/completed
+    /// with matching cache key), returns Ok(Some(message)) without restarting.
+    /// Otherwise restarts the task and returns Ok(None).
+    ///
+    /// Cache key computation (which may involve filesystem I/O) is done outside
+    /// the workspace lock to avoid blocking other operations.
+    pub fn spawn_task_by_name_cached(
+        &self,
+        name: &str,
+        params: ValueMap,
+        profile: &str,
+        cached: bool,
+    ) -> Result<Option<String>, String> {
+        let log_start = self.logs.read().unwrap().tail();
+
+        if cached {
+            // Phase 1: Gather info needed for cache key computation (hold lock briefly)
+            let cache_info = {
+                let state = self.state.read().unwrap();
+                let Some(&base_index) = state.name_map.get(name) else {
+                    return Err(format!("Task '{}' not found", name));
+                };
+                let bt = &state.base_tasks[base_index.idx()];
+                let Some(cache_config) = &bt.config.cache else {
+                    drop(state);
+                    let state = &mut *self.state.write().unwrap();
+                    let (_, _) = state.lookup_and_spawn_task(
+                        self.workspace_id,
+                        &self.process_channel,
+                        name,
+                        log_start,
+                        params,
+                        profile,
+                    )?;
+                    return Ok(None);
+                };
+                if cache_config.never {
+                    drop(state);
+                    let state = &mut *self.state.write().unwrap();
+                    let (_, _) = state.lookup_and_spawn_task(
+                        self.workspace_id,
+                        &self.process_channel,
+                        name,
+                        log_start,
+                        params,
+                        profile,
+                    )?;
+                    return Ok(None);
+                };
+
+                let base_path = state.config.current.base_path.to_path_buf();
+                let cache_key_inputs: Vec<_> = cache_config
+                    .key
+                    .iter()
+                    .map(|input| match input {
+                        CacheKeyInput::Modified { paths, ignore } => CacheKeyInfoItem::Modified {
+                            paths: paths.iter().map(|p| base_path.join(p)).collect(),
+                            ignore: &ignore,
+                        },
+                        CacheKeyInput::ProfileChanged(task_name) => {
+                            let counter = state
+                                .name_map
+                                .get(*task_name)
+                                .map_or(0, |&bti| state.base_tasks[bti.idx()].profile_change_counter);
+                            CacheKeyInfoItem::ProfileChanged { task_name: task_name.to_string(), counter }
+                        }
+                    })
+                    .collect();
+
+                CacheKeyInfo { base_index, cache_key_inputs }
+            };
+            // Lock released here
+
+            // Phase 2: Compute cache key (filesystem I/O, no lock held)
+            let expected_cache_key = compute_cache_key_standalone(&cache_info.cache_key_inputs, profile, &params);
+
+            // Phase 3: Check for cache hit and spawn if needed (re-acquire lock)
+            let state = &mut *self.state.write().unwrap();
+            if let Some(msg) = state.check_cache_hit_with_key(name, cache_info.base_index, &expected_cache_key) {
+                return Ok(Some(msg));
+            }
+
+            let (_, _job_index) = state.lookup_and_spawn_task(
+                self.workspace_id,
+                &self.process_channel,
+                name,
+                log_start,
+                params,
+                profile,
+            )?;
+            Ok(None)
+        } else {
+            let state = &mut *self.state.write().unwrap();
+            let (_, _job_index) = state.lookup_and_spawn_task(
+                self.workspace_id,
+                &self.process_channel,
+                name,
+                log_start,
+                params,
+                profile,
+            )?;
+            Ok(None)
+        }
+    }
+
     /// Layer 1: Restart task by name and mark as test.
     ///
     /// Acquires state lock, looks up task, spawns it, and records it as a test group.
-    pub fn restart_task_as_test(&self, name: &str, params: ValueMap, profile: &str) -> Result<(), String> {
+    pub fn spawn_task_as_test(&self, name: &str, params: ValueMap, profile: &str) -> Result<(), String> {
         let log_start = self.logs.read().unwrap().tail();
         let state = &mut *self.state.write().unwrap();
         let (base_index, job_index) =
