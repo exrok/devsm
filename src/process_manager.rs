@@ -1064,12 +1064,10 @@ impl ProcessManager {
 
                 match ws.handle.call_function(req.function_name) {
                     Ok(msg) => respond_ok!(ws_index, msg),
-                    Err(e) if e == "RestartSelected" => {
-                        match self.restart_selected_from_clients(ws_index, ws) {
-                            Ok(()) => respond_ok!(ws_index),
-                            Err(e) => respond_err!(ws_index, e),
-                        }
-                    }
+                    Err(e) if e == "RestartSelected" => match self.restart_selected_from_clients(ws_index, ws) {
+                        Ok(()) => respond_ok!(ws_index),
+                        Err(e) => respond_err!(ws_index, e),
+                    },
                     Err(e) => respond_err!(ws_index, e),
                 }
             }
@@ -2496,7 +2494,8 @@ fn wait_thread(req: Arc<MioChannel>) {
             if pid > 0 {
                 req.send(ProcessRequest::ProcessExited { pid: pid as u32, status: status as u32 });
             } else if pid == -1 {
-                let errno = *libc::__errno_location();
+                // let errno = *libc::__errno_location();
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if errno == libc::ECHILD {
                     std::thread::park();
                 } else {

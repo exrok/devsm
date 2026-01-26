@@ -89,7 +89,7 @@ impl CacheKeyHasherPosix {
         #[cfg(target_os = "linux")]
         let mtime_ns = stat_buf.st_mtime as u128 * 1_000_000_000 + stat_buf.st_mtime_nsec as u128;
         #[cfg(target_os = "macos")]
-        let mtime_ns = stat_buf.st_mtime as u128 * 1_000_000_000 + stat_buf.st_mtimespec.tv_nsec as u128;
+        let mtime_ns = stat_buf.st_mtime as u128 * 1_000_000_000 + stat_buf.st_mtime_nsec as u128;
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let mtime_ns = stat_buf.st_mtime as u128 * 1_000_000_000;
         hasher.update(&mtime_ns.to_le_bytes());
