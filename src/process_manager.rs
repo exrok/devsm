@@ -1062,73 +1062,34 @@ impl ProcessManager {
                 let ws_index = resolve!(req.workspace);
                 let ws = &self.workspaces[ws_index as usize];
 
-                match ws.handle.call_function(req.function_name) {
-                    Ok(msg) => respond_ok!(ws_index, msg),
-                    Err(e) => respond_err!(ws_index, e),
+                let is_restart_selected = {
+                    let state = ws.handle.state();
+                    matches!(
+                        state.session_functions.get(req.function_name),
+                        Some(crate::function::FunctionAction::RestartSelected)
+                    )
+                };
+
+                if is_restart_selected {
+                    match self.restart_selected_from_clients(ws_index, ws) {
+                        Ok(()) => respond_ok!(ws_index),
+                        Err(e) => respond_err!(ws_index, e),
+                    }
+                } else {
+                    match ws.handle.call_function(req.function_name) {
+                        Ok(msg) => respond_ok!(ws_index, msg),
+                        Err(e) => respond_err!(ws_index, e),
+                    }
                 }
             }
             RpcMessageKind::RestartSelected => {
                 let req = parse!(RestartSelectedRequest);
                 let ws_index = resolve!(req.workspace);
-
                 let ws = &self.workspaces[ws_index as usize];
-                let mut found_client = false;
-                let mut error: Option<&str> = None;
 
-                for (_, client) in &self.clients {
-                    if client.workspace != ws_index {
-                        continue;
-                    }
-                    found_client = true;
-                    let selected = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
-                    if selected & SELECTED_META_GROUP_FLAG != 0 {
-                        let kind = match selected {
-                            SELECTED_META_GROUP_TESTS => TaskKind::Test,
-                            SELECTED_META_GROUP_ACTIONS => TaskKind::Action,
-                            _ => {
-                                error = Some("invalid meta-group selection");
-                                break;
-                            }
-                        };
-                        let ws_state = ws.handle.state();
-                        let jobs = ws_state.jobs_by_kind(kind);
-                        let Some(&last_ji) = jobs.last() else {
-                            error = Some("no jobs in selected meta-group");
-                            break;
-                        };
-                        let job = &ws_state[last_ji];
-                        let bti = job.log_group.base_task_index();
-                        let params = job.spawn_params.clone();
-                        let profile = job.spawn_profile.clone();
-                        drop(ws_state);
-                        ws.handle.restart_task(bti, params, &profile);
-                    } else {
-                        let bti = workspace::BaseTaskIndex(selected as u32);
-                        let ws_state = ws.handle.state();
-                        let Some(bt) = ws_state.base_tasks.get(bti.idx()) else {
-                            error = Some("selected task no longer exists");
-                            break;
-                        };
-                        if let Some(&last_ji) = bt.jobs.all().last() {
-                            let job = &ws_state[last_ji];
-                            let params = job.spawn_params.clone();
-                            let profile = job.spawn_profile.clone();
-                            drop(ws_state);
-                            ws.handle.restart_task(bti, params, &profile);
-                        } else {
-                            drop(ws_state);
-                            ws.handle.restart_task(bti, ValueMap::new(), "");
-                        }
-                    }
-                    break;
-                }
-
-                if let Some(err) = error {
-                    respond_err!(ws_index, err);
-                } else if !found_client {
-                    respond_err!(ws_index, "no active TUI session");
-                } else {
-                    respond_ok!(ws_index);
+                match self.restart_selected_from_clients(ws_index, ws) {
+                    Ok(()) => respond_ok!(ws_index),
+                    Err(e) => respond_err!(ws_index, e),
                 }
             }
             RpcMessageKind::GetLoggedRustPanics => {
@@ -1237,6 +1198,51 @@ impl ProcessManager {
         if !one_shot {
             self.register_rpc_client(socket, persist_ws);
         }
+    }
+
+    fn restart_selected_from_clients(&self, ws_index: WorkspaceIndex, ws: &WorkspaceEntry) -> Result<(), &'static str> {
+        for (_, client) in &self.clients {
+            if client.workspace != ws_index {
+                continue;
+            }
+            let selected = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
+            if selected & SELECTED_META_GROUP_FLAG != 0 {
+                let kind = match selected {
+                    SELECTED_META_GROUP_TESTS => TaskKind::Test,
+                    SELECTED_META_GROUP_ACTIONS => TaskKind::Action,
+                    _ => return Err("invalid meta-group selection"),
+                };
+                let ws_state = ws.handle.state();
+                let jobs = ws_state.jobs_by_kind(kind);
+                let Some(&last_ji) = jobs.last() else {
+                    return Err("no jobs in selected meta-group");
+                };
+                let job = &ws_state[last_ji];
+                let bti = job.log_group.base_task_index();
+                let params = job.spawn_params.clone();
+                let profile = job.spawn_profile.clone();
+                drop(ws_state);
+                ws.handle.restart_task(bti, params, &profile);
+            } else {
+                let bti = workspace::BaseTaskIndex(selected as u32);
+                let ws_state = ws.handle.state();
+                let Some(bt) = ws_state.base_tasks.get(bti.idx()) else {
+                    return Err("selected task no longer exists");
+                };
+                if let Some(&last_ji) = bt.jobs.all().last() {
+                    let job = &ws_state[last_ji];
+                    let params = job.spawn_params.clone();
+                    let profile = job.spawn_profile.clone();
+                    drop(ws_state);
+                    ws.handle.restart_task(bti, params, &profile);
+                } else {
+                    drop(ws_state);
+                    ws.handle.restart_task(bti, ValueMap::new(), "");
+                }
+            }
+            return Ok(());
+        }
+        Err("no active TUI session")
     }
 
     fn register_rpc_client(&mut self, socket: UnixStream, ws_index: WorkspaceIndex) {
