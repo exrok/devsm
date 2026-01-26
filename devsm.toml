@@ -11,7 +11,6 @@ ready.when.output_contains = "RPC Socket bound"
 ready.timeout = 5.0
 cache.never = true
 
-
 [action.tmux-attach]
 pwd = "tests/workspace"
 sh = 'tmux attach -t devsm-tester:0 || tmux new-session -A -s devsm-tester'
@@ -21,7 +20,15 @@ managed = false
 [action.devsm-in-tmux]
 pwd = "tests/workspace"
 sh = """
-tmux send-keys -t devsm-tester:0 "env DEVSM_SOCKET=/tmp/.devsm.test.socket DEVSM_NO_AUTO_SPAWN=1 cargo run" "ENTER" || exit 1
+COMMAND="cargo run"
+if [ -f "/tmp/rust-target/debug/devsm" ]; then
+    # Avoid the slight delay introduced by executing cargo once again,
+    # Since devsm-in-tmux requires devsm and devsm is cache never, it will always run
+    # devsm-in-tmux will run building exceeds, on my system, this is the location of the
+    # target directory.
+    COMMAND=/tmp/rust-target/debug/devsm
+fi
+tmux send-keys -t devsm-tester:0 "env DEVSM_SOCKET=/tmp/.devsm.test.socket DEVSM_NO_AUTO_SPAWN=1 $COMMAND" "ENTER" || exit 1
 """
 require = ["devsm"]
 

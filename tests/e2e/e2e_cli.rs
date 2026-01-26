@@ -2544,3 +2544,50 @@ cache.key = [{{ modified = "{trigger}" }}]
         "Action should have run again after cache invalidation"
     );
 }
+
+#[test]
+fn function_call_with_config_override() {
+    let mut harness = TestHarness::new("function_call_override");
+    let marker = harness.temp_dir.join("fn1_ran.txt");
+    harness.write_config(&format!(
+        r#"
+[action.my_task]
+sh = "echo ran > {marker}"
+
+[function]
+fn1 = {{ restart = "my_task" }}
+"#,
+        marker = marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["function", "call", "fn1"]);
+
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(marker.exists(), "fn1 should have restarted my_task which creates the marker file");
+}
+
+#[test]
+fn function_call_default_restart_selected() {
+    let mut harness = TestHarness::new("function_call_default");
+    harness.write_config(
+        r#"
+[action.dummy]
+cmd = ["true"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["function", "call", "fn2"]);
+
+    assert!(
+        result.stderr.contains("no active TUI session")
+            || result.stderr.contains("no jobs in selected meta-group")
+            || result.stderr.contains("selected task no longer exists"),
+        "fn2 should default to restart-selected which fails without a TUI/selection, got: {}",
+        result.stderr
+    );
+}

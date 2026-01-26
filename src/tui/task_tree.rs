@@ -651,11 +651,9 @@ impl TaskTreeState {
 
 fn get_bound_function<'a>(ws: &'a WorkspaceState, bti: BaseTaskIndex) -> Option<&'a str> {
     let task_name = ws.base_tasks[bti.idx()].name;
-    for (fn_name, action) in &ws.session_functions {
-        if let FunctionAction::RestartCaptured { task_name: captured, .. } = action {
-            if captured == task_name {
-                return Some(fn_name);
-            }
+    for (fn_name, FunctionAction::RestartCaptured { task_name: captured, .. }) in &ws.session_functions {
+        if captured == task_name {
+            return Some(fn_name);
         }
     }
     None

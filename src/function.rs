@@ -3,8 +3,6 @@
 pub enum FunctionAction {
     /// Restart a captured selection (task name and profile captured when function was set).
     RestartCaptured { task_name: String, profile: String },
-    /// Restart whatever task is currently selected (mimics `restart-selected` command).
-    RestartSelected,
 }
 
 /// Actions available when setting a function via keybinding.

@@ -1062,24 +1062,15 @@ impl ProcessManager {
                 let ws_index = resolve!(req.workspace);
                 let ws = &self.workspaces[ws_index as usize];
 
-                let is_restart_selected = {
-                    let state = ws.handle.state();
-                    matches!(
-                        state.session_functions.get(req.function_name),
-                        Some(crate::function::FunctionAction::RestartSelected)
-                    )
-                };
-
-                if is_restart_selected {
-                    match self.restart_selected_from_clients(ws_index, ws) {
-                        Ok(()) => respond_ok!(ws_index),
-                        Err(e) => respond_err!(ws_index, e),
+                match ws.handle.call_function(req.function_name) {
+                    Ok(msg) => respond_ok!(ws_index, msg),
+                    Err(e) if e == "RestartSelected" => {
+                        match self.restart_selected_from_clients(ws_index, ws) {
+                            Ok(()) => respond_ok!(ws_index),
+                            Err(e) => respond_err!(ws_index, e),
+                        }
                     }
-                } else {
-                    match ws.handle.call_function(req.function_name) {
-                        Ok(msg) => respond_ok!(ws_index, msg),
-                        Err(e) => respond_err!(ws_index, e),
-                    }
+                    Err(e) => respond_err!(ws_index, e),
                 }
             }
             RpcMessageKind::RestartSelected => {

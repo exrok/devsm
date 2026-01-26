@@ -111,6 +111,8 @@ pub enum FunctionDefAction<'a> {
     Spawn { tasks: &'a [TaskCall<'a>] },
     /// Kill a specific task.
     Kill { task: &'a str },
+    /// Restart the currently selected task (TUI context required).
+    RestartSelected,
 }
 
 /// Definition of a saved function from workspace config.

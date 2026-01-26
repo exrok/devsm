@@ -378,9 +378,9 @@ impl LatestConfig {
         for (base_name, variants) in self.current.tests {
             for (variant_index, config) in variants.iter().enumerate() {
                 let task_name: &'static str = if variants.len() == 1 {
-                    format!("~test:{}", base_name).leak()
+                    format!("test/{}", base_name).leak()
                 } else {
-                    format!("~test:{}:{}", base_name, variant_index).leak()
+                    format!("test/{}.{}", base_name, variant_index).leak()
                 };
                 let task_config = config.to_task_config_expr();
                 let test_info = Some(TestInfo { base_name, variant_index: variant_index as u32 });
@@ -1365,6 +1365,7 @@ impl WorkspaceState {
         let mut base_tasks = Vec::new();
         let mut name_map = hashbrown::HashMap::new();
         config.update_base_tasks(&mut base_tasks, &mut name_map);
+
         Ok(WorkspaceState {
             change_number: 0,
             config,
@@ -1376,10 +1377,7 @@ impl WorkspaceState {
             test_jobs: JobIndexList::default(),
             service_jobs: JobIndexList::default(),
             service_dependents: ServiceDependents::default(),
-            session_functions: hashbrown::HashMap::from_iter([
-                ("fn1".to_string(), FunctionAction::RestartSelected),
-                ("fn2".to_string(), FunctionAction::RestartSelected),
-            ]),
+            session_functions: hashbrown::HashMap::new(),
             last_test_group: None,
             cache_key_hasher: CacheKeyHasher::new(),
         })
@@ -1865,23 +1863,17 @@ impl Workspace {
         let log_start = self.logs.read().unwrap().tail();
         let state = &mut *self.state.write().unwrap();
 
-        if let Some(action) = state.session_functions.get(name).cloned() {
-            match action {
-                FunctionAction::RestartCaptured { task_name, profile } => {
-                    state.lookup_and_spawn_task(
-                        self.workspace_id,
-                        &self.process_channel,
-                        &task_name,
-                        log_start,
-                        ValueMap::new(),
-                        &profile,
-                    )?;
-                    return Ok("ok".to_string());
-                }
-                FunctionAction::RestartSelected => {
-                    return Err("RestartSelected requires TUI context".to_string());
-                }
-            }
+        if let Some(FunctionAction::RestartCaptured { task_name, profile }) = state.session_functions.get(name).cloned()
+        {
+            state.lookup_and_spawn_task(
+                self.workspace_id,
+                &self.process_channel,
+                &task_name,
+                log_start,
+                ValueMap::new(),
+                &profile,
+            )?;
+            return Ok("ok".to_string());
         }
 
         for func_def in state.config.current.functions {
@@ -1911,6 +1903,9 @@ impl Workspace {
                                 task_call.profile.unwrap_or(""),
                             )?;
                         }
+                    }
+                    FunctionDefAction::RestartSelected => {
+                        return Err("RestartSelected".to_string());
                     }
                 }
                 return Ok("ok".to_string());

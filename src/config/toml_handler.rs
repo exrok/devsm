@@ -795,21 +795,48 @@ fn parse_function_action<'a>(
 
 fn parse_functions<'a>(
     alloc: &'a Bump,
-    func_table: &Table<'a>,
+    func_table: Option<&Table<'a>>,
     re: &mut dyn FnMut(Diagnostic),
 ) -> Result<&'a [FunctionDef<'a>], ()> {
     let mut functions = bumpalo::collections::Vec::new_in(alloc);
+    let mut has_fn1 = false;
+    let mut has_fn2 = false;
 
-    for (name, func_value) in func_table.iter() {
-        let name_str = name.name.as_ref();
+    if let Some(func_table) = func_table {
+        for (name, func_value) in func_table.iter() {
+            let name_str = name.name.as_ref();
+            if name_str == "fn1" {
+                has_fn1 = true;
+            }
+            if name_str == "fn2" {
+                has_fn2 = true;
+            }
 
-        let Some(table) = func_value.as_table() else {
-            mismatched_in_object(re, "table", func_value, name_str);
-            return Err(());
-        };
+            let action = if let Some(s) = func_value.as_str() {
+                if s == "restart-selected" {
+                    FunctionDefAction::RestartSelected
+                } else {
+                    re(Diagnostic::error()
+                        .with_message(format!("unknown function action: '{}', expected 'restart-selected' or a table", s))
+                        .with_label(DiagnosticLabel::primary(func_value.span.into())));
+                    return Err(());
+                }
+            } else if let Some(table) = func_value.as_table() {
+                parse_function_action(alloc, table, func_value, re)?
+            } else {
+                mismatched_in_object(re, "string or table", func_value, name_str);
+                return Err(());
+            };
 
-        let action = parse_function_action(alloc, table, func_value, re)?;
-        functions.push(FunctionDef { name: alloc.alloc_str(name_str), action });
+            functions.push(FunctionDef { name: alloc.alloc_str(name_str), action });
+        }
+    }
+
+    if !has_fn1 {
+        functions.push(FunctionDef { name: "fn1", action: FunctionDefAction::RestartSelected });
+    }
+    if !has_fn2 {
+        functions.push(FunctionDef { name: "fn2", action: FunctionDefAction::RestartSelected });
     }
 
     Ok(functions.into_bump_slice())
@@ -902,8 +929,7 @@ pub fn parse<'a>(
         }
     }
 
-    let functions =
-        if let Some(func_table) = table(root, "function", re)? { parse_functions(alloc, func_table, re)? } else { &[] };
+    let functions = parse_functions(alloc, table(root, "function", re)?, re)?;
 
     Ok(WorkspaceConfig {
         base_path,

@@ -934,15 +934,13 @@ fn call_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str) {
                     }
                     tui.status_message = Some(StatusMessage::info(format!("{} spawned tasks", fn_name)));
                 }
+                FunctionDefAction::RestartSelected => {
+                    drop(ws);
+                    restart_selected_task(tui, workspace);
+                }
             }
             return;
         }
-    }
-
-    if let Some(FunctionAction::RestartSelected) = ws.session_functions.get(fn_name) {
-        drop(ws);
-        restart_selected_task(tui, workspace);
-        return;
     }
 
     tui.status_message = Some(StatusMessage::error(format!("{} not configured", fn_name)));
