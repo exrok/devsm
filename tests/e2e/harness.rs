@@ -8,6 +8,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use libc;
+
 use crate::rpc::{
     ClientProtocol, DecodeResult, ExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind,
     encode_attach_rpc,
@@ -176,6 +178,16 @@ impl TestHarness {
 impl Drop for TestHarness {
     fn drop(&mut self) {
         if let Some(ref mut server) = self.server {
+            let pid = server.id() as i32;
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            for _ in 0..50 {
+                if let Ok(Some(_)) = server.try_wait() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let _ = server.kill();
             let _ = server.wait();
         }

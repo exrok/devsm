@@ -1,4 +1,4 @@
-use extui::{Color, DisplayRect, DoubleBuffer, HAlign, Rect};
+use extui::{Color, DoubleBuffer, HAlign, Rect};
 
 use crate::{
     config::{Command, ServiceHidden, TaskKind},
