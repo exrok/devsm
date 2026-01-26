@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     cli::TestFilter,
+    config::TaskKind,
     keybinds::{Command, InputEvent, Keybinds, Mode},
     searcher::{Entry, FatSearch},
     tui::constrain_scroll_offset,
@@ -76,11 +77,11 @@ impl TestFilterLauncherState {
     pub fn new(ws: &WorkspaceState) -> Self {
         let mut test_map: std::collections::HashMap<&'static str, Vec<&'static str>> = std::collections::HashMap::new();
         for bt in &ws.base_tasks {
-            if bt.removed {
+            if bt.removed || bt.config.kind != TaskKind::Test {
                 continue;
             }
-            let Some(test_info) = &bt.test_info else { continue };
-            let tags = test_map.entry(test_info.base_name).or_default();
+            // TODO: The test launcher needs to be entirely rethough
+            let tags = test_map.entry(bt.name).or_default();
             for &tag in bt.config.tags {
                 if !tags.contains(&tag) {
                     tags.push(tag);
@@ -123,17 +124,16 @@ impl TestFilterLauncherState {
         ws.base_tasks
             .iter()
             .filter(|bt| {
-                if bt.removed {
+                if bt.removed || bt.config.kind != TaskKind::Test {
                     return false;
                 }
-                let Some(test_info) = &bt.test_info else { return false };
-                self.matches_filters(test_info.base_name, bt.config.tags)
+                self.matches_filters(bt.name, bt.config.tags)
             })
             .count()
     }
 
     pub fn total_test_count(&self, ws: &WorkspaceState) -> usize {
-        ws.base_tasks.iter().filter(|bt| !bt.removed && bt.test_info.is_some()).count()
+        ws.base_tasks.iter().filter(|bt| !bt.removed && bt.config.kind == TaskKind::Test).count()
     }
 
     fn matches_filters(&self, name: &str, tags: &[&str]) -> bool {

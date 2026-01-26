@@ -369,7 +369,6 @@ impl LatestConfig {
                         jobs: JobIndexList::default(),
                         profile_change_counter: 0,
                         last_profile: None,
-                        test_info: None,
                         has_run_this_session: false,
                     });
                 }
@@ -377,20 +376,21 @@ impl LatestConfig {
         }
         for (base_name, variants) in self.current.tests {
             for (variant_index, config) in variants.iter().enumerate() {
-                let task_name: &'static str = if variants.len() == 1 {
-                    format!("test/{}", base_name).leak()
+                let task_name: &'static str =
+                    if variants.len() == 1 { base_name } else { format!("{}.{}", base_name, variant_index).leak() };
+
+                let entry_task_name: &'static str = if variants.len() == 1 {
+                    format!("~test/{}", base_name).leak()
                 } else {
-                    format!("test/{}.{}", base_name, variant_index).leak()
+                    format!("~test/{}.{}", base_name, variant_index).leak()
                 };
                 let task_config = config.to_task_config_expr();
-                let test_info = Some(TestInfo { base_name, variant_index: variant_index as u32 });
 
-                match name_map.entry(task_name) {
+                match name_map.entry(entry_task_name) {
                     hashbrown::hash_map::Entry::Occupied(occupied_entry) => {
                         let base_task = &mut base_tasks[occupied_entry.get().idx()];
                         base_task.removed = false;
                         base_task.config = task_config;
-                        base_task.test_info = test_info;
                     }
                     hashbrown::hash_map::Entry::Vacant(vacant_entry) => {
                         vacant_entry.insert(BaseTaskIndex::new_or_panic(base_tasks.len()));
@@ -401,7 +401,6 @@ impl LatestConfig {
                             jobs: JobIndexList::default(),
                             profile_change_counter: 0,
                             last_profile: None,
-                            test_info,
                             has_run_this_session: false,
                         });
                     }
@@ -409,13 +408,6 @@ impl LatestConfig {
             }
         }
     }
-}
-
-/// Test-specific metadata for base tasks that are tests.
-pub struct TestInfo {
-    /// The test group name (e.g., "frontend" for test variant "frontend:0").
-    pub base_name: &'static str,
-    pub variant_index: u32,
 }
 
 #[derive(jsony::Jsony)]
@@ -444,7 +436,7 @@ pub struct BaseTask {
     /// The profile used for the last spawn (for tracking profile changes).
     pub last_profile: Option<String>,
     /// Test-specific metadata. Present only for tests (kind == Test).
-    pub test_info: Option<TestInfo>,
+    //pub test_info: Option<TestInfo>,
     /// Whether this service has been run at least once this session.
     /// Used for `hidden = "until_ran"` visibility.
     pub has_run_this_session: bool,
@@ -816,7 +808,6 @@ impl WorkspaceState {
                 jobs: JobIndexList::default(),
                 profile_change_counter: 0,
                 last_profile: None,
-                test_info: None,
                 has_run_this_session: false,
             });
             if index > u32::MAX as usize {
@@ -1934,14 +1925,11 @@ impl Workspace {
         }
         let mut matched_tests = Vec::new();
         for (base_task_idx, base_task) in state.base_tasks.iter().enumerate() {
-            if base_task.removed {
+            if base_task.removed || base_task.config.kind != TaskKind::Test {
                 continue;
             }
-            let Some(test_info) = &base_task.test_info else {
-                continue;
-            };
             let tags = base_task.config.tags;
-            if !matches_test_filters(test_info.base_name, tags, filters) {
+            if !matches_test_filters(base_task.name, tags, filters) {
                 continue;
             }
             let env = Environment { profile: "", param: ValueMap::new(), vars: base_task.config.vars };
@@ -2477,7 +2465,7 @@ fn matches_test_filters(name: &str, tags: &[&str], filters: &[TestFilter]) -> bo
         }
     }
 
-    if !include_names.is_empty() && !include_names.contains(&name) {
+    if !include_names.is_empty() && !include_names.iter().any(|prefix| name.starts_with(prefix)) {
         return false;
     }
     if !include_tags.is_empty() && !include_tags.iter().any(|tag| tags.contains(tag)) {

@@ -1,4 +1,4 @@
-use extui::{Color, DoubleBuffer, HAlign, Rect};
+use extui::{Color, DisplayRect, DoubleBuffer, HAlign, Rect};
 
 use crate::{
     config::{Command, ServiceHidden, TaskKind},
@@ -476,21 +476,6 @@ impl TaskTreeState {
         StatusKind::of(&ws[ji].process_status, task_kind)
     }
 
-    /// Counts running and scheduled jobs across all tasks of the given kind.
-    fn meta_group_counts(&self, ws: &WorkspaceState, kind: MetaGroupKind) -> (usize, usize) {
-        let task_kind = kind.task_kind();
-        let mut running = 0;
-        let mut scheduled = 0;
-        for bt in &ws.base_tasks {
-            if bt.removed || bt.config.kind != task_kind {
-                continue;
-            }
-            running += bt.jobs.running().len();
-            scheduled += bt.jobs.scheduled().len();
-        }
-        (running, scheduled)
-    }
-
     pub fn render_primary(&mut self, out: &mut DoubleBuffer, mut rect: Rect, ws: &WorkspaceState) {
         let sel = match self.selection_state(ws) {
             Some(sel) => sel,
@@ -530,33 +515,43 @@ impl TaskTreeState {
 
                     let fn_indicator = get_bound_function(ws, task_id);
 
-                    let rem = line
-                        .with(if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() })
-                        .fill(out)
-                        .skip(1)
-                        .fmt(
-                            out,
-                            format_args!(
-                                "{} R:{} S:{}",
-                                task.name,
-                                task.jobs.running().len(),
-                                task.jobs.scheduled().len()
-                            ),
-                        )
-                        .with(HAlign::Right);
+                    let style = if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() };
+                    let substyle =
+                        if is_selected { status.light_bg().with_fg(Color::Grey[7]) } else { Color::Grey[16].as_fg() };
+                    let mut rem = line.with(style).fill(out).skip(1);
+                    if task.config.kind == TaskKind::Test {
+                        rem = rem.with(substyle).text(out, "test/").with(style);
+                    }
+                    rem = rem.text(out, task.name).with(HAlign::Right);
 
                     if let Some(fn_name) = fn_indicator {
-                        rem.with(if is_selected {
-                            status.dark_bg().with_fg(Color::Black)
-                        } else {
-                            status.dark_bg().with_bg(Color::Grey[4])
-                        })
-                        .fmt(out, format_args!(" {} ", fn_name));
+                        rem = rem
+                            .with(if is_selected {
+                                status.dark_bg().with_fg(Color::Black)
+                            } else {
+                                status.dark_bg().with_bg(Color::Grey[4])
+                            })
+                            .fmt(out, format_args!(" {} ", fn_name));
+                    }
+
+                    let active = task.jobs.running().len();
+                    let sched = task.jobs.scheduled().len();
+                    let all = task.jobs.all().len();
+                    if all != 0 {
+                        rem = rem.with(substyle).fmt(out, format_args!("{all} ")).with(style);
+                    }
+                    if active != 0 || sched != 0 {
+                        rem = rem.text(out, "/");
+                    }
+                    if sched > 0 {
+                        rem = rem.fmt(out, format_args!("+{sched}"));
+                    }
+                    if active > 0 {
+                        rem = rem.fmt(out, format_args!("{active}"));
                     }
                 }
                 PrimaryEntry::MetaGroup(kind) => {
                     let status = self.meta_group_status(ws, kind);
-                    let (running, scheduled) = self.meta_group_counts(ws, kind);
 
                     line.take_left(6)
                         .with(if is_selected {
@@ -566,10 +561,36 @@ impl TaskTreeState {
                         })
                         .text(out, status.padded_text());
 
-                    line.with(if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() })
+                    let style = if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() };
+                    let substyle =
+                        if is_selected { status.light_bg().with_fg(Color::Grey[7]) } else { Color::Grey[16].as_fg() };
+
+                    let mut rem = line
+                        .with(if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() })
                         .fill(out)
                         .skip(1)
-                        .fmt(out, format_args!("{} R:{} S:{}", kind.display_name(), running, scheduled));
+                        .fmt(out, kind.display_name())
+                        .with(HAlign::Right);
+
+                    let jobs = match kind {
+                        MetaGroupKind::Tests => &ws.test_jobs,
+                        MetaGroupKind::Actions => &ws.action_jobs,
+                    };
+                    let active = jobs.running().len();
+                    let sched = jobs.scheduled().len();
+                    let all = jobs.all().len();
+                    if all != 0 {
+                        rem = rem.with(substyle).fmt(out, format_args!("{all} ")).with(style);
+                    }
+                    if active != 0 || sched != 0 {
+                        rem = rem.text(out, "/");
+                    }
+                    if sched > 0 {
+                        rem = rem.fmt(out, format_args!("+{sched}"));
+                    }
+                    if active > 0 {
+                        rem = rem.fmt(out, format_args!("{active}"));
+                    }
                 }
             }
         }

@@ -598,9 +598,8 @@ fn update_test_statuses(
                             }
                             first = false;
                             if strip_ansi {
-                                let mut stripped = Vec::new();
-                                strip_ansi_to_buffer_preserve_case(line, &mut stripped);
-                                writeln!(buf, "{}", String::from_utf8_lossy(&stripped)).ok();
+                                strip_ansi_to_buffer_preserve_case(line, buf);
+                                buf.push(b'\n')
                             } else {
                                 writeln!(buf, "{}", line).ok();
                             }
@@ -621,19 +620,7 @@ fn update_test_statuses(
 
 fn format_test_name(test_job: &TestJob, base_tasks: &[BaseTask]) -> String {
     let base_task = &base_tasks[test_job.base_task_index.idx()];
-    let Some(test_info) = &base_task.test_info else {
-        return base_task.name.to_string();
-    };
-    let is_single = !base_tasks.iter().any(|bt| {
-        bt.test_info
-            .as_ref()
-            .is_some_and(|ti| ti.base_name == test_info.base_name && ti.variant_index != test_info.variant_index)
-    });
-    if is_single {
-        test_info.base_name.to_string()
-    } else {
-        format!("{}[{}]", test_info.base_name, test_info.variant_index)
-    }
+    return base_task.name.to_string();
 }
 
 fn print_summary(buf: &mut Vec<u8>, test_run: &TestRun, _base_tasks: &[BaseTask]) {
