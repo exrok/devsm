@@ -119,6 +119,7 @@ pub enum ExitCause {
     Restarted,
     SpawnFailed,
     ProfileConflict,
+    Timeout,
 }
 
 impl ExitCause {
@@ -129,6 +130,7 @@ impl ExitCause {
             ExitCause::Restarted => "restarted",
             ExitCause::SpawnFailed => "spawn_failed",
             ExitCause::ProfileConflict => "profile_conflict",
+            ExitCause::Timeout => "timeout",
         }
     }
 }

@@ -468,6 +468,7 @@ pub enum ExitCause {
     Restarted = 2,
     SpawnFailed = 3,
     ProfileConflict = 4,
+    Timeout = 5,
 }
 
 #[derive(Jsony, Debug)]

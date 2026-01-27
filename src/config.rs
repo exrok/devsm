@@ -102,6 +102,57 @@ pub struct ReadyConfig<'a> {
     pub timeout: Option<f64>,
 }
 
+/// Predicate determining when a timeout condition triggers.
+/// Reuses the same predicates as ReadyPredicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimeoutPredicate<'a> {
+    /// Timeout starts when stdout/stderr contains this string (ANSI stripped, case-sensitive).
+    OutputContains(&'a str),
+}
+
+/// Timeout configuration for actions, tests, and services.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TimeoutConfig<'a> {
+    /// Optional predicate that starts the conditional timeout.
+    pub when: Option<TimeoutPredicate<'a>>,
+    /// Timeout in seconds after the predicate matches.
+    pub conditional: Option<f64>,
+    /// Maximum absolute timeout in seconds from task start.
+    pub max: Option<f64>,
+    /// Idle timeout in seconds - terminates if no output is generated within this duration.
+    pub idle: Option<f64>,
+}
+
+/// Parses a duration string like "10m", "30s", "1.5h", "2d" into seconds.
+/// Supports suffixes: s (seconds), m (minutes), h (hours), d (days).
+/// Plain numbers without suffix are treated as seconds.
+pub fn parse_duration(s: &str) -> Result<f64, &'static str> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty duration string");
+    }
+
+    let (num_str, multiplier) = if let Some(stripped) = s.strip_suffix("ms") {
+        (stripped, 0.001)
+    } else if let Some(stripped) = s.strip_suffix('d') {
+        (stripped, 86400.0)
+    } else if let Some(stripped) = s.strip_suffix('h') {
+        (stripped, 3600.0)
+    } else if let Some(stripped) = s.strip_suffix('m') {
+        (stripped, 60.0)
+    } else if let Some(stripped) = s.strip_suffix('s') {
+        (stripped, 1.0)
+    } else {
+        (s, 1.0)
+    };
+    let num: f64 =
+        num_str.trim().parse().map_err(|s| &*format!("invalid duration number '{num_str}': {s:?}").leak())?;
+    if num < 0.0 {
+        return Err("duration cannot be negative");
+    }
+    Ok(num * multiplier)
+}
+
 /// Action that a saved function performs.
 #[derive(Debug, Clone)]
 pub enum FunctionDefAction<'a> {
@@ -146,6 +197,7 @@ pub struct TaskConfig<'a> {
     pub require: &'a [TaskCall<'a>],
     pub cache: Option<CacheConfig<'a>>,
     pub ready: Option<ReadyConfig<'a>>,
+    pub timeout: Option<TimeoutConfig<'a>>,
 }
 
 pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
@@ -273,6 +325,8 @@ pub struct TaskConfigExpr<'a> {
     pub require: &'a [TaskCall<'a>],
     pub cache: Option<CacheConfig<'a>>,
     pub ready: Option<ReadyConfig<'a>>,
+    /// Timeout configuration for the task.
+    pub timeout: Option<TimeoutConfig<'a>>,
     /// Tags for test filtering. Empty for non-test tasks.
     pub tags: &'a [&'a str],
     /// Controls how the task can be executed:
@@ -297,6 +351,8 @@ pub struct TestConfigExpr<'a> {
     pub require: &'a [TaskCall<'a>],
     pub tags: &'a [&'a str],
     pub cache: Option<CacheConfig<'a>>,
+    /// Timeout configuration for the test.
+    pub timeout: Option<TimeoutConfig<'a>>,
     /// Variable metadata (description, default) for variables used in this test.
     pub vars: &'a [(&'a str, VarMeta<'a>)],
 }
@@ -316,6 +372,7 @@ impl TestConfigExpr<'static> {
             require: self.require,
             cache: self.cache.clone(),
             ready: None,
+            timeout: self.timeout.clone(),
             tags: self.tags,
             managed: None,
             hidden: ServiceHidden::Never,
@@ -338,6 +395,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         require: EMPTY_TASK_CALLS,
         cache: None,
         ready: None,
+        timeout: None,
         tags: &[],
         managed: None,
         hidden: ServiceHidden::Never,
@@ -365,7 +423,15 @@ impl TaskConfigExpr<'static> {
     pub fn eval(&self, env: &Environment) -> Result<TaskConfigRc, EvalError> {
         #[allow(clippy::arc_with_non_send_sync)]
         let mut new = Arc::new((
-            TaskConfig { pwd: "", command: Command::Cmd(&[]), require: &[], cache: None, ready: None, envvar: &[] },
+            TaskConfig {
+                pwd: "",
+                command: Command::Cmd(&[]),
+                require: &[],
+                cache: None,
+                ready: None,
+                timeout: None,
+                envvar: &[],
+            },
             Bump::new(),
         ));
         let alloc = Arc::get_mut(&mut new).unwrap();
@@ -399,6 +465,7 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
             require: self.require,
             cache: self.cache.clone(),
             ready: self.ready.clone(),
+            timeout: self.timeout.clone(),
             envvar: if self.envvar.is_empty() {
                 &[]
             } else {
@@ -691,6 +758,7 @@ mod tests {
             require: EMPTY_TASK_CALLS,
             cache: None,
             ready: None,
+            timeout: None,
             tags: &[],
             managed: None,
             hidden: ServiceHidden::Never,
@@ -718,6 +786,7 @@ mod tests {
             require: EMPTY_TASK_CALLS,
             cache: None,
             ready: None,
+            timeout: None,
             tags: &[],
             managed: None,
             hidden: ServiceHidden::Never,
@@ -726,5 +795,19 @@ mod tests {
         let vars = TEST_EXPR.collect_variables();
         assert!(vars.contains(&"then_var"), "should find then_var: {:?}", vars);
         assert!(vars.contains(&"else_var"), "should find else_var: {:?}", vars);
+    }
+
+    #[test]
+    fn test_parse_duration() {
+        assert_eq!(parse_duration("10s").unwrap(), 10.0);
+        assert_eq!(parse_duration("5m").unwrap(), 300.0);
+        assert_eq!(parse_duration("2h").unwrap(), 7200.0);
+        assert_eq!(parse_duration("1d").unwrap(), 86400.0);
+        assert_eq!(parse_duration("1.5m").unwrap(), 90.0);
+        assert_eq!(parse_duration("30").unwrap(), 30.0);
+        assert_eq!(parse_duration(" 10s ").unwrap(), 10.0);
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("-5s").is_err());
     }
 }

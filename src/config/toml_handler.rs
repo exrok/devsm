@@ -8,7 +8,7 @@ use toml_spanner::{
 use crate::config::{
     Alias, CacheConfig, CacheKeyInput, CommandExpr, FunctionDef, FunctionDefAction, If, Predicate, ReadyConfig,
     ReadyPredicate, ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr,
-    VarMeta, WorkspaceConfig,
+    TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, toml_error_to_diagnostic};
 
@@ -130,6 +130,115 @@ fn parse_var_meta<'a>(
     Ok(VarMeta { description, default })
 }
 
+fn parse_duration_value(value: &TomlValue, key: &str, re: &mut dyn FnMut(Diagnostic)) -> Result<f64, ()> {
+    match &value.value {
+        ValueInner::Float(f) => Ok(*f),
+        ValueInner::Integer(i) => Ok(*i as f64),
+        ValueInner::String(s) => match parse_duration(as_str(s)) {
+            Ok(secs) => Ok(secs),
+            Err(err) => {
+                re(Diagnostic::error()
+                    .with_message(format!("invalid duration for `{}`: {}", key, err))
+                    .with_label(DiagnosticLabel::primary(value.span.into())));
+                Err(())
+            }
+        },
+        _ => {
+            mismatched_in_object(re, "number or duration string", value, key);
+            Err(())
+        }
+    }
+}
+
+fn parse_timeout_predicate<'a>(
+    alloc: &'a Bump,
+    when_table: &Table<'a>,
+    when_value: &TomlValue<'a>,
+    re: &mut dyn FnMut(Diagnostic),
+) -> Result<TimeoutPredicate<'a>, ()> {
+    if let Some(output_contains_val) = when_table.get("output_contains") {
+        let Some(needle) = output_contains_val.as_str() else {
+            mismatched_in_object(re, "string", output_contains_val, "output_contains");
+            return Err(());
+        };
+        return Ok(TimeoutPredicate::OutputContains(alloc.alloc_str(needle)));
+    }
+    re(Diagnostic::error()
+        .with_message("`timeout.when` must specify a predicate (e.g., `output_contains`)")
+        .with_label(DiagnosticLabel::primary(when_value.span.into())));
+    Err(())
+}
+
+fn parse_timeout_config<'a>(
+    alloc: &'a Bump,
+    value: &TomlValue<'a>,
+    re: &mut dyn FnMut(Diagnostic),
+) -> Result<TimeoutConfig<'a>, ()> {
+    match &value.value {
+        ValueInner::String(s) => {
+            let max = match parse_duration(as_str(s)) {
+                Ok(secs) => secs,
+                Err(err) => {
+                    re(Diagnostic::error()
+                        .with_message(format!("invalid duration for `timeout`: {}", err))
+                        .with_label(DiagnosticLabel::primary(value.span.into())));
+                    return Err(());
+                }
+            };
+            Ok(TimeoutConfig { when: None, conditional: None, max: Some(max), idle: None })
+        }
+        ValueInner::Float(f) => Ok(TimeoutConfig { when: None, conditional: None, max: Some(*f), idle: None }),
+        ValueInner::Integer(i) => Ok(TimeoutConfig { when: None, conditional: None, max: Some(*i as f64), idle: None }),
+        ValueInner::Table(timeout_table) => {
+            let mut when: Option<TimeoutPredicate<'a>> = None;
+            let mut conditional: Option<f64> = None;
+            let mut max: Option<f64> = None;
+            let mut idle: Option<f64> = None;
+
+            for (key, val) in timeout_table.iter() {
+                let key_str = key.name.as_ref();
+                match key_str {
+                    "when" => {
+                        let Some(when_table) = val.as_table() else {
+                            mismatched_in_object(re, "table", val, "when");
+                            return Err(());
+                        };
+                        when = Some(parse_timeout_predicate(alloc, when_table, val, re)?);
+                    }
+                    "conditional" => {
+                        conditional = Some(parse_duration_value(val, "conditional", re)?);
+                    }
+                    "max" => {
+                        max = Some(parse_duration_value(val, "max", re)?);
+                    }
+                    "idle" => {
+                        idle = Some(parse_duration_value(val, "idle", re)?);
+                    }
+                    _ => {
+                        re(Diagnostic::error()
+                            .with_message(format!("unknown key `{}` in timeout configuration", key_str))
+                            .with_label(DiagnosticLabel::primary(val.span.into())));
+                        return Err(());
+                    }
+                }
+            }
+
+            if conditional.is_some() && when.is_none() {
+                re(Diagnostic::error()
+                    .with_message("`timeout.conditional` requires `timeout.when` to be specified")
+                    .with_label(DiagnosticLabel::primary(value.span.into())));
+                return Err(());
+            }
+
+            Ok(TimeoutConfig { when, conditional, max, idle })
+        }
+        _ => {
+            mismatched_in_object(re, "duration string, number, or table", value, "timeout");
+            Err(())
+        }
+    }
+}
+
 fn parse_string_list_expr<'a>(
     alloc: &'a Bump,
     value: &TomlValue<'a>,
@@ -228,6 +337,7 @@ fn parse_task<'a>(
     let mut require: &[TaskCall<'a>] = &[];
     let mut cache: Option<CacheConfig<'a>> = None;
     let mut ready: Option<ReadyConfig<'a>> = None;
+    let mut timeout: Option<TimeoutConfig<'a>> = None;
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
@@ -387,7 +497,7 @@ fn parse_task<'a>(
                         .with_label(DiagnosticLabel::primary(when_value.span.into())));
                     return Err(());
                 };
-                let timeout = if let Some(timeout_val) = ready_table.get("timeout") {
+                let ready_timeout = if let Some(timeout_val) = ready_table.get("timeout") {
                     match &timeout_val.value {
                         ValueInner::Float(f) => Some(*f),
                         ValueInner::Integer(i) => Some(*i as f64),
@@ -399,7 +509,10 @@ fn parse_task<'a>(
                 } else {
                     None
                 };
-                ready = Some(ReadyConfig { when, timeout });
+                ready = Some(ReadyConfig { when, timeout: ready_timeout });
+            }
+            "timeout" => {
+                timeout = Some(parse_timeout_config(alloc, value, re)?);
             }
             "managed" => {
                 let ValueInner::Boolean(b) = &value.value else {
@@ -480,6 +593,7 @@ fn parse_task<'a>(
         require,
         cache,
         ready,
+        timeout,
         tags: &[],
         managed,
         hidden,
@@ -552,6 +666,7 @@ fn parse_test<'a>(
     let mut require: &[TaskCall<'a>] = &[];
     let mut tags_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut cache: Option<CacheConfig<'a>> = None;
+    let mut timeout: Option<TimeoutConfig<'a>> = None;
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
@@ -624,6 +739,9 @@ fn parse_test<'a>(
                 };
                 info = alloc.alloc_str(s);
             }
+            "timeout" => {
+                timeout = Some(parse_timeout_config(alloc, value, re)?);
+            }
             "var" => {
                 let Some(var_table) = value.as_table() else {
                     mismatched_in_object(re, "table", value, "var");
@@ -669,6 +787,7 @@ fn parse_test<'a>(
         require,
         tags: tags_vec.into_bump_slice(),
         cache,
+        timeout,
         vars: vars_vec.into_bump_slice(),
     })
 }
@@ -817,7 +936,10 @@ fn parse_functions<'a>(
                     FunctionDefAction::RestartSelected
                 } else {
                     re(Diagnostic::error()
-                        .with_message(format!("unknown function action: '{}', expected 'restart-selected' or a table", s))
+                        .with_message(format!(
+                            "unknown function action: '{}', expected 'restart-selected' or a table",
+                            s
+                        ))
                         .with_label(DiagnosticLabel::primary(func_value.span.into())));
                     return Err(());
                 }

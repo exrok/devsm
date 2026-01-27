@@ -42,6 +42,22 @@ pub(crate) struct ReadyChecker {
     pub(crate) timeout_at: Option<std::time::Instant>,
 }
 
+/// Tracks timeout conditions for a process.
+pub(crate) struct TimeoutTracker {
+    /// String to search for in output that starts the conditional timeout (ANSI stripped).
+    pub(crate) conditional_needle: Option<String>,
+    /// Absolute timeout at this instant (max timeout).
+    pub(crate) max_timeout_at: Option<std::time::Instant>,
+    /// Timeout at this instant after conditional predicate matched.
+    pub(crate) conditional_timeout_at: Option<std::time::Instant>,
+    /// Duration for conditional timeout (stored to compute timeout_at when predicate matches).
+    pub(crate) conditional_duration_secs: Option<f64>,
+    /// Idle timeout duration in seconds.
+    pub(crate) idle_duration_secs: Option<f64>,
+    /// Last time output was received (for idle timeout).
+    pub(crate) last_output_at: std::time::Instant,
+}
+
 pub(crate) struct ActiveProcess {
     pub(crate) log_group: LogGroup,
     pub(crate) job_index: JobIndex,
@@ -54,6 +70,8 @@ pub(crate) struct ActiveProcess {
     pub(crate) pending_exit_cause: Option<ExitCause>,
     /// Ready condition checker. None if no ready condition or already ready.
     pub(crate) ready_checker: Option<ReadyChecker>,
+    /// Timeout tracker. None if no timeout configured.
+    pub(crate) timeout_tracker: Option<TimeoutTracker>,
 }
 
 impl ActiveProcess {
@@ -142,6 +160,7 @@ pub(crate) struct ProcessManager {
     request: Arc<MioChannel>,
     poll: Poll,
     timed_ready_count: u32,
+    timed_timeout_count: u32,
 }
 
 pub(crate) enum ReadResult {
@@ -280,6 +299,21 @@ impl ProcessManager {
                         process.ready_checker = None;
                     }
                 }
+
+                if let Some(ref mut tracker) = process.timeout_tracker {
+                    let now = std::time::Instant::now();
+                    tracker.last_output_at = now;
+
+                    if tracker.conditional_timeout_at.is_none()
+                        && let Some(ref needle) = tracker.conditional_needle
+                        && crate::line_width::strip_ansi_and_contains(text, needle)
+                    {
+                        if let Some(secs) = tracker.conditional_duration_secs {
+                            tracker.conditional_timeout_at = Some(now + std::time::Duration::from_secs_f64(secs));
+                        }
+                        tracker.conditional_needle = None;
+                    }
+                }
                 process.style = new_style;
             }
         }
@@ -393,6 +427,53 @@ impl ProcessManager {
         }
     }
 
+    fn check_timeouts(&mut self) {
+        let now = std::time::Instant::now();
+        let mut to_kill: Vec<(usize, u32)> = Vec::new();
+
+        for (index, process) in &self.processes {
+            if !process.alive {
+                continue;
+            }
+            let Some(ref tracker) = process.timeout_tracker else {
+                continue;
+            };
+
+            let should_kill = tracker.max_timeout_at.is_some_and(|t| now > t)
+                || tracker.conditional_timeout_at.is_some_and(|t| now > t)
+                || tracker
+                    .idle_duration_secs
+                    .is_some_and(|secs| now.duration_since(tracker.last_output_at).as_secs_f64() > secs);
+
+            if should_kill {
+                to_kill.push((index, process.child.id()));
+            }
+        }
+
+        for (index, child_pid) in to_kill {
+            let Some(process) = self.processes.get_mut(index) else {
+                continue;
+            };
+            if !process.alive {
+                continue;
+            }
+
+            kvlog::info!(
+                "Process killed due to timeout",
+                job_index = process.job_index,
+                base_task_index = process.log_group.base_task_index().0,
+                reason = ExitCause::Timeout.name()
+            );
+
+            process.pending_exit_cause = Some(ExitCause::Timeout);
+            let pgid_to_kill = -(child_pid as i32);
+            unsafe {
+                libc::kill(pgid_to_kill, libc::SIGINT);
+            }
+            process.alive = false;
+        }
+    }
+
     pub(crate) fn spawn(
         &mut self,
         workspace_index: WorkspaceIndex,
@@ -497,6 +578,24 @@ impl ProcessManager {
             self.timed_ready_count += 1;
         }
         let ready_state = ready_checker.as_ref().map(|_| false);
+
+        let now = std::time::Instant::now();
+        let timeout_tracker = tc.timeout.as_ref().map(|tc| {
+            use crate::config::TimeoutPredicate;
+            TimeoutTracker {
+                conditional_needle: tc.when.as_ref().map(|w| match w {
+                    TimeoutPredicate::OutputContains(s) => s.to_string(),
+                }),
+                max_timeout_at: tc.max.map(|secs| now + std::time::Duration::from_secs_f64(secs)),
+                conditional_timeout_at: None,
+                conditional_duration_secs: tc.conditional,
+                idle_duration_secs: tc.idle,
+                last_output_at: now,
+            }
+        });
+        if timeout_tracker.is_some() {
+            self.timed_timeout_count += 1;
+        }
         let process_index = self.processes.insert(ActiveProcess {
             workspace_index,
             job_index,
@@ -508,6 +607,7 @@ impl ProcessManager {
             child,
             pending_exit_cause: None,
             ready_checker,
+            timeout_tracker,
         });
         {
             let mut ws = workspace.handle.state.write().unwrap();
@@ -889,6 +989,7 @@ impl ProcessManager {
                         ExitCause::Restarted => crate::rpc::ExitCause::Restarted,
                         ExitCause::SpawnFailed => crate::rpc::ExitCause::SpawnFailed,
                         ExitCause::ProfileConflict => crate::rpc::ExitCause::ProfileConflict,
+                        ExitCause::Timeout => crate::rpc::ExitCause::Timeout,
                     };
                     if let Some(workspace) = self.workspaces.get(ws_idx as usize) {
                         let mut ws = workspace.handle.state.write().unwrap();
@@ -904,6 +1005,9 @@ impl ProcessManager {
                     }
                     if process.ready_checker.as_ref().is_some_and(|rc| rc.timeout_at.is_some()) {
                         self.timed_ready_count -= 1;
+                    }
+                    if process.timeout_tracker.is_some() {
+                        self.timed_timeout_count -= 1;
                     }
                     self.processes.remove(index);
                     self.broadcast_job_exited(ws_idx, job_idx, exit_code as i32, rpc_cause);
@@ -2385,6 +2489,7 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
         wait_thread,
         poll,
         timed_ready_count: 0,
+        timed_timeout_count: 0,
     };
     loop {
         if TERMINATED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2392,8 +2497,11 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
             return;
         }
 
-        let poll_timeout =
-            if job_manager.timed_ready_count > 0 { Some(std::time::Duration::from_millis(500)) } else { None };
+        let poll_timeout = if job_manager.timed_ready_count > 0 || job_manager.timed_timeout_count > 0 {
+            Some(std::time::Duration::from_millis(500))
+        } else {
+            None
+        };
 
         if let Err(err) = job_manager.poll.poll(&mut events, poll_timeout) {
             if err.kind() == std::io::ErrorKind::Interrupted {
@@ -2432,6 +2540,9 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
         job_manager.scheduled();
         if job_manager.timed_ready_count > 0 {
             job_manager.check_ready_timeouts();
+        }
+        if job_manager.timed_timeout_count > 0 {
+            job_manager.check_timeouts();
         }
 
         for (_, client) in &job_manager.clients {

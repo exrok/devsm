@@ -24,6 +24,7 @@ use crate::config::Command;
 use crate::line_width::strip_ansi_to_buffer_preserve_case;
 use crate::log_storage::LogGroup;
 use crate::rpc::{Encoder, RpcMessageKind};
+use crate::workspace::ExitCause;
 use crate::{
     process_manager::ClientChannel,
     workspace::{BaseTask, BaseTaskIndex, JobIndex, JobStatus, TestJob, TestJobStatus, TestRun, Workspace},
@@ -33,6 +34,18 @@ fn format_command(cmd: &Command) -> String {
     match cmd {
         Command::Cmd(args) => args.join(" "),
         Command::Sh(script) => format!("sh -c '{}'", script.trim()),
+    }
+}
+
+fn format_duration(secs: f64) -> String {
+    if secs >= 86400.0 {
+        format!("{}d", secs / 86400.0)
+    } else if secs >= 3600.0 {
+        format!("{}h", secs / 3600.0)
+    } else if secs >= 60.0 {
+        format!("{}m", secs / 60.0)
+    } else {
+        format!("{}s", secs)
     }
 }
 
@@ -58,6 +71,7 @@ struct TestDisplay {
     started_at: Option<Instant>,
     finished_at: Option<Instant>,
     recent_logs: VecDeque<String>,
+    timeout_info: Option<f64>,
 }
 
 struct TuiState {
@@ -248,6 +262,7 @@ fn init_tui_state(test_run: &TestRun, workspace: &Workspace, width: u16, height:
                 started_at: None,
                 finished_at: None,
                 recent_logs: VecDeque::new(),
+                timeout_info: None,
             }
         })
         .collect();
@@ -269,23 +284,28 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
         }
 
         let job = &ws_state.jobs[test_job.job_index.idx()];
-        let new_status = match &job.process_status {
+        let (new_status, timeout_info) = match &job.process_status {
             JobStatus::Scheduled { .. } | JobStatus::Starting => {
                 all_done = false;
-                TestJobStatus::Pending
+                (TestJobStatus::Pending, None)
             }
             JobStatus::Running { .. } => {
                 all_done = false;
-                TestJobStatus::Running
+                (TestJobStatus::Running, None)
             }
-            JobStatus::Exited { status, .. } => {
+            JobStatus::Exited { status, cause, .. } => {
                 if *status == 0 {
-                    TestJobStatus::Passed
+                    (TestJobStatus::Passed, None)
                 } else {
-                    TestJobStatus::Failed(*status as i32)
+                    let timeout = if *cause == ExitCause::Timeout {
+                        job.task.config().timeout.as_ref().and_then(|t| t.max.or(t.idle).or(t.conditional))
+                    } else {
+                        None
+                    };
+                    (TestJobStatus::Failed(*status as i32), timeout)
                 }
             }
-            JobStatus::Cancelled => TestJobStatus::Failed(-1),
+            JobStatus::Cancelled => (TestJobStatus::Failed(-1), None),
         };
 
         if new_status != display.status {
@@ -294,6 +314,7 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
             }
             if matches!(new_status, TestJobStatus::Passed | TestJobStatus::Failed(_)) {
                 display.finished_at = Some(Instant::now());
+                display.timeout_info = timeout_info;
             }
             display.status = new_status;
             changed = true;
@@ -411,7 +432,11 @@ fn render_test_header(buf: &mut Vec<u8>, test: &TestDisplay, _width: u16, row: u
 
     if let TestJobStatus::Failed(code) = test.status {
         Color::Grey[14].as_fg().write_to_buffer(buf);
-        write!(buf, " exit {}", code).ok();
+        if let Some(timeout_secs) = test.timeout_info {
+            write!(buf, " terminated: exceeded timeout of {}", format_duration(timeout_secs)).ok();
+        } else {
+            write!(buf, " exit {}", code).ok();
+        }
         buf.extend_from_slice(vt::CLEAR_STYLE);
     }
 
@@ -477,7 +502,11 @@ fn write_color_summary(buf: &mut Vec<u8>, state: &TuiState, workspace: &Workspac
         splat!(buf, "\n", Color(1).as_fg(), "FAIL ", test.name, vt::CLEAR_STYLE, "\n");
         splat!(buf, "  Command: ", test.command, "\n");
         if let TestJobStatus::Failed(code) = test.status {
-            splat!(buf, "  Exit code: ", code, "\n");
+            if let Some(timeout_secs) = test.timeout_info {
+                splat!(buf, "  Terminated: exceeded timeout of ", format_duration(timeout_secs), "\n");
+            } else {
+                splat!(buf, "  Exit code: ", code, "\n");
+            }
         }
 
         let recent = collect_recent_logs(&logs, test.log_group, MAX_SUMMARY_LOGS);
@@ -541,23 +570,28 @@ fn update_test_statuses(
         }
 
         let job = &state.jobs[test_job.job_index.idx()];
-        let new_status = match &job.process_status {
+        let (new_status, timeout_info) = match &job.process_status {
             JobStatus::Scheduled { .. } | JobStatus::Starting => {
                 all_done = false;
-                TestJobStatus::Pending
+                (TestJobStatus::Pending, None)
             }
             JobStatus::Running { .. } => {
                 all_done = false;
-                TestJobStatus::Running
+                (TestJobStatus::Running, None)
             }
-            JobStatus::Exited { status, .. } => {
+            JobStatus::Exited { status, cause, .. } => {
                 if *status == 0 {
-                    TestJobStatus::Passed
+                    (TestJobStatus::Passed, None)
                 } else {
-                    TestJobStatus::Failed(*status as i32)
+                    let timeout = if *cause == ExitCause::Timeout {
+                        job.task.config().timeout.as_ref().and_then(|t| t.max.or(t.idle).or(t.conditional))
+                    } else {
+                        None
+                    };
+                    (TestJobStatus::Failed(*status as i32), timeout)
                 }
             }
-            JobStatus::Cancelled => TestJobStatus::Failed(-1),
+            JobStatus::Cancelled => (TestJobStatus::Failed(-1), None),
         };
 
         if new_status != test_job.status {
@@ -577,7 +611,11 @@ fn update_test_statuses(
                     }
 
                     writeln!(buf, "=== FAIL {}", display_name).ok();
-                    writeln!(buf, "exit_code: {}", code).ok();
+                    if let Some(timeout_secs) = timeout_info {
+                        writeln!(buf, "terminated: exceeded timeout of {}", format_duration(timeout_secs)).ok();
+                    } else {
+                        writeln!(buf, "exit_code: {}", code).ok();
+                    }
                     writeln!(buf, "pwd: {}", path.display()).ok();
                     match &config.command {
                         Command::Cmd(items) => {

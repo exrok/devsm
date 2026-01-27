@@ -2,8 +2,8 @@
 
 [function]
 f1 = { kill = "full_basic" }
-f2 = { spawn = [["with_var", { dir = "/tmp/" }], "multiline_sh"]}
-f3 = { restart = "full_basic"}
+f2 = { spawn = [["with_var", { dir = "/tmp/" }], "multiline_sh"] }
+f3 = { restart = "full_basic" }
 
 # Minimal action with cmd array
 [action.simple_cmd]
@@ -12,7 +12,6 @@ cmd = ["echo", "hello"]
 # Minimal action with sh string
 [action.simple_sh]
 sh = "echo hello"
-
 
 # Action with multiline shell script
 [action.multiline_sh]
@@ -59,20 +58,20 @@ profiles = ["default", "release"]
 # Action using conditional with or_else
 [action.with_conditional_else]
 cmd = [
-    "cargo",
-    "build",
-    { if.profile = "debug", then = "--debug", or_else = "--release" },
+  "cargo",
+  "build",
+  { if.profile = "debug", then = "--debug", or_else = "--release" },
 ]
 profiles = ["debug", "release"]
 
 # Action with nested expressions in cmd
 [action.complex_cmd]
 cmd = [
-    "cargo",
-    { if.profile = "verbose", then = "-v" },
-    "build",
-    { if.profile = "release", then = "--release", or_else = "--debug" },
-    { var = "extra_args" },
+  "cargo",
+  { if.profile = "verbose", then = "-v" },
+  "build",
+  { if.profile = "release", then = "--release", or_else = "--debug" },
+  { var = "extra_args" },
 ]
 profiles = ["default", "verbose", "release"]
 
@@ -120,18 +119,18 @@ require = [["with_var", { dir = "/usr/local" }]]
 [action.with_require_full]
 cmd = ["./integration-test.sh"]
 require = [
-    "simple_cmd",
-    "full_basic:debug",
-    [
-        "with_var:default",
-        { dir = "/tmp" },
-    ],
+  "simple_cmd",
+  "full_basic:debug",
+  [
+    "with_var:default",
+    { dir = "/tmp" },
+  ],
 ]
 
 # Action with empty cache (simple success-based caching)
 [action.with_cache_empty]
 cmd = ["./expensive-setup.sh"]
-cache = {}
+cache = {  }
 
 # Action with cache key using modified
 [action.with_cache_modified]
@@ -147,11 +146,11 @@ cache.key = [{ profile_changed = "full_basic" }]
 [action.with_cache_multiple]
 cmd = ["./compile.sh"]
 cache.key = [
-    { modified = ["Cargo.toml", "Cargo.lock", "src"], ignore = "*.md" },
-    { modified = ["docs/"], ignore = ["*.png", "*.jpg"] },
-    { modified = "src/lib.rs" },
-    { profile_changed = "simple_cmd" },
-    { profile_changed = "full_basic" },
+  { modified = ["Cargo.toml", "Cargo.lock", "src"], ignore = "*.md" },
+  { modified = ["docs/"], ignore = ["*.png", "*.jpg"] },
+  { modified = "src/lib.rs" },
+  { profile_changed = "simple_cmd" },
+  { profile_changed = "full_basic" },
 ]
 
 # Action with cache.never (always re-runs when required, never uses cached result)
@@ -159,14 +158,49 @@ cache.key = [
 cmd = ["./always-run.sh"]
 cache.never = true
 
+# Action with simple timeout (string duration, equivalent to timeout.max)
+[action.with_simple_timeout]
+cmd = ["./long-running-script.sh"]
+timeout = "10m"
+
+# Action with timeout as number (seconds)
+[action.with_timeout_seconds]
+cmd = ["./quick-script.sh"]
+timeout = 30
+
+# Action with max timeout
+[action.with_timeout_max]
+cmd = ["./slow-build.sh"]
+timeout.max = "30m"
+
+# Action with idle timeout
+[action.with_timeout_idle]
+cmd = ["./streaming-process.sh"]
+timeout.idle = "30s"
+
+# Action with conditional timeout (starts after output contains string)
+[action.with_timeout_conditional]
+cmd = ["cargo", "build"]
+timeout.when.output_contains = "Compiling"
+timeout.conditional = "5m"
+timeout.max = "15m"
+
+# Action with all timeout options
+[action.with_full_timeout]
+cmd = ["./complex-task.sh"]
+timeout.when.output_contains = "Starting phase 2"
+timeout.conditional = "2m"
+timeout.max = "10m"
+timeout.idle = "30s"
+
 # Action combining all features (cmd version)
 [action.kitchen_sink_cmd]
 cmd = [
-    "cargo",
-    { if.profile = "verbose", then = "-v" },
-    "build",
-    { if.profile = "release", then = "--release", or_else = "--debug" },
-    { var = "target" },
+  "cargo",
+  { if.profile = "verbose", then = "-v" },
+  "build",
+  { if.profile = "release", then = "--release", or_else = "--debug" },
+  { var = "target" },
 ]
 pwd = { if.profile = "frontend", then = "./frontend", or_else = "./backend" }
 profiles = ["default", "verbose", "release", "frontend"]
@@ -175,8 +209,8 @@ env.BUILD_DIR = { var = "build_dir" }
 env.CI = "true"
 require = ["simple_cmd", "full_basic:release", ["with_var", { dir = "/opt" }]]
 cache.key = [
-    { modified = "Cargo.toml" },
-    { profile_changed = "with_cache_modified" },
+  { modified = "Cargo.toml" },
+  { profile_changed = "with_cache_modified" },
 ]
 info = "The ultimate test action with every possible field (cmd)"
 
@@ -264,12 +298,12 @@ profiles = ["default", "docker"]
 env.DATABASE_URL = { var = "db_url" }
 env.ENVIRONMENT = { if.profile = "docker", then = "container", or_else = "local" }
 require = [
-    "simple_service",
-    "full_service:staging",
-    [
-        "service_with_env:dev",
-        { log_level = "debug" },
-    ],
+  "simple_service",
+  "full_service:staging",
+  [
+    "service_with_env:dev",
+    { log_level = "debug" },
+  ],
 ]
 info = "Complex service with all supported fields"
 
@@ -333,23 +367,35 @@ require = ["with_cache_empty"]
 [test.test_with_complex_require]
 cmd = ["./e2e-tests.sh"]
 require = [
-    "simple_cmd",
-    "full_basic:debug",
-    [
-        "with_var",
-        { dir = "/test-data" },
-    ],
+  "simple_cmd",
+  "full_basic:debug",
+  [
+    "with_var",
+    { dir = "/test-data" },
+  ],
 ]
 
 # Test with cache
 [test.test_with_cache]
 cmd = ["cargo", "test", "--lib"]
-cache = {}
+cache = {  }
 
 # Test with cache key
 [test.test_with_cache_key]
 cmd = ["cargo", "test"]
 cache.key = [{ modified = "src/" }, { profile_changed = "full_basic" }]
+
+# Test with timeout
+[test.test_with_timeout]
+cmd = ["cargo", "test", "--", "--test-threads=1"]
+timeout = "5m"
+
+# Test with detailed timeout config
+[test.test_with_detailed_timeout]
+cmd = ["./slow-integration-tests.sh"]
+timeout.max = "30m"
+timeout.idle = "2m"
+tag = ["integration", "slow"]
 
 # Test with all fields
 [test.comprehensive_test]
@@ -400,55 +446,49 @@ cache.key = [{ modified = "tests/sqlite/" }]
 [group]
 # Simple group with task names
 simple = ["simple_cmd", "simple_sh"]
-
 # Group with tasks using profiles
 with_profiles = ["full_basic:release", "service_conditional_cmd:watch"]
-
 # Group with tasks using variables
 with_vars = [
-    [
-        "with_var",
-        { dir = "/home" },
-    ],
-    [
-        "with_require_vars",
-        { extra = "value" },
-    ],
+  [
+    "with_var",
+    { dir = "/home" },
+  ],
+  [
+    "with_require_vars",
+    { extra = "value" },
+  ],
 ]
-
 # Group mixing all formats
 mixed = [
-    "simple_cmd",
-    "full_basic:debug",
-    [
-        "with_var",
-        { dir = "/usr" },
-    ],
-    "simple_service",
-    "full_service:production",
-    [
-        "service_with_env:production",
-        { log_level = "warn" },
-    ],
+  "simple_cmd",
+  "full_basic:debug",
+  [
+    "with_var",
+    { dir = "/usr" },
+  ],
+  "simple_service",
+  "full_service:production",
+  [
+    "service_with_env:production",
+    { log_level = "warn" },
+  ],
 ]
-
 # CI-style group
 ci = ["with_cache_empty", "with_cache_modified", "simple_test", "full_test"]
-
 # Development group
 dev = [
-    "simple_cmd",
-    "full_basic:debug",
-    "simple_service",
-    "service_with_env:dev",
+  "simple_cmd",
+  "full_basic:debug",
+  "simple_service",
+  "service_with_env:dev",
 ]
-
 # Production deployment group
 deploy = [
-    "with_cache_multiple",
-    "full_basic:release",
-    [
-        "complex_service:docker",
-        { db_url = "postgres://prod/db" },
-    ],
+  "with_cache_multiple",
+  "full_basic:release",
+  [
+    "complex_service:docker",
+    { db_url = "postgres://prod/db" },
+  ],
 ]

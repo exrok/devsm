@@ -64,7 +64,7 @@
       "type": "object",
       "description": "Variable reference expression",
       "additionalProperties": false,
-      "required": [ "var" ],
+      "required": ["var"],
       "properties": {
         "var": {
           "type": "string",
@@ -76,7 +76,7 @@
       "type": "object",
       "description": "Conditional string expression",
       "additionalProperties": false,
-      "required": [ "if", "then" ],
+      "required": ["if", "then"],
       "properties": {
         "if": {
           "$ref": "#/definitions/predicate"
@@ -115,7 +115,7 @@
       "type": "object",
       "description": "Conditional string list expression",
       "additionalProperties": false,
-      "required": [ "if", "then" ],
+      "required": ["if", "then"],
       "properties": {
         "if": {
           "$ref": "#/definitions/predicate"
@@ -134,7 +134,7 @@
       "type": "object",
       "description": "Condition predicate",
       "additionalProperties": false,
-      "required": [ "profile" ],
+      "required": ["profile"],
       "properties": {
         "profile": {
           "type": "string",
@@ -188,7 +188,7 @@
           "type": "object",
           "description": "Invalidate when file modification time changes",
           "additionalProperties": false,
-          "required": [ "modified" ],
+          "required": ["modified"],
           "properties": {
             "modified": {
               "oneOf": [
@@ -226,7 +226,7 @@
           "type": "object",
           "description": "Invalidate when another task's profile changes",
           "additionalProperties": false,
-          "required": [ "profile_changed" ],
+          "required": ["profile_changed"],
           "properties": {
             "profile_changed": {
               "type": "string",
@@ -255,7 +255,7 @@
         }
       },
       "x-taplo": {
-        "initKeys": [ "key" ]
+        "initKeys": ["key"]
       }
     },
     "readyPredicate": {
@@ -273,7 +273,7 @@
       "type": "object",
       "description": "Ready condition configuration for services",
       "additionalProperties": false,
-      "required": [ "when" ],
+      "required": ["when"],
       "properties": {
         "when": {
           "$ref": "#/definitions/readyPredicate",
@@ -285,6 +285,63 @@
           "description": "Timeout in seconds for ready condition"
         }
       }
+    },
+    "timeoutPredicate": {
+      "type": "object",
+      "description": "Predicate determining when a timeout condition starts",
+      "additionalProperties": false,
+      "properties": {
+        "output_contains": {
+          "type": "string",
+          "description": "Timeout starts when output contains this string (ANSI codes ignored)"
+        }
+      }
+    },
+    "duration": {
+      "description": "Duration value: number (seconds) or string with suffix (s, m, h, d)",
+      "oneOf": [
+        {
+          "type": "number",
+          "minimum": 0,
+          "description": "Duration in seconds"
+        },
+        {
+          "type": "string",
+          "pattern": "^\\d+(\\.\\d+)?[smhd]?$",
+          "description": "Duration string (e.g., '10s', '5m', '2h', '1d')"
+        }
+      ]
+    },
+    "timeoutConfig": {
+      "description": "Timeout configuration for tasks. Can be a simple duration (equivalent to timeout.max) or a detailed configuration object.",
+      "oneOf": [
+        {
+          "$ref": "#/definitions/duration"
+        },
+        {
+          "type": "object",
+          "description": "Detailed timeout configuration",
+          "additionalProperties": false,
+          "properties": {
+            "when": {
+              "$ref": "#/definitions/timeoutPredicate",
+              "description": "Predicate that starts the conditional timeout"
+            },
+            "conditional": {
+              "$ref": "#/definitions/duration",
+              "description": "Timeout duration after the 'when' predicate matches"
+            },
+            "max": {
+              "$ref": "#/definitions/duration",
+              "description": "Maximum absolute timeout from task start"
+            },
+            "idle": {
+              "$ref": "#/definitions/duration",
+              "description": "Terminates if no output is generated within this duration"
+            }
+          }
+        }
+      ]
     },
     "varMeta": {
       "type": "object",
@@ -305,10 +362,7 @@
       "type": "object",
       "description": "Action configuration - a one-time task",
       "additionalProperties": false,
-      "oneOf": [
-        { "required": [ "cmd" ] },
-        { "required": [ "sh" ] }
-      ],
+      "oneOf": [{ "required": ["cmd"] }, { "required": ["sh"] }],
       "properties": {
         "cmd": {
           "$ref": "#/definitions/stringListExpr",
@@ -329,7 +383,7 @@
           "items": {
             "type": "string"
           },
-          "default": [ "default" ]
+          "default": ["default"]
         },
         "env": {
           "$ref": "#/definitions/envTable",
@@ -350,6 +404,10 @@
           "type": "string",
           "description": "Description of the action"
         },
+        "timeout": {
+          "$ref": "#/definitions/timeoutConfig",
+          "description": "Timeout configuration - terminates the task if it exceeds the specified duration"
+        },
         "managed": {
           "type": "boolean",
           "description": "Controls execution mode: true = must use 'devsm run' (for complex dependencies), false = must use 'devsm exec' (for interactive commands). Omit for default behavior (either allowed)."
@@ -363,17 +421,14 @@
         }
       },
       "x-taplo": {
-        "initKeys": [ "cmd" ]
+        "initKeys": ["cmd"]
       }
     },
     "service": {
       "type": "object",
       "description": "Service configuration - a long-running process",
       "additionalProperties": false,
-      "oneOf": [
-        { "required": [ "cmd" ] },
-        { "required": [ "sh" ] }
-      ],
+      "oneOf": [{ "required": ["cmd"] }, { "required": ["sh"] }],
       "properties": {
         "cmd": {
           "$ref": "#/definitions/stringListExpr",
@@ -394,7 +449,7 @@
           "items": {
             "type": "string"
           },
-          "default": [ "default" ]
+          "default": ["default"]
         },
         "env": {
           "$ref": "#/definitions/envTable",
@@ -415,13 +470,17 @@
           "type": "string",
           "description": "Description of the service"
         },
+        "timeout": {
+          "$ref": "#/definitions/timeoutConfig",
+          "description": "Timeout configuration - terminates the service if it exceeds the specified duration"
+        },
         "managed": {
           "type": "boolean",
           "description": "Controls execution mode: true = must use 'devsm run' (for complex dependencies), false = must use 'devsm exec' (for interactive commands). Omit for default behavior (either allowed)."
         },
         "hidden": {
           "type": "string",
-          "enum": [ "never", "until_ran" ],
+          "enum": ["never", "until_ran"],
           "default": "never",
           "description": "Controls when the service is visible in the task list. 'never' (default) always shows the service, 'until_ran' hides it until it has been run at least once this session."
         },
@@ -438,17 +497,14 @@
         }
       },
       "x-taplo": {
-        "initKeys": [ "cmd" ]
+        "initKeys": ["cmd"]
       }
     },
     "test": {
       "type": "object",
       "description": "Test configuration",
       "additionalProperties": false,
-      "oneOf": [
-        { "required": [ "cmd" ] },
-        { "required": [ "sh" ] }
-      ],
+      "oneOf": [{ "required": ["cmd"] }, { "required": ["sh"] }],
       "properties": {
         "cmd": {
           "$ref": "#/definitions/stringListExpr",
@@ -498,6 +554,10 @@
           "type": "string",
           "description": "Description of the test"
         },
+        "timeout": {
+          "$ref": "#/definitions/timeoutConfig",
+          "description": "Timeout configuration - terminates the test if it exceeds the specified duration"
+        },
         "var": {
           "type": "object",
           "description": "Variable metadata table (e.g., var.myvar = { description = '...', default = '...' })",
@@ -507,7 +567,7 @@
         }
       },
       "x-taplo": {
-        "initKeys": [ "cmd" ]
+        "initKeys": ["cmd"]
       }
     },
     "testEntry": {
@@ -554,9 +614,9 @@
         }
       },
       "oneOf": [
-        { "required": [ "restart" ] },
-        { "required": [ "kill" ] },
-        { "required": [ "spawn" ] }
+        { "required": ["restart"] },
+        { "required": ["kill"] },
+        { "required": ["spawn"] }
       ]
     }
   }

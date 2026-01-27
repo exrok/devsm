@@ -1,4 +1,3 @@
-
 [function]
 fn1 = { restart = "devsm-in-tmux" }
 
@@ -13,7 +12,7 @@ cache.never = true
 
 [action.tmux-attach]
 pwd = "tests/workspace"
-sh = 'tmux attach -t devsm-tester:0 || tmux new-session -A -s devsm-tester'
+sh = "tmux attach -t devsm-tester:0 || tmux new-session -A -s devsm-tester"
 env.DEVSM_SOCKET = "/tmp/.devsm.test.socket"
 managed = false
 
@@ -46,12 +45,12 @@ tag = ["schema"]
 
 [test.devsm-validate-big-config]
 cmd = [
-    "cargo",
-    "run",
-    "--",
-    "validate",
-    "--skip-path-checks",
-    "schema/devsm.example-big.toml",
+  "cargo",
+  "run",
+  "--",
+  "validate",
+  "--skip-path-checks",
+  "schema/devsm.example-big.toml",
 ]
 tag = ["schema"]
 

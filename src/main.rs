@@ -742,7 +742,7 @@ fn logs_client(options: cli::LogsOptions) -> anyhow::Result<()> {
     let is_tty = unsafe { libc::isatty(1) == 1 };
 
     let query = daemon::LogsQuery {
-        max_age_secs: options.max_age.and_then(|s| parse_duration(s).ok()),
+        max_age_secs: options.max_age.and_then(|s| config::parse_duration(s).ok().map(|f| f as u32)),
         task_filters: options.tasks.iter().map(|t| daemon::TaskFilter { name: t.name, latest: t.latest }).collect(),
         job_index: options.job,
         kind_filters: options.kinds.iter().map(|k| daemon::KindFilter { kind: k.kind, latest: k.latest }).collect(),
@@ -807,26 +807,6 @@ fn logs_client(options: cli::LogsOptions) -> anyhow::Result<()> {
     }
 
     Ok(())
-}
-
-fn parse_duration(s: &str) -> anyhow::Result<u32> {
-    let s = s.trim();
-    if let Some(num) = s.strip_suffix("ms") {
-        let ms: u32 = num.trim().parse()?;
-        return Ok(ms / 1000);
-    }
-    if let Some(num) = s.strip_suffix('s') {
-        return Ok(num.trim().parse()?);
-    }
-    if let Some(num) = s.strip_suffix('m') {
-        let mins: u32 = num.trim().parse()?;
-        return Ok(mins * 60);
-    }
-    if let Some(num) = s.strip_suffix('h') {
-        let hours: u32 = num.trim().parse()?;
-        return Ok(hours * 3600);
-    }
-    s.parse().map_err(Into::into)
 }
 
 fn get_self_logs(follow: bool) -> anyhow::Result<()> {
