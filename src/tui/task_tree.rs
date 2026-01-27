@@ -268,8 +268,14 @@ impl TaskTreeState {
                 }
             }
 
-            let has_tests = ws.base_tasks.iter().any(|bt| !bt.removed && bt.config.managed != Some(false) && bt.config.kind == TaskKind::Test);
-            let has_actions = ws.base_tasks.iter().any(|bt| !bt.removed && bt.config.managed != Some(false) && bt.config.kind == TaskKind::Action);
+            let has_tests = ws
+                .base_tasks
+                .iter()
+                .any(|bt| !bt.removed && bt.config.managed != Some(false) && bt.config.kind == TaskKind::Test);
+            let has_actions = ws
+                .base_tasks
+                .iter()
+                .any(|bt| !bt.removed && bt.config.managed != Some(false) && bt.config.kind == TaskKind::Action);
 
             if has_actions {
                 self.primary_list.push(PrimaryEntry::MetaGroup(MetaGroupKind::Actions));
@@ -636,36 +642,37 @@ impl TaskTreeState {
                     format!("sh: {}", prefix)
                 }
             };
+            let is_selected = Some(ji) == sel.job;
 
             let display_text = if show_task_name { format!("{}: {}", bt.name, command) } else { command };
 
             let status = StatusKind::of(&job.process_status, bt.config.kind);
+            let substyle =
+                if is_selected { status.light_bg().with_fg(Color::Grey[7]) } else { Color::Grey[16].as_fg() };
             line.take_left(6)
-                .with(if Some(ji) == sel.job {
+                .with(if is_selected {
                     status.dark_bg().with_fg(Color::Black)
                 } else {
                     status.dark_bg().with_bg(Color::Grey[4])
                 })
                 .text(out, status.padded_text());
-            let rem = line
-                .with(if Some(ji) == sel.job { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() })
-                .fill(out)
-                .skip(1)
-                .text(out, &display_text)
-                .skip(1)
-                .with(HAlign::Right);
+            let style = if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() };
+            let mut rem = line.with(style).fill(out).skip(1);
 
-            match &job.process_status {
-                JobStatus::Exited { finished_at, .. } => {
-                    let elapsed = finished_at.saturating_duration_since(job.started_at);
-                    rem.fmt(out, format_args!("{:.0?} ", elapsed));
-                }
-                JobStatus::Cancelled => (),
-                _ => {
-                    let elapsed = now.saturating_duration_since(job.started_at);
-                    rem.fmt(out, format_args!("{:.0?} ", elapsed));
-                }
+            'no_time: {
+                let elapsed = match &job.process_status {
+                    JobStatus::Exited { finished_at, .. } => finished_at.saturating_duration_since(job.started_at),
+                    JobStatus::Cancelled => break 'no_time,
+                    _ => now.saturating_duration_since(job.started_at),
+                };
+                rem = rem
+                    .with(substyle)
+                    .with(HAlign::Right)
+                    .fmt(out, format_args!("{:.0?}", elapsed))
+                    .skip(1)
+                    .with(HAlign::Left);
             };
+            rem.with(style).with(extui::Ellipsis(true)).text(out, &display_text).skip(1);
         }
     }
 }
