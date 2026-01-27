@@ -745,6 +745,7 @@ fn process_key(
             let initial_view_pos = logs.tail();
             let state = LogSearchState::new(&logs, filter, initial_view_pos);
             drop(logs);
+            drop(ws_state);
             tui.logs.enter_scroll_mode(workspace);
             tui.overlay = FocusOverlap::LogSearch { state };
         }

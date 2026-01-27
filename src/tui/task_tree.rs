@@ -254,7 +254,7 @@ impl TaskTreeState {
 
         if self.collapsed {
             for (i, bt) in ws.base_tasks.iter().enumerate() {
-                if bt.removed {
+                if bt.removed || bt.config.managed == Some(false) {
                     continue;
                 }
                 if bt.config.kind == TaskKind::Service {
@@ -268,8 +268,8 @@ impl TaskTreeState {
                 }
             }
 
-            let has_tests = ws.base_tasks.iter().any(|bt| !bt.removed && bt.config.kind == TaskKind::Test);
-            let has_actions = ws.base_tasks.iter().any(|bt| !bt.removed && bt.config.kind == TaskKind::Action);
+            let has_tests = ws.base_tasks.iter().any(|bt| !bt.removed && bt.config.managed != Some(false) && bt.config.kind == TaskKind::Test);
+            let has_actions = ws.base_tasks.iter().any(|bt| !bt.removed && bt.config.managed != Some(false) && bt.config.kind == TaskKind::Action);
 
             if has_actions {
                 self.primary_list.push(PrimaryEntry::MetaGroup(MetaGroupKind::Actions));
@@ -279,7 +279,7 @@ impl TaskTreeState {
             }
         } else {
             for (i, bt) in ws.base_tasks.iter().enumerate() {
-                if bt.removed {
+                if bt.removed || bt.config.managed == Some(false) {
                     continue;
                 }
                 let should_display = match bt.config.kind {
