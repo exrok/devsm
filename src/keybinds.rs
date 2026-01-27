@@ -279,13 +279,28 @@ impl ChainGroup {
 /// Keybinding modes corresponding to different UI states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Mode {
+    ///  Always active as a fallback. Bindings here apply when no mode-specific
+    ///  binding exists. Use for universally-available commands like `Quit` or `ToggleHelp`.
+    ///
+    ///  This is the primary mode for most interactions including task control,
+    ///  navigation, and log viewing commands.
     Global,
+    /// Active in modal overlays that accept text input or selection,
+    /// such as profile selection dialogs. Used for navigation (up/down) and
+    /// confirm/cancel actions within input overlays.
     Input,
+    /// Active when viewing paginated content such as configuration errors.
+    /// Reserved for read-only scrollable views that are not the main task tree.
     Pager,
+    /// Active in the main TUI view when navigating tasks and jobs.
     TaskTree,
+    /// Active when the group selection search overlay is open.
     SelectSearch,
+    /// Active when the log search overlay is open for pattern matching.
     LogSearch,
+    /// Active when the multi-step task launcher overlay is open.
     TaskLauncher,
+    /// Active when the test filter selection overlay is open.
     TestFilterLauncher,
 }
 
@@ -424,17 +439,6 @@ impl Keybinds {
         self.bind(Mode::Input, "C-l", Command::OverlayConfirm);
         self.bind(Mode::Input, "ENTER", Command::OverlayConfirm);
 
-        self.bind(Mode::Pager, "/", Command::SearchLogs);
-        self.bind(Mode::Pager, "HOME", Command::JumpToOldestLogs);
-        self.bind(Mode::Pager, "END", Command::JumpToNewestLogs);
-        self.bind(Mode::Pager, "C-k", Command::LogScrollUp);
-        self.bind(Mode::Pager, "C-j", Command::LogScrollDown);
-        self.bind(Mode::Pager, "PGUP", Command::HelpScrollUp);
-        self.bind(Mode::Pager, "PGDN", Command::HelpScrollDown);
-        self.bind(Mode::Pager, "1", Command::LogModeAll);
-        self.bind(Mode::Pager, "2", Command::LogModeSelected);
-        self.bind(Mode::Pager, "3", Command::LogModeHybrid);
-
         self.bind(Mode::TaskTree, "j", Command::SelectNext);
         self.bind(Mode::TaskTree, "k", Command::SelectPrev);
         self.bind(Mode::TaskTree, "UP", Command::SelectPrev);
@@ -456,6 +460,25 @@ impl Keybinds {
         self.bind(Mode::TaskTree, "N", Command::NarrowTestGroup);
         self.bind(Mode::TaskTree, "n", Command::NextFailInTestGroup);
         self.bind(Mode::TaskTree, "p", Command::PrevFailInTestGroup);
+        self.bind(Mode::TaskTree, "/", Command::SearchLogs);
+        self.bind(Mode::TaskTree, "HOME", Command::JumpToOldestLogs);
+        self.bind(Mode::TaskTree, "END", Command::JumpToNewestLogs);
+        self.bind(Mode::TaskTree, "C-k", Command::LogScrollUp);
+        self.bind(Mode::TaskTree, "C-j", Command::LogScrollDown);
+        self.bind(Mode::TaskTree, "PGUP", Command::HelpScrollUp);
+        self.bind(Mode::TaskTree, "PGDN", Command::HelpScrollDown);
+        self.bind(Mode::TaskTree, "1", Command::LogModeAll);
+        self.bind(Mode::TaskTree, "2", Command::LogModeSelected);
+        self.bind(Mode::TaskTree, "3", Command::LogModeHybrid);
+
+        self.bind(Mode::Pager, "j", Command::SelectNext);
+        self.bind(Mode::Pager, "k", Command::SelectPrev);
+        self.bind(Mode::Pager, "UP", Command::SelectPrev);
+        self.bind(Mode::Pager, "DOWN", Command::SelectNext);
+        self.bind(Mode::Pager, "PGUP", Command::HelpScrollUp);
+        self.bind(Mode::Pager, "PGDN", Command::HelpScrollDown);
+        self.bind(Mode::Pager, "HOME", Command::JumpToOldestLogs);
+        self.bind(Mode::Pager, "END", Command::JumpToNewestLogs);
     }
 
     /// Binds a key to a command in a specific mode.
@@ -749,6 +772,8 @@ mod tests {
 
         let home: InputEvent = "HOME".parse().unwrap();
         let end: InputEvent = "END".parse().unwrap();
+        assert_eq!(keybinds.lookup(Mode::TaskTree, home), Some(Command::JumpToOldestLogs));
+        assert_eq!(keybinds.lookup(Mode::TaskTree, end), Some(Command::JumpToNewestLogs));
         assert_eq!(keybinds.lookup(Mode::Pager, home), Some(Command::JumpToOldestLogs));
         assert_eq!(keybinds.lookup(Mode::Pager, end), Some(Command::JumpToNewestLogs));
     }
@@ -758,16 +783,13 @@ mod tests {
         let keybinds = Keybinds::default();
 
         let j: InputEvent = "j".parse().unwrap();
-        assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Pager, Mode::Global], j), Some(Command::SelectNext));
+        assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Global], j), Some(Command::SelectNext));
 
         let ctrl_c: InputEvent = "C-c".parse().unwrap();
-        assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Pager, Mode::Global], ctrl_c), Some(Command::Quit));
+        assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Global], ctrl_c), Some(Command::Quit));
 
         let slash: InputEvent = "/".parse().unwrap();
-        assert_eq!(
-            keybinds.lookup_chain(&[Mode::TaskTree, Mode::Pager, Mode::Global], slash),
-            Some(Command::SearchLogs)
-        );
+        assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Global], slash), Some(Command::SearchLogs));
     }
 
     #[test]

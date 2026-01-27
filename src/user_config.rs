@@ -23,6 +23,26 @@ pub fn default_user_config_toml() -> String {
     let keybinds = Keybinds::default();
     let mut output = String::new();
 
+    output.push_str(
+        r#"# devsm user configuration
+# Save to: ~/.config/devsm.user.toml
+#
+# Keybinding Modes:
+#   global     - Always active (fallback for all modes)
+#   task_tree  - Main TUI view for task/job navigation and log viewing
+#   pager      - Read-only scrollable views (e.g., config errors)
+#   input      - Modal overlays with selection (confirm/cancel)
+#   select_search, log_search, task_launcher, test_filter_launcher - Overlay-specific
+#
+# Tips:
+#   - Run `devsm get self-logs --follow` to see keybindings and commands as you use them
+#   - Press 'R' (Shift+r) to reload all configs including this user config (default binding)
+#   - Set a key to `nan` to unbind it (e.g., g = nan)
+#   - Chain bindings: "SPACE l" = "LaunchTask" (press SPACE then l)
+
+"#,
+    );
+
     for (i, mode) in Mode::ALL.iter().enumerate() {
         let mut bindings: Vec<_> = keybinds
             .mode_bindings(*mode)

@@ -694,7 +694,7 @@ fn process_key(
         FocusOverlap::None => {}
     }
 
-    let modes = &[Mode::TaskTree, Mode::Pager, Mode::Global];
+    let modes = &[Mode::TaskTree, Mode::Global];
 
     let entry = if let Some(chain_idx) = tui.chain.current {
         let Some(group) = keybinds.chain(chain_idx) else {

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use extui::event::{KeyCode, KeyEvent};
+use extui::event::KeyEvent;
 use extui::{Color, DoubleBuffer, Rect, Style};
 
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
@@ -85,24 +85,23 @@ impl ConfigErrorState {
             return ConfigErrorAction::Retry;
         }
 
-        match key.code {
-            KeyCode::Char('R') => return ConfigErrorAction::Retry,
-            KeyCode::Char('j') | KeyCode::Down => {
+        match keybinds.lookup(Mode::Pager, input) {
+            Some(Command::SelectNext) => {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            Some(Command::SelectPrev) => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
             }
-            KeyCode::PageDown => {
+            Some(Command::HelpScrollDown) => {
                 self.scroll_offset = self.scroll_offset.saturating_add(10);
             }
-            KeyCode::PageUp => {
+            Some(Command::HelpScrollUp) => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
             }
-            KeyCode::Home => {
+            Some(Command::JumpToOldestLogs) => {
                 self.scroll_offset = 0;
             }
-            KeyCode::End => {
+            Some(Command::JumpToNewestLogs) => {
                 self.scroll_offset = self.error_lines.len().saturating_sub(1);
             }
             _ => {}
