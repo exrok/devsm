@@ -47,11 +47,29 @@ impl<'a> Iterator for SegmentIterator<'a> {
         let bytes = self.remaining.as_bytes();
         let first_byte = bytes[0];
 
-        if first_byte == b'\x1b' && bytes.get(1) == Some(&b'[') {
-            let segment_len = bytes.iter().skip(2).position(|&b| b == b'm').map(|pos| pos + 3).unwrap_or(bytes.len());
-            self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
-
-            Some(Segment::AnsiEscapes(unsafe { std::str::from_utf8_unchecked(&bytes[2..segment_len - 1]) }))
+        if first_byte == b'\x1b' {
+            if bytes.get(1) == Some(&b'[') {
+                // CSI sequence: \x1b[...m (SGR and other CSI commands)
+                let segment_len = bytes.iter().skip(2).position(|&b| b == b'm').map(|pos| pos + 3).unwrap_or(bytes.len());
+                self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
+                Some(Segment::AnsiEscapes(unsafe { std::str::from_utf8_unchecked(&bytes[2..segment_len - 1]) }))
+            } else if bytes.get(1) == Some(&b']') {
+                // OSC sequence: \x1b]...ST where ST is \x1b\\ or BEL (\x07)
+                // Common example: OSC 8 hyperlinks \x1b]8;params;uri\x1b\\
+                let segment_len = bytes
+                    .windows(2)
+                    .position(|w| w == b"\x1b\\")
+                    .map(|pos| pos + 2)
+                    .or_else(|| bytes.iter().position(|&b| b == b'\x07').map(|pos| pos + 1))
+                    .unwrap_or(bytes.len());
+                self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
+                Some(Segment::AnsiEscapes(""))
+            } else {
+                // Other escape sequence - skip ESC and next byte if present
+                let segment_len = if bytes.len() > 1 { 2 } else { 1 };
+                self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
+                Some(Segment::AnsiEscapes(""))
+            }
         } else if first_byte.is_ascii() {
             let segment_len = bytes.iter().position(|&b| !b.is_ascii() || b == b'\x1b').unwrap_or(bytes.len());
             let (segment_str, next_remaining) = self.remaining.split_at(segment_len);
@@ -336,6 +354,51 @@ mod tests {
                 Segment::AnsiEscapes("0"),
             ]
         );
+    }
+
+    #[test]
+    fn test_osc8_hyperlink() {
+        // OSC 8 hyperlink: \x1b]8;params;uri\x1b\\text\x1b]8;;\x1b\\
+        // This is what cargo outputs in gnome-terminal for clickable links
+        let text = "\x1b[1m\x1b[92m    Finished\x1b[0m \x1b]8;;https://doc.rust-lang.org/cargo/reference/profiles.html\x1b\\`dev` profile\x1b]8;;\x1b\\ in 0.13s";
+        let segments: Vec<_> = Segment::iterator(text).collect();
+        assert_eq!(
+            segments,
+            vec![
+                Segment::AnsiEscapes("1"),
+                Segment::AnsiEscapes("92"),
+                Segment::Ascii("    Finished"),
+                Segment::AnsiEscapes("0"),
+                Segment::Ascii(" "),
+                Segment::AnsiEscapes(""), // OSC 8 start hyperlink
+                Segment::Ascii("`dev` profile"),
+                Segment::AnsiEscapes(""), // OSC 8 end hyperlink
+                Segment::Ascii(" in 0.13s"),
+            ]
+        );
+
+        // Verify width calculation ignores the OSC sequences
+        // "    Finished" (12) + " " (1) + "`dev` profile" (13) + " in 0.13s" (9) = 35
+        assert_eq!(display_width(text), 35);
+    }
+
+    #[test]
+    fn test_osc8_hyperlink_with_bel_terminator() {
+        // Some terminals use BEL (\x07) instead of ST (\x1b\\) as OSC terminator
+        let text = "Click \x1b]8;;https://example.com\x07here\x1b]8;;\x07 for more";
+        let segments: Vec<_> = Segment::iterator(text).collect();
+        assert_eq!(
+            segments,
+            vec![
+                Segment::Ascii("Click "),
+                Segment::AnsiEscapes(""), // OSC 8 start
+                Segment::Ascii("here"),
+                Segment::AnsiEscapes(""), // OSC 8 end
+                Segment::Ascii(" for more"),
+            ]
+        );
+        // "Click " (6) + "here" (4) + " for more" (9) = 19
+        assert_eq!(display_width(text), 19);
     }
     //字👍 <-- Double width characters I can actually see
     //〇

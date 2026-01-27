@@ -72,6 +72,8 @@ pub(crate) struct ActiveProcess {
     pub(crate) ready_checker: Option<ReadyChecker>,
     /// Timeout tracker. None if no timeout configured.
     pub(crate) timeout_tracker: Option<TimeoutTracker>,
+    /// When SIGINT was sent (for SIGKILL escalation after timeout).
+    pub(crate) kill_sent_at: Option<std::time::Instant>,
 }
 
 impl ActiveProcess {
@@ -238,7 +240,7 @@ impl ProcessManager {
             Pipe::Stderr => (
                 process.child.stderr.as_ref().map(|s| s.as_raw_fd()).context("No stderr")?,
                 process
-                    .stdout_buffer
+                    .stderr_buffer
                     .take()
                     .unwrap_or_else(|| Buffer { data: self.buffer_pool.pop().unwrap_or_default(), read: 0 }),
             ),
@@ -362,19 +364,22 @@ impl ProcessManager {
 
                     if let Some(process) = self.processes.get_mut(process_index) {
                         if process.log_group == job_id && process.alive {
-                            kvlog::info!(
-                                "Process killed",
-                                job_index = service_to_kill,
-                                base_task_index = job_id.base_task_index().0,
-                                reason = ExitCause::ProfileConflict.name()
-                            );
-                            process.pending_exit_cause = Some(ExitCause::ProfileConflict);
                             let child_pid = process.child.id();
                             let pgid_to_kill = -(child_pid as i32);
+                            kvlog::info!(
+                                "Sending SIGINT to process group",
+                                job_index = service_to_kill,
+                                base_task_index = job_id.base_task_index().0,
+                                reason = ExitCause::ProfileConflict.name(),
+                                pid = child_pid,
+                                pgid = pgid_to_kill
+                            );
+                            process.pending_exit_cause = Some(ExitCause::ProfileConflict);
                             unsafe {
                                 libc::kill(pgid_to_kill, libc::SIGINT);
                             }
                             process.alive = false;
+                            process.kill_sent_at = Some(std::time::Instant::now());
                         }
                     }
                     break;
@@ -458,19 +463,58 @@ impl ProcessManager {
                 continue;
             }
 
+            let pgid_to_kill = -(child_pid as i32);
             kvlog::info!(
-                "Process killed due to timeout",
+                "Sending SIGINT to process group (timeout)",
                 job_index = process.job_index,
                 base_task_index = process.log_group.base_task_index().0,
-                reason = ExitCause::Timeout.name()
+                reason = ExitCause::Timeout.name(),
+                pid = child_pid,
+                pgid = pgid_to_kill
             );
 
             process.pending_exit_cause = Some(ExitCause::Timeout);
-            let pgid_to_kill = -(child_pid as i32);
             unsafe {
                 libc::kill(pgid_to_kill, libc::SIGINT);
             }
             process.alive = false;
+            process.kill_sent_at = Some(now);
+        }
+    }
+
+    fn check_kill_escalation(&mut self) {
+        const SIGKILL_ESCALATION_SECS: u64 = 20;
+        let now = std::time::Instant::now();
+
+        for (_index, process) in &mut self.processes {
+            let Some(kill_sent_at) = process.kill_sent_at else {
+                continue;
+            };
+
+            if now.duration_since(kill_sent_at).as_secs() < SIGKILL_ESCALATION_SECS {
+                continue;
+            }
+
+            let child_pid = process.child.id();
+            let pgid_to_kill = -(child_pid as i32);
+
+            kvlog::warn!(
+                "Process did not terminate after SIGINT, escalating to SIGKILL",
+                job_index = process.job_index,
+                base_task_index = process.log_group.base_task_index().0,
+                pid = child_pid,
+                pgid = pgid_to_kill,
+                elapsed_secs = now.duration_since(kill_sent_at).as_secs()
+            );
+
+            unsafe {
+                if libc::kill(pgid_to_kill, libc::SIGKILL) == -1 {
+                    let err = std::io::Error::last_os_error();
+                    kvlog::error!("Failed to send SIGKILL", ?err, pid = child_pid, pgid = pgid_to_kill);
+                }
+            }
+
+            process.kill_sent_at = None;
         }
     }
 
@@ -608,6 +652,7 @@ impl ProcessManager {
             pending_exit_cause: None,
             ready_checker,
             timeout_tracker,
+            kill_sent_at: None,
         });
         {
             let mut ws = workspace.handle.state.write().unwrap();
@@ -802,13 +847,20 @@ impl ProcessManager {
         match req {
             ProcessRequest::TerminateJob { job_id, process_index, exit_cause } => {
                 let Some(process) = self.processes.get_mut(process_index) else {
+                    kvlog::warn!(
+                        "TerminateJob: process not found in slab",
+                        ?process_index,
+                        ?job_id,
+                        reason = exit_cause.name()
+                    );
                     return false;
                 };
                 if process.log_group != job_id {
                     kvlog::error!(
-                        "Mismatched job id for termination",
+                        "TerminateJob: mismatched job id",
                         ?job_id,
-                        expected = ?process.log_group
+                        expected = ?process.log_group,
+                        ?process_index
                     );
                     return false;
                 }
@@ -817,19 +869,22 @@ impl ProcessManager {
                 let pgid_to_kill = -(child_pid as i32);
 
                 kvlog::info!(
-                    "Process killed",
+                    "Sending SIGINT to process group",
                     job_index = process.job_index,
                     base_task_index = job_id.base_task_index().0,
-                    reason = exit_cause.name()
+                    reason = exit_cause.name(),
+                    pid = child_pid,
+                    pgid = pgid_to_kill
                 );
 
                 unsafe {
                     if libc::kill(pgid_to_kill, libc::SIGINT) == -1 {
                         let err = std::io::Error::last_os_error();
-                        kvlog::error!("Failed to send SIGTERM", ?err, ?child_pid);
+                        kvlog::error!("Failed to send SIGINT", ?err, pid = child_pid, pgid = pgid_to_kill);
                     }
                 }
                 process.alive = false;
+                process.kill_sent_at = Some(std::time::Instant::now());
                 false
             }
             ProcessRequest::AttachClient { stdin, stdout, socket, workspace_config, kind } => {
@@ -2544,6 +2599,7 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
         if job_manager.timed_timeout_count > 0 {
             job_manager.check_timeouts();
         }
+        job_manager.check_kill_escalation();
 
         for (_, client) in &job_manager.clients {
             let _ = client.channel.wake();
@@ -2685,15 +2741,21 @@ impl ProcessManagerHandle {
         let request = Arc::new(MioChannel { waker, events: Mutex::new(Vec::new()) });
         let r = request.clone();
         let r2 = r.clone();
-        let wait_thread = std::thread::spawn(move || {
-            wait_thread(r2);
-        });
+        let wait_thread = std::thread::Builder::new()
+            .name("PID-Poller".into())
+            .spawn(move || {
+                wait_thread(r2);
+            })
+            .unwrap();
 
         let handle = ProcessManagerHandle { request };
 
-        std::thread::spawn(move || {
-            func(handle);
-        });
+        std::thread::Builder::new()
+            .name("RPC-forwarder".into())
+            .spawn(move || {
+                func(handle);
+            })
+            .unwrap();
         process_worker(r, wait_thread, poll);
         Ok(())
     }

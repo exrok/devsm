@@ -1233,31 +1233,68 @@ impl WorkspaceState {
 
         let bt = &self.base_tasks[index.idx()];
 
-        let has_running = bt
-            .jobs
-            .non_terminal()
-            .iter()
-            .any(|ji| matches!(self.jobs[ji.idx()].process_status, JobStatus::Running { .. }));
+        let has_non_terminal = !bt.jobs.non_terminal().is_empty();
 
-        if !has_running {
+        if !has_non_terminal {
             return Ok(format!("Task '{}' was already finished", bt.name));
         }
 
         let task_name = bt.name.to_string();
         self.change_number = self.change_number.wrapping_add(1);
 
+        let mut jobs_to_cancel = Vec::new();
+        let mut killed_count = 0u32;
+        let mut cancelled_count = 0u32;
+
         for job_index in bt.jobs.non_terminal() {
             let job = &self.jobs[job_index.idx()];
-            if let JobStatus::Running { process_index, .. } = &job.process_status {
-                channel.send(crate::process_manager::ProcessRequest::TerminateJob {
-                    job_id: job.log_group,
-                    process_index: *process_index,
-                    exit_cause: ExitCause::Killed,
-                });
+            match &job.process_status {
+                JobStatus::Running { process_index, .. } => {
+                    kvlog::info!(
+                        "Terminating running job",
+                        task_name,
+                        job_index,
+                        process_index
+                    );
+                    channel.send(crate::process_manager::ProcessRequest::TerminateJob {
+                        job_id: job.log_group,
+                        process_index: *process_index,
+                        exit_cause: ExitCause::Killed,
+                    });
+                    killed_count += 1;
+                }
+                JobStatus::Starting => {
+                    kvlog::warn!(
+                        "Job is in Starting state during termination",
+                        task_name,
+                        job_index
+                    );
+                }
+                JobStatus::Scheduled { .. } => {
+                    kvlog::info!(
+                        "Cancelling scheduled job",
+                        task_name,
+                        job_index
+                    );
+                    jobs_to_cancel.push(*job_index);
+                    cancelled_count += 1;
+                }
+                JobStatus::Exited { .. } | JobStatus::Cancelled => {}
             }
         }
 
-        Ok(format!("Task '{}' terminated", task_name))
+        for job_index in jobs_to_cancel {
+            self.update_job_status(job_index, JobStatus::Cancelled);
+        }
+
+        let msg = match (killed_count, cancelled_count) {
+            (0, 0) => format!("Task '{}' was already finished", task_name),
+            (k, 0) => format!("Task '{}' terminated ({} killed)", task_name, k),
+            (0, c) => format!("Task '{}' cancelled ({} scheduled)", task_name, c),
+            (k, c) => format!("Task '{}' terminated ({} killed, {} cancelled)", task_name, k, c),
+        };
+
+        Ok(msg)
     }
 
     /// Layer 2: Record a single task spawn as a test group.
@@ -1693,17 +1730,48 @@ impl Workspace {
     pub fn terminate_tasks(&self, base_task: BaseTaskIndex) {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
-        let bt = &mut state.base_tasks[base_task.idx()];
-        for job_index in bt.jobs.non_terminal() {
+
+        let task_name = state.base_tasks[base_task.idx()].name;
+        let job_indices: Vec<JobIndex> = state.base_tasks[base_task.idx()].jobs.non_terminal().to_vec();
+
+        let mut jobs_to_cancel = Vec::new();
+        for job_index in job_indices {
             let job = &state.jobs[job_index.idx()];
-            let JobStatus::Running { process_index, .. } = &job.process_status else {
-                continue;
-            };
-            self.process_channel.send(crate::process_manager::ProcessRequest::TerminateJob {
-                job_id: job.log_group,
-                process_index: *process_index,
-                exit_cause: ExitCause::Killed,
-            });
+            match &job.process_status {
+                JobStatus::Running { process_index, .. } => {
+                    kvlog::info!(
+                        "Terminating running job",
+                        task_name,
+                        job_index,
+                        process_index
+                    );
+                    self.process_channel.send(crate::process_manager::ProcessRequest::TerminateJob {
+                        job_id: job.log_group,
+                        process_index: *process_index,
+                        exit_cause: ExitCause::Killed,
+                    });
+                }
+                JobStatus::Starting => {
+                    kvlog::warn!(
+                        "Job is in Starting state during termination (spawn in progress)",
+                        task_name,
+                        job_index
+                    );
+                }
+                JobStatus::Scheduled { .. } => {
+                    kvlog::info!(
+                        "Cancelling scheduled job",
+                        task_name,
+                        job_index
+                    );
+                    jobs_to_cancel.push(job_index);
+                }
+                JobStatus::Exited { .. } | JobStatus::Cancelled => {}
+            }
+        }
+
+        for job_index in jobs_to_cancel {
+            state.update_job_status(job_index, JobStatus::Cancelled);
         }
     }
 
