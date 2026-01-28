@@ -291,6 +291,7 @@ fn handle_rpc_connection(pm: &ProcessManagerHandle, socket: UnixStream, buffer: 
     let ws_end = HEAD_SIZE + head.ws_len as usize;
     let ws_data = &buffer[HEAD_SIZE..ws_end];
     let payload = &buffer[ws_end..total_len];
+    let remaining = buffer[total_len..].to_vec();
 
     pm.request.send(crate::event_loop::ProcessRequest::RpcMessage {
         socket,
@@ -300,6 +301,7 @@ fn handle_rpc_connection(pm: &ProcessManagerHandle, socket: UnixStream, buffer: 
         one_shot: head.one_shot,
         ws_data: ws_data.to_vec(),
         payload: payload.to_vec(),
+        remaining,
     });
 }
 

@@ -16,9 +16,6 @@ use std::{
     time::{Instant, SystemTime},
 };
 mod job_index_list;
-pub mod scheduler_backend;
-
-pub use scheduler_backend::spawn_job;
 
 /// Info needed to compute a cache key outside the workspace lock.
 enum CacheKeyInfoItem {
@@ -1045,7 +1042,7 @@ impl WorkspaceState {
             spawn_params: params.to_owned(),
         });
         if spawn {
-            spawn_job(channel, job_index, task, workspace_id, job_id);
+            channel.send(crate::event_loop::ProcessRequest::Spawn { task, job_index, workspace_id, job_id });
         } else {
             kvlog::info!("Job scheduled", task_name, job_index, reason = reason.name());
         }

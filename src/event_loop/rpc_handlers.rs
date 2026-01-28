@@ -496,6 +496,7 @@ impl EventLoop {
         one_shot: bool,
         ws_data: &[u8],
         payload: &[u8],
+        remaining: Vec<u8>,
     ) {
         use crate::rpc::{self, CommandResponse, RpcMessageKind};
 
@@ -642,11 +643,13 @@ impl EventLoop {
         let _ = socket.write_all(encoder.output());
 
         if !one_shot {
+            let partial_rpc_read =
+                if remaining.is_empty() { None } else { Some((DecodingState::default(), remaining)) };
             self.register_client(
                 socket,
                 ws_index,
                 ClientKind::Rpc { subscriptions: RpcSubscriptions::default() },
-                None,
+                partial_rpc_read,
             );
         }
     }

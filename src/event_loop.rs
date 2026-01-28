@@ -711,6 +711,7 @@ pub(crate) enum ProcessRequest {
         one_shot: bool,
         ws_data: Vec<u8>,
         payload: Vec<u8>,
+        remaining: Vec<u8>,
     },
     Spawn {
         task: TaskConfigRc,
@@ -1119,8 +1120,8 @@ impl EventLoop {
                 }
                 false
             }
-            ProcessRequest::RpcMessage { socket, fds, kind, correlation, one_shot, ws_data, payload } => {
-                self.handle_rpc_request(socket, fds, kind, correlation, one_shot, &ws_data, &payload);
+            ProcessRequest::RpcMessage { socket, fds, kind, correlation, one_shot, ws_data, payload, remaining } => {
+                self.handle_rpc_request(socket, fds, kind, correlation, one_shot, &ws_data, &payload, remaining);
                 false
             }
         }

@@ -579,6 +579,7 @@ impl<'a> ReceivedPayload<'a> {
 /// Manages a Unix socket connection with automatic event queuing.
 /// When waiting for a command response, subscription events are
 /// buffered and can be retrieved via [`Self::next_event`].
+/// Currenlty only used in tests.
 pub struct WorkspaceClient {
     socket: std::os::unix::net::UnixStream,
     encoder: Encoder,
