@@ -19,10 +19,10 @@ pub(crate) mod unix_path {
 }
 
 /// Protocol magic number identifying devsm RPC messages.
-pub const MAGIC: u32 = 0xDE75_0001;
+pub const MAGIC: u32 = 0xDE75_0002;
 
 /// Size of the message header in bytes.
-pub const HEAD_SIZE: usize = 12;
+pub const HEAD_SIZE: usize = 14;
 
 /// Default maximum payload size (64KB).
 pub const DEFAULT_MAX_PAYLOAD: usize = 64 * 1024;
@@ -38,11 +38,14 @@ pub const CORRELATION_MASK: u16 = 0x7FFF;
 
 /// Message header for the RPC protocol.
 ///
-/// The header is 12 bytes in little-endian format and precedes every message.
+/// The header is 14 bytes in little-endian format and precedes every message.
 ///
 /// The correlation field uses bit 15 as a one-shot flag:
 /// - Bit 15 = 1: One-shot mode (fast path, no mio registration)
 /// - Bits 0-14: Correlation ID (0-32767)
+///
+/// The ws_len field indicates the length of the workspace reference that follows
+/// the header. If ws_len == 0, this is a global command with no workspace context.
 ///
 /// # Examples
 ///
@@ -52,7 +55,8 @@ pub const CORRELATION_MASK: u16 = 0x7FFF;
 ///     kind: RpcMessageKind::Resize as u16,
 ///     one_shot: false,
 ///     correlation: 1,
-///     len: 4,
+///     ws_len: 4,  // workspace ref is 4 bytes
+///     len: 8,     // payload is 8 bytes
 /// };
 /// let bytes = head.to_bytes();
 /// let parsed = Head::from_bytes(&bytes)?;
@@ -63,6 +67,7 @@ pub struct Head {
     pub kind: u16,
     pub one_shot: bool,
     pub correlation: u16,
+    pub ws_len: u16,
     pub len: u32,
 }
 
@@ -83,7 +88,8 @@ impl Head {
             kind: u16::from_le_bytes([bytes[4], bytes[5]]),
             one_shot: (flags_correlation & ONE_SHOT_FLAG) != 0,
             correlation: flags_correlation & CORRELATION_MASK,
-            len: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            ws_len: u16::from_le_bytes([bytes[8], bytes[9]]),
+            len: u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]),
         })
     }
 
@@ -94,7 +100,8 @@ impl Head {
         buf[4..6].copy_from_slice(&self.kind.to_le_bytes());
         let flags_correlation = self.correlation | if self.one_shot { ONE_SHOT_FLAG } else { 0 };
         buf[6..8].copy_from_slice(&flags_correlation.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.len.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.ws_len.to_le_bytes());
+        buf[10..14].copy_from_slice(&self.len.to_le_bytes());
         buf
     }
 }
@@ -226,8 +233,9 @@ impl std::error::Error for ProtocolError {}
 ///
 /// loop {
 ///     match state.decode(&buffer) {
-///         DecodeResult::Message { kind, correlation, payload } => {
-///             process(kind, payload);
+///         DecodeResult::Message { kind, ws_data, payload, .. } => {
+///             let ws_index = resolve_workspace(ws_data)?;
+///             process(kind, ws_index, payload);
 ///         }
 ///         DecodeResult::MissingData { additional } => {
 ///             // Read more data
@@ -258,7 +266,15 @@ impl Default for DecodingState {
 /// Result of attempting to decode a message.
 pub enum DecodeResult<'a> {
     /// A complete message was decoded.
-    Message { correlation: u16, one_shot: bool, kind: RpcMessageKind, payload: &'a [u8] },
+    Message {
+        correlation: u16,
+        one_shot: bool,
+        kind: RpcMessageKind,
+        /// Workspace reference bytes (empty if ws_len == 0, i.e., global command).
+        ws_data: &'a [u8],
+        /// Command-specific payload (after workspace ref).
+        payload: &'a [u8],
+    },
     /// More data is needed to complete the message.
     MissingData {
         /// Minimum additional bytes needed.
@@ -288,7 +304,6 @@ impl DecodingState {
         let remaining = &bytes[self.offset..];
 
         if remaining.is_empty() {
-            self.offset = 0;
             return DecodeResult::Empty;
         }
 
@@ -306,19 +321,22 @@ impl DecodingState {
             return DecodeResult::Error(ProtocolError::UnknownMessageKind(head.kind));
         };
 
-        if head.len as usize > self.max_payload_size {
-            return DecodeResult::Error(ProtocolError::PayloadTooLarge(head.len));
+        let total_payload = head.ws_len as usize + head.len as usize;
+        if total_payload > self.max_payload_size {
+            return DecodeResult::Error(ProtocolError::PayloadTooLarge(total_payload as u32));
         }
 
-        let total_size = HEAD_SIZE + head.len as usize;
+        let total_size = HEAD_SIZE + total_payload;
         if remaining.len() < total_size {
             return DecodeResult::MissingData { additional: total_size - remaining.len() };
         }
 
-        let payload = &remaining[HEAD_SIZE..total_size];
+        let ws_end = HEAD_SIZE + head.ws_len as usize;
+        let ws_data = &remaining[HEAD_SIZE..ws_end];
+        let payload = &remaining[ws_end..total_size];
         self.offset += total_size;
 
-        DecodeResult::Message { correlation: head.correlation, one_shot: head.one_shot, kind, payload }
+        DecodeResult::Message { correlation: head.correlation, one_shot: head.one_shot, kind, ws_data, payload }
     }
 
     /// Compacts the buffer by removing already-processed bytes.
@@ -390,23 +408,75 @@ impl Encoder {
 
     /// Encodes a message with no payload.
     pub fn encode_empty(&mut self, kind: RpcMessageKind, correlation: u16) {
-        let head = Head { magic: MAGIC, kind: kind as u16, one_shot: false, correlation, len: 0 };
+        let head = Head { magic: MAGIC, kind: kind as u16, one_shot: false, correlation, ws_len: 0, len: 0 };
         self.buf.extend_from_slice(&head.to_bytes());
     }
 
     /// Encodes a one-shot message with no payload.
     pub fn encode_empty_one_shot(&mut self, kind: RpcMessageKind, correlation: u16) {
-        let head = Head { magic: MAGIC, kind: kind as u16, one_shot: true, correlation, len: 0 };
+        let head = Head { magic: MAGIC, kind: kind as u16, one_shot: true, correlation, ws_len: 0, len: 0 };
         self.buf.extend_from_slice(&head.to_bytes());
     }
 
     fn encode_with_correlation<T: jsony::ToBinary>(&mut self, kind: RpcMessageKind, correlation: u16, payload: &T) {
-        self.encode_internal(kind, correlation, false, payload);
+        self.encode_internal(kind, correlation, false, 0, payload);
     }
 
-    /// Encodes a one-shot request message.
+    /// Encodes a one-shot request message (global command, no workspace).
     pub fn encode_one_shot<T: jsony::ToBinary>(&mut self, kind: RpcMessageKind, correlation: u16, payload: &T) {
-        self.encode_internal(kind, correlation, true, payload);
+        self.encode_internal(kind, correlation, true, 0, payload);
+    }
+
+    /// Encodes a one-shot workspace command with workspace ref in header.
+    pub fn encode_one_shot_ws<T: jsony::ToBinary>(
+        &mut self,
+        kind: RpcMessageKind,
+        correlation: u16,
+        workspace: &WorkspaceRef<'_>,
+        payload: &T,
+    ) {
+        self.encode_ws_internal(kind, correlation, true, workspace, payload);
+    }
+
+    /// Encodes a persistent connection workspace command with workspace ref in header.
+    pub fn encode_response_ws<T: jsony::ToBinary>(
+        &mut self,
+        kind: RpcMessageKind,
+        correlation: u16,
+        workspace: &WorkspaceRef<'_>,
+        payload: &T,
+    ) {
+        self.encode_ws_internal(kind, correlation, false, workspace, payload);
+    }
+
+    fn encode_ws_internal<T: jsony::ToBinary>(
+        &mut self,
+        kind: RpcMessageKind,
+        correlation: u16,
+        one_shot: bool,
+        workspace: &WorkspaceRef<'_>,
+        payload: &T,
+    ) {
+        let header_start = self.buf.len();
+        self.buf.extend_from_slice(&[0u8; HEAD_SIZE]);
+
+        let ws_start = self.buf.len();
+        jsony::to_binary_into(workspace, &mut self.buf);
+        let ws_len = self.buf.len() - ws_start;
+
+        let payload_start = self.buf.len();
+        jsony::to_binary_into(payload, &mut self.buf);
+        let payload_len = self.buf.len() - payload_start;
+
+        let head = Head {
+            magic: MAGIC,
+            kind: kind as u16,
+            one_shot,
+            correlation,
+            ws_len: ws_len as u16,
+            len: payload_len as u32,
+        };
+        self.buf[header_start..header_start + HEAD_SIZE].copy_from_slice(&head.to_bytes());
     }
 
     fn encode_internal<T: jsony::ToBinary>(
@@ -414,6 +484,7 @@ impl Encoder {
         kind: RpcMessageKind,
         correlation: u16,
         one_shot: bool,
+        ws_len: u16,
         payload: &T,
     ) {
         let header_start = self.buf.len();
@@ -423,7 +494,7 @@ impl Encoder {
         jsony::to_binary_into(payload, &mut self.buf);
         let payload_len = self.buf.len() - payload_start;
 
-        let head = Head { magic: MAGIC, kind: kind as u16, one_shot, correlation, len: payload_len as u32 };
+        let head = Head { magic: MAGIC, kind: kind as u16, one_shot, correlation, ws_len, len: payload_len as u32 };
         self.buf[header_start..header_start + HEAD_SIZE].copy_from_slice(&head.to_bytes());
     }
 }
@@ -540,7 +611,7 @@ pub struct ErrorResponsePayload {
 ///
 /// Commands can reference workspaces either by ID (efficient for repeated calls)
 /// or by config path (for first-time setup).
-#[derive(Jsony, Debug)]
+#[derive(Jsony, Debug, Clone, Copy)]
 #[jsony(Binary)]
 pub enum WorkspaceRef<'a> {
     Id(u32),
@@ -842,8 +913,14 @@ mod tests {
 
     #[test]
     fn head_round_trip() {
-        let head =
-            Head { magic: MAGIC, kind: RpcMessageKind::Resize as u16, one_shot: false, correlation: 42, len: 100 };
+        let head = Head {
+            magic: MAGIC,
+            kind: RpcMessageKind::Resize as u16,
+            one_shot: false,
+            correlation: 42,
+            ws_len: 5,
+            len: 100,
+        };
         let bytes = head.to_bytes();
         let parsed = Head::from_bytes(&bytes).unwrap();
         assert_eq!(head, parsed);
@@ -851,8 +928,14 @@ mod tests {
 
     #[test]
     fn head_one_shot_flag() {
-        let head =
-            Head { magic: MAGIC, kind: RpcMessageKind::SpawnTask as u16, one_shot: true, correlation: 123, len: 0 };
+        let head = Head {
+            magic: MAGIC,
+            kind: RpcMessageKind::SpawnTask as u16,
+            one_shot: true,
+            correlation: 123,
+            ws_len: 0,
+            len: 0,
+        };
         let bytes = head.to_bytes();
         let parsed = Head::from_bytes(&bytes).unwrap();
         assert!(parsed.one_shot);

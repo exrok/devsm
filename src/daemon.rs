@@ -282,13 +282,15 @@ fn handle_rpc_connection(pm: &ProcessManagerHandle, socket: UnixStream, buffer: 
         return;
     };
 
-    let total_len = HEAD_SIZE + head.len as usize;
+    let total_len = HEAD_SIZE + head.ws_len as usize + head.len as usize;
     if buffer.len() < total_len {
         kvlog::error!("RPC payload incomplete", expected = total_len, actual = buffer.len());
         return;
     }
 
-    let payload = &buffer[HEAD_SIZE..total_len];
+    let ws_end = HEAD_SIZE + head.ws_len as usize;
+    let ws_data = &buffer[HEAD_SIZE..ws_end];
+    let payload = &buffer[ws_end..total_len];
 
     pm.request.send(crate::process_manager::ProcessRequest::RpcMessage {
         socket,
@@ -296,6 +298,7 @@ fn handle_rpc_connection(pm: &ProcessManagerHandle, socket: UnixStream, buffer: 
         kind,
         correlation: head.correlation,
         one_shot: head.one_shot,
+        ws_data: ws_data.to_vec(),
         payload: payload.to_vec(),
     });
 }

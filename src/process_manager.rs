@@ -1,4 +1,5 @@
-use crate::rpc::{DecodeResult, DecodingState, RpcMessageKind};
+use crate::rpc;
+use crate::rpc::{CommandBody, DecodingState, RpcMessageKind};
 use crate::workspace::{self, ExitCause, JobIndex, JobStatus, Workspace, WorkspaceState};
 use crate::{
     config::{Command, TaskConfigRc, TaskKind},
@@ -12,6 +13,7 @@ use jsony_value::ValueMap;
 use mio::{Events, Interest, Poll, Token, Waker, unix::SourceFd};
 use slab::Slab;
 use std::io::Write;
+use std::panic::UnwindSafe;
 use std::{
     fs::File,
     os::{
@@ -32,6 +34,8 @@ pub(crate) enum Pipe {
     Stdout,
     Stderr,
 }
+
+mod rpc_handlers;
 
 type WorkspaceIndex = u32;
 /// Tracks ready condition checking for a service process.
@@ -153,16 +157,22 @@ pub struct WorkspaceEntry {
 }
 
 pub(crate) struct ProcessManager {
+    buffer_pool: Vec<Vec<u8>>,
+
+    processes: slab::Slab<ActiveProcess>,
+
     clients: Slab<ClientEntry>,
+
     workspaces: slab::Slab<WorkspaceEntry>,
     workspace_map: HashMap<Box<Path>, WorkspaceIndex>,
-    processes: slab::Slab<ActiveProcess>,
-    buffer_pool: Vec<Vec<u8>>,
-    wait_thread: std::thread::JoinHandle<()>,
+
     request: Arc<MioChannel>,
+
     poll: Poll,
     timed_ready_count: u32,
     timed_timeout_count: u32,
+
+    wait_thread: std::thread::JoinHandle<()>,
 }
 
 pub(crate) enum ReadResult {
@@ -684,6 +694,7 @@ pub(crate) enum ProcessRequest {
         kind: crate::rpc::RpcMessageKind,
         correlation: u16,
         one_shot: bool,
+        ws_data: Vec<u8>,
         payload: Vec<u8>,
     },
     Spawn {
@@ -941,7 +952,7 @@ impl ProcessManager {
                 false
             }
             ProcessRequest::ClientExited { index } => {
-                self.terminate_client(index as ClientIndex);
+                self.client_exited(index as ClientIndex);
                 false
             }
             ProcessRequest::AttachSelfLogsClient { stdout, socket } => {
@@ -1092,259 +1103,10 @@ impl ProcessManager {
                 }
                 false
             }
-            ProcessRequest::RpcMessage { socket, fds, kind, correlation, one_shot, payload } => {
-                self.handle_rpc_request(socket, fds, kind, correlation, one_shot, &payload);
+            ProcessRequest::RpcMessage { socket, fds, kind, correlation, one_shot, ws_data, payload } => {
+                self.handle_rpc_request(socket, fds, kind, correlation, one_shot, &ws_data, &payload);
                 false
             }
-        }
-    }
-
-    fn handle_rpc_request(
-        &mut self,
-        mut socket: UnixStream,
-        fds: ReceivedFds,
-        kind: crate::rpc::RpcMessageKind,
-        correlation: u16,
-        one_shot: bool,
-        payload: &[u8],
-    ) {
-        use crate::rpc::{self, CommandBody, CommandResponse, RpcMessageKind, WorkspaceRef};
-
-        let mut encoder = rpc::Encoder::new();
-        let persist_ws: WorkspaceIndex;
-
-        macro_rules! respond {
-            ($ws:expr, $body:expr) => {{
-                encoder.encode_response(
-                    RpcMessageKind::CommandAck,
-                    correlation,
-                    &CommandResponse { workspace_id: $ws, body: $body },
-                );
-                let _ = socket.write_all(encoder.output());
-                #[allow(unused_assignments)]
-                {
-                    persist_ws = $ws;
-                }
-            }};
-        }
-
-        macro_rules! respond_ok {
-            ($ws:expr) => {
-                respond!($ws, CommandBody::Empty)
-            };
-            ($ws:expr, $msg:expr) => {
-                respond!($ws, CommandBody::Message($msg.into()))
-            };
-        }
-
-        macro_rules! respond_err {
-            ($ws:expr, $err:expr) => {
-                respond!($ws, CommandBody::Error($err.into()))
-            };
-        }
-
-        macro_rules! parse {
-            ($kind:ident) => {
-                match jsony::from_binary::<rpc::$kind>(payload) {
-                    Ok(value) => value,
-                    Err(err) => {
-                        respond_err!(0, format!("Invalid request payload: {:?}", err));
-                        return;
-                    }
-                }
-            };
-        }
-
-        macro_rules! resolve {
-            ($ws_ref:expr) => {
-                match &$ws_ref {
-                    WorkspaceRef::Id(id) => {
-                        if (*id as usize) < self.workspaces.len() {
-                            *id
-                        } else {
-                            respond_err!(0, format!("Invalid workspace ID: {}", id));
-                            return;
-                        }
-                    }
-                    WorkspaceRef::Path { config } => match self.workspace_index(config.to_path_buf()) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            respond_err!(0, e.to_string());
-                            return;
-                        }
-                    },
-                }
-            };
-        }
-
-        match kind {
-            RpcMessageKind::SpawnTask => {
-                let req = parse!(SpawnTaskRequest);
-                let ws_index = resolve!(req.workspace);
-                let ws = &self.workspaces[ws_index as usize];
-                let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
-
-                let result = if req.as_test {
-                    ws.handle.spawn_task_as_test(req.task_name, params, req.profile).map(|()| None)
-                } else {
-                    ws.handle.spawn_task_by_name_cached(req.task_name, params, req.profile, req.cached)
-                };
-
-                match result {
-                    Ok(None) => respond_ok!(ws_index),
-                    Ok(Some(msg)) => respond_ok!(ws_index, msg),
-                    Err(e) => respond_err!(ws_index, e),
-                }
-            }
-            RpcMessageKind::KillTask => {
-                let req = parse!(KillTaskRequest);
-                let ws_index = resolve!(req.workspace);
-                let ws = &self.workspaces[ws_index as usize];
-
-                match ws.handle.terminate_task_by_name(req.task_name) {
-                    Ok(msg) => respond_ok!(ws_index, msg),
-                    Err(e) => respond_err!(ws_index, e),
-                }
-            }
-            RpcMessageKind::RerunTests => {
-                let req = parse!(RerunTestsRequest);
-                let ws_index = resolve!(req.workspace);
-
-                let ws = &self.workspaces[ws_index as usize];
-                match ws.handle.rerun_test_group(req.only_failed) {
-                    Ok(_) => respond_ok!(ws_index, "Rerunning tests"),
-                    Err(e) => respond_err!(ws_index, e.to_string()),
-                }
-            }
-            RpcMessageKind::CallFunction => {
-                let req = parse!(CallFunctionRequest);
-                let ws_index = resolve!(req.workspace);
-                let ws = &self.workspaces[ws_index as usize];
-
-                match ws.handle.call_function(req.function_name) {
-                    Ok(msg) => respond_ok!(ws_index, msg),
-                    Err(e) if e == "RestartSelected" => match self.restart_selected_from_clients(ws_index, ws) {
-                        Ok(()) => respond_ok!(ws_index),
-                        Err(e) => respond_err!(ws_index, e),
-                    },
-                    Err(e) => respond_err!(ws_index, e),
-                }
-            }
-            RpcMessageKind::RestartSelected => {
-                let req = parse!(RestartSelectedRequest);
-                let ws_index = resolve!(req.workspace);
-                let ws = &self.workspaces[ws_index as usize];
-
-                match self.restart_selected_from_clients(ws_index, ws) {
-                    Ok(()) => respond_ok!(ws_index),
-                    Err(e) => respond_err!(ws_index, e),
-                }
-            }
-            RpcMessageKind::GetLoggedRustPanics => {
-                let req = parse!(GetLoggedRustPanicsRequest);
-                let ws_index = resolve!(req.workspace);
-
-                let response = jsony::to_json(&self.workspaces[ws_index as usize].handle.logged_rust_panics());
-                respond_ok!(ws_index, response);
-            }
-            RpcMessageKind::AttachTui => {
-                let Ok(req) = jsony::from_binary::<rpc::AttachTuiRequest>(payload) else {
-                    kvlog::error!("Invalid AttachTui request payload");
-                    return;
-                };
-                let ws_index = resolve!(req.workspace);
-
-                let ReceivedFds::Pair([stdin, stdout]) = fds else {
-                    kvlog::error!("TUI client requires 2 FDs");
-                    return;
-                };
-
-                self.attach_tui_client(stdin, stdout, socket, ws_index);
-                return;
-            }
-            RpcMessageKind::AttachRun => {
-                let Ok(req) = jsony::from_binary::<rpc::AttachRunRequest>(payload) else {
-                    kvlog::error!("Invalid AttachRun request payload");
-                    return;
-                };
-                let ws_index = resolve!(req.workspace);
-
-                let ReceivedFds::Pair([stdin, stdout]) = fds else {
-                    kvlog::error!("Run client requires 2 FDs");
-                    return;
-                };
-
-                self.attach_run_client(
-                    stdin,
-                    stdout,
-                    socket,
-                    ws_index,
-                    req.task_name,
-                    req.params.to_vec(),
-                    req.as_test,
-                );
-                return;
-            }
-            RpcMessageKind::AttachTests => {
-                let Ok(req) = jsony::from_binary::<rpc::AttachTestsRequest>(payload) else {
-                    kvlog::error!("Invalid AttachTests request payload");
-                    return;
-                };
-                let ws_index = resolve!(req.workspace);
-
-                let ReceivedFds::Pair([stdin, stdout]) = fds else {
-                    kvlog::error!("Test client requires 2 FDs");
-                    return;
-                };
-
-                self.attach_test_run_client(stdin, stdout, socket, ws_index, jsony::to_binary(&req.filters));
-                return;
-            }
-            RpcMessageKind::AttachLogs => {
-                let Ok(req) = jsony::from_binary::<rpc::AttachLogsRequest>(payload) else {
-                    kvlog::error!("Invalid AttachLogs request payload");
-                    return;
-                };
-                let ws_index = resolve!(req.workspace);
-
-                let ReceivedFds::Pair([stdin, stdout]) = fds else {
-                    kvlog::error!("Logs client requires 2 FDs");
-                    return;
-                };
-
-                self.attach_logs_client(stdin, stdout, socket, ws_index, jsony::to_binary(&req.query));
-                return;
-            }
-            RpcMessageKind::GetSelfLogs => {
-                let Ok(req) = jsony::from_binary::<rpc::GetSelfLogsRequest>(payload) else {
-                    kvlog::error!("Invalid GetSelfLogs request payload");
-                    return;
-                };
-
-                if req.follow {
-                    let ReceivedFds::Single(stdout) = fds else {
-                        kvlog::error!("GetSelfLogs follow requires 1 FD");
-                        return;
-                    };
-                    self.attach_self_logs_client(stdout, socket);
-                    return;
-                }
-
-                let logs = crate::self_log::get_daemon_logs().unwrap_or_default();
-                let _ = socket.write_all(&logs);
-                return;
-            }
-            _ => {
-                kvlog::warn!("Unhandled RPC message kind in handle_rpc_request", ?kind);
-                respond_err!(0, "Unsupported command");
-                return;
-            }
-        }
-
-        // For non-Attach commands that didn't consume the socket, check if we should keep it open
-        // Attach* commands move the socket and return early, so this code won't run for them
-        if !one_shot {
-            self.register_rpc_client(socket, persist_ws);
         }
     }
 
@@ -1393,7 +1155,13 @@ impl ProcessManager {
         Err("no active TUI session")
     }
 
-    fn register_rpc_client(&mut self, socket: UnixStream, ws_index: WorkspaceIndex) {
+    fn register_client(
+        &mut self,
+        socket: UnixStream,
+        ws_index: WorkspaceIndex,
+        kind: ClientKind,
+        partial_rpc_read: Option<(DecodingState, Vec<u8>)>,
+    ) -> (usize, Arc<ClientChannel>) {
         let channel = Arc::new(ClientChannel {
             waker: extui::event::polling::Waker::new().unwrap(),
             events: Mutex::new(Vec::new()),
@@ -1407,70 +1175,26 @@ impl ProcessManager {
             Interest::READABLE,
         );
         let _ = socket.set_nonblocking(true);
-        let client_entry = ClientEntry {
-            channel,
-            workspace: ws_index,
-            socket,
-            kind: ClientKind::Rpc { subscriptions: RpcSubscriptions::default() },
-            partial_rpc_read: None,
-        };
-        self.clients.insert(client_entry);
-        kvlog::info!("Registered persistent RPC client", ws_index);
+        let client_entry =
+            ClientEntry { channel: channel.clone(), workspace: ws_index, socket, kind, partial_rpc_read };
+        let index = self.clients.insert(client_entry);
+        (index, channel)
     }
 
     fn attach_tui_client(&mut self, stdin: File, stdout: File, socket: UnixStream, ws_index: WorkspaceIndex) {
+        let (index, channel) = self.register_client(socket, ws_index, ClientKind::Tui, None);
         let ws = &mut self.workspaces[ws_index as usize];
         let ws_handle = ws.handle.clone();
-        let channel = Arc::new(ClientChannel {
-            waker: extui::event::polling::Waker::new().unwrap(),
-            events: Mutex::new(Vec::new()),
-            selected: AtomicU64::new(0),
-            state: AtomicU64::new(0),
-        });
-        let next = self.clients.vacant_key();
-        let _ = self.poll.registry().register(
-            &mut SourceFd(&socket.as_raw_fd()),
-            TokenHandle::Client(next as u32).into(),
-            Interest::READABLE,
-        );
-        let _ = socket.set_nonblocking(true);
-        let client_entry = ClientEntry {
-            channel: channel.clone(),
-            workspace: ws_index,
-            socket,
-            kind: ClientKind::Tui,
-            partial_rpc_read: None,
-        };
-        let index = self.clients.insert(client_entry);
         kvlog::info!("Client Attached");
         let keybinds = global_keybinds();
-        let channel_clone = channel.clone();
+
         let output_mode = if std::env::var("DEVSM_JSON_STATE_STREAM").is_ok() {
             crate::tui::OutputMode::JsonStateStream
         } else {
             crate::tui::OutputMode::Terminal
         };
-        std::thread::spawn(move || {
-            kvlog::debug!("TUI thread started", index);
-            let result = std::panic::catch_unwind(|| {
-                crate::tui::run(stdin, stdout, &ws_handle, channel_clone, keybinds, output_mode)
-            });
-            match result {
-                Ok(Ok(())) => {
-                    if channel.is_terminated() {
-                        kvlog::info!("TUI thread exiting", index, reason = "signaled_to_terminate");
-                    } else {
-                        kvlog::info!("TUI thread exiting", index, reason = "completed_normally");
-                    }
-                }
-                Ok(Err(err)) => {
-                    kvlog::error!("TUI thread exiting with error", index, %err);
-                }
-                Err(_) => {
-                    kvlog::error!("TUI thread panicked", index);
-                }
-            }
-            ws_handle.process_channel.send(ProcessRequest::ClientExited { index });
+        self.spawn_client_channel("tui", index, move || {
+            crate::tui::run(stdin, stdout, &ws_handle, channel, keybinds, output_mode)
         });
     }
 
@@ -1514,52 +1238,13 @@ impl ProcessManager {
             state.last_test_group =
                 Some(workspace::TestGroup { group_id, base_tasks: vec![base_index], job_indices: vec![job_index] });
         }
-
-        let channel = Arc::new(ClientChannel {
-            waker: extui::event::polling::Waker::new().unwrap(),
-            events: Mutex::new(Vec::new()),
-            selected: AtomicU64::new(0),
-            state: AtomicU64::new(0),
-        });
-
-        let next = self.clients.vacant_key();
-        let _ = self.poll.registry().register(
-            &mut SourceFd(&socket.as_raw_fd()),
-            TokenHandle::Client(next as u32).into(),
-            Interest::READABLE,
-        );
-        let _ = socket.set_nonblocking(true);
-
         let forwarder_socket = socket.try_clone().ok();
-
-        let client_entry = ClientEntry {
-            channel: channel.clone(),
-            workspace: ws_index,
-            socket,
-            kind: ClientKind::Run { log_group: job_id },
-            partial_rpc_read: None,
-        };
-        let index = self.clients.insert(client_entry);
+        let (index, channel) = self.register_client(socket, ws_index, ClientKind::Run { log_group: job_id }, None);
+        let ws = &self.workspaces[ws_index as usize]; // require ws to allow register_client to run
 
         let ws_handle = ws.handle.clone();
-        let request_channel = self.request.clone();
-        std::thread::spawn(move || {
-            kvlog::debug!("Run client thread started", index);
-            let result = std::panic::catch_unwind(|| {
-                crate::log_fowarder_ui::run(stdin, stdout, forwarder_socket, &ws_handle, job_id, channel)
-            });
-            match result {
-                Ok(Ok(())) => {
-                    kvlog::info!("Run client thread exiting", index, reason = "completed");
-                }
-                Ok(Err(err)) => {
-                    kvlog::error!("Run client thread exiting with error", index, %err);
-                }
-                Err(_) => {
-                    kvlog::error!("Run client thread panicked", index);
-                }
-            }
-            request_channel.send(ProcessRequest::ClientExited { index });
+        self.spawn_client_channel("run", index, move || {
+            crate::log_fowarder_ui::run(stdin, stdout, forwarder_socket, &ws_handle, job_id, channel)
         });
     }
 
@@ -1609,82 +1294,51 @@ impl ProcessManager {
             let _ = socket.write_all(encoder.output());
             return;
         }
-
-        let channel = Arc::new(ClientChannel {
-            waker: extui::event::polling::Waker::new().unwrap(),
-            events: Mutex::new(Vec::new()),
-            selected: AtomicU64::new(0),
-            state: AtomicU64::new(0),
-        });
-
-        let next = self.clients.vacant_key();
-        let _ = self.poll.registry().register(
-            &mut SourceFd(&socket.as_raw_fd()),
-            TokenHandle::Client(next as u32).into(),
-            Interest::READABLE,
-        );
-        let _ = socket.set_nonblocking(true);
-
         let forwarder_socket = socket.try_clone().ok();
-
-        let client_entry = ClientEntry {
-            channel: channel.clone(),
-            workspace: ws_index,
-            socket,
-            kind: ClientKind::TestRun,
-            partial_rpc_read: None,
-        };
-        let index = self.clients.insert(client_entry);
+        let (index, channel) = self.register_client(socket, ws_index, ClientKind::TestRun, None);
+        let ws = &self.workspaces[ws_index as usize];
 
         let ws_handle = ws.handle.clone();
+        self.spawn_client_channel("test-run", index, move || {
+            crate::test_summary_ui::run(stdin, stdout, forwarder_socket, &ws_handle, test_run, channel)
+        });
+    }
+
+    fn spawn_client_channel(
+        &mut self,
+        kind: &'static str,
+        index: usize,
+        func: impl (FnOnce() -> anyhow::Result<()>) + 'static + Send + UnwindSafe,
+    ) {
         let request_channel = self.request.clone();
-        std::thread::spawn(move || {
-            kvlog::debug!("Test run client thread started", index);
-            let result = std::panic::catch_unwind(|| {
-                crate::test_summary_ui::run(stdin, stdout, forwarder_socket, &ws_handle, test_run, channel)
-            });
+        let result = std::thread::Builder::new().name(format!("{kind}[{index}")).spawn(move || {
+            let result = std::panic::catch_unwind(|| func());
             match result {
                 Ok(Ok(())) => {
-                    kvlog::info!("Test run client thread exiting", index, reason = "completed");
+                    kvlog::info!("Client thread exiting", index, reason = "completed", kind);
                 }
                 Ok(Err(err)) => {
-                    kvlog::error!("Test run client thread exiting with error", index, %err);
+                    kvlog::error!("Client thread exiting with error", index, %err, kind);
                 }
                 Err(_) => {
-                    kvlog::error!("Test run client thread panicked", index);
+                    kvlog::error!("Client thread panicked", index, kind);
                 }
             }
             request_channel.send(ProcessRequest::ClientExited { index });
         });
+        match result {
+            Ok(_) => {}
+            Err(err) => {
+                kvlog::error!("Failed to spawn client thread", ?err, index, kind);
+                self.request.send(ProcessRequest::ClientExited { index });
+            }
+        }
     }
 
     fn attach_rpc_client(&mut self, socket: UnixStream, ws_index: WorkspaceIndex, subscribe: bool) {
         let subscriptions = RpcSubscriptions { job_status: subscribe, job_exits: subscribe };
 
-        let channel = Arc::new(ClientChannel {
-            waker: extui::event::polling::Waker::new().unwrap(),
-            events: Mutex::new(Vec::new()),
-            selected: AtomicU64::new(0),
-            state: AtomicU64::new(0),
-        });
-
-        let next = self.clients.vacant_key();
-        let _ = self.poll.registry().register(
-            &mut SourceFd(&socket.as_raw_fd()),
-            TokenHandle::Client(next as u32).into(),
-            Interest::READABLE,
-        );
-        let _ = socket.set_nonblocking(true);
-
-        let client_entry = ClientEntry {
-            channel,
-            workspace: ws_index,
-            socket,
-            kind: ClientKind::Rpc { subscriptions },
-            partial_rpc_read: None,
-        };
-        let client_index = self.clients.insert(client_entry);
-
+        let (client_index, _) = self.register_client(socket, ws_index, ClientKind::Rpc { subscriptions }, None);
         let mut encoder = crate::rpc::Encoder::new();
         encoder.encode_response(
             crate::rpc::RpcMessageKind::OpenWorkspaceAck,
@@ -1707,98 +1361,24 @@ impl ProcessManager {
     ) {
         let query: crate::daemon::LogsQuery =
             jsony::from_binary(&query).unwrap_or_else(|_| crate::daemon::LogsQuery::default());
-
-        let channel = Arc::new(ClientChannel {
-            waker: extui::event::polling::Waker::new().unwrap(),
-            events: Mutex::new(Vec::new()),
-            selected: AtomicU64::new(0),
-            state: AtomicU64::new(0),
-        });
-
-        let next = self.clients.vacant_key();
-        let _ = self.poll.registry().register(
-            &mut SourceFd(&socket.as_raw_fd()),
-            TokenHandle::Client(next as u32).into(),
-            Interest::READABLE,
-        );
-        let _ = socket.set_nonblocking(true);
-
         let forwarder_socket = socket.try_clone().ok();
-
-        let client_entry = ClientEntry {
-            channel: channel.clone(),
-            workspace: ws_index,
-            socket,
-            kind: ClientKind::Logs,
-            partial_rpc_read: None,
-        };
-        let index = self.clients.insert(client_entry);
+        let (index, channel) = self.register_client(socket, ws_index, ClientKind::Logs, None);
 
         let ws = &self.workspaces[ws_index as usize];
         let ws_handle = ws.handle.clone();
-        let request_channel = self.request.clone();
-
         let config = crate::log_fowarder_ui::LogForwarderConfig::from_query(&query, &ws_handle);
-
-        std::thread::spawn(move || {
-            kvlog::debug!("Logs client thread started", index);
-            let result = std::panic::catch_unwind(|| {
-                crate::log_fowarder_ui::run_logs(stdin, stdout, forwarder_socket, &ws_handle, config, channel)
-            });
-            match result {
-                Ok(Ok(())) => {
-                    kvlog::info!("Logs client thread exiting", index, reason = "completed");
-                }
-                Ok(Err(err)) => {
-                    kvlog::error!("Logs client thread exiting with error", index, %err);
-                }
-                Err(_) => {
-                    kvlog::error!("Logs client thread panicked", index);
-                }
-            }
-            request_channel.send(ProcessRequest::ClientExited { index });
+        self.spawn_client_channel("logs", index, move || {
+            crate::log_fowarder_ui::run_logs(stdin, stdout, forwarder_socket, &ws_handle, config, channel)
         });
-
-        kvlog::info!("Logs client attached", workspace = ws_index);
     }
 
     fn attach_self_logs_client(&mut self, stdout: File, socket: UnixStream) {
-        let channel = Arc::new(ClientChannel {
-            waker: extui::event::polling::Waker::new().unwrap(),
-            events: Mutex::new(Vec::new()),
-            selected: AtomicU64::new(0),
-            state: AtomicU64::new(0),
-        });
-
-        let next = self.clients.vacant_key();
-        let _ = self.poll.registry().register(
-            &mut SourceFd(&socket.as_raw_fd()),
-            TokenHandle::Client(next as u32).into(),
-            Interest::READABLE,
-        );
-        let _ = socket.set_nonblocking(true);
-
-        let client_entry = ClientEntry {
-            channel: channel.clone(),
-            workspace: 0,
-            socket,
-            kind: ClientKind::SelfLogs,
-            partial_rpc_read: None,
-        };
-        let index = self.clients.insert(client_entry);
+        let (index, channel) = self.register_client(socket, 0, ClientKind::SelfLogs, None);
         let request_channel = self.request.clone();
-
-        std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_self_logs_forwarder(stdout, channel, request_channel.clone(), index);
-            }));
-            if result.is_err() {
-                kvlog::error!("Self-logs forwarder thread panicked", index);
-                request_channel.send(ProcessRequest::ClientExited { index });
-            }
+        self.spawn_client_channel("self-logs", index, move || {
+            run_self_logs_forwarder(stdout, channel, request_channel.clone(), index);
+            Ok(())
         });
-
-        kvlog::info!("Self-logs client attached");
     }
 
     fn handle_self_logs_client_read(&mut self, client_index: ClientIndex) {
@@ -1811,351 +1391,38 @@ impl ProcessManager {
             match try_read(client.socket.as_raw_fd(), &mut buffer) {
                 ReadResult::More => continue,
                 ReadResult::EOF => {
-                    self.signal_threaded_client_exit(client_index, SocketTerminationReason::Eof);
+                    self.terminate_client(client_index, SocketTerminationReason::Eof);
                     return;
                 }
                 ReadResult::Done | ReadResult::WouldBlock => return,
                 ReadResult::OtherError(err) => {
                     kvlog::error!("Self-logs client read failed", ?err, index = client_index as usize);
-                    self.signal_threaded_client_exit(client_index, SocketTerminationReason::ReadError);
+                    self.terminate_client(client_index, SocketTerminationReason::ReadError);
                     return;
                 }
             }
         }
     }
-
-    fn handle_rpc_client_read(&mut self, client_index: ClientIndex) {
-        let Some(client) = self.clients.get_mut(client_index as usize) else {
+    fn terminate_client(&mut self, client_index: ClientIndex, reason: SocketTerminationReason) {
+        let Some(client) = self.clients.get(client_index as usize) else {
             return;
         };
-        let ws_index = client.workspace;
-
-        let (mut state, mut buffer) = client
-            .partial_rpc_read
-            .take()
-            .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
-
-        let mut termination_reason: Option<SocketTerminationReason> = None;
-        loop {
-            match try_read(client.socket.as_raw_fd(), &mut buffer) {
-                ReadResult::More => continue,
-                ReadResult::EOF => {
-                    termination_reason = Some(SocketTerminationReason::Eof);
-                    break;
-                }
-                ReadResult::Done | ReadResult::WouldBlock => break,
-                ReadResult::OtherError(err) => {
-                    kvlog::error!("RPC client read error", ?err, index = client_index as usize);
-                    termination_reason = Some(SocketTerminationReason::ReadError);
-                    break;
-                }
-            }
-        }
-
-        let mut encoder = crate::rpc::Encoder::new();
-
-        loop {
-            match state.decode(&buffer) {
-                DecodeResult::Message { kind, correlation, payload, .. } => {
-                    self.handle_rpc_message(client_index, ws_index, kind, correlation, payload, &mut encoder);
-                }
-                DecodeResult::MissingData { .. } => break,
-                DecodeResult::Empty => {
-                    buffer.clear();
-                    break;
-                }
-                DecodeResult::Error(e) => {
-                    kvlog::error!("RPC client protocol decode error", ?e, index = client_index as usize);
-                    termination_reason = Some(SocketTerminationReason::ProtocolError);
-                    break;
-                }
-            }
-        }
-
-        state.compact(&mut buffer, 4096);
-
-        if !encoder.output().is_empty() {
-            let Some(client) = self.clients.get_mut(client_index as usize) else {
-                self.buffer_pool.push(buffer);
-                return;
-            };
-            let _ = client.socket.write_all(encoder.output());
-        }
-
-        if let Some(reason) = termination_reason {
-            kvlog::info!("RPC client terminated", index = client_index as usize, reason = reason.as_str());
-            self.buffer_pool.push(buffer);
-            self.terminate_client(client_index);
-        } else if buffer.is_empty() {
-            self.buffer_pool.push(buffer);
-        } else {
-            let Some(client) = self.clients.get_mut(client_index as usize) else { return };
-            client.partial_rpc_read = Some((state, buffer));
-        }
-    }
-
-    fn handle_rpc_message(
-        &mut self,
-        client_index: ClientIndex,
-        ws_index: WorkspaceIndex,
-        kind: RpcMessageKind,
-        correlation: u16,
-        payload: &[u8],
-        encoder: &mut crate::rpc::Encoder,
-    ) {
-        match kind {
-            RpcMessageKind::Subscribe => {
-                let Ok(filter) = jsony::from_binary::<crate::rpc::SubscriptionFilter>(payload) else {
-                    encoder.encode_response(
-                        RpcMessageKind::ErrorResponse,
-                        correlation,
-                        &crate::rpc::ErrorResponsePayload { code: 1, message: "Invalid subscription filter".into() },
-                    );
+        client.channel.set_terminated();
+        let _ = client.channel.wake();
+        let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
+        kvlog::info!("Client terminated", index = client_index as usize, reason = reason.as_str());
+        match &client.kind {
+            ClientKind::Rpc { .. } => {
+                let Some(_) = self.clients.try_remove(client_index as usize) else {
+                    kvlog::debug!("Client already removed", index = client_index as usize);
                     return;
                 };
-                let Some(client) = self.clients.get_mut(client_index as usize) else { return };
-                let ClientKind::Rpc { subscriptions } = &mut client.kind else { return };
-                subscriptions.job_status = filter.job_status;
-                subscriptions.job_exits = filter.job_exits;
-                encoder.encode_response(
-                    RpcMessageKind::SubscribeAck,
-                    correlation,
-                    &crate::rpc::SubscribeAck { success: true },
-                );
             }
-            RpcMessageKind::RunTask => {
-                let Ok(req) = jsony::from_binary::<crate::rpc::RunTaskRequest>(payload) else {
-                    encoder.encode_response(
-                        RpcMessageKind::ErrorResponse,
-                        correlation,
-                        &crate::rpc::ErrorResponsePayload { code: 2, message: "Invalid run task request".into() },
-                    );
-                    return;
-                };
-                let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
-                let ws = &self.workspaces[ws_index as usize];
-                let mut state = ws.handle.state.write().unwrap();
-                let Some(base_index) = state.base_index_by_name(req.task_name) else {
-                    drop(state);
-                    encoder.encode_response(
-                        RpcMessageKind::RunTaskAck,
-                        correlation,
-                        &crate::rpc::RunTaskResponse {
-                            success: false,
-                            job_index: None,
-                            error: Some(format!("Task '{}' not found", req.task_name).into()),
-                        },
-                    );
-                    return;
-                };
-                drop(state);
-
-                ws.handle.restart_task(base_index, params, req.profile);
-
-                let ws_state = ws.handle.state.read().unwrap();
-                let bt = &ws_state.base_tasks[base_index.idx()];
-                let job_index = bt.jobs.all().last().map(|ji| ji.as_u32());
-
-                encoder.encode_response(
-                    RpcMessageKind::RunTaskAck,
-                    correlation,
-                    &crate::rpc::RunTaskResponse { success: true, job_index, error: None },
-                );
-            }
-            RpcMessageKind::Terminate => {
-                encoder.encode_empty(RpcMessageKind::TerminateAck, correlation);
-            }
-            RpcMessageKind::OpenWorkspace => {
-                encoder.encode_response(
-                    RpcMessageKind::OpenWorkspaceAck,
-                    correlation,
-                    &crate::rpc::OpenWorkspaceResponse { success: true, error: None },
-                );
-            }
-            RpcMessageKind::SpawnTask => {
-                self.handle_rpc_restart_task(ws_index, correlation, payload, encoder);
-            }
-            RpcMessageKind::KillTask => {
-                self.handle_rpc_kill_task(ws_index, correlation, payload, encoder);
-            }
-            RpcMessageKind::RerunTests => {
-                self.handle_rpc_rerun_tests(ws_index, correlation, payload, encoder);
-            }
-            RpcMessageKind::CallFunction => {
-                self.handle_rpc_call_function(ws_index, correlation, payload, encoder);
-            }
-            RpcMessageKind::GetLoggedRustPanics => {
-                self.handle_rpc_get_logged_rust_panics(ws_index, correlation, payload, encoder);
-            }
-            _ => {
-                kvlog::warn!("Unexpected RPC message kind from client", ?kind);
-            }
+            _ => (),
         }
     }
 
-    fn handle_rpc_restart_task(
-        &mut self,
-        ws_index: WorkspaceIndex,
-        correlation: u16,
-        payload: &[u8],
-        encoder: &mut crate::rpc::Encoder,
-    ) {
-        use crate::rpc::{CommandBody, CommandResponse, RpcMessageKind, SpawnTaskRequest};
-
-        let Ok(req) = jsony::from_binary::<SpawnTaskRequest>(payload) else {
-            encoder.encode_response(
-                RpcMessageKind::CommandAck,
-                correlation,
-                &CommandResponse { workspace_id: ws_index, body: CommandBody::Error("Invalid request payload".into()) },
-            );
-            return;
-        };
-
-        let ws = &self.workspaces[ws_index as usize];
-        let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
-
-        let result = if req.as_test {
-            ws.handle.spawn_task_as_test(req.task_name, params, req.profile).map(|()| None)
-        } else {
-            ws.handle.spawn_task_by_name_cached(req.task_name, params, req.profile, req.cached)
-        };
-
-        let body = match result {
-            Ok(None) => CommandBody::Empty,
-            Ok(Some(msg)) => CommandBody::Message(msg.into()),
-            Err(e) => CommandBody::Error(e.into()),
-        };
-        encoder.encode_response(
-            RpcMessageKind::CommandAck,
-            correlation,
-            &CommandResponse { workspace_id: ws_index, body },
-        );
-    }
-
-    fn handle_rpc_kill_task(
-        &mut self,
-        ws_index: WorkspaceIndex,
-        correlation: u16,
-        payload: &[u8],
-        encoder: &mut crate::rpc::Encoder,
-    ) {
-        use crate::rpc::{CommandBody, CommandResponse, KillTaskRequest, RpcMessageKind};
-
-        let Ok(req) = jsony::from_binary::<KillTaskRequest>(payload) else {
-            encoder.encode_response(
-                RpcMessageKind::CommandAck,
-                correlation,
-                &CommandResponse { workspace_id: ws_index, body: CommandBody::Error("Invalid request payload".into()) },
-            );
-            return;
-        };
-
-        let ws = &self.workspaces[ws_index as usize];
-        let body = match ws.handle.terminate_task_by_name(req.task_name) {
-            Ok(msg) => CommandBody::Message(msg.into()),
-            Err(e) => CommandBody::Error(e.into()),
-        };
-        encoder.encode_response(
-            RpcMessageKind::CommandAck,
-            correlation,
-            &CommandResponse { workspace_id: ws_index, body },
-        );
-    }
-
-    fn handle_rpc_rerun_tests(
-        &mut self,
-        ws_index: WorkspaceIndex,
-        correlation: u16,
-        payload: &[u8],
-        encoder: &mut crate::rpc::Encoder,
-    ) {
-        use crate::rpc::{CommandBody, CommandResponse, RerunTestsRequest, RpcMessageKind};
-
-        let Ok(req) = jsony::from_binary::<RerunTestsRequest>(payload) else {
-            encoder.encode_response(
-                RpcMessageKind::CommandAck,
-                correlation,
-                &CommandResponse { workspace_id: ws_index, body: CommandBody::Error("Invalid request payload".into()) },
-            );
-            return;
-        };
-
-        let ws = &self.workspaces[ws_index as usize];
-        match ws.handle.rerun_test_group(req.only_failed) {
-            Ok(_) => {
-                encoder.encode_response(
-                    RpcMessageKind::CommandAck,
-                    correlation,
-                    &CommandResponse { workspace_id: ws_index, body: CommandBody::Message("Rerunning tests".into()) },
-                );
-            }
-            Err(e) => {
-                encoder.encode_response(
-                    RpcMessageKind::CommandAck,
-                    correlation,
-                    &CommandResponse { workspace_id: ws_index, body: CommandBody::Error(e.to_string().into()) },
-                );
-            }
-        }
-    }
-
-    fn handle_rpc_call_function(
-        &mut self,
-        ws_index: WorkspaceIndex,
-        correlation: u16,
-        payload: &[u8],
-        encoder: &mut crate::rpc::Encoder,
-    ) {
-        use crate::rpc::{CallFunctionRequest, CommandBody, CommandResponse, RpcMessageKind};
-
-        let Ok(req) = jsony::from_binary::<CallFunctionRequest>(payload) else {
-            encoder.encode_response(
-                RpcMessageKind::CommandAck,
-                correlation,
-                &CommandResponse { workspace_id: ws_index, body: CommandBody::Error("Invalid request payload".into()) },
-            );
-            return;
-        };
-
-        let ws = &self.workspaces[ws_index as usize];
-        let body = match ws.handle.call_function(req.function_name) {
-            Ok(msg) => CommandBody::Message(msg.into()),
-            Err(e) => CommandBody::Error(e.into()),
-        };
-        encoder.encode_response(
-            RpcMessageKind::CommandAck,
-            correlation,
-            &CommandResponse { workspace_id: ws_index, body },
-        );
-    }
-
-    fn handle_rpc_get_logged_rust_panics(
-        &mut self,
-        ws_index: WorkspaceIndex,
-        correlation: u16,
-        payload: &[u8],
-        encoder: &mut crate::rpc::Encoder,
-    ) {
-        use crate::rpc::{CommandBody, CommandResponse, GetLoggedRustPanicsRequest, RpcMessageKind};
-
-        let Ok(_req) = jsony::from_binary::<GetLoggedRustPanicsRequest>(payload) else {
-            encoder.encode_response(
-                RpcMessageKind::CommandAck,
-                correlation,
-                &CommandResponse { workspace_id: ws_index, body: CommandBody::Error("Invalid request payload".into()) },
-            );
-            return;
-        };
-
-        let response = jsony::to_json(&self.workspaces[ws_index as usize].handle.logged_rust_panics());
-        encoder.encode_response(
-            RpcMessageKind::CommandAck,
-            correlation,
-            &CommandResponse { workspace_id: ws_index, body: CommandBody::Message(response.into()) },
-        );
-    }
-
-    fn terminate_client(&mut self, client_index: ClientIndex) {
+    fn client_exited(&mut self, client_index: ClientIndex) {
         let Some(client) = self.clients.try_remove(client_index as usize) else {
             kvlog::debug!("Client already removed", index = client_index as usize);
             return;
@@ -2163,325 +1430,7 @@ impl ProcessManager {
         client.channel.set_terminated();
         let _ = client.channel.wake();
         let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
-        kvlog::info!("Client terminated", index = client_index as usize);
-    }
-
-    fn signal_threaded_client_exit(&mut self, client_index: ClientIndex, reason: SocketTerminationReason) {
-        let Some(client) = self.clients.get(client_index as usize) else {
-            return;
-        };
-        if client.channel.is_terminated() {
-            kvlog::debug!(
-                "Client already signaled for termination",
-                index = client_index as usize,
-                reason = reason.as_str()
-            );
-            return;
-        }
-        kvlog::info!("Signaling threaded client exit", index = client_index as usize, reason = reason.as_str());
-        client.channel.set_terminated();
-        let _ = client.channel.wake();
-        let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
-    }
-
-    fn handle_client_read(&mut self, client_index: ClientIndex) {
-        let Some(client) = self.clients.get(client_index as usize) else {
-            kvlog::error!("Read for missing client", index = client_index as usize);
-            return;
-        };
-
-        match &client.kind {
-            ClientKind::Tui => self.handle_tui_client_read(client_index),
-            ClientKind::Run { log_group: job_id } => {
-                let job_id = *job_id;
-                self.handle_run_client_read(client_index, job_id);
-            }
-            ClientKind::TestRun => self.handle_test_run_client_read(client_index),
-            ClientKind::Rpc { .. } => self.handle_rpc_client_read(client_index),
-            ClientKind::SelfLogs => self.handle_self_logs_client_read(client_index),
-            ClientKind::Logs => self.handle_logs_client_read(client_index),
-        }
-    }
-
-    fn handle_tui_client_read(&mut self, client_index: ClientIndex) {
-        let Some(client) = self.clients.get_mut(client_index as usize) else {
-            return;
-        };
-        let (mut state, mut buffer) = client
-            .partial_rpc_read
-            .take()
-            .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
-
-        let mut termination_reason: Option<SocketTerminationReason> = None;
-        loop {
-            match try_read(client.socket.as_raw_fd(), &mut buffer) {
-                ReadResult::More => continue,
-                ReadResult::EOF => {
-                    termination_reason = Some(SocketTerminationReason::Eof);
-                    break;
-                }
-                ReadResult::Done => break,
-                ReadResult::WouldBlock => break,
-                ReadResult::OtherError(err) => {
-                    kvlog::error!("TUI client read failed", ?err, index = client_index as usize);
-                    termination_reason = Some(SocketTerminationReason::ReadError);
-                    break;
-                }
-            }
-        }
-
-        let mut wake = false;
-        loop {
-            match state.decode(&buffer) {
-                DecodeResult::Message { kind, .. } => match kind {
-                    RpcMessageKind::Resize => {
-                        client.channel.state.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        wake = true;
-                    }
-                    RpcMessageKind::Terminate => {
-                        termination_reason = Some(SocketTerminationReason::ClientRequestedTerminate);
-                    }
-                    _ => {
-                        kvlog::error!("Unexpected message kind from TUI client", ?kind);
-                    }
-                },
-                DecodeResult::MissingData { .. } => break,
-                DecodeResult::Empty => {
-                    buffer.clear();
-                    break;
-                }
-                DecodeResult::Error(e) => {
-                    kvlog::error!("TUI client protocol decode error", ?e, index = client_index as usize);
-                    termination_reason = Some(SocketTerminationReason::ProtocolError);
-                    break;
-                }
-            }
-        }
-
-        state.compact(&mut buffer, 4096);
-
-        if let Some(reason) = termination_reason {
-            self.buffer_pool.push(buffer);
-            self.signal_threaded_client_exit(client_index, reason);
-        } else {
-            if buffer.is_empty() {
-                self.buffer_pool.push(buffer);
-            } else {
-                let Some(client) = self.clients.get_mut(client_index as usize) else { return };
-                client.partial_rpc_read = Some((state, buffer));
-            }
-            if wake {
-                let Some(client) = self.clients.get_mut(client_index as usize) else { return };
-                let _ = client.channel.wake();
-            }
-        }
-    }
-
-    fn handle_run_client_read(&mut self, client_index: ClientIndex, job_id: LogGroup) {
-        let Some(client) = self.clients.get_mut(client_index as usize) else {
-            return;
-        };
-        let (mut state, mut buffer) = client
-            .partial_rpc_read
-            .take()
-            .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
-
-        let mut termination_reason: Option<SocketTerminationReason> = None;
-        let mut kill_task = false;
-
-        loop {
-            match try_read(client.socket.as_raw_fd(), &mut buffer) {
-                ReadResult::More => continue,
-                ReadResult::EOF => {
-                    termination_reason = Some(SocketTerminationReason::Eof);
-                    break;
-                }
-                ReadResult::Done => break,
-                ReadResult::WouldBlock => break,
-                ReadResult::OtherError(err) => {
-                    kvlog::error!("Run client read failed", ?err, index = client_index as usize);
-                    termination_reason = Some(SocketTerminationReason::ReadError);
-                    break;
-                }
-            }
-        }
-
-        loop {
-            match state.decode(&buffer) {
-                DecodeResult::Message { kind, .. } => match kind {
-                    RpcMessageKind::Terminate => {
-                        kill_task = true;
-                        termination_reason = Some(SocketTerminationReason::ClientRequestedTerminate);
-                    }
-                    _ => {
-                        kvlog::error!("Unexpected message kind from run client", ?kind);
-                    }
-                },
-                DecodeResult::MissingData { .. } => break,
-                DecodeResult::Empty => {
-                    buffer.clear();
-                    break;
-                }
-                DecodeResult::Error(e) => {
-                    kvlog::error!("Run client protocol decode error", ?e, index = client_index as usize);
-                    termination_reason = Some(SocketTerminationReason::ProtocolError);
-                    break;
-                }
-            }
-        }
-
-        state.compact(&mut buffer, 4096);
-
-        if kill_task {
-            for (_, process) in &self.processes {
-                if process.log_group == job_id {
-                    let child_pid = process.child.id();
-                    let pgid = -(child_pid as i32);
-                    unsafe {
-                        libc::kill(pgid, libc::SIGINT);
-                    }
-                    break;
-                }
-            }
-        }
-
-        if let Some(reason) = termination_reason {
-            self.buffer_pool.push(buffer);
-            self.signal_threaded_client_exit(client_index, reason);
-        } else if buffer.is_empty() {
-            self.buffer_pool.push(buffer);
-        } else {
-            let Some(client) = self.clients.get_mut(client_index as usize) else { return };
-            client.partial_rpc_read = Some((state, buffer));
-        }
-    }
-
-    fn handle_test_run_client_read(&mut self, client_index: ClientIndex) {
-        let Some(client) = self.clients.get_mut(client_index as usize) else {
-            return;
-        };
-        let (mut state, mut buffer) = client
-            .partial_rpc_read
-            .take()
-            .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
-
-        let mut termination_reason: Option<SocketTerminationReason> = None;
-
-        loop {
-            match try_read(client.socket.as_raw_fd(), &mut buffer) {
-                ReadResult::More => continue,
-                ReadResult::EOF => {
-                    termination_reason = Some(SocketTerminationReason::Eof);
-                    break;
-                }
-                ReadResult::Done => break,
-                ReadResult::WouldBlock => break,
-                ReadResult::OtherError(err) => {
-                    kvlog::error!("Test run client read failed", ?err, index = client_index as usize);
-                    termination_reason = Some(SocketTerminationReason::ReadError);
-                    break;
-                }
-            }
-        }
-
-        loop {
-            match state.decode(&buffer) {
-                DecodeResult::Message { kind, .. } => match kind {
-                    RpcMessageKind::Terminate => {
-                        termination_reason = Some(SocketTerminationReason::ClientRequestedTerminate);
-                    }
-                    _ => {
-                        kvlog::error!("Unexpected message kind from test client", ?kind);
-                    }
-                },
-                DecodeResult::MissingData { .. } => break,
-                DecodeResult::Empty => {
-                    buffer.clear();
-                    break;
-                }
-                DecodeResult::Error(e) => {
-                    kvlog::error!("Test run client protocol decode error", ?e, index = client_index as usize);
-                    termination_reason = Some(SocketTerminationReason::ProtocolError);
-                    break;
-                }
-            }
-        }
-
-        state.compact(&mut buffer, 4096);
-
-        if let Some(reason) = termination_reason {
-            self.buffer_pool.push(buffer);
-            self.signal_threaded_client_exit(client_index, reason);
-        } else if buffer.is_empty() {
-            self.buffer_pool.push(buffer);
-        } else {
-            let Some(client) = self.clients.get_mut(client_index as usize) else { return };
-            client.partial_rpc_read = Some((state, buffer));
-        }
-    }
-
-    fn handle_logs_client_read(&mut self, client_index: ClientIndex) {
-        let Some(client) = self.clients.get_mut(client_index as usize) else {
-            return;
-        };
-        let (mut state, mut buffer) = client
-            .partial_rpc_read
-            .take()
-            .unwrap_or_else(|| (DecodingState::default(), self.buffer_pool.pop().unwrap_or_default()));
-
-        let mut termination_reason: Option<SocketTerminationReason> = None;
-
-        loop {
-            match try_read(client.socket.as_raw_fd(), &mut buffer) {
-                ReadResult::More => continue,
-                ReadResult::EOF => {
-                    termination_reason = Some(SocketTerminationReason::Eof);
-                    break;
-                }
-                ReadResult::Done => break,
-                ReadResult::WouldBlock => break,
-                ReadResult::OtherError(err) => {
-                    kvlog::error!("Logs client read failed", ?err, index = client_index as usize);
-                    termination_reason = Some(SocketTerminationReason::ReadError);
-                    break;
-                }
-            }
-        }
-
-        loop {
-            match state.decode(&buffer) {
-                DecodeResult::Message { kind, .. } => match kind {
-                    RpcMessageKind::Terminate => {
-                        termination_reason = Some(SocketTerminationReason::ClientRequestedTerminate);
-                    }
-                    _ => {
-                        kvlog::error!("Unexpected message kind from logs client", ?kind);
-                    }
-                },
-                DecodeResult::MissingData { .. } => break,
-                DecodeResult::Empty => {
-                    buffer.clear();
-                    break;
-                }
-                DecodeResult::Error(e) => {
-                    kvlog::error!("Logs client protocol decode error", ?e, index = client_index as usize);
-                    termination_reason = Some(SocketTerminationReason::ProtocolError);
-                    break;
-                }
-            }
-        }
-
-        state.compact(&mut buffer, 4096);
-
-        if let Some(reason) = termination_reason {
-            self.buffer_pool.push(buffer);
-            self.signal_threaded_client_exit(client_index, reason);
-        } else if buffer.is_empty() {
-            self.buffer_pool.push(buffer);
-        } else {
-            let Some(client) = self.clients.get_mut(client_index as usize) else { return };
-            client.partial_rpc_read = Some((state, buffer));
-        }
+        kvlog::info!("Client exited", index = client_index as usize);
     }
 
     fn broadcast_job_status(
@@ -2587,7 +1536,7 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
                     }
                 }
                 TokenHandle::Client(index) => {
-                    job_manager.handle_client_read(index);
+                    job_manager.handle_client_rpc_read(index);
                 }
             }
         }

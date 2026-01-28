@@ -2039,17 +2039,18 @@ enum RpcResponse {
     Other(RpcMessageKind),
 }
 
-/// Helper to send an RPC command and receive response over a persistent connection.
-fn rpc_send_recv<T: jsony::ToBinary>(
+/// Helper to send an RPC workspace command (workspace in header) and receive response.
+fn rpc_send_recv_ws<T: jsony::ToBinary>(
     socket: &mut UnixStream,
     encoder: &mut Encoder,
     decoder: &mut DecodingState,
     buffer: &mut Vec<u8>,
     kind: RpcMessageKind,
     correlation: u16,
+    workspace: &WorkspaceRef<'_>,
     payload: &T,
 ) -> CommandResponse {
-    encoder.encode_response(kind, correlation, payload);
+    encoder.encode_response_ws(kind, correlation, workspace, payload);
     socket.write_all(encoder.output()).expect("Failed to send RPC command");
     encoder.clear();
 
@@ -2205,21 +2206,23 @@ while true; do sleep 1; done
     let mut correlation: u16 = 1;
 
     // Command 1: SpawnTask (starts the action) - with one_shot=false to keep connection open
+    let workspace = WorkspaceRef::Path { config: &config_path };
     let req1 = SpawnTaskRequest {
-        workspace: WorkspaceRef::Path { config: &config_path },
+        workspace,
         task_name: "my_action",
         profile: "",
         params: &[],
         as_test: false,
         cached: false,
     };
-    let resp1 = rpc_send_recv(
+    let resp1 = rpc_send_recv_ws(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
         RpcMessageKind::SpawnTask,
         correlation,
+        &workspace,
         &req1,
     );
     correlation += 1;
@@ -2234,20 +2237,21 @@ while true; do sleep 1; done
 
     // Command 2: SpawnTask (starts the service) - connection still open
     let req2 = SpawnTaskRequest {
-        workspace: WorkspaceRef::Path { config: &config_path },
+        workspace,
         task_name: "my_service",
         profile: "",
         params: &[],
         as_test: false,
         cached: false,
     };
-    let resp2 = rpc_send_recv(
+    let resp2 = rpc_send_recv_ws(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
         RpcMessageKind::SpawnTask,
         correlation,
+        &workspace,
         &req2,
     );
     correlation += 1;
@@ -2256,14 +2260,15 @@ while true; do sleep 1; done
     assert!(harness.wait_for_file(&service_marker, Duration::from_secs(3)), "Service should start");
 
     // Command 3: KillTask (kills the service)
-    let req3 = KillTaskRequest { workspace: WorkspaceRef::Path { config: &config_path }, task_name: "my_service" };
-    let resp3 = rpc_send_recv(
+    let req3 = KillTaskRequest { workspace, task_name: "my_service" };
+    let resp3 = rpc_send_recv_ws(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
         RpcMessageKind::KillTask,
         correlation,
+        &workspace,
         &req3,
     );
     correlation += 1;
@@ -2277,14 +2282,15 @@ while true; do sleep 1; done
     rpc_wait_for_job_exit(&mut socket, &mut decoder, &mut buffer, 1, Duration::from_secs(5));
 
     // Command 4: KillTask again (should say already finished)
-    let req4 = KillTaskRequest { workspace: WorkspaceRef::Path { config: &config_path }, task_name: "my_service" };
-    let resp4 = rpc_send_recv(
+    let req4 = KillTaskRequest { workspace, task_name: "my_service" };
+    let resp4 = rpc_send_recv_ws(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
         RpcMessageKind::KillTask,
         correlation,
+        &workspace,
         &req4,
     );
     correlation += 1;
@@ -2296,20 +2302,21 @@ while true; do sleep 1; done
 
     // Command 5: SpawnTask on nonexistent task (should error)
     let req5 = SpawnTaskRequest {
-        workspace: WorkspaceRef::Path { config: &config_path },
+        workspace,
         task_name: "nonexistent_task",
         profile: "",
         params: &[],
         as_test: false,
         cached: false,
     };
-    let resp5 = rpc_send_recv(
+    let resp5 = rpc_send_recv_ws(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
         RpcMessageKind::SpawnTask,
         correlation,
+        &workspace,
         &req5,
     );
     let _ = correlation;
@@ -2457,21 +2464,23 @@ cache.key = [{{ modified = "{trigger}" }}]
     let mut correlation: u16 = 1;
 
     // First restart with cached=false: should run the action
+    let workspace = WorkspaceRef::Path { config: &config_path };
     let req1 = SpawnTaskRequest {
-        workspace: WorkspaceRef::Path { config: &config_path },
+        workspace,
         task_name: "cached_action",
         profile: "",
         params: &[],
         as_test: false,
         cached: false,
     };
-    let resp1 = rpc_send_recv(
+    let resp1 = rpc_send_recv_ws(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
         RpcMessageKind::SpawnTask,
         correlation,
+        &workspace,
         &req1,
     );
     correlation += 1;
@@ -2483,20 +2492,21 @@ cache.key = [{{ modified = "{trigger}" }}]
 
     // Second restart with cached=true: should return cache hit message
     let req2 = SpawnTaskRequest {
-        workspace: WorkspaceRef::Path { config: &config_path },
+        workspace,
         task_name: "cached_action",
         profile: "",
         params: &[],
         as_test: false,
         cached: true,
     };
-    let resp2 = rpc_send_recv(
+    let resp2 = rpc_send_recv_ws(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
         RpcMessageKind::SpawnTask,
         correlation,
+        &workspace,
         &req2,
     );
     correlation += 1;
@@ -2513,20 +2523,21 @@ cache.key = [{{ modified = "{trigger}" }}]
 
     // Third restart with cached=true: cache invalidated, should run
     let req3 = SpawnTaskRequest {
-        workspace: WorkspaceRef::Path { config: &config_path },
+        workspace,
         task_name: "cached_action",
         profile: "",
         params: &[],
         as_test: false,
         cached: true,
     };
-    let resp3 = rpc_send_recv(
+    let resp3 = rpc_send_recv_ws(
         &mut socket,
         &mut encoder,
         &mut decoder,
         &mut buffer,
         RpcMessageKind::SpawnTask,
         correlation,
+        &workspace,
         &req3,
     );
     let _ = correlation;

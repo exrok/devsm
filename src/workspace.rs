@@ -1250,12 +1250,7 @@ impl WorkspaceState {
             let job = &self.jobs[job_index.idx()];
             match &job.process_status {
                 JobStatus::Running { process_index, .. } => {
-                    kvlog::info!(
-                        "Terminating running job",
-                        task_name,
-                        job_index,
-                        process_index
-                    );
+                    kvlog::info!("Terminating running job", task_name, job_index, process_index);
                     channel.send(crate::process_manager::ProcessRequest::TerminateJob {
                         job_id: job.log_group,
                         process_index: *process_index,
@@ -1264,18 +1259,10 @@ impl WorkspaceState {
                     killed_count += 1;
                 }
                 JobStatus::Starting => {
-                    kvlog::warn!(
-                        "Job is in Starting state during termination",
-                        task_name,
-                        job_index
-                    );
+                    kvlog::warn!("Job is in Starting state during termination", task_name, job_index);
                 }
                 JobStatus::Scheduled { .. } => {
-                    kvlog::info!(
-                        "Cancelling scheduled job",
-                        task_name,
-                        job_index
-                    );
+                    kvlog::info!("Cancelling scheduled job", task_name, job_index);
                     jobs_to_cancel.push(*job_index);
                     cancelled_count += 1;
                 }
@@ -1685,7 +1672,7 @@ impl Workspace {
                 let (pwd, cmd) = match job {
                     Some(job) => {
                         let config = job.task.config();
-                        let pwd = config.pwd.to_string();
+                        let pwd = state.config.current.base_path.join(&config.pwd).to_string_lossy().to_string();
                         let cmd = match &config.command {
                             Command::Cmd(args) => args.iter().map(|s| s.to_string()).collect(),
                             Command::Sh(sh) => vec!["sh".to_string(), "-c".to_string(), sh.to_string()],
@@ -1739,12 +1726,7 @@ impl Workspace {
             let job = &state.jobs[job_index.idx()];
             match &job.process_status {
                 JobStatus::Running { process_index, .. } => {
-                    kvlog::info!(
-                        "Terminating running job",
-                        task_name,
-                        job_index,
-                        process_index
-                    );
+                    kvlog::info!("Terminating running job", task_name, job_index, process_index);
                     self.process_channel.send(crate::process_manager::ProcessRequest::TerminateJob {
                         job_id: job.log_group,
                         process_index: *process_index,
@@ -1759,11 +1741,7 @@ impl Workspace {
                     );
                 }
                 JobStatus::Scheduled { .. } => {
-                    kvlog::info!(
-                        "Cancelling scheduled job",
-                        task_name,
-                        job_index
-                    );
+                    kvlog::info!("Cancelling scheduled job", task_name, job_index);
                     jobs_to_cancel.push(job_index);
                 }
                 JobStatus::Exited { .. } | JobStatus::Cancelled => {}
