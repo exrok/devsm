@@ -15,7 +15,7 @@ use crate::config::TaskKind;
 use crate::daemon::LogsQuery;
 use crate::line_width::{strip_ansi_to_buffer, strip_ansi_to_buffer_preserve_case};
 use crate::log_storage::{BaseTaskSet, LogEntry, LogFilter, LogGroup, LogId, Logs};
-use crate::process_manager::ClientChannel;
+use crate::event_loop::ClientChannel;
 use crate::rpc::{Encoder, ExitCause as RpcExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind};
 use crate::workspace::{BaseTaskIndex, ExitCause, JobIndex, JobStatus, Workspace};
 

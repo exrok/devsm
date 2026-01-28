@@ -156,22 +156,33 @@ pub struct WorkspaceEntry {
     handle: Arc<Workspace>,
 }
 
-pub(crate) struct ProcessManager {
-    buffer_pool: Vec<Vec<u8>>,
-
+struct State {
+    poll: Poll,
     processes: slab::Slab<ActiveProcess>,
-
-    clients: Slab<ClientEntry>,
 
     workspaces: slab::Slab<WorkspaceEntry>,
     workspace_map: HashMap<Box<Path>, WorkspaceIndex>,
 
     request: Arc<MioChannel>,
-
-    poll: Poll,
     timed_ready_count: u32,
     timed_timeout_count: u32,
+}
 
+pub(crate) struct EventLoop {
+    buffer_pool: Vec<Vec<u8>>,
+
+    clients: Slab<ClientEntry>,
+
+    state: State,
+    // poll: Poll,
+    // processes: slab::Slab<ActiveProcess>,
+
+    // workspaces: slab::Slab<WorkspaceEntry>,
+    // workspace_map: HashMap<Box<Path>, WorkspaceIndex>,
+
+    // request: Arc<MioChannel>,
+    // timed_ready_count: u32,
+    // timed_timeout_count: u32,
     wait_thread: std::thread::JoinHandle<()>,
 }
 
@@ -235,10 +246,10 @@ pub(crate) fn try_read(fd: RawFd, buffer: &mut Vec<u8>) -> ReadResult {
     }
 }
 
-impl ProcessManager {
+impl EventLoop {
     pub(crate) fn read(&mut self, index: ProcessIndex, pipe: Pipe) -> anyhow::Result<()> {
         kvlog::debug!("Read process", index, pipe= ?pipe);
-        let process = self.processes.get_mut(index).context("Invalid process index")?;
+        let process = self.state.processes.get_mut(index).context("Invalid process index")?;
         let (fd, mut buffer) = match pipe {
             Pipe::Stdout => (
                 process.child.stdout.as_ref().map(|s| s.as_raw_fd()).context("No stdout")?,
@@ -261,7 +272,7 @@ impl ProcessManager {
                 ReadResult::Done | ReadResult::WouldBlock => break,
                 ReadResult::More => continue,
                 ReadResult::EOF => {
-                    if let Err(err) = self.poll.registry().deregister(&mut SourceFd(&fd)) {
+                    if let Err(err) = self.state.poll.registry().deregister(&mut SourceFd(&fd)) {
                         kvlog::error!("Failed to unregister fd", ?err, ?pipe, job_index = process.job_index);
                     }
                     match pipe {
@@ -298,14 +309,14 @@ impl ProcessManager {
                     }
                 }
 
-                if let Some(workspace) = self.workspaces.get_mut(process.workspace_index as usize) {
+                if let Some(workspace) = self.state.workspaces.get_mut(process.workspace_index as usize) {
                     workspace.line_writer.push_line(text, width as u32, process.log_group, process.style);
                 }
 
                 if let Some(ref checker) = process.ready_checker {
                     if crate::line_width::strip_ansi_and_contains(text, &checker.needle) {
                         if checker.timeout_at.is_some() {
-                            self.timed_ready_count -= 1;
+                            self.state.timed_ready_count -= 1;
                         }
                         ready_matched = true;
                         process.ready_checker = None;
@@ -356,11 +367,11 @@ impl ProcessManager {
                 kvlog::error!(
                     "Scheduler exceeded maximum iterations",
                     iterations = MAX_ITERATIONS,
-                    workspaces = self.workspaces.len()
+                    workspaces = self.state.workspaces.len()
                 );
                 break;
             }
-            for (wsi, ws) in &self.workspaces {
+            for (wsi, ws) in &self.state.workspaces {
                 let state = ws.handle.state();
 
                 if let Some(service_to_kill) = state.service_to_terminate_for_queue() {
@@ -372,7 +383,7 @@ impl ProcessManager {
                     };
                     drop(state);
 
-                    if let Some(process) = self.processes.get_mut(process_index) {
+                    if let Some(process) = self.state.processes.get_mut(process_index) {
                         if process.log_group == job_id && process.alive {
                             let child_pid = process.child.id();
                             let pgid_to_kill = -(child_pid as i32);
@@ -419,7 +430,7 @@ impl ProcessManager {
     }
 
     fn mark_service_ready(&mut self, ws_index: WorkspaceIndex, job_index: JobIndex) {
-        if let Some(ws) = self.workspaces.get(ws_index as usize) {
+        if let Some(ws) = self.state.workspaces.get(ws_index as usize) {
             let mut state = ws.handle.state.write().unwrap();
             if let JobStatus::Running { ready_state, .. } = &mut state[job_index].process_status {
                 *ready_state = Some(true);
@@ -432,10 +443,10 @@ impl ProcessManager {
 
     fn check_ready_timeouts(&mut self) {
         let now = std::time::Instant::now();
-        for (_, process) in &mut self.processes {
+        for (_, process) in &mut self.state.processes {
             if let Some(ref checker) = process.ready_checker {
                 if checker.timeout_at.is_some_and(|t| now > t) {
-                    self.timed_ready_count -= 1;
+                    self.state.timed_ready_count -= 1;
                     process.ready_checker = None;
                 }
             }
@@ -446,7 +457,7 @@ impl ProcessManager {
         let now = std::time::Instant::now();
         let mut to_kill: Vec<(usize, u32)> = Vec::new();
 
-        for (index, process) in &self.processes {
+        for (index, process) in &self.state.processes {
             if !process.alive {
                 continue;
             }
@@ -466,7 +477,7 @@ impl ProcessManager {
         }
 
         for (index, child_pid) in to_kill {
-            let Some(process) = self.processes.get_mut(index) else {
+            let Some(process) = self.state.processes.get_mut(index) else {
                 continue;
             };
             if !process.alive {
@@ -496,7 +507,7 @@ impl ProcessManager {
         const SIGKILL_ESCALATION_SECS: u64 = 20;
         let now = std::time::Instant::now();
 
-        for (_index, process) in &mut self.processes {
+        for (_index, process) in &mut self.state.processes {
             let Some(kill_sent_at) = process.kill_sent_at else {
                 continue;
             };
@@ -535,9 +546,9 @@ impl ProcessManager {
         job_index: JobIndex,
         task: TaskConfigRc,
     ) -> anyhow::Result<()> {
-        let index = self.processes.vacant_key();
+        let index = self.state.processes.vacant_key();
         let tc = task.config();
-        let workspace = &self.workspaces[workspace_index as usize];
+        let workspace = &self.state.workspaces[workspace_index as usize];
         let path = {
             let ws = &mut *workspace.handle.state.write().unwrap();
             ws.change_number = ws.change_number.wrapping_add(1);
@@ -605,7 +616,11 @@ impl ProcessManager {
                     panic!("Failed to set non-blocking");
                 }
             }
-            self.poll.registry().register(&mut SourceFd(&stdout.as_raw_fd()), Token(index << 1), Interest::READABLE)?;
+            self.state.poll.registry().register(
+                &mut SourceFd(&stdout.as_raw_fd()),
+                Token(index << 1),
+                Interest::READABLE,
+            )?;
         };
         if let Some(stderr) = &mut child.stderr {
             unsafe {
@@ -613,7 +628,7 @@ impl ProcessManager {
                     panic!("Failed to set non-blocking");
                 }
             }
-            self.poll.registry().register(
+            self.state.poll.registry().register(
                 &mut SourceFd(&stderr.as_raw_fd()),
                 Token((index << 1) | 1),
                 Interest::READABLE,
@@ -629,7 +644,7 @@ impl ProcessManager {
             }
         });
         if ready_checker.as_ref().is_some_and(|rc| rc.timeout_at.is_some()) {
-            self.timed_ready_count += 1;
+            self.state.timed_ready_count += 1;
         }
         let ready_state = ready_checker.as_ref().map(|_| false);
 
@@ -648,9 +663,9 @@ impl ProcessManager {
             }
         });
         if timeout_tracker.is_some() {
-            self.timed_timeout_count += 1;
+            self.state.timed_timeout_count += 1;
         }
-        let process_index = self.processes.insert(ActiveProcess {
+        let process_index = self.state.processes.insert(ActiveProcess {
             workspace_index,
             job_index,
             log_group: job_id,
@@ -835,9 +850,8 @@ impl MioChannel {
 pub(crate) struct ProcessManagerHandle {
     pub(crate) request: Arc<MioChannel>,
 }
-
-impl ProcessManager {
-    fn workspace_index(&mut self, workspace_config: PathBuf) -> anyhow::Result<WorkspaceIndex> {
+impl State {
+    fn get_or_create_workspace_index(&mut self, workspace_config: PathBuf) -> anyhow::Result<WorkspaceIndex> {
         if let Some(index) = self.workspace_map.get(workspace_config.as_path()) {
             return Ok(*index);
         }
@@ -854,10 +868,12 @@ impl ProcessManager {
         self.workspace_map.insert(workspace_config.to_path_buf().into_boxed_path(), index);
         Ok(index)
     }
+}
+impl EventLoop {
     fn handle_request(&mut self, req: ProcessRequest) -> bool {
         match req {
             ProcessRequest::TerminateJob { job_id, process_index, exit_cause } => {
-                let Some(process) = self.processes.get_mut(process_index) else {
+                let Some(process) = self.state.processes.get_mut(process_index) else {
                     kvlog::warn!(
                         "TerminateJob: process not found in slab",
                         ?process_index,
@@ -899,7 +915,7 @@ impl ProcessManager {
                 false
             }
             ProcessRequest::AttachClient { stdin, stdout, socket, workspace_config, kind } => {
-                let ws_index = match self.workspace_index(workspace_config) {
+                let ws_index = match self.state.get_or_create_workspace_index(workspace_config) {
                     Ok(ws) => ws,
                     Err(err) => {
                         kvlog::info!("Error spawning workspace", %err);
@@ -960,7 +976,7 @@ impl ProcessManager {
                 false
             }
             ProcessRequest::GlobalTermination => {
-                for (_, process) in &mut self.processes {
+                for (_, process) in &mut self.state.processes {
                     let child_pid = process.child.id();
                     let pgid_to_kill = -(child_pid as i32);
 
@@ -974,7 +990,7 @@ impl ProcessManager {
                 true
             }
             ProcessRequest::ProcessExited { pid, status } => {
-                for (index, process) in &mut self.processes {
+                for (index, process) in &mut self.state.processes {
                     if process.child.id() != pid {
                         continue;
                     }
@@ -997,7 +1013,7 @@ impl ProcessManager {
                                 }
                             }
                         }
-                        if let Some(workspace) = self.workspaces.get_mut(process.workspace_index as usize) {
+                        if let Some(workspace) = self.state.workspaces.get_mut(process.workspace_index as usize) {
                             while let Some(line) = buffer.readline() {
                                 process.append_line(line, &mut workspace.line_writer);
                             }
@@ -1008,7 +1024,7 @@ impl ProcessManager {
 
                         buffer.reset();
                         self.buffer_pool.push(buffer.data);
-                        if let Err(err) = self.poll.registry().deregister(&mut SourceFd(&stdin.as_raw_fd())) {
+                        if let Err(err) = self.state.poll.registry().deregister(&mut SourceFd(&stdin.as_raw_fd())) {
                             kvlog::error!("Failed to unregister fd", ?err);
                         }
                     }
@@ -1030,7 +1046,7 @@ impl ProcessManager {
                                 }
                             }
                         }
-                        if let Some(workspace) = self.workspaces.get_mut(process.workspace_index as usize) {
+                        if let Some(workspace) = self.state.workspaces.get_mut(process.workspace_index as usize) {
                             while let Some(line) = buffer.readline() {
                                 process.append_line(line, &mut workspace.line_writer);
                             }
@@ -1040,7 +1056,7 @@ impl ProcessManager {
                         }
                         buffer.reset();
                         self.buffer_pool.push(buffer.data);
-                        if let Err(err) = self.poll.registry().deregister(&mut SourceFd(&stderr.as_raw_fd())) {
+                        if let Err(err) = self.state.poll.registry().deregister(&mut SourceFd(&stderr.as_raw_fd())) {
                             kvlog::error!("Failed to unregister fd", ?err);
                         }
                     }
@@ -1057,7 +1073,7 @@ impl ProcessManager {
                         ExitCause::ProfileConflict => crate::rpc::ExitCause::ProfileConflict,
                         ExitCause::Timeout => crate::rpc::ExitCause::Timeout,
                     };
-                    if let Some(workspace) = self.workspaces.get(ws_idx as usize) {
+                    if let Some(workspace) = self.state.workspaces.get(ws_idx as usize) {
                         let mut ws = workspace.handle.state.write().unwrap();
                         ws.update_job_status(
                             job_idx,
@@ -1070,12 +1086,12 @@ impl ProcessManager {
                         );
                     }
                     if process.ready_checker.as_ref().is_some_and(|rc| rc.timeout_at.is_some()) {
-                        self.timed_ready_count -= 1;
+                        self.state.timed_ready_count -= 1;
                     }
                     if process.timeout_tracker.is_some() {
-                        self.timed_timeout_count -= 1;
+                        self.state.timed_timeout_count -= 1;
                     }
-                    self.processes.remove(index);
+                    self.state.processes.remove(index);
                     self.broadcast_job_exited(ws_idx, job_idx, exit_code as i32, rpc_cause);
                     return false;
                 }
@@ -1085,7 +1101,7 @@ impl ProcessManager {
             ProcessRequest::Spawn { task, job_id, workspace_id, job_index } => {
                 if let Err(err) = self.spawn(workspace_id, job_id, job_index, task) {
                     kvlog::error!("Failed to spawn process", ?err, ?job_id);
-                    if let Some(workspace) = self.workspaces.get(workspace_id as usize) {
+                    if let Some(workspace) = self.state.workspaces.get(workspace_id as usize) {
                         let log_end = workspace.line_writer.tail();
                         let mut ws = workspace.handle.state.write().unwrap();
                         ws.update_job_status(
@@ -1110,51 +1126,6 @@ impl ProcessManager {
         }
     }
 
-    fn restart_selected_from_clients(&self, ws_index: WorkspaceIndex, ws: &WorkspaceEntry) -> Result<(), &'static str> {
-        for (_, client) in &self.clients {
-            if client.workspace != ws_index {
-                continue;
-            }
-            let selected = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
-            if selected & SELECTED_META_GROUP_FLAG != 0 {
-                let kind = match selected {
-                    SELECTED_META_GROUP_TESTS => TaskKind::Test,
-                    SELECTED_META_GROUP_ACTIONS => TaskKind::Action,
-                    _ => return Err("invalid meta-group selection"),
-                };
-                let ws_state = ws.handle.state();
-                let jobs = ws_state.jobs_by_kind(kind);
-                let Some(&last_ji) = jobs.last() else {
-                    return Err("no jobs in selected meta-group");
-                };
-                let job = &ws_state[last_ji];
-                let bti = job.log_group.base_task_index();
-                let params = job.spawn_params.clone();
-                let profile = job.spawn_profile.clone();
-                drop(ws_state);
-                ws.handle.restart_task(bti, params, &profile);
-            } else {
-                let bti = workspace::BaseTaskIndex(selected as u32);
-                let ws_state = ws.handle.state();
-                let Some(bt) = ws_state.base_tasks.get(bti.idx()) else {
-                    return Err("selected task no longer exists");
-                };
-                if let Some(&last_ji) = bt.jobs.all().last() {
-                    let job = &ws_state[last_ji];
-                    let params = job.spawn_params.clone();
-                    let profile = job.spawn_profile.clone();
-                    drop(ws_state);
-                    ws.handle.restart_task(bti, params, &profile);
-                } else {
-                    drop(ws_state);
-                    ws.handle.restart_task(bti, ValueMap::new(), "");
-                }
-            }
-            return Ok(());
-        }
-        Err("no active TUI session")
-    }
-
     fn register_client(
         &mut self,
         socket: UnixStream,
@@ -1169,7 +1140,7 @@ impl ProcessManager {
             state: AtomicU64::new(0),
         });
         let next = self.clients.vacant_key();
-        let _ = self.poll.registry().register(
+        let _ = self.state.poll.registry().register(
             &mut SourceFd(&socket.as_raw_fd()),
             TokenHandle::Client(next as u32).into(),
             Interest::READABLE,
@@ -1183,7 +1154,7 @@ impl ProcessManager {
 
     fn attach_tui_client(&mut self, stdin: File, stdout: File, socket: UnixStream, ws_index: WorkspaceIndex) {
         let (index, channel) = self.register_client(socket, ws_index, ClientKind::Tui, None);
-        let ws = &mut self.workspaces[ws_index as usize];
+        let ws = &mut self.state.workspaces[ws_index as usize];
         let ws_handle = ws.handle.clone();
         kvlog::info!("Client Attached");
         let keybinds = global_keybinds();
@@ -1211,7 +1182,7 @@ impl ProcessManager {
         let params: ValueMap = jsony::from_binary(&params).unwrap_or_else(|_| ValueMap::new());
         let (name, profile) = task_name.rsplit_once(":").unwrap_or((&*task_name, ""));
 
-        let ws = &self.workspaces[ws_index as usize];
+        let ws = &self.state.workspaces[ws_index as usize];
         let job_id = {
             let mut state = ws.handle.state.write().unwrap();
             let Some(base_index) = state.base_index_by_name(name) else {
@@ -1240,7 +1211,7 @@ impl ProcessManager {
         }
         let forwarder_socket = socket.try_clone().ok();
         let (index, channel) = self.register_client(socket, ws_index, ClientKind::Run { log_group: job_id }, None);
-        let ws = &self.workspaces[ws_index as usize]; // require ws to allow register_client to run
+        let ws = &self.state.workspaces[ws_index as usize]; // require ws to allow register_client to run
 
         let ws_handle = ws.handle.clone();
         self.spawn_client_channel("run", index, move || {
@@ -1273,7 +1244,7 @@ impl ProcessManager {
             v
         };
 
-        let ws = &self.workspaces[ws_index as usize];
+        let ws = &self.state.workspaces[ws_index as usize];
         let test_run = match ws.handle.start_test_run(&test_filters) {
             Ok(run) => run,
             Err(err) => {
@@ -1296,7 +1267,7 @@ impl ProcessManager {
         }
         let forwarder_socket = socket.try_clone().ok();
         let (index, channel) = self.register_client(socket, ws_index, ClientKind::TestRun, None);
-        let ws = &self.workspaces[ws_index as usize];
+        let ws = &self.state.workspaces[ws_index as usize];
 
         let ws_handle = ws.handle.clone();
         self.spawn_client_channel("test-run", index, move || {
@@ -1310,7 +1281,7 @@ impl ProcessManager {
         index: usize,
         func: impl (FnOnce() -> anyhow::Result<()>) + 'static + Send + UnwindSafe,
     ) {
-        let request_channel = self.request.clone();
+        let request_channel = self.state.request.clone();
         let result = std::thread::Builder::new().name(format!("{kind}[{index}")).spawn(move || {
             let result = std::panic::catch_unwind(|| func());
             match result {
@@ -1330,7 +1301,7 @@ impl ProcessManager {
             Ok(_) => {}
             Err(err) => {
                 kvlog::error!("Failed to spawn client thread", ?err, index, kind);
-                self.request.send(ProcessRequest::ClientExited { index });
+                self.state.request.send(ProcessRequest::ClientExited { index });
             }
         }
     }
@@ -1364,7 +1335,7 @@ impl ProcessManager {
         let forwarder_socket = socket.try_clone().ok();
         let (index, channel) = self.register_client(socket, ws_index, ClientKind::Logs, None);
 
-        let ws = &self.workspaces[ws_index as usize];
+        let ws = &self.state.workspaces[ws_index as usize];
         let ws_handle = ws.handle.clone();
         let config = crate::log_fowarder_ui::LogForwarderConfig::from_query(&query, &ws_handle);
         self.spawn_client_channel("logs", index, move || {
@@ -1374,42 +1345,20 @@ impl ProcessManager {
 
     fn attach_self_logs_client(&mut self, stdout: File, socket: UnixStream) {
         let (index, channel) = self.register_client(socket, 0, ClientKind::SelfLogs, None);
-        let request_channel = self.request.clone();
+        let request_channel = self.state.request.clone();
         self.spawn_client_channel("self-logs", index, move || {
             run_self_logs_forwarder(stdout, channel, request_channel.clone(), index);
             Ok(())
         });
     }
 
-    fn handle_self_logs_client_read(&mut self, client_index: ClientIndex) {
-        let Some(client) = self.clients.get_mut(client_index as usize) else {
-            return;
-        };
-
-        let mut buffer = Vec::new();
-        loop {
-            match try_read(client.socket.as_raw_fd(), &mut buffer) {
-                ReadResult::More => continue,
-                ReadResult::EOF => {
-                    self.terminate_client(client_index, SocketTerminationReason::Eof);
-                    return;
-                }
-                ReadResult::Done | ReadResult::WouldBlock => return,
-                ReadResult::OtherError(err) => {
-                    kvlog::error!("Self-logs client read failed", ?err, index = client_index as usize);
-                    self.terminate_client(client_index, SocketTerminationReason::ReadError);
-                    return;
-                }
-            }
-        }
-    }
     fn terminate_client(&mut self, client_index: ClientIndex, reason: SocketTerminationReason) {
         let Some(client) = self.clients.get(client_index as usize) else {
             return;
         };
         client.channel.set_terminated();
         let _ = client.channel.wake();
-        let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
+        let _ = self.state.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
         kvlog::info!("Client terminated", index = client_index as usize, reason = reason.as_str());
         match &client.kind {
             ClientKind::Rpc { .. } => {
@@ -1429,7 +1378,7 @@ impl ProcessManager {
         };
         client.channel.set_terminated();
         let _ = client.channel.wake();
-        let _ = self.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
+        let _ = self.state.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
         kvlog::info!("Client exited", index = client_index as usize);
     }
 
@@ -1483,17 +1432,19 @@ impl ProcessManager {
 
 pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread::JoinHandle<()>, poll: Poll) {
     let mut events = Events::with_capacity(128);
-    let mut job_manager = ProcessManager {
-        clients: Slab::new(),
-        request,
-        workspace_map: HashMap::new(),
-        workspaces: slab::Slab::new(),
-        processes: slab::Slab::new(),
+    let mut job_manager = EventLoop {
         buffer_pool: Vec::new(),
+        clients: Slab::new(),
+        state: State {
+            request,
+            workspace_map: HashMap::new(),
+            workspaces: slab::Slab::new(),
+            processes: slab::Slab::new(),
+            poll,
+            timed_ready_count: 0,
+            timed_timeout_count: 0,
+        },
         wait_thread,
-        poll,
-        timed_ready_count: 0,
-        timed_timeout_count: 0,
     };
     loop {
         if TERMINATED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1501,13 +1452,13 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
             return;
         }
 
-        let poll_timeout = if job_manager.timed_ready_count > 0 || job_manager.timed_timeout_count > 0 {
+        let poll_timeout = if job_manager.state.timed_ready_count > 0 || job_manager.state.timed_timeout_count > 0 {
             Some(std::time::Duration::from_millis(500))
         } else {
             None
         };
 
-        if let Err(err) = job_manager.poll.poll(&mut events, poll_timeout) {
+        if let Err(err) = job_manager.state.poll.poll(&mut events, poll_timeout) {
             if err.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
@@ -1523,7 +1474,7 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
             match TokenHandle::from(event.token()) {
                 TokenHandle::RequestChannel => {
                     let mut reqs = Vec::new();
-                    job_manager.request.swap_recv(&mut reqs);
+                    job_manager.state.request.swap_recv(&mut reqs);
                     for req in reqs {
                         if job_manager.handle_request(req) {
                             return;
@@ -1542,10 +1493,10 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
         }
 
         job_manager.scheduled();
-        if job_manager.timed_ready_count > 0 {
+        if job_manager.state.timed_ready_count > 0 {
             job_manager.check_ready_timeouts();
         }
-        if job_manager.timed_timeout_count > 0 {
+        if job_manager.state.timed_timeout_count > 0 {
             job_manager.check_timeouts();
         }
         job_manager.check_kill_escalation();

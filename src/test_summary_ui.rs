@@ -26,7 +26,7 @@ use crate::log_storage::LogGroup;
 use crate::rpc::{Encoder, RpcMessageKind};
 use crate::workspace::ExitCause;
 use crate::{
-    process_manager::ClientChannel,
+    event_loop::ClientChannel,
     workspace::{BaseTask, BaseTaskIndex, JobIndex, JobStatus, TestJob, TestJobStatus, TestRun, Workspace},
 };
 

@@ -20,12 +20,12 @@ mod collection;
 mod config;
 mod daemon;
 mod diagnostic;
+mod event_loop;
 mod function;
 mod keybinds;
 mod line_width;
 mod log_fowarder_ui;
 mod log_storage;
-mod process_manager;
 mod rpc;
 mod scroll_view;
 mod searcher;
@@ -368,7 +368,6 @@ fn rpc_ws_command<T: jsony::ToBinary>(
 }
 
 fn rpc_read_response(socket: &mut UnixStream) -> anyhow::Result<CommandResponse> {
-
     let mut protocol = ClientProtocol::new();
     let mut read_buf = Vec::with_capacity(1024);
 
@@ -406,7 +405,7 @@ fn restart_selected_command() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
     let workspace = WorkspaceRef::Path { config: &config };
-    let req = rpc::RestartSelectedRequest { workspace: workspace.clone() };
+    let req = rpc::RestartSelectedRequest {};
     let response = rpc_ws_command(RpcMessageKind::RestartSelected, &workspace, &req)?;
 
     if let CommandBody::Error(err) = response.body {
@@ -424,14 +423,7 @@ fn spawn_task_command(job: &str, value_map: jsony_value::ValueMap, as_test: bool
     let params_bytes = jsony::to_binary(&value_map);
 
     let workspace = WorkspaceRef::Path { config: &config };
-    let req = rpc::SpawnTaskRequest {
-        workspace: workspace.clone(),
-        task_name,
-        profile,
-        params: &params_bytes,
-        as_test,
-        cached,
-    };
+    let req = rpc::SpawnTaskRequest { task_name, profile, params: &params_bytes, as_test, cached };
     let response = rpc_ws_command(RpcMessageKind::SpawnTask, &workspace, &req)?;
     handle_command_response(response)
 }
@@ -442,7 +434,7 @@ fn kill_task_command(job: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
     let workspace = WorkspaceRef::Path { config: &config };
-    let req = rpc::KillTaskRequest { workspace: workspace.clone(), task_name: job };
+    let req = rpc::KillTaskRequest { task_name: job };
     let response = rpc_ws_command(RpcMessageKind::KillTask, &workspace, &req)?;
     handle_command_response(response)
 }
@@ -453,7 +445,7 @@ fn rerun_tests_command(only_failed: bool) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
     let workspace = WorkspaceRef::Path { config: &config };
-    let req = rpc::RerunTestsRequest { workspace: workspace.clone(), only_failed };
+    let req = rpc::RerunTestsRequest { only_failed };
     let response = rpc_ws_command(RpcMessageKind::RerunTests, &workspace, &req)?;
     handle_command_response(response)
 }
@@ -464,7 +456,7 @@ fn call_function_command(name: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
     let workspace = WorkspaceRef::Path { config: &config };
-    let req = rpc::CallFunctionRequest { workspace: workspace.clone(), function_name: name };
+    let req = rpc::CallFunctionRequest { function_name: name };
     let response = rpc_ws_command(RpcMessageKind::CallFunction, &workspace, &req)?;
     handle_command_response(response)
 }
@@ -475,7 +467,7 @@ fn get_logged_rust_panics_command() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
     let workspace = WorkspaceRef::Path { config: &config };
-    let req = rpc::GetLoggedRustPanicsRequest { workspace: workspace.clone() };
+    let req = rpc::GetLoggedRustPanicsRequest {};
     let response = rpc_ws_command(RpcMessageKind::GetLoggedRustPanics, &workspace, &req)?;
     handle_command_response(response)
 }

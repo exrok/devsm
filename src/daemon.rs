@@ -17,7 +17,7 @@ use jsony::Jsony;
 use jsony_value::ValueMap;
 use sendfd::RecvWithFd;
 
-use crate::process_manager::ProcessManagerHandle;
+use crate::event_loop::ProcessManagerHandle;
 use crate::rpc::{HEAD_SIZE, Head, MAGIC, RpcMessageKind};
 
 static SOCKET_PATH: OnceLock<String> = OnceLock::new();
@@ -144,7 +144,7 @@ pub enum Request<'a> {
     },
 }
 
-use crate::process_manager::ReceivedFds;
+use crate::event_loop::ReceivedFds;
 
 unsafe fn convert_received_fds(raw_fds: &[i32], fd_count: usize) -> Option<ReceivedFds> {
     for &fd in &raw_fds[..fd_count] {
@@ -177,12 +177,12 @@ fn handle_request(
             let ReceivedFds::Pair([stdin, stdout]) = fds else {
                 bail!("Expected 2 FDs");
             };
-            pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
+            pm.request.send(crate::event_loop::ProcessRequest::AttachClient {
                 stdin: Some(stdin),
                 stdout: Some(stdout),
                 socket,
                 workspace_config: config.into(),
-                kind: crate::process_manager::AttachKind::Tui,
+                kind: crate::event_loop::AttachKind::Tui,
             });
         }
         Request::AttachRun { config, name, params, as_test } => {
@@ -190,12 +190,12 @@ fn handle_request(
             let ReceivedFds::Pair([stdin, stdout]) = fds else {
                 bail!("Expected 2 FDs");
             };
-            pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
+            pm.request.send(crate::event_loop::ProcessRequest::AttachClient {
                 stdin: Some(stdin),
                 stdout: Some(stdout),
                 socket,
                 workspace_config: config.into(),
-                kind: crate::process_manager::AttachKind::Run {
+                kind: crate::event_loop::AttachKind::Run {
                     task_name: name,
                     params: jsony::to_binary(&params),
                     as_test,
@@ -207,22 +207,22 @@ fn handle_request(
             let ReceivedFds::Pair([stdin, stdout]) = fds else {
                 bail!("Expected 2 FDs");
             };
-            pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
+            pm.request.send(crate::event_loop::ProcessRequest::AttachClient {
                 stdin: Some(stdin),
                 stdout: Some(stdout),
                 socket,
                 workspace_config: config.into(),
-                kind: crate::process_manager::AttachKind::TestRun { filters: jsony::to_binary(&filters) },
+                kind: crate::event_loop::AttachKind::TestRun { filters: jsony::to_binary(&filters) },
             });
         }
         Request::AttachRpc { config, subscribe } => {
             kvlog::info!("Attaching RPC client");
-            pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
+            pm.request.send(crate::event_loop::ProcessRequest::AttachClient {
                 stdin: None,
                 stdout: None,
                 socket,
                 workspace_config: config.into(),
-                kind: crate::process_manager::AttachKind::Rpc { subscribe },
+                kind: crate::event_loop::AttachKind::Rpc { subscribe },
             });
         }
         Request::AttachLogs { config, query } => {
@@ -230,12 +230,12 @@ fn handle_request(
             let ReceivedFds::Pair([stdin, stdout]) = fds else {
                 bail!("Expected 2 FDs for logs");
             };
-            pm.request.send(crate::process_manager::ProcessRequest::AttachClient {
+            pm.request.send(crate::event_loop::ProcessRequest::AttachClient {
                 stdin: Some(stdin),
                 stdout: Some(stdout),
                 socket,
                 workspace_config: config.into(),
-                kind: crate::process_manager::AttachKind::Logs { query: jsony::to_binary(&query) },
+                kind: crate::event_loop::AttachKind::Logs { query: jsony::to_binary(&query) },
             });
         }
         Request::GetSelfLogs { follow } => {
@@ -243,7 +243,7 @@ fn handle_request(
                 let ReceivedFds::Single(stdout) = fds else {
                     bail!("Expected 1 FD for self-logs follow");
                 };
-                pm.request.send(crate::process_manager::ProcessRequest::AttachSelfLogsClient { stdout, socket });
+                pm.request.send(crate::event_loop::ProcessRequest::AttachSelfLogsClient { stdout, socket });
             } else {
                 let logs = crate::self_log::get_daemon_logs().unwrap_or_default();
                 let mut socket = socket;
@@ -292,7 +292,7 @@ fn handle_rpc_connection(pm: &ProcessManagerHandle, socket: UnixStream, buffer: 
     let ws_data = &buffer[HEAD_SIZE..ws_end];
     let payload = &buffer[ws_end..total_len];
 
-    pm.request.send(crate::process_manager::ProcessRequest::RpcMessage {
+    pm.request.send(crate::event_loop::ProcessRequest::RpcMessage {
         socket,
         fds,
         kind,

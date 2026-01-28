@@ -4,9 +4,9 @@ use crate::{
     config::{
         CARGO_AUTO_EXPR, CacheKeyInput, Command, Environment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig,
     },
+    event_loop::MioChannel,
     function::FunctionAction,
     log_storage::{LogGroup, LogId, Logs},
-    process_manager::MioChannel,
 };
 pub use job_index_list::JobIndexList;
 use jsony_value::ValueMap;
@@ -864,7 +864,7 @@ impl WorkspaceState {
                 continue;
             };
             pred.push(ScheduleRequirement { job: job_index, predicate: JobPredicate::Terminated });
-            channel.send(crate::process_manager::ProcessRequest::TerminateJob {
+            channel.send(crate::event_loop::ProcessRequest::TerminateJob {
                 job_id: job.log_group,
                 process_index: *process_index,
                 exit_cause: ExitCause::Restarted,
@@ -1251,7 +1251,7 @@ impl WorkspaceState {
             match &job.process_status {
                 JobStatus::Running { process_index, .. } => {
                     kvlog::info!("Terminating running job", task_name, job_index, process_index);
-                    channel.send(crate::process_manager::ProcessRequest::TerminateJob {
+                    channel.send(crate::event_loop::ProcessRequest::TerminateJob {
                         job_id: job.log_group,
                         process_index: *process_index,
                         exit_cause: ExitCause::Killed,
@@ -1614,6 +1614,10 @@ pub fn extract_rust_panic_from_line(line: &str) -> Option<(&str, &str, u64, u64)
     Some((thread, file, line, col))
 }
 
+pub enum FunctionGlobalAction {
+    RestartSelected,
+}
+
 impl Workspace {
     pub fn logged_rust_panics(&self) -> Vec<LoggedPanic> {
         struct PanicFromLog {
@@ -1727,7 +1731,7 @@ impl Workspace {
             match &job.process_status {
                 JobStatus::Running { process_index, .. } => {
                     kvlog::info!("Terminating running job", task_name, job_index, process_index);
-                    self.process_channel.send(crate::process_manager::ProcessRequest::TerminateJob {
+                    self.process_channel.send(crate::event_loop::ProcessRequest::TerminateJob {
                         job_id: job.log_group,
                         process_index: *process_index,
                         exit_cause: ExitCause::Killed,
@@ -1895,7 +1899,7 @@ impl Workspace {
     /// Layer 1: Execute a function by name.
     ///
     /// Looks up function from session_functions or config.functions, then executes its action.
-    pub fn call_function(&self, name: &str) -> Result<String, String> {
+    pub fn call_function(&self, name: &str) -> Result<Option<FunctionGlobalAction>, String> {
         use crate::config::FunctionDefAction;
         use crate::function::FunctionAction;
 
@@ -1912,7 +1916,7 @@ impl Workspace {
                 ValueMap::new(),
                 &profile,
             )?;
-            return Ok("ok".to_string());
+            return Ok(None);
         }
 
         for func_def in state.config.current.functions {
@@ -1944,10 +1948,10 @@ impl Workspace {
                         }
                     }
                     FunctionDefAction::RestartSelected => {
-                        return Err("RestartSelected".to_string());
+                        return Ok(Some(FunctionGlobalAction::RestartSelected));
                     }
                 }
-                return Ok("ok".to_string());
+                return Ok(None);
             }
         }
 
@@ -2155,7 +2159,7 @@ impl Workspace {
             });
 
             if spawn {
-                self.process_channel.send(crate::process_manager::ProcessRequest::Spawn {
+                self.process_channel.send(crate::event_loop::ProcessRequest::Spawn {
                     task: task_config,
                     job_index,
                     workspace_id: self.workspace_id,
@@ -2381,7 +2385,7 @@ impl Workspace {
             });
 
             if spawn {
-                self.process_channel.send(crate::process_manager::ProcessRequest::Spawn {
+                self.process_channel.send(crate::event_loop::ProcessRequest::Spawn {
                     task: task_config,
                     job_index,
                     workspace_id: self.workspace_id,

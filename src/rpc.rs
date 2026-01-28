@@ -5,7 +5,9 @@
 //! I just don't want to worry about publishing one and maintaining semver version this
 //! early.
 
-use jsony::Jsony;
+use std::{collections::VecDeque, time::Duration};
+
+use jsony::{FromBinary, Jsony, ToBinary};
 
 pub(crate) mod unix_path {
     use jsony::{BytesWriter, FromBinary, ToBinary};
@@ -16,6 +18,15 @@ pub(crate) mod unix_path {
     pub fn decode_binary<'a>(decoder: &mut jsony::binary::Decoder<'a>) -> &'a Path {
         Path::new(OsStr::from_bytes(<&'a [u8]>::decode_binary(decoder)))
     }
+}
+
+pub trait RpcRequest<'a>: ToBinary + FromBinary<'a> {
+    const KIND: RpcMessageKind;
+    type Ack<'b>: RpcResponse<'b>;
+}
+
+pub trait RpcResponse<'a>: ToBinary + FromBinary<'a> {
+    const KIND: RpcMessageKind;
 }
 
 /// Protocol magic number identifying devsm RPC messages.
@@ -499,6 +510,356 @@ impl Encoder {
     }
 }
 
+/// Subscription events pushed by the server.
+#[derive(Debug)]
+pub enum SubscriptionEvent {
+    JobStatus(JobStatusEvent),
+    JobExited(JobExitedEvent),
+}
+
+/// Errors from workspace client operations.
+#[derive(Debug)]
+pub enum ClientError {
+    Io(std::io::Error),
+    Protocol(ProtocolError),
+    Timeout,
+    UnexpectedResponse(RpcMessageKind),
+    ConnectionClosed,
+    DecodeError,
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Protocol(e) => write!(f, "protocol error: {e}"),
+            Self::Timeout => write!(f, "operation timed out"),
+            Self::UnexpectedResponse(k) => write!(f, "unexpected response: {k:?}"),
+            Self::ConnectionClosed => write!(f, "connection closed"),
+            Self::DecodeError => write!(f, "failed to decode response"),
+        }
+    }
+}
+
+impl std::error::Error for ClientError {}
+
+impl From<std::io::Error> for ClientError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<ProtocolError> for ClientError {
+    fn from(e: ProtocolError) -> Self {
+        Self::Protocol(e)
+    }
+}
+
+/// A received message payload that can be decoded.
+pub struct ReceivedPayload<'a> {
+    pub kind: RpcMessageKind,
+    pub correlation: u16,
+    payload: &'a [u8],
+}
+
+impl<'a> ReceivedPayload<'a> {
+    /// Decodes the payload into the specified type.
+    pub fn decode<T: FromBinary<'a>>(&self) -> Result<T, ClientError> {
+        jsony::from_binary(self.payload).map_err(|_| ClientError::DecodeError)
+    }
+
+    /// Returns the raw payload bytes.
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+}
+
+/// Client for issuing commands to a specific workspace.
+///
+/// Manages a Unix socket connection with automatic event queuing.
+/// When waiting for a command response, subscription events are
+/// buffered and can be retrieved via [`Self::next_event`].
+pub struct WorkspaceClient {
+    socket: std::os::unix::net::UnixStream,
+    encoder: Encoder,
+    decoder: DecodingState,
+    buffer: Vec<u8>,
+    workspace_path: std::path::PathBuf,
+    workspace_id: Option<u32>,
+    next_correlation: u16,
+    subscription_events: VecDeque<SubscriptionEvent>,
+    timeout: Duration,
+}
+
+impl WorkspaceClient {
+    /// Connects to the daemon socket and targets the specified workspace.
+    pub fn connect(socket_path: &std::path::Path, workspace_config: &std::path::Path) -> Result<Self, ClientError> {
+        use std::os::unix::net::UnixStream;
+
+        let socket = UnixStream::connect(socket_path)?;
+
+        Ok(Self {
+            socket,
+            encoder: Encoder::new(),
+            decoder: DecodingState::new(),
+            buffer: Vec::with_capacity(4096),
+            workspace_path: workspace_config.to_path_buf(),
+            workspace_id: None,
+            next_correlation: 1,
+            subscription_events: VecDeque::new(),
+            timeout: Duration::from_secs(5),
+        })
+    }
+
+    /// Sets the timeout for send/receive operations.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
+
+    /// Returns the cached workspace ID if available.
+    pub fn workspace_id(&self) -> Option<u32> {
+        self.workspace_id
+    }
+
+    fn next_correlation(&mut self) -> u16 {
+        let id = self.next_correlation;
+        self.next_correlation = if id == u16::MAX { 1 } else { id + 1 };
+        id
+    }
+
+    #[cfg(test)]
+    #[track_caller]
+    pub fn send_unwrap<'s, 'a, R>(&'s mut self, req: &R) -> R::Ack<'s>
+    where
+        R: RpcRequest<'a> + std::fmt::Debug,
+    {
+        let workspace_path = self.workspace_path.clone();
+        match self.send(req) {
+            Ok(value) => value,
+            Err(err) => {
+                panic!("RPC send failed\n  request: {:?}\n  error: {err}\n  workspace: {workspace_path:?}", req)
+            }
+        }
+    }
+
+    /// Sends a request and waits for the typed ack response.
+    ///
+    /// Uses the `RpcRequest` trait to determine message kinds automatically.
+    /// Returns the decoded ack borrowing from the internal buffer.
+    pub fn send<'s, 'a, R>(&'s mut self, req: &R) -> Result<R::Ack<'s>, ClientError>
+    where
+        R: RpcRequest<'a>,
+    {
+        let ack_kind = <R::Ack<'static> as RpcResponse<'static>>::KIND;
+        let payload = self.send_raw(R::KIND, ack_kind, req)?;
+        jsony::from_binary(payload.payload).map_err(|_| ClientError::DecodeError)
+    }
+
+    /// Sends a subscribe request to receive events.
+    ///
+    /// Returns the raw payload - caller must decode it.
+    pub fn subscribe(&mut self, filter: &SubscriptionFilter) -> Result<ReceivedPayload<'_>, ClientError> {
+        self.decoder.compact(&mut self.buffer, 4096);
+
+        let correlation = self.next_correlation();
+        self.encoder.encode_response(RpcMessageKind::Subscribe, correlation, filter);
+        self.write_all()?;
+        self.encoder.clear();
+
+        self.recv_until(RpcMessageKind::SubscribeAck)
+    }
+
+    /// Sends a raw request and waits for the specified ack kind.
+    ///
+    /// Returns the payload borrowing from the internal buffer.
+    /// Decode it before calling other methods on this client.
+    pub fn send_raw<T: ToBinary>(
+        &mut self,
+        kind: RpcMessageKind,
+        ack_kind: RpcMessageKind,
+        req: &T,
+    ) -> Result<ReceivedPayload<'_>, ClientError> {
+        self.decoder.compact(&mut self.buffer, 4096);
+
+        let correlation = self.next_correlation();
+        let ws = if let Some(id) = self.workspace_id {
+            WorkspaceRef::Id(id)
+        } else {
+            WorkspaceRef::Path { config: &self.workspace_path }
+        };
+
+        self.encoder.encode_response_ws(kind, correlation, &ws, req);
+        self.write_all()?;
+        self.encoder.clear();
+
+        self.recv_until(ack_kind)
+    }
+
+    /// Returns the next buffered subscription event, if any.
+    pub fn next_event(&mut self) -> Option<SubscriptionEvent> {
+        self.subscription_events.pop_front()
+    }
+
+    /// Waits for and returns the next subscription event.
+    pub fn recv_event(&mut self) -> Result<SubscriptionEvent, ClientError> {
+        if let Some(event) = self.subscription_events.pop_front() {
+            return Ok(event);
+        }
+        self.recv_event_blocking()
+    }
+
+    /// Waits for a specific job to exit.
+    pub fn wait_for_job_exit(&mut self, job_index: u32) -> Result<JobExitedEvent, ClientError> {
+        loop {
+            let event = self.recv_event()?;
+            if let SubscriptionEvent::JobExited(evt) = event {
+                if evt.job_index == job_index {
+                    return Ok(evt);
+                }
+                self.subscription_events.push_back(SubscriptionEvent::JobExited(evt));
+            } else {
+                self.subscription_events.push_back(event);
+            }
+        }
+    }
+
+    fn write_all(&mut self) -> Result<(), ClientError> {
+        use std::io::Write;
+
+        self.socket.set_write_timeout(Some(self.timeout))?;
+        let data = self.encoder.output();
+        let mut written = 0;
+
+        while written < data.len() {
+            match self.socket.write(&data[written..]) {
+                Ok(0) => return Err(ClientError::ConnectionClosed),
+                Ok(n) => written += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return Err(ClientError::Timeout),
+                Err(e) => return Err(ClientError::Io(e)),
+            }
+        }
+        Ok(())
+    }
+
+    fn read_more(&mut self) -> Result<usize, ClientError> {
+        use std::io::Read;
+
+        self.buffer.reserve(1024);
+        let spare = self.buffer.spare_capacity_mut();
+        let buf = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
+
+        match self.socket.read(buf) {
+            Ok(0) => Err(ClientError::ConnectionClosed),
+            Ok(n) => {
+                unsafe { self.buffer.set_len(self.buffer.len() + n) };
+                Ok(n)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Err(ClientError::Timeout),
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => Err(ClientError::Timeout),
+            Err(e) => Err(ClientError::Io(e)),
+        }
+    }
+
+    /// Non-generic core: reads messages until one matches expected_kind.
+    /// Subscription events are decoded and queued along the way.
+    fn recv_until(&mut self, expected_kind: RpcMessageKind) -> Result<ReceivedPayload<'_>, ClientError> {
+        let deadline = std::time::Instant::now() + self.timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ClientError::Timeout);
+            }
+            self.socket.set_read_timeout(Some(remaining))?;
+
+            match self.try_decode_one(expected_kind)? {
+                TryDecodeResult::Found { correlation, start, end } => {
+                    let payload = &self.buffer[start..end];
+                    return Ok(ReceivedPayload { kind: expected_kind, correlation, payload });
+                }
+                TryDecodeResult::QueuedEvent => continue,
+                TryDecodeResult::NeedMoreData => {
+                    self.read_more()?;
+                }
+            }
+        }
+    }
+
+    fn try_decode_one(&mut self, expected_kind: RpcMessageKind) -> Result<TryDecodeResult, ClientError> {
+        match self.decoder.decode(&self.buffer) {
+            DecodeResult::Message { kind, correlation, payload, .. } => {
+                let start = payload.as_ptr() as usize - self.buffer.as_ptr() as usize;
+                let end = start + payload.len();
+
+                if kind == expected_kind {
+                    return Ok(TryDecodeResult::Found { correlation, start, end });
+                }
+
+                match kind {
+                    RpcMessageKind::JobStatus => {
+                        let evt: JobStatusEvent = jsony::from_binary(payload).map_err(|_| ClientError::DecodeError)?;
+                        self.subscription_events.push_back(SubscriptionEvent::JobStatus(evt));
+                        Ok(TryDecodeResult::QueuedEvent)
+                    }
+                    RpcMessageKind::JobExited => {
+                        let evt: JobExitedEvent = jsony::from_binary(payload).map_err(|_| ClientError::DecodeError)?;
+                        self.subscription_events.push_back(SubscriptionEvent::JobExited(evt));
+                        Ok(TryDecodeResult::QueuedEvent)
+                    }
+                    other => Err(ClientError::UnexpectedResponse(other)),
+                }
+            }
+            DecodeResult::MissingData { .. } => Ok(TryDecodeResult::NeedMoreData),
+            DecodeResult::Empty => {
+                self.buffer.clear();
+                Ok(TryDecodeResult::NeedMoreData)
+            }
+            DecodeResult::Error(e) => Err(ClientError::Protocol(e)),
+        }
+    }
+
+    fn recv_event_blocking(&mut self) -> Result<SubscriptionEvent, ClientError> {
+        self.decoder.compact(&mut self.buffer, 4096);
+        let deadline = std::time::Instant::now() + self.timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(ClientError::Timeout);
+            }
+            self.socket.set_read_timeout(Some(remaining))?;
+
+            match self.decoder.decode(&self.buffer) {
+                DecodeResult::Message { kind, payload, .. } => match kind {
+                    RpcMessageKind::JobStatus => {
+                        let evt: JobStatusEvent = jsony::from_binary(payload).map_err(|_| ClientError::DecodeError)?;
+                        return Ok(SubscriptionEvent::JobStatus(evt));
+                    }
+                    RpcMessageKind::JobExited => {
+                        let evt: JobExitedEvent = jsony::from_binary(payload).map_err(|_| ClientError::DecodeError)?;
+                        return Ok(SubscriptionEvent::JobExited(evt));
+                    }
+                    _ => continue,
+                },
+                DecodeResult::MissingData { .. } | DecodeResult::Empty => {
+                    if matches!(self.decoder.decode(&self.buffer), DecodeResult::Empty) {
+                        self.buffer.clear();
+                    }
+                    self.read_more()?;
+                }
+                DecodeResult::Error(e) => return Err(ClientError::Protocol(e)),
+            }
+        }
+    }
+}
+
+enum TryDecodeResult {
+    Found { correlation: u16, start: usize, end: usize },
+    QueuedEvent,
+    NeedMoreData,
+}
+
 impl Default for Encoder {
     fn default() -> Self {
         Self::new()
@@ -625,7 +986,6 @@ pub enum WorkspaceRef<'a> {
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub struct SpawnTaskRequest<'a> {
-    pub workspace: WorkspaceRef<'a>,
     pub task_name: &'a str,
     pub profile: &'a str,
     pub params: &'a [u8],
@@ -637,15 +997,13 @@ pub struct SpawnTaskRequest<'a> {
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub struct KillTaskRequest<'a> {
-    pub workspace: WorkspaceRef<'a>,
     pub task_name: &'a str,
 }
 
 /// Request to rerun tests.
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
-pub struct RerunTestsRequest<'a> {
-    pub workspace: WorkspaceRef<'a>,
+pub struct RerunTestsRequest {
     pub only_failed: bool,
 }
 
@@ -653,22 +1011,18 @@ pub struct RerunTestsRequest<'a> {
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub struct CallFunctionRequest<'a> {
-    pub workspace: WorkspaceRef<'a>,
     pub function_name: &'a str,
 }
 
 /// Request to attach a TUI client.
-#[derive(Jsony, Debug)]
+#[derive(Jsony, Debug, Default)]
 #[jsony(Binary)]
-pub struct AttachTuiRequest<'a> {
-    pub workspace: WorkspaceRef<'a>,
-}
+pub struct AttachTuiRequest {}
 
 /// Request to attach a run client.
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub struct AttachRunRequest<'a> {
-    pub workspace: WorkspaceRef<'a>,
     pub task_name: &'a str,
     pub params: &'a [u8],
     pub as_test: bool,
@@ -687,7 +1041,6 @@ pub struct TestFilters<'a> {
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub struct AttachTestsRequest<'a> {
-    pub workspace: WorkspaceRef<'a>,
     pub filters: TestFilters<'a>,
 }
 
@@ -728,7 +1081,6 @@ pub struct LogsQuery<'a> {
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub struct AttachLogsRequest<'a> {
-    pub workspace: WorkspaceRef<'a>,
     pub query: LogsQuery<'a>,
 }
 
@@ -740,18 +1092,14 @@ pub struct GetSelfLogsRequest {
 }
 
 /// Request to restart the currently selected task in TUI.
-#[derive(Jsony, Debug)]
+#[derive(Jsony, Debug, Default)]
 #[jsony(Binary)]
-pub struct RestartSelectedRequest<'a> {
-    pub workspace: WorkspaceRef<'a>,
-}
+pub struct RestartSelectedRequest {}
 
 /// Request to get logged Rust panics.
-#[derive(Jsony, Debug)]
+#[derive(Jsony, Debug, Default)]
 #[jsony(Binary)]
-pub struct GetLoggedRustPanicsRequest<'a> {
-    pub workspace: WorkspaceRef<'a>,
-}
+pub struct GetLoggedRustPanicsRequest {}
 
 /// Body of a command response.
 #[derive(Jsony, Debug)]
@@ -771,6 +1119,98 @@ pub enum CommandBody {
 pub struct CommandResponse {
     pub workspace_id: u32,
     pub body: CommandBody,
+}
+
+// RpcResponse implementations
+
+impl RpcResponse<'_> for OpenWorkspaceResponse {
+    const KIND: RpcMessageKind = RpcMessageKind::OpenWorkspaceAck;
+}
+
+impl RpcResponse<'_> for SubscribeAck {
+    const KIND: RpcMessageKind = RpcMessageKind::SubscribeAck;
+}
+
+impl RpcResponse<'_> for RunTaskResponse {
+    const KIND: RpcMessageKind = RpcMessageKind::RunTaskAck;
+}
+
+impl RpcResponse<'_> for CommandResponse {
+    const KIND: RpcMessageKind = RpcMessageKind::CommandAck;
+}
+
+// RpcRequest implementations (legacy)
+
+impl<'a> RpcRequest<'a> for OpenWorkspaceRequest<'a> {
+    const KIND: RpcMessageKind = RpcMessageKind::OpenWorkspace;
+    type Ack<'l> = OpenWorkspaceResponse;
+}
+
+impl RpcRequest<'_> for SubscriptionFilter {
+    const KIND: RpcMessageKind = RpcMessageKind::Subscribe;
+    type Ack<'l> = SubscribeAck;
+}
+
+impl<'a> RpcRequest<'a> for RunTaskRequest<'a> {
+    const KIND: RpcMessageKind = RpcMessageKind::RunTask;
+    type Ack<'l> = RunTaskResponse;
+}
+
+// RpcRequest implementations (new unified protocol)
+
+impl<'a> RpcRequest<'a> for SpawnTaskRequest<'a> {
+    const KIND: RpcMessageKind = RpcMessageKind::SpawnTask;
+    type Ack<'l> = CommandResponse;
+}
+
+impl<'a> RpcRequest<'a> for KillTaskRequest<'a> {
+    const KIND: RpcMessageKind = RpcMessageKind::KillTask;
+    type Ack<'l> = CommandResponse;
+}
+
+impl RpcRequest<'_> for RerunTestsRequest {
+    const KIND: RpcMessageKind = RpcMessageKind::RerunTests;
+    type Ack<'l> = CommandResponse;
+}
+
+impl<'a> RpcRequest<'a> for CallFunctionRequest<'a> {
+    const KIND: RpcMessageKind = RpcMessageKind::CallFunction;
+    type Ack<'l> = CommandResponse;
+}
+
+impl RpcRequest<'_> for AttachTuiRequest {
+    const KIND: RpcMessageKind = RpcMessageKind::AttachTui;
+    type Ack<'l> = CommandResponse;
+}
+
+impl<'a> RpcRequest<'a> for AttachRunRequest<'a> {
+    const KIND: RpcMessageKind = RpcMessageKind::AttachRun;
+    type Ack<'l> = CommandResponse;
+}
+
+impl<'a> RpcRequest<'a> for AttachTestsRequest<'a> {
+    const KIND: RpcMessageKind = RpcMessageKind::AttachTests;
+    type Ack<'l> = CommandResponse;
+}
+
+impl<'a> RpcRequest<'a> for AttachLogsRequest<'a> {
+    const KIND: RpcMessageKind = RpcMessageKind::AttachLogs;
+    type Ack<'l> = CommandResponse;
+}
+
+impl RpcRequest<'_> for GetSelfLogsRequest {
+    const KIND: RpcMessageKind = RpcMessageKind::GetSelfLogs;
+    type Ack<'l> = CommandResponse;
+}
+
+impl RpcRequest<'_> for RestartSelectedRequest {
+    const KIND: RpcMessageKind = RpcMessageKind::RestartSelected;
+    type Ack<'l> = CommandResponse;
+}
+
+impl RpcRequest<'_> for GetLoggedRustPanicsRequest {
+    const KIND: RpcMessageKind = RpcMessageKind::GetLoggedRustPanics;
+    type Ack<'l> = CommandResponse;
 }
 
 /// Client-side protocol with encoder and decoder state.

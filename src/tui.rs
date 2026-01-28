@@ -9,10 +9,10 @@ use extui::{Color, DoubleBuffer, HAlign, Rect, Style, TerminalFlags, vt};
 use jsony_value::ValueMap;
 
 use crate::config::{FunctionDefAction, TaskKind};
+use crate::event_loop::{Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_TESTS};
 use crate::function::{FunctionAction, SetFunctionAction};
 use crate::keybinds::{BindingEntry, Command, InputEvent, Keybinds, Mode};
 use crate::log_storage::{BaseTaskSet, LogFilter};
-use crate::process_manager::{Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_TESTS};
 use crate::tui::log_search::{LogSearchState, SearchAction};
 use crate::tui::log_stack::LogStack;
 use crate::tui::select_search::SelectSearch;
@@ -1279,8 +1279,8 @@ fn attempt_config_reload(tui: &mut TuiState, workspace: &Workspace, keybinds: &m
 
     match crate::user_config::reload_user_config() {
         Ok(config) => {
-            crate::process_manager::update_global_keybinds(config.keybinds);
-            *keybinds = crate::process_manager::global_keybinds();
+            crate::event_loop::update_global_keybinds(config.keybinds);
+            *keybinds = crate::event_loop::global_keybinds();
         }
         Err(e) => {
             errors.push(e);

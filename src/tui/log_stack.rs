@@ -5,7 +5,7 @@ use crate::{
     keybinds::Keybinds,
     line_width::display_width,
     log_storage::{BaseTaskSet, LogFilter, LogId},
-    process_manager::user_config_loaded,
+    event_loop::user_config_loaded,
     scroll_view::{LogHighlight, LogStyle, LogWidget, ScrollState},
     tui::task_tree::{MetaGroupKind, SelectionState},
     welcome_message::render_welcome_message,

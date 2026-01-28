@@ -3,14 +3,13 @@
 use crate::harness;
 
 use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::rpc::{
-    CommandBody, CommandResponse, DecodeResult, DecodingState, Encoder, ExitCause, JobExitedEvent, JobStatusKind,
-    KillTaskRequest, RpcMessageKind, SpawnTaskRequest, SubscribeAck, SubscriptionFilter, WorkspaceRef,
+    CommandBody, ExitCause, JobStatusKind, KillTaskRequest, SpawnTaskRequest, SubscribeAck, SubscriptionFilter,
+    WorkspaceClient,
 };
 use harness::{RpcEvent, RpcSubscriber, TestHarness, cargo_bin_path};
 
@@ -2029,147 +2028,6 @@ sh = "echo 'service started'; touch {marker}; while true; do sleep 1; done"
     );
 }
 
-/// RPC response types that can be received.
-#[derive(Debug)]
-#[allow(dead_code)]
-enum RpcResponse {
-    Command(CommandResponse),
-    Subscribe(SubscribeAck),
-    JobExited { job_index: u32 },
-    Other(RpcMessageKind),
-}
-
-/// Helper to send an RPC workspace command (workspace in header) and receive response.
-fn rpc_send_recv_ws<T: jsony::ToBinary>(
-    socket: &mut UnixStream,
-    encoder: &mut Encoder,
-    decoder: &mut DecodingState,
-    buffer: &mut Vec<u8>,
-    kind: RpcMessageKind,
-    correlation: u16,
-    workspace: &WorkspaceRef<'_>,
-    payload: &T,
-) -> CommandResponse {
-    encoder.encode_response_ws(kind, correlation, workspace, payload);
-    socket.write_all(encoder.output()).expect("Failed to send RPC command");
-    encoder.clear();
-
-    loop {
-        match rpc_recv_any(socket, decoder, buffer, Duration::from_secs(5)) {
-            RpcResponse::Command(resp) => return resp,
-            _ => continue, // Skip events while waiting for command response
-        }
-    }
-}
-
-/// Helper to send Subscribe and wait for SubscribeAck.
-fn rpc_subscribe(
-    socket: &mut UnixStream,
-    encoder: &mut Encoder,
-    decoder: &mut DecodingState,
-    buffer: &mut Vec<u8>,
-    filter: &SubscriptionFilter,
-    correlation: u16,
-) {
-    encoder.encode_response(RpcMessageKind::Subscribe, correlation, filter);
-    socket.write_all(encoder.output()).expect("Failed to send Subscribe");
-    encoder.clear();
-
-    loop {
-        match rpc_recv_any(socket, decoder, buffer, Duration::from_secs(5)) {
-            RpcResponse::Subscribe(ack) => {
-                assert!(ack.success, "Subscribe should succeed");
-                return;
-            }
-            _ => continue,
-        }
-    }
-}
-
-/// Helper to wait for a specific job to exit.
-fn rpc_wait_for_job_exit(
-    socket: &mut UnixStream,
-    decoder: &mut DecodingState,
-    buffer: &mut Vec<u8>,
-    expected_job_index: u32,
-    timeout: Duration,
-) {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        match rpc_recv_any(socket, decoder, buffer, Duration::from_millis(100)) {
-            RpcResponse::JobExited { job_index } if job_index == expected_job_index => return,
-            _ => continue,
-        }
-    }
-    panic!("Timeout waiting for job {} to exit", expected_job_index);
-}
-
-/// Helper to receive any RPC message.
-fn rpc_recv_any(
-    socket: &mut UnixStream,
-    decoder: &mut DecodingState,
-    buffer: &mut Vec<u8>,
-    timeout: Duration,
-) -> RpcResponse {
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed() > timeout {
-            panic!("Timeout waiting for RPC message");
-        }
-
-        let spare = buffer.spare_capacity_mut();
-        if spare.len() < 1024 {
-            buffer.reserve(1024);
-        }
-        let spare = buffer.spare_capacity_mut();
-        let n = match socket.read(unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) })
-        {
-            Ok(0) => panic!("Connection closed unexpectedly"),
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
-            Err(e) => panic!("Read error: {}", e),
-        };
-        unsafe { buffer.set_len(buffer.len() + n) };
-
-        loop {
-            let result = match decoder.decode(buffer) {
-                DecodeResult::Message { kind, payload, .. } => {
-                    let response = match kind {
-                        RpcMessageKind::CommandAck => {
-                            let resp: CommandResponse = jsony::from_binary(payload).expect("Invalid CommandResponse");
-                            RpcResponse::Command(resp)
-                        }
-                        RpcMessageKind::SubscribeAck => {
-                            let resp: SubscribeAck = jsony::from_binary(payload).expect("Invalid SubscribeAck");
-                            RpcResponse::Subscribe(resp)
-                        }
-                        RpcMessageKind::JobExited => {
-                            let evt: JobExitedEvent = jsony::from_binary(payload).expect("Invalid JobExitedEvent");
-                            RpcResponse::JobExited { job_index: evt.job_index }
-                        }
-                        other => RpcResponse::Other(other),
-                    };
-                    Some(response)
-                }
-                DecodeResult::MissingData { .. } => None,
-                DecodeResult::Empty => {
-                    buffer.clear();
-                    None
-                }
-                DecodeResult::Error(e) => panic!("Decode error: {:?}", e),
-            };
-
-            if let Some(response) = result {
-                decoder.compact(buffer, 4096);
-                return response;
-            } else {
-                break;
-            }
-        }
-    }
-}
-
 #[test]
 fn rpc_multi_command_single_stream() {
     let mut harness = TestHarness::new("rpc_multi_cmd");
@@ -2194,84 +2052,39 @@ while true; do sleep 1; done
     assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
 
     let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("Failed to connect");
 
-    // Connect directly without AttachRpc - use direct RPC commands
-    let mut socket = UnixStream::connect(&harness.socket_path).expect("Failed to connect");
-    socket.set_read_timeout(Some(Duration::from_millis(100))).ok();
-    socket.set_nonblocking(true).ok();
-
-    let mut encoder = Encoder::new();
-    let mut decoder = DecodingState::default();
-    let mut buffer = Vec::with_capacity(4096);
-    let mut correlation: u16 = 1;
-
-    // Command 1: SpawnTask (starts the action) - with one_shot=false to keep connection open
-    let workspace = WorkspaceRef::Path { config: &config_path };
-    let req1 = SpawnTaskRequest {
-        workspace,
+    // Command 1: SpawnTask (starts the action)
+    let resp1 = client.send_unwrap(&SpawnTaskRequest {
         task_name: "my_action",
         profile: "",
         params: &[],
         as_test: false,
         cached: false,
-    };
-    let resp1 = rpc_send_recv_ws(
-        &mut socket,
-        &mut encoder,
-        &mut decoder,
-        &mut buffer,
-        RpcMessageKind::SpawnTask,
-        correlation,
-        &workspace,
-        &req1,
-    );
-    correlation += 1;
+    });
     assert!(matches!(resp1.body, CommandBody::Empty), "SpawnTask should succeed with Empty, got {:?}", resp1.body);
 
     assert!(harness.wait_for_file(&action_marker, Duration::from_secs(3)), "Action should complete");
 
     // Subscribe to job exit events so we can wait for service termination
     let filter = SubscriptionFilter { job_status: false, job_exits: true };
-    rpc_subscribe(&mut socket, &mut encoder, &mut decoder, &mut buffer, &filter, correlation);
-    correlation += 1;
+    let sub_ack: SubscribeAck = client.subscribe(&filter).expect("subscribe failed").decode().expect("decode failed");
+    assert!(sub_ack.success, "Subscribe should succeed");
 
-    // Command 2: SpawnTask (starts the service) - connection still open
-    let req2 = SpawnTaskRequest {
-        workspace,
+    // Command 2: SpawnTask (starts the service)
+    let resp2 = client.send_unwrap(&SpawnTaskRequest {
         task_name: "my_service",
         profile: "",
         params: &[],
         as_test: false,
         cached: false,
-    };
-    let resp2 = rpc_send_recv_ws(
-        &mut socket,
-        &mut encoder,
-        &mut decoder,
-        &mut buffer,
-        RpcMessageKind::SpawnTask,
-        correlation,
-        &workspace,
-        &req2,
-    );
-    correlation += 1;
+    });
     assert!(matches!(resp2.body, CommandBody::Empty), "SpawnTask for service should succeed, got {:?}", resp2.body);
 
     assert!(harness.wait_for_file(&service_marker, Duration::from_secs(3)), "Service should start");
 
     // Command 3: KillTask (kills the service)
-    let req3 = KillTaskRequest { workspace, task_name: "my_service" };
-    let resp3 = rpc_send_recv_ws(
-        &mut socket,
-        &mut encoder,
-        &mut decoder,
-        &mut buffer,
-        RpcMessageKind::KillTask,
-        correlation,
-        &workspace,
-        &req3,
-    );
-    correlation += 1;
+    let resp3 = client.send_unwrap(&KillTaskRequest { task_name: "my_service" });
     assert!(
         matches!(resp3.body, CommandBody::Message(ref msg) if msg.contains("terminated")),
         "KillTask should succeed with terminated message, got {:?}",
@@ -2279,21 +2092,10 @@ while true; do sleep 1; done
     );
 
     // Wait for JobExited event (job_index 1 is the service since action was job 0)
-    rpc_wait_for_job_exit(&mut socket, &mut decoder, &mut buffer, 1, Duration::from_secs(5));
+    client.wait_for_job_exit(1).expect("wait_for_job_exit failed");
 
     // Command 4: KillTask again (should say already finished)
-    let req4 = KillTaskRequest { workspace, task_name: "my_service" };
-    let resp4 = rpc_send_recv_ws(
-        &mut socket,
-        &mut encoder,
-        &mut decoder,
-        &mut buffer,
-        RpcMessageKind::KillTask,
-        correlation,
-        &workspace,
-        &req4,
-    );
-    correlation += 1;
+    let resp4 = client.send_unwrap(&KillTaskRequest { task_name: "my_service" });
     assert!(
         matches!(resp4.body, CommandBody::Message(ref msg) if msg.contains("already finished")),
         "KillTask on dead service should return 'already finished', got {:?}",
@@ -2301,25 +2103,13 @@ while true; do sleep 1; done
     );
 
     // Command 5: SpawnTask on nonexistent task (should error)
-    let req5 = SpawnTaskRequest {
-        workspace,
+    let resp5 = client.send_unwrap(&SpawnTaskRequest {
         task_name: "nonexistent_task",
         profile: "",
         params: &[],
         as_test: false,
         cached: false,
-    };
-    let resp5 = rpc_send_recv_ws(
-        &mut socket,
-        &mut encoder,
-        &mut decoder,
-        &mut buffer,
-        RpcMessageKind::SpawnTask,
-        correlation,
-        &workspace,
-        &req5,
-    );
-    let _ = correlation;
+    });
     assert!(
         matches!(resp5.body, CommandBody::Error(ref err) if err.contains("not found")),
         "SpawnTask on nonexistent should error, got {:?}",
@@ -2453,37 +2243,16 @@ cache.key = [{{ modified = "{trigger}" }}]
     assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
 
     let config_path = harness.temp_dir.join("devsm.toml");
-
-    let mut socket = UnixStream::connect(&harness.socket_path).expect("Failed to connect");
-    socket.set_read_timeout(Some(Duration::from_millis(100))).ok();
-    socket.set_nonblocking(true).ok();
-
-    let mut encoder = Encoder::new();
-    let mut decoder = DecodingState::default();
-    let mut buffer = Vec::with_capacity(4096);
-    let mut correlation: u16 = 1;
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("Failed to connect");
 
     // First restart with cached=false: should run the action
-    let workspace = WorkspaceRef::Path { config: &config_path };
-    let req1 = SpawnTaskRequest {
-        workspace,
+    let resp1 = client.send_unwrap(&SpawnTaskRequest {
         task_name: "cached_action",
         profile: "",
         params: &[],
         as_test: false,
         cached: false,
-    };
-    let resp1 = rpc_send_recv_ws(
-        &mut socket,
-        &mut encoder,
-        &mut decoder,
-        &mut buffer,
-        RpcMessageKind::SpawnTask,
-        correlation,
-        &workspace,
-        &req1,
-    );
-    correlation += 1;
+    });
     assert!(matches!(resp1.body, CommandBody::Empty), "First restart should succeed with Empty, got {:?}", resp1.body);
 
     // Wait for action to complete
@@ -2491,25 +2260,13 @@ cache.key = [{{ modified = "{trigger}" }}]
     assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "Action should have run once");
 
     // Second restart with cached=true: should return cache hit message
-    let req2 = SpawnTaskRequest {
-        workspace,
+    let resp2 = client.send_unwrap(&SpawnTaskRequest {
         task_name: "cached_action",
         profile: "",
         params: &[],
         as_test: false,
         cached: true,
-    };
-    let resp2 = rpc_send_recv_ws(
-        &mut socket,
-        &mut encoder,
-        &mut decoder,
-        &mut buffer,
-        RpcMessageKind::SpawnTask,
-        correlation,
-        &workspace,
-        &req2,
-    );
-    correlation += 1;
+    });
     assert!(
         matches!(resp2.body, CommandBody::Message(ref msg) if msg.contains("cache hit")),
         "Second restart with cached=true should return cache hit message, got {:?}",
@@ -2522,25 +2279,13 @@ cache.key = [{{ modified = "{trigger}" }}]
     fs::write(&trigger, "modified").unwrap();
 
     // Third restart with cached=true: cache invalidated, should run
-    let req3 = SpawnTaskRequest {
-        workspace,
+    let resp3 = client.send_unwrap(&SpawnTaskRequest {
         task_name: "cached_action",
         profile: "",
         params: &[],
         as_test: false,
         cached: true,
-    };
-    let resp3 = rpc_send_recv_ws(
-        &mut socket,
-        &mut encoder,
-        &mut decoder,
-        &mut buffer,
-        RpcMessageKind::SpawnTask,
-        correlation,
-        &workspace,
-        &req3,
-    );
-    let _ = correlation;
+    });
     assert!(
         matches!(resp3.body, CommandBody::Empty),
         "Third restart should succeed (cache invalidated), got {:?}",
