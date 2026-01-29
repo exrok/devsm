@@ -42,7 +42,7 @@ fn compute_cache_key_standalone(inputs: &[CacheKeyInfoItem], profile: &str, para
             CacheKeyInfoItem::Modified { paths, ignore } => {
                 hasher.update(b"modified:");
                 for path in paths {
-                    hasher.hash_path(path, &ignore);
+                    hasher.hash_path(path, ignore);
                 }
             }
             CacheKeyInfoItem::ProfileChanged { task_name, counter } => {
@@ -1463,7 +1463,7 @@ impl WorkspaceState {
     ) -> ServiceCompatibility {
         let spawner = &self.base_tasks[base_task.idx()];
 
-        for &ji in spawner.jobs.running() {
+        if let Some(&ji) = spawner.jobs.running().iter().next() {
             let job = &self.jobs[ji.idx()];
             if service_matches_require(job, requested_profile, requested_params) {
                 return ServiceCompatibility::Compatible(ji);
@@ -1506,30 +1506,30 @@ impl WorkspaceState {
                 TaskKind::Action => {
                     let mut resolved = None;
 
-                    if let Some(cache_config) = dep_config.cache.as_ref() {
-                        if !cache_config.never {
-                            let expected_cache_key =
-                                self.compute_cache_key_with_require(cache_config.key, &profile, &params);
-                            let spawner = &self.base_tasks[base_task.idx()];
+                    if let Some(cache_config) = dep_config.cache.as_ref()
+                        && !cache_config.never
+                    {
+                        let expected_cache_key =
+                            self.compute_cache_key_with_require(cache_config.key, &profile, &params);
+                        let spawner = &self.base_tasks[base_task.idx()];
 
-                            for ji in spawner.jobs.all().iter().rev() {
-                                let job = &self.jobs[ji.idx()];
-                                if matches!(job.process_status, JobStatus::Cancelled) {
-                                    continue;
+                        for ji in spawner.jobs.all().iter().rev() {
+                            let job = &self.jobs[ji.idx()];
+                            if matches!(job.process_status, JobStatus::Cancelled) {
+                                continue;
+                            }
+                            if job.process_status.is_successful_completion() {
+                                if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
+                                    resolved = Some(ResolvedRequirement::Cached);
+                                    break;
                                 }
-                                if job.process_status.is_successful_completion() {
-                                    if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
-                                        resolved = Some(ResolvedRequirement::Cached);
-                                        break;
-                                    }
-                                    continue;
-                                }
-                                if job.process_status.is_pending_completion() {
-                                    if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
-                                        resolved = Some(ResolvedRequirement::Pending(*ji));
-                                        break;
-                                    }
-                                }
+                                continue;
+                            }
+                            if job.process_status.is_pending_completion()
+                                && (expected_cache_key.is_empty() || job.cache_key == expected_cache_key)
+                            {
+                                resolved = Some(ResolvedRequirement::Pending(*ji));
+                                break;
                             }
                         }
                     }
@@ -1676,7 +1676,7 @@ impl Workspace {
                 let (pwd, cmd) = match job {
                     Some(job) => {
                         let config = job.task.config();
-                        let pwd = state.config.current.base_path.join(&config.pwd).to_string_lossy().to_string();
+                        let pwd = state.config.current.base_path.join(config.pwd).to_string_lossy().to_string();
                         let cmd = match &config.command {
                             Command::Cmd(args) => args.iter().map(|s| s.to_string()).collect(),
                             Command::Sh(sh) => vec!["sh".to_string(), "-c".to_string(), sh.to_string()],
@@ -1828,7 +1828,7 @@ impl Workspace {
                     .map(|input| match input {
                         CacheKeyInput::Modified { paths, ignore } => CacheKeyInfoItem::Modified {
                             paths: paths.iter().map(|p| base_path.join(p)).collect(),
-                            ignore: &ignore,
+                            ignore,
                         },
                         CacheKeyInput::ProfileChanged(task_name) => {
                             let counter = state
@@ -2420,10 +2420,8 @@ impl Workspace {
                 let Some(job) = state.jobs.get(job_index.idx()) else { continue };
                 let is_failed = matches!(&job.process_status, JobStatus::Exited { status, .. } if *status != 0)
                     || matches!(&job.process_status, JobStatus::Cancelled);
-                if is_failed {
-                    if let Some(&bti) = test_group.base_tasks.get(i) {
-                        failed.push((bti, Some(job_index)));
-                    }
+                if is_failed && let Some(&bti) = test_group.base_tasks.get(i) {
+                    failed.push((bti, Some(job_index)));
                 }
             }
             if failed.is_empty() {

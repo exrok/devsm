@@ -50,7 +50,8 @@ impl<'a> Iterator for SegmentIterator<'a> {
         if first_byte == b'\x1b' {
             if bytes.get(1) == Some(&b'[') {
                 // CSI sequence: \x1b[...m (SGR and other CSI commands)
-                let segment_len = bytes.iter().skip(2).position(|&b| b == b'm').map(|pos| pos + 3).unwrap_or(bytes.len());
+                let segment_len =
+                    bytes.iter().skip(2).position(|&b| b == b'm').map(|pos| pos + 3).unwrap_or(bytes.len());
                 self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
                 Some(Segment::AnsiEscapes(unsafe { std::str::from_utf8_unchecked(&bytes[2..segment_len - 1]) }))
             } else if bytes.get(1) == Some(&b']') {
@@ -111,7 +112,7 @@ pub fn strip_ansi_and_contains(text: &str, needle: &str) -> bool {
             Segment::AnsiEscapes(_) => {}
         }
     }
-    std::str::from_utf8(&buffer).map_or(false, |s| s.contains(needle))
+    std::str::from_utf8(&buffer).is_ok_and(|s| s.contains(needle))
 }
 
 /// Strips ANSI escape codes from text and appends lowercase content to buffer.

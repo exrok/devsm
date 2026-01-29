@@ -177,17 +177,15 @@ pub fn init_client_logging() -> LoggerGuard {
                 let mut fmt_buf = Vec::new();
                 let mut parents = kvlog::collector::ParentSpanSuffixCache::new_boxed();
                 for entry in entries {
-                    for log in kvlog::encoding::decode(&entry) {
-                        if let Ok((ts, level, span, fields)) = log {
-                            kvlog::collector::format_statement_with_colors(
-                                &mut fmt_buf,
-                                &mut parents,
-                                ts,
-                                level,
-                                span,
-                                fields,
-                            );
-                        }
+                    for (ts, level, span, fields) in kvlog::encoding::decode(&entry).flatten() {
+                        kvlog::collector::format_statement_with_colors(
+                            &mut fmt_buf,
+                            &mut parents,
+                            ts,
+                            level,
+                            span,
+                            fields,
+                        );
                     }
                 }
                 eprint!("{}", String::from_utf8_lossy(&fmt_buf));
@@ -252,7 +250,7 @@ mod tests {
     use super::*;
 
     fn make_entry(payload: &[u8]) -> Vec<u8> {
-        let header = (kvlog::encoding::MAGIC_BYTE as u32) << 24 | (payload.len() as u32);
+        let header = (kvlog::encoding::MAGIC_BYTE) << 24 | (payload.len() as u32);
         let mut entry = header.to_le_bytes().to_vec();
         entry.extend_from_slice(payload);
         entry

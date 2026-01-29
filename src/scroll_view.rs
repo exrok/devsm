@@ -417,7 +417,7 @@ fn render_text_with_highlight(
                     let hl_end_in_seg = (match_end - seg_start).min(s.len());
 
                     if hl_start_in_seg > 0 {
-                        buf.extend_from_slice(s[..hl_start_in_seg].as_bytes());
+                        buf.extend_from_slice(&s.as_bytes()[..hl_start_in_seg]);
                     }
                     extui::splat!(
                         buf,
@@ -428,7 +428,7 @@ fn render_text_with_highlight(
                     );
 
                     if hl_end_in_seg < s.len() {
-                        buf.extend_from_slice(s[hl_end_in_seg..].as_bytes());
+                        buf.extend_from_slice(&s.as_bytes()[hl_end_in_seg..]);
                     }
                 } else {
                     buf.extend_from_slice(s.as_bytes());
@@ -543,11 +543,11 @@ impl LogWidget {
     }
 
     pub fn check_resize_revert_to_tail(&mut self, view: &LogView, style: &LogStyle, rect: Rect) -> bool {
-        if let LogWidget::Scroll(_) = self {
-            if !self.can_scroll(view, style, rect) {
-                *self = LogWidget::Tail(tail_widget::LogTailWidget::default());
-                return true;
-            }
+        if let LogWidget::Scroll(_) = self
+            && !self.can_scroll(view, style, rect)
+        {
+            *self = LogWidget::Tail(tail_widget::LogTailWidget::default());
+            return true;
         }
         false
     }
@@ -762,11 +762,11 @@ impl LogWidget {
     }
 
     pub fn scroll_up(&mut self, amount: u32, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
-        if let LogWidget::Tail(_) = self {
-            if !self.can_scroll(view, style, rect) {
-                self.render(buf, rect, view, style);
-                return;
-            }
+        if let LogWidget::Tail(_) = self
+            && !self.can_scroll(view, style, rect)
+        {
+            self.render(buf, rect, view, style);
+            return;
         }
         let scroll_view = self.scrollify(view, style);
         let logs = view.logs.indexer();
@@ -879,10 +879,10 @@ impl LogWidget {
                             scroll_view.top_index -= 1;
                             let entry = logs[scroll_view.ids[scroll_view.top_index]];
                             let h = get_entry_height(&entry, style, rect.w as u32);
-                            if h as u32 <= lines_to_fill {
-                                lines_to_fill -= h as u32;
+                            if h <= lines_to_fill {
+                                lines_to_fill -= h;
                             } else {
-                                scroll_view.scroll_shift_up = (h as u32 - lines_to_fill) as u16;
+                                scroll_view.scroll_shift_up = (h - lines_to_fill) as u16;
                                 lines_to_fill = 0;
                             }
                         } else {

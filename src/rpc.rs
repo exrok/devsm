@@ -105,7 +105,7 @@ impl Head {
     }
 
     /// Serializes the header to raw bytes.
-    pub fn to_bytes(&self) -> [u8; HEAD_SIZE] {
+    pub fn as_bytes(&self) -> [u8; HEAD_SIZE] {
         let mut buf = [0u8; HEAD_SIZE];
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
         buf[4..6].copy_from_slice(&self.kind.to_le_bytes());
@@ -420,13 +420,13 @@ impl Encoder {
     /// Encodes a message with no payload.
     pub fn encode_empty(&mut self, kind: RpcMessageKind, correlation: u16) {
         let head = Head { magic: MAGIC, kind: kind as u16, one_shot: false, correlation, ws_len: 0, len: 0 };
-        self.buf.extend_from_slice(&head.to_bytes());
+        self.buf.extend_from_slice(&head.as_bytes());
     }
 
     /// Encodes a one-shot message with no payload.
     pub fn encode_empty_one_shot(&mut self, kind: RpcMessageKind, correlation: u16) {
         let head = Head { magic: MAGIC, kind: kind as u16, one_shot: true, correlation, ws_len: 0, len: 0 };
-        self.buf.extend_from_slice(&head.to_bytes());
+        self.buf.extend_from_slice(&head.as_bytes());
     }
 
     fn encode_with_correlation<T: jsony::ToBinary>(&mut self, kind: RpcMessageKind, correlation: u16, payload: &T) {
@@ -487,7 +487,7 @@ impl Encoder {
             ws_len: ws_len as u16,
             len: payload_len as u32,
         };
-        self.buf[header_start..header_start + HEAD_SIZE].copy_from_slice(&head.to_bytes());
+        self.buf[header_start..header_start + HEAD_SIZE].copy_from_slice(&head.as_bytes());
     }
 
     fn encode_internal<T: jsony::ToBinary>(
@@ -506,7 +506,7 @@ impl Encoder {
         let payload_len = self.buf.len() - payload_start;
 
         let head = Head { magic: MAGIC, kind: kind as u16, one_shot, correlation, ws_len, len: payload_len as u32 };
-        self.buf[header_start..header_start + HEAD_SIZE].copy_from_slice(&head.to_bytes());
+        self.buf[header_start..header_start + HEAD_SIZE].copy_from_slice(&head.as_bytes());
     }
 }
 
@@ -1461,7 +1461,7 @@ mod tests {
             ws_len: 5,
             len: 100,
         };
-        let bytes = head.to_bytes();
+        let bytes = head.as_bytes();
         let parsed = Head::from_bytes(&bytes).unwrap();
         assert_eq!(head, parsed);
     }
@@ -1476,7 +1476,7 @@ mod tests {
             ws_len: 0,
             len: 0,
         };
-        let bytes = head.to_bytes();
+        let bytes = head.as_bytes();
         let parsed = Head::from_bytes(&bytes).unwrap();
         assert!(parsed.one_shot);
         assert_eq!(parsed.correlation, 123);

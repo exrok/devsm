@@ -496,7 +496,7 @@ fn write_color_summary(buf: &mut Vec<u8>, state: &TuiState, workspace: &Workspac
     if !failed.is_empty() {
         splat!(buf, ", ", Color(1).as_fg(), failed.len(), " failed", vt::CLEAR_STYLE);
     }
-    write!(buf, " ({:.1}s)\n", elapsed.as_secs_f64()).ok();
+    writeln!(buf, " ({:.1}s)", elapsed.as_secs_f64()).ok();
 
     for test in &failed {
         splat!(buf, "\n", Color(1).as_fg(), "FAIL ", test.name, vt::CLEAR_STYLE, "\n");
@@ -528,7 +528,7 @@ fn write_cancelled_summary(buf: &mut Vec<u8>, state: &TuiState) {
     let pending = state.tests.iter().filter(|t| t.status == TestJobStatus::Pending).count();
 
     splat!(buf, b'\n', Color(3).as_fg(), "Tests cancelled.", vt::CLEAR_STYLE);
-    write!(buf, " ({:.1}s)\n", elapsed.as_secs_f64()).ok();
+    writeln!(buf, " ({:.1}s)", elapsed.as_secs_f64()).ok();
     buf.extend_from_slice(b"  ");
     if passed > 0 {
         splat!(buf, Color(2).as_fg(), passed, " passed", vt::CLEAR_STYLE);
@@ -658,7 +658,7 @@ fn update_test_statuses(
 
 fn format_test_name(test_job: &TestJob, base_tasks: &[BaseTask]) -> String {
     let base_task = &base_tasks[test_job.base_task_index.idx()];
-    return base_task.name.to_string();
+    base_task.name.to_string()
 }
 
 fn print_summary(buf: &mut Vec<u8>, test_run: &TestRun, _base_tasks: &[BaseTask]) {

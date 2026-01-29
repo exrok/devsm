@@ -201,12 +201,8 @@ fn parse_spawn<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
 
     while let Some(component) = parser.next() {
         match component {
-            Component::Long(long) if long == "as-test" => {
-                as_test = true;
-            }
-            Component::Long(long) if long == "cached" => {
-                cached = true;
-            }
+            Component::Long("as-test") => as_test = true,
+            Component::Long("cached") => cached = true,
             Component::Long(key) => {
                 let Some(val) = parser.next_value() else {
                     bail!("Flag --{} requires a value (use --{}=value)", key, key);
@@ -253,7 +249,7 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
 
     while let Some(component) = parser.next() {
         match component {
-            Component::Long(long) if long == "as-test" => {
+            Component::Long("as-test") => {
                 as_test = true;
             }
             Component::Long(key) => {
@@ -361,10 +357,10 @@ fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<
 fn parse_rerun_tests<'a>(parser: &mut ArgParser<'a>) -> Command<'a> {
     let mut only_failed = false;
     for component in parser.by_ref() {
-        if let Component::Long(long) = component {
-            if long == "only-failed" {
-                only_failed = true;
-            }
+        if let Component::Long(long) = component
+            && long == "only-failed"
+        {
+            only_failed = true;
         }
     }
     Command::RerunTests { only_failed }
@@ -537,7 +533,9 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
             break 'command Command::Tui;
         };
         match arg {
-            Component::Flags(flags) => {
+            Component::Flags(flags) =>
+            {
+                #[allow(clippy::never_loop)]
                 for flag in flags.chars() {
                     match flag {
                         'h' => break 'command Command::Help,
@@ -664,9 +662,9 @@ mod tests {
         let ValueRef::Number(n) = v.as_ref() else { panic!() };
         assert_eq!(n.as_i64(), Some(-42));
 
-        let v = parse_flag_value("3.14");
+        let v = parse_flag_value("3.143");
         let ValueRef::Number(n) = v.as_ref() else { panic!() };
-        assert_eq!(n.as_f64(), Some(3.14));
+        assert_eq!(n.as_f64(), Some(3.143));
 
         let v = parse_flag_value("true");
         let ValueRef::Boolean(b) = v.as_ref() else { panic!() };

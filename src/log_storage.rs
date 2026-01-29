@@ -40,7 +40,6 @@ impl Default for BaseTaskSet {
 }
 
 #[derive(Clone)]
-#[allow(clippy::large_enum_variant)]
 pub enum LogFilter {
     All,
     IsGroup(LogGroup),
@@ -562,11 +561,11 @@ mod tests {
 
         let lines = collect_lines(&reader);
         assert_eq!(lines.len(), 5);
-        for i in 0..5 {
-            assert_eq!(lines[i].0, LogId(i));
-            assert_eq!(lines[i].1, LogGroup(1));
-            assert_eq!(lines[i].2, format!("Line {}", i));
-            assert_eq!(lines[i].3, 10);
+        for (i, line) in lines.iter().enumerate() {
+            assert_eq!(line.0, LogId(i));
+            assert_eq!(line.1, LogGroup(1));
+            assert_eq!(line.2, format!("Line {}", i));
+            assert_eq!(line.3, 10);
         }
     }
 

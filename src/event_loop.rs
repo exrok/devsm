@@ -188,7 +188,7 @@ pub(crate) struct EventLoop {
 pub(crate) enum ReadResult {
     Done,
     More,
-    EOF,
+    Eof,
     WouldBlock,
     OtherError(std::io::ErrorKind),
 }
@@ -231,7 +231,7 @@ pub(crate) fn try_read(fd: RawFd, buffer: &mut Vec<u8>) -> ReadResult {
             }
             return ReadResult::OtherError(err.kind());
         } else if result == 0 {
-            return ReadResult::EOF;
+            return ReadResult::Eof;
         } else {
             unsafe {
                 buffer.set_len(buffer.len() + result as usize);
@@ -270,7 +270,7 @@ impl EventLoop {
             match try_read(fd, &mut buffer.data) {
                 ReadResult::Done | ReadResult::WouldBlock => break,
                 ReadResult::More => continue,
-                ReadResult::EOF => {
+                ReadResult::Eof => {
                     if let Err(err) = self.state.poll.registry().deregister(&mut SourceFd(&fd)) {
                         kvlog::error!("Failed to unregister fd", ?err, ?pipe, job_index = process.job_index);
                     }
@@ -312,14 +312,14 @@ impl EventLoop {
                     workspace.line_writer.push_line(text, width as u32, process.log_group, process.style);
                 }
 
-                if let Some(ref checker) = process.ready_checker {
-                    if crate::line_width::strip_ansi_and_contains(text, &checker.needle) {
-                        if checker.timeout_at.is_some() {
-                            self.state.timed_ready_count -= 1;
-                        }
-                        ready_matched = true;
-                        process.ready_checker = None;
+                if let Some(ref checker) = process.ready_checker
+                    && crate::line_width::strip_ansi_and_contains(text, &checker.needle)
+                {
+                    if checker.timeout_at.is_some() {
+                        self.state.timed_ready_count -= 1;
                     }
+                    ready_matched = true;
+                    process.ready_checker = None;
                 }
 
                 if let Some(ref mut tracker) = process.timeout_tracker {
@@ -382,25 +382,26 @@ impl EventLoop {
                     };
                     drop(state);
 
-                    if let Some(process) = self.state.processes.get_mut(process_index) {
-                        if process.log_group == job_id && process.alive {
-                            let child_pid = process.child.id();
-                            let pgid_to_kill = -(child_pid as i32);
-                            kvlog::info!(
-                                "Sending SIGINT to process group",
-                                job_index = service_to_kill,
-                                base_task_index = job_id.base_task_index().0,
-                                reason = ExitCause::ProfileConflict.name(),
-                                pid = child_pid,
-                                pgid = pgid_to_kill
-                            );
-                            process.pending_exit_cause = Some(ExitCause::ProfileConflict);
-                            unsafe {
-                                libc::kill(pgid_to_kill, libc::SIGINT);
-                            }
-                            process.alive = false;
-                            process.kill_sent_at = Some(std::time::Instant::now());
+                    if let Some(process) = self.state.processes.get_mut(process_index)
+                        && process.log_group == job_id
+                        && process.alive
+                    {
+                        let child_pid = process.child.id();
+                        let pgid_to_kill = -(child_pid as i32);
+                        kvlog::info!(
+                            "Sending SIGINT to process group",
+                            job_index = service_to_kill,
+                            base_task_index = job_id.base_task_index().0,
+                            reason = ExitCause::ProfileConflict.name(),
+                            pid = child_pid,
+                            pgid = pgid_to_kill
+                        );
+                        process.pending_exit_cause = Some(ExitCause::ProfileConflict);
+                        unsafe {
+                            libc::kill(pgid_to_kill, libc::SIGINT);
                         }
+                        process.alive = false;
+                        process.kill_sent_at = Some(std::time::Instant::now());
                     }
                     break;
                 }
@@ -443,11 +444,11 @@ impl EventLoop {
     fn check_ready_timeouts(&mut self) {
         let now = std::time::Instant::now();
         for (_, process) in &mut self.state.processes {
-            if let Some(ref checker) = process.ready_checker {
-                if checker.timeout_at.is_some_and(|t| now > t) {
-                    self.state.timed_ready_count -= 1;
-                    process.ready_checker = None;
-                }
+            if let Some(ref checker) = process.ready_checker
+                && checker.timeout_at.is_some_and(|t| now > t)
+            {
+                self.state.timed_ready_count -= 1;
+                process.ready_checker = None;
             }
         }
     }
@@ -736,7 +737,7 @@ pub(crate) enum ProcessRequest {
 /// Flag bit indicating the selection is a meta-group rather than a base task.
 pub const SELECTED_META_GROUP_FLAG: u64 = 1 << 63;
 /// Meta-group selection for tests (`@tests`).
-pub const SELECTED_META_GROUP_TESTS: u64 = SELECTED_META_GROUP_FLAG | 0;
+pub const SELECTED_META_GROUP_TESTS: u64 = SELECTED_META_GROUP_FLAG;
 /// Meta-group selection for actions (`@actions`).
 pub const SELECTED_META_GROUP_ACTIONS: u64 = SELECTED_META_GROUP_FLAG | 1;
 
@@ -1060,7 +1061,7 @@ impl EventLoop {
 
                 loop {
                     match try_read(stdout.as_raw_fd(), &mut buffer.data) {
-                        ReadResult::Done | ReadResult::WouldBlock | ReadResult::EOF => {
+                        ReadResult::Done | ReadResult::WouldBlock | ReadResult::Eof => {
                             break;
                         }
                         ReadResult::More => continue,
@@ -1093,7 +1094,7 @@ impl EventLoop {
 
                 loop {
                     match try_read(stderr.as_raw_fd(), &mut buffer.data) {
-                        ReadResult::Done | ReadResult::WouldBlock | ReadResult::EOF => {
+                        ReadResult::Done | ReadResult::WouldBlock | ReadResult::Eof => {
                             break;
                         }
                         ReadResult::More => continue,
@@ -1209,7 +1210,7 @@ impl EventLoop {
         as_test: bool,
     ) {
         let params: ValueMap = jsony::from_binary(&params).unwrap_or_else(|_| ValueMap::new());
-        let (name, profile) = task_name.rsplit_once(":").unwrap_or((&*task_name, ""));
+        let (name, profile) = task_name.rsplit_once(":").unwrap_or((task_name, ""));
 
         let ws = &self.state.workspaces[ws_index as usize];
         let job_id = {
@@ -1312,7 +1313,7 @@ impl EventLoop {
     ) {
         let request_channel = self.state.request.clone();
         let result = std::thread::Builder::new().name(format!("{kind}[{index}")).spawn(move || {
-            let result = std::panic::catch_unwind(|| func());
+            let result = std::panic::catch_unwind(func);
             match result {
                 Ok(Ok(())) => {
                     kvlog::info!("Client thread exiting", index, reason = "completed", kind);
@@ -1389,14 +1390,11 @@ impl EventLoop {
         let _ = client.channel.wake();
         let _ = self.state.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
         kvlog::info!("Client terminated", index = client_index as usize, reason = reason.as_str());
-        match &client.kind {
-            ClientKind::Rpc { .. } => {
-                let Some(_) = self.clients.try_remove(client_index as usize) else {
-                    kvlog::debug!("Client already removed", index = client_index as usize);
-                    return;
-                };
-            }
-            _ => (),
+        if let ClientKind::Rpc { .. } = &client.kind {
+            let Some(_) = self.clients.try_remove(client_index as usize) else {
+                kvlog::debug!("Client already removed", index = client_index as usize);
+                return;
+            };
         }
     }
 
@@ -1710,10 +1708,8 @@ fn run_self_logs_forwarder(
 
         if !logs.is_empty() {
             fmt_buf.clear();
-            for log in kvlog::encoding::decode(&logs) {
-                if let Ok((ts, level, span, fields)) = log {
-                    kvlog::collector::format_statement_with_colors(&mut fmt_buf, &mut parents, ts, level, span, fields);
-                }
+            for (ts, level, span, fields) in kvlog::encoding::decode(&logs).flatten() {
+                kvlog::collector::format_statement_with_colors(&mut fmt_buf, &mut parents, ts, level, span, fields);
             }
             if stdout.write_all(&fmt_buf).is_err() {
                 log_state.lock().unwrap().unregister_follower(follower_id);

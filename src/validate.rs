@@ -197,17 +197,17 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                             .with_notes(vec![format!("in group '{}'", group_name)]),
                     );
                 }
-            } else if !task_profiles.contains(&(task_name, profile)) {
-                if let Some(span) = find_group_item_span(root, group_name, task_name) {
-                    let available: Vec<_> =
-                        task_profiles.iter().filter(|(n, _)| *n == task_name).map(|(_, p)| *p).collect();
-                    emit(
-                        Diagnostic::error()
-                            .with_message(format!("task '{}' does not have profile '{}'", task_name, profile))
-                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                            .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
-                    );
-                }
+            } else if !task_profiles.contains(&(task_name, profile))
+                && let Some(span) = find_group_item_span(root, group_name, task_name)
+            {
+                let available: Vec<_> =
+                    task_profiles.iter().filter(|(n, _)| *n == task_name).map(|(_, p)| *p).collect();
+                emit(
+                    Diagnostic::error()
+                        .with_message(format!("task '{}' does not have profile '{}'", task_name, profile))
+                        .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                        .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
+                );
             }
         }
     }
@@ -226,38 +226,34 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                             .with_notes(vec![format!("in task '{}'", task_name)]),
                     );
                 }
-            } else if !task_profiles.contains(&(required_name, profile)) {
-                if let Some(span) = find_require_span(root, task_name, required_name) {
-                    let available: Vec<_> =
-                        task_profiles.iter().filter(|(n, _)| *n == required_name).map(|(_, p)| *p).collect();
-                    emit(
-                        Diagnostic::error()
-                            .with_message(format!(
-                                "required task '{}' does not have profile '{}'",
-                                required_name, profile
-                            ))
-                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                            .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
-                    );
-                }
+            } else if !task_profiles.contains(&(required_name, profile))
+                && let Some(span) = find_require_span(root, task_name, required_name)
+            {
+                let available: Vec<_> =
+                    task_profiles.iter().filter(|(n, _)| *n == required_name).map(|(_, p)| *p).collect();
+                emit(
+                    Diagnostic::error()
+                        .with_message(format!("required task '{}' does not have profile '{}'", required_name, profile))
+                        .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                        .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
+                );
             }
         }
 
         if let Some(cache) = &task_expr.cache {
             for key_input in cache.key.iter() {
-                if let crate::config::CacheKeyInput::ProfileChanged(ref_task) = key_input {
-                    if !task_names.contains(ref_task) {
-                        if let Some(span) = find_profile_changed_span(root, task_name, ref_task) {
-                            emit(
-                                Diagnostic::error()
-                                    .with_message(format!(
-                                        "profile_changed references task '{}' which does not exist",
-                                        ref_task
-                                    ))
-                                    .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")]),
-                            );
-                        }
-                    }
+                if let crate::config::CacheKeyInput::ProfileChanged(ref_task) = key_input
+                    && !task_names.contains(ref_task)
+                    && let Some(span) = find_profile_changed_span(root, task_name, ref_task)
+                {
+                    emit(
+                        Diagnostic::error()
+                            .with_message(format!(
+                                "profile_changed references task '{}' which does not exist",
+                                ref_task
+                            ))
+                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")]),
+                    );
                 }
             }
         }
@@ -278,20 +274,20 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                                 .with_notes(vec![format!("in test '{}'", test_name)]),
                         );
                     }
-                } else if !task_profiles.contains(&(required_name, profile)) {
-                    if let Some(span) = find_test_require_span(root, test_name, required_name) {
-                        let available: Vec<_> =
-                            task_profiles.iter().filter(|(n, _)| *n == required_name).map(|(_, p)| *p).collect();
-                        emit(
-                            Diagnostic::error()
-                                .with_message(format!(
-                                    "required task '{}' does not have profile '{}'",
-                                    required_name, profile
-                                ))
-                                .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                                .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
-                        );
-                    }
+                } else if !task_profiles.contains(&(required_name, profile))
+                    && let Some(span) = find_test_require_span(root, test_name, required_name)
+                {
+                    let available: Vec<_> =
+                        task_profiles.iter().filter(|(n, _)| *n == required_name).map(|(_, p)| *p).collect();
+                    emit(
+                        Diagnostic::error()
+                            .with_message(format!(
+                                "required task '{}' does not have profile '{}'",
+                                required_name, profile
+                            ))
+                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                            .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
+                    );
                 }
             }
         }
@@ -302,15 +298,15 @@ fn validate_pwd_paths(config: &WorkspaceConfig, base_path: &Path, root: &Table, 
     for (task_name, task_expr) in config.tasks.iter() {
         if let StringExpr::Literal(pwd_literal) = task_expr.pwd {
             let full_path = base_path.join(pwd_literal);
-            if !full_path.exists() {
-                if let Some(span) = find_task_pwd_span(root, task_name) {
-                    emit(
-                        Diagnostic::error()
-                            .with_message(format!("pwd path '{}' does not exist", pwd_literal))
-                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("path not found")])
-                            .with_notes(vec![format!("resolved to: {}", full_path.display())]),
-                    );
-                }
+            if !full_path.exists()
+                && let Some(span) = find_task_pwd_span(root, task_name)
+            {
+                emit(
+                    Diagnostic::error()
+                        .with_message(format!("pwd path '{}' does not exist", pwd_literal))
+                        .with_labels(vec![DiagnosticLabel::primary(span).with_message("path not found")])
+                        .with_notes(vec![format!("resolved to: {}", full_path.display())]),
+                );
             }
         }
     }
@@ -319,15 +315,15 @@ fn validate_pwd_paths(config: &WorkspaceConfig, base_path: &Path, root: &Table, 
         for test_expr in test_variants.iter() {
             if let StringExpr::Literal(pwd_literal) = test_expr.pwd {
                 let full_path = base_path.join(pwd_literal);
-                if !full_path.exists() {
-                    if let Some(span) = find_test_pwd_span(root, test_name) {
-                        emit(
-                            Diagnostic::error()
-                                .with_message(format!("pwd path '{}' does not exist", pwd_literal))
-                                .with_labels(vec![DiagnosticLabel::primary(span).with_message("path not found")])
-                                .with_notes(vec![format!("resolved to: {}", full_path.display())]),
-                        );
-                    }
+                if !full_path.exists()
+                    && let Some(span) = find_test_pwd_span(root, test_name)
+                {
+                    emit(
+                        Diagnostic::error()
+                            .with_message(format!("pwd path '{}' does not exist", pwd_literal))
+                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("path not found")])
+                            .with_notes(vec![format!("resolved to: {}", full_path.display())]),
+                    );
                 }
             }
         }
@@ -392,10 +388,10 @@ fn find_test_require_span(root: &Table, test_name: &str, required_name: &str) ->
         ValueInner::Table(table) => search_require(table),
         ValueInner::Array(arr) => {
             for item in arr {
-                if let ValueInner::Table(table) = &item.value {
-                    if let Some(span) = search_require(table) {
-                        return Some(span);
-                    }
+                if let ValueInner::Table(table) = &item.value
+                    && let Some(span) = search_require(table)
+                {
+                    return Some(span);
                 }
             }
             None
@@ -439,14 +435,12 @@ fn find_profile_changed_span(root: &Table, task_name: &str, ref_task: &str) -> O
     let task = table_by_task_name(root, task_name)?;
     let keys = task.get("cache")?.as_table()?.get("key")?.as_array()?;
     for item in keys {
-        if let Some(item_table) = item.as_table() {
-            if let Some(pc_value) = item_table.get("profile_changed") {
-                if let Some(pc_str) = pc_value.as_str() {
-                    if pc_str == ref_task {
-                        return Some(span_to_range(pc_value.span));
-                    }
-                }
-            }
+        if let Some(item_table) = item.as_table()
+            && let Some(pc_value) = item_table.get("profile_changed")
+            && let Some(pc_str) = pc_value.as_str()
+            && pc_str == ref_task
+        {
+            return Some(span_to_range(pc_value.span));
         }
     }
     None
@@ -468,10 +462,10 @@ fn find_test_pwd_span(root: &Table, test_name: &str) -> Option<Range<usize>> {
         ValueInner::Table(table) => table.get("pwd").map(|v| span_to_range(v.span)),
         ValueInner::Array(arr) => {
             for item in arr {
-                if let ValueInner::Table(table) = &item.value {
-                    if let Some(pwd_value) = table.get("pwd") {
-                        return Some(span_to_range(pwd_value.span));
-                    }
+                if let ValueInner::Table(table) = &item.value
+                    && let Some(pwd_value) = table.get("pwd")
+                {
+                    return Some(span_to_range(pwd_value.span));
                 }
             }
             None

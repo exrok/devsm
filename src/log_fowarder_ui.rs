@@ -13,9 +13,9 @@ use std::{
 
 use crate::config::TaskKind;
 use crate::daemon::LogsQuery;
+use crate::event_loop::ClientChannel;
 use crate::line_width::{strip_ansi_to_buffer, strip_ansi_to_buffer_preserve_case};
 use crate::log_storage::{BaseTaskSet, LogEntry, LogFilter, LogGroup, LogId, Logs};
-use crate::event_loop::ClientChannel;
 use crate::rpc::{Encoder, ExitCause as RpcExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind};
 use crate::workspace::{BaseTaskIndex, ExitCause, JobIndex, JobStatus, Workspace};
 
@@ -292,10 +292,10 @@ fn dump_logs(
                 continue;
             }
 
-            if let Some(max_age) = config.max_age_secs {
-                if entry.time + max_age < elapsed_secs {
-                    continue;
-                }
+            if let Some(max_age) = config.max_age_secs
+                && entry.time + max_age < elapsed_secs
+            {
+                continue;
             }
 
             let text = unsafe { entry.text(&logs) };
@@ -376,10 +376,10 @@ fn forward_logs_filtered(
                 continue;
             }
 
-            if let Some(max_age) = config.max_age_secs {
-                if entry.time + max_age < elapsed_secs {
-                    continue;
-                }
+            if let Some(max_age) = config.max_age_secs
+                && entry.time + max_age < elapsed_secs
+            {
+                continue;
             }
 
             let _ = write_log_entry(file, entry, &logs, config, ansi_buffer);

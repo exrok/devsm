@@ -581,17 +581,16 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
 
     let workspace_config = config::load_from_env()?;
     let (name, _profile) = job.rsplit_once(':').unwrap_or((job, "default"));
-    if name != "~cargo" {
-        if let Some((_, expr)) = workspace_config.tasks.iter().find(|(n, _)| *n == name) {
-            if expr.managed == Some(false) {
-                bail!(
-                    "Task '{}' has managed = false and must be run with exec.\n\
+    if name != "~cargo"
+        && let Some((_, expr)) = workspace_config.tasks.iter().find(|(n, _)| *n == name)
+        && expr.managed == Some(false)
+    {
+        bail!(
+            "Task '{}' has managed = false and must be run with exec.\n\
                      Use 'devsm exec {}' instead.",
-                    name,
-                    job
-                );
-            }
-        }
+            name,
+            job
+        );
     }
 
     setup_signal_handler(libc::SIGTERM, term_handler)?;
@@ -858,10 +857,8 @@ fn get_self_logs(follow: bool) -> anyhow::Result<()> {
 
         let mut fmt_buf = Vec::new();
         let mut parents = kvlog::collector::ParentSpanSuffixCache::new_boxed();
-        for log in kvlog::encoding::decode(&logs) {
-            if let Ok((ts, level, span, fields)) = log {
-                kvlog::collector::format_statement_with_colors(&mut fmt_buf, &mut parents, ts, level, span, fields);
-            }
+        for (ts, level, span, fields) in kvlog::encoding::decode(&logs).flatten() {
+            kvlog::collector::format_statement_with_colors(&mut fmt_buf, &mut parents, ts, level, span, fields);
         }
         print!("{}", String::from_utf8_lossy(&fmt_buf));
     }

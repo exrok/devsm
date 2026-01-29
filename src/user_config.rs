@@ -155,7 +155,7 @@ fn parse_table_binding(
                 return Err(render_diagnostic(file_name, content, &diagnostic));
             };
 
-            for (fn_key, action_value) in inner_table.iter() {
+            if let Some((fn_key, action_value)) = inner_table.iter().next() {
                 let fn_name = fn_key.name.as_ref();
 
                 let Some(action_str) = action_value.as_str() else {
@@ -322,18 +322,18 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                         return Err(render_diagnostic(file_name, content, &diagnostic));
                     }
 
-                    if let Some(label_table) = cmd_value.as_table() {
-                        if let Some(label_value) = label_table.get("Label") {
-                            let label_str = label_value.as_str().ok_or_else(|| {
-                                let span: std::ops::Range<usize> = label_value.span.into();
-                                let diagnostic = Diagnostic::error()
-                                    .with_message("Label must be a string")
-                                    .with_label(DiagnosticLabel::primary(span));
-                                render_diagnostic(file_name, content, &diagnostic)
-                            })?;
-                            set_chain_label(&mut keybinds, mode, &keys, label_str.into());
-                            continue;
-                        }
+                    if let Some(label_table) = cmd_value.as_table()
+                        && let Some(label_value) = label_table.get("Label")
+                    {
+                        let label_str = label_value.as_str().ok_or_else(|| {
+                            let span: std::ops::Range<usize> = label_value.span.into();
+                            let diagnostic = Diagnostic::error()
+                                .with_message("Label must be a string")
+                                .with_label(DiagnosticLabel::primary(span));
+                            render_diagnostic(file_name, content, &diagnostic)
+                        })?;
+                        set_chain_label(&mut keybinds, mode, &keys, label_str.into());
+                        continue;
                     }
 
                     if let Some(cmd_str) = cmd_value.as_str() {
@@ -358,18 +358,18 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                         render_diagnostic(file_name, content, &diagnostic)
                     })?;
 
-                    if let Some(label_table) = cmd_value.as_table() {
-                        if let Some(label_value) = label_table.get("Label") {
-                            let label_str = label_value.as_str().ok_or_else(|| {
-                                let span: std::ops::Range<usize> = label_value.span.into();
-                                let diagnostic = Diagnostic::error()
-                                    .with_message("Label must be a string")
-                                    .with_label(DiagnosticLabel::primary(span));
-                                render_diagnostic(file_name, content, &diagnostic)
-                            })?;
-                            set_chain_label(&mut keybinds, mode, &[input], label_str.into());
-                            continue;
-                        }
+                    if let Some(label_table) = cmd_value.as_table()
+                        && let Some(label_value) = label_table.get("Label")
+                    {
+                        let label_str = label_value.as_str().ok_or_else(|| {
+                            let span: std::ops::Range<usize> = label_value.span.into();
+                            let diagnostic = Diagnostic::error()
+                                .with_message("Label must be a string")
+                                .with_label(DiagnosticLabel::primary(span));
+                            render_diagnostic(file_name, content, &diagnostic)
+                        })?;
+                        set_chain_label(&mut keybinds, mode, &[input], label_str.into());
+                        continue;
                     }
 
                     let command = if let Some(f) = cmd_value.as_float() {

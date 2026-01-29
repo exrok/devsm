@@ -3,12 +3,6 @@ name = "devsm"
 version = "0.1.0"
 edition = "2024"
 
-[profile.release]
-debug = true
-# lto = "fat"
-# codegen-units = 1
-# panic = "abort"
-
 [dependencies]
 anyhow = "1.0.100"
 kvlog = { version = "0.1.5", default-features = false }
@@ -35,6 +29,10 @@ blake3 = { version = "1.8.3" }
 fast-glob = "1.0.0"
 # Use git dependency until version 0.2 is released.
 extui = { git = "https://github.com/exrok/extui", rev = "787c46bc2ddd634aa37221e5cf8f1c9c541ee321" }
+mimalloc = { version = "0.1.48", optional = true }
 
 [dev-dependencies]
 vt100 = "*"
+
+[features]
+mimalloc = ["dep:mimalloc"]

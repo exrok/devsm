@@ -3,12 +3,10 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-
-use libc;
 
 use crate::rpc::{
     ClientProtocol, DecodeResult, ExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind,
@@ -163,7 +161,7 @@ impl TestHarness {
     }
 
     /// Waits for a file to exist with timeout, useful for checking task completion.
-    pub fn wait_for_file(&self, path: &PathBuf, timeout: Duration) -> bool {
+    pub fn wait_for_file(&self, path: &Path, timeout: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {
             if path.exists() {

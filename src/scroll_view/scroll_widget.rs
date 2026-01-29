@@ -414,30 +414,21 @@ impl LogScrollWidget {
         let old_highlight = self.last_highlight;
         let new_highlight = style.highlight;
 
-        if let Some(old_hl) = old_highlight {
-            if let Some((new_start, new_end)) = self.entry_screen_position(view, style, rect, old_hl.log_id) {
-                let (old_start, old_end) = match direction {
-                    ScrollDirection::Up => {
-                        (new_start.saturating_sub(scrolled_lines), new_end.saturating_sub(scrolled_lines))
-                    }
-                    ScrollDirection::Down => {
-                        (new_start.saturating_add(scrolled_lines), new_end.saturating_add(scrolled_lines))
-                    }
-                };
-
-                if old_start < rect.h {
-                    let clamped_end = old_end.min(rect.h);
-                    self.render_entry_at_screen_pos(
-                        buf,
-                        rect,
-                        view,
-                        old_hl.log_id,
-                        old_start,
-                        clamped_end,
-                        style,
-                        None,
-                    );
+        if let Some(old_hl) = old_highlight
+            && let Some((new_start, new_end)) = self.entry_screen_position(view, style, rect, old_hl.log_id)
+        {
+            let (old_start, old_end) = match direction {
+                ScrollDirection::Up => {
+                    (new_start.saturating_sub(scrolled_lines), new_end.saturating_sub(scrolled_lines))
                 }
+                ScrollDirection::Down => {
+                    (new_start.saturating_add(scrolled_lines), new_end.saturating_add(scrolled_lines))
+                }
+            };
+
+            if old_start < rect.h {
+                let clamped_end = old_end.min(rect.h);
+                self.render_entry_at_screen_pos(buf, rect, view, old_hl.log_id, old_start, clamped_end, style, None);
             }
         }
 
@@ -446,16 +437,16 @@ impl LogScrollWidget {
             ScrollDirection::Down => self.delta_scroll_down(buf, rect, view, scrolled_lines, style),
         }
 
-        if let Some(new_hl) = new_highlight {
-            if let Some((start, end)) = self.entry_screen_position(view, style, rect, new_hl.log_id) {
-                let newly_rendered = match direction {
-                    ScrollDirection::Up => (0, scrolled_lines),
-                    ScrollDirection::Down => (rect.h.saturating_sub(scrolled_lines), rect.h),
-                };
-                let is_fully_contained = start >= newly_rendered.0 && end <= newly_rendered.1;
-                if !is_fully_contained {
-                    self.render_entry_in_place(buf, rect, view, new_hl.log_id, style, style.highlight);
-                }
+        if let Some(new_hl) = new_highlight
+            && let Some((start, end)) = self.entry_screen_position(view, style, rect, new_hl.log_id)
+        {
+            let newly_rendered = match direction {
+                ScrollDirection::Up => (0, scrolled_lines),
+                ScrollDirection::Down => (rect.h.saturating_sub(scrolled_lines), rect.h),
+            };
+            let is_fully_contained = start >= newly_rendered.0 && end <= newly_rendered.1;
+            if !is_fully_contained {
+                self.render_entry_in_place(buf, rect, view, new_hl.log_id, style, style.highlight);
             }
         }
     }

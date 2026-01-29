@@ -25,21 +25,18 @@ impl RpcClientStream {
         self.termination_reason = Some(SocketTerminationReason::ClientRequestedTerminate);
     }
     fn next<'b>(&'b mut self) -> Option<ClientMessage<'b>> {
-        loop {
-            match self.state.decode(&self.buffer) {
-                DecodeResult::Message { kind, correlation, one_shot, payload, ws_data } => {
-                    return Some(ClientMessage { correlation, kind, one_shot, ws_data, payload });
-                }
-                DecodeResult::MissingData { .. } => break,
-                DecodeResult::Empty => break,
-                DecodeResult::Error(e) => {
-                    kvlog::error!("Test run client protocol decode error", ?e, index = self.client_index);
-                    self.termination_reason = Some(SocketTerminationReason::ProtocolError);
-                    break;
-                }
+        match self.state.decode(&self.buffer) {
+            DecodeResult::Message { kind, correlation, one_shot, payload, ws_data } => {
+                Some(ClientMessage { correlation, kind, one_shot, ws_data, payload })
+            }
+            DecodeResult::MissingData { .. } => None,
+            DecodeResult::Empty => None,
+            DecodeResult::Error(e) => {
+                kvlog::error!("Test run client protocol decode error", ?e, index = self.client_index);
+                self.termination_reason = Some(SocketTerminationReason::ProtocolError);
+                None
             }
         }
-        None
     }
 }
 impl ClientEntry {
@@ -50,7 +47,7 @@ impl ClientEntry {
         loop {
             match try_read(self.socket.as_raw_fd(), &mut reader.buffer) {
                 ReadResult::More => continue,
-                ReadResult::EOF => {
+                ReadResult::Eof => {
                     reader.termination_reason = Some(SocketTerminationReason::Eof);
                     break;
                 }
@@ -185,8 +182,8 @@ fn resolve_workspace_from_header_result(
         return Err(rpc::HandlerError::new(1, "Workspace required"));
     }
 
-    let ws_ref = jsony::from_binary::<WorkspaceRef>(ws_data)
-        .map_err(|_| rpc::HandlerError::new(2, "Invalid workspace ref"))?;
+    let ws_ref =
+        jsony::from_binary::<WorkspaceRef>(ws_data).map_err(|_| rpc::HandlerError::new(2, "Invalid workspace ref"))?;
 
     resolve_workspace(state, &ws_ref).map_err(|e| rpc::HandlerError::new(3, e))
 }
@@ -354,9 +351,7 @@ fn handle_rpc_get_logged_rust_panics(ws: &mut WorkspaceEntry, payload: &[u8]) ->
 
 fn handle_self_logs_client_read(rpc_reader: &mut RpcClientStream) {
     while let Some(message) = rpc_reader.next() {
-        match message.kind {
-            _ => kvlog::error!("Unexpected message kind from test client", kind = ?message.kind),
-        }
+        kvlog::error!("Unexpected message kind from test client", kind = ?message.kind)
     }
 }
 
@@ -525,7 +520,15 @@ impl EventLoop {
                 let ReceivedFds::Pair([stdin, stdout]) = fds else {
                     return Err(RpcError::new(socket, 1, "AttachRun requires 2 FDs", correlation));
                 };
-                self.attach_run_client(stdin, stdout, socket, ws_index, req.task_name, req.params.to_vec(), req.as_test);
+                self.attach_run_client(
+                    stdin,
+                    stdout,
+                    socket,
+                    ws_index,
+                    req.task_name,
+                    req.params.to_vec(),
+                    req.as_test,
+                );
                 Ok(AttachOutcome::Attached)
             }
             RpcMessageKind::AttachTests => {

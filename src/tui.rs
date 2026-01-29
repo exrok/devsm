@@ -182,7 +182,7 @@ fn compute_menu_height(terminal_height: u16) -> u16 {
     } else if terminal_height <= MIN_TERMINAL {
         MIN_HEIGHT
     } else {
-        (MIN_HEIGHT + (terminal_height - MIN_TERMINAL + 4) / 5).min(MAX_HEIGHT)
+        (MIN_HEIGHT + (terminal_height - MIN_TERMINAL).div_ceil(5)).min(MAX_HEIGHT)
     }
 }
 
@@ -263,7 +263,7 @@ fn render<'a>(
                         rect.with(style).fill(out);
                     }
                     let (name, tasks) = &groups[idx];
-                    rect.take_left(max_name_width as i32).with(style).text(out, *name);
+                    rect.take_left(max_name_width as i32).with(style).text(out, name);
                     let task_list: Vec<_> = tasks.iter().map(|t| &*t.name).collect();
                     rect.with(substyle).text(out, &task_list.join(", "));
                 });
@@ -441,7 +441,7 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
     };
 
     let scroll_state = tui.logs.scroll_state(&ws, workspace);
-    let is_scrolled = scroll_state.top.is_scrolled || scroll_state.bottom.map_or(false, |b| b.is_scrolled);
+    let is_scrolled = scroll_state.top.is_scrolled || scroll_state.bottom.is_some_and(|b| b.is_scrolled);
 
     let has_active_status = tui.status_message.as_ref().is_some_and(|m| m.is_visible());
     let status_message = if has_active_status {
@@ -951,25 +951,25 @@ fn set_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str, action
     match action {
         SetFunctionAction::RestartCurrentSelection => {
             let ws = workspace.state();
-            if let Some(sel) = tui.task_tree.selection_state(&ws) {
-                if let Some(bti) = sel.base_task {
-                    let task_name = ws.base_tasks[bti.idx()].name.to_string();
-                    let profile = sel.job.map(|ji| ws[ji].spawn_profile.clone()).unwrap_or_default();
-                    drop(ws);
-                    let mut ws = workspace.state.write().unwrap();
-                    ws.session_functions.insert(
-                        fn_name.to_string(),
-                        FunctionAction::RestartCaptured { task_name: task_name.clone(), profile: profile.clone() },
-                    );
-                    drop(ws);
-                    let msg = if profile.is_empty() {
-                        format!("{} set to restart {}", fn_name, task_name)
-                    } else {
-                        format!("{} set to restart {}:{}", fn_name, task_name, profile)
-                    };
-                    tui.status_message = Some(StatusMessage::info(msg));
-                    return;
-                }
+            if let Some(sel) = tui.task_tree.selection_state(&ws)
+                && let Some(bti) = sel.base_task
+            {
+                let task_name = ws.base_tasks[bti.idx()].name.to_string();
+                let profile = sel.job.map(|ji| ws[ji].spawn_profile.clone()).unwrap_or_default();
+                drop(ws);
+                let mut ws = workspace.state.write().unwrap();
+                ws.session_functions.insert(
+                    fn_name.to_string(),
+                    FunctionAction::RestartCaptured { task_name: task_name.clone(), profile: profile.clone() },
+                );
+                drop(ws);
+                let msg = if profile.is_empty() {
+                    format!("{} set to restart {}", fn_name, task_name)
+                } else {
+                    format!("{} set to restart {}:{}", fn_name, task_name, profile)
+                };
+                tui.status_message = Some(StatusMessage::info(msg));
+                return;
             }
             tui.status_message = Some(StatusMessage::error(format!("No task selected for {}", fn_name)));
         }
@@ -1389,10 +1389,10 @@ pub fn run(
             extui::event::Polled::ReadReady => events.read_from(&stdin)?,
             extui::event::Polled::Woken => {}
             extui::event::Polled::TimedOut => {
-                if let FocusOverlap::ConfigError { state } = &mut tui.overlay {
-                    if state.check_file_changed() {
-                        attempt_config_reload(&mut tui, workspace, &mut keybinds);
-                    }
+                if let FocusOverlap::ConfigError { state } = &mut tui.overlay
+                    && state.check_file_changed()
+                {
+                    attempt_config_reload(&mut tui, workspace, &mut keybinds);
                 }
             }
         }

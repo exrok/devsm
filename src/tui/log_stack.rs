@@ -2,10 +2,10 @@ use extui::{Color, Rect, vt::BufferWrite};
 
 use crate::{
     config::TaskKind,
+    event_loop::user_config_loaded,
     keybinds::Keybinds,
     line_width::display_width,
     log_storage::{BaseTaskSet, LogFilter, LogId},
-    event_loop::user_config_loaded,
     scroll_view::{LogHighlight, LogStyle, LogWidget, ScrollState},
     tui::task_tree::{MetaGroupKind, SelectionState},
     welcome_message::render_welcome_message,
@@ -262,8 +262,7 @@ impl LogStack {
         };
 
         self.base_task_log_style.highlight = self.highlight;
-        let mut def = LogStyle::default();
-        def.highlight = self.highlight;
+        let def = LogStyle { highlight: self.highlight, ..LogStyle::default() };
 
         let logs = ws.logs.read().unwrap();
         if let Some(bot_filter) = bot_filter {

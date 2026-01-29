@@ -296,10 +296,10 @@ impl TaskLauncherState {
         }
 
         for (name, meta) in self.available_var_meta {
-            if !params.entries().iter().any(|(k, _)| k.as_ref() as &str == *name) {
-                if let Some(default) = meta.default {
-                    params.insert((*name).to_string().into(), default.to_string().into());
-                }
+            if !params.entries().iter().any(|(k, _)| k.as_ref() as &str == *name)
+                && let Some(default) = meta.default
+            {
+                params.insert((*name).to_string().into(), default.to_string().into());
             }
         }
 
@@ -520,7 +520,7 @@ impl TaskLauncherState {
                         TaskKind::Test => "test",
                     };
                     entry_rect.take_left(name_col_width as i32).with(style).text(out, task.name);
-                    entry_rect.take_left(kind_col_width as i32).with(substyle).text(out, kind_str);
+                    entry_rect.take_left(kind_col_width).with(substyle).text(out, kind_str);
 
                     if !task.command_preview.is_empty() {
                         let preview = if task.command_preview.len() > 40 {
