@@ -1,3 +1,10 @@
+use crate::daemon::socket_path;
+use crate::rpc::{
+    ClientProtocol, CommandBody, CommandResponse, DecodeResult, Encoder, JobExitedEvent, JobStatusEvent, JobStatusKind,
+    ONE_SHOT_FLAG, ResizeNotification, RpcMessageKind, WorkspaceRef,
+};
+use anyhow::bail;
+use sendfd::SendWithFd;
 use std::{
     io::{ErrorKind, Read, Write},
     os::unix::{net::UnixStream, process::CommandExt},
@@ -5,14 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::bail;
-use sendfd::SendWithFd;
-
-use crate::daemon::socket_path;
-use crate::rpc::{
-    ClientProtocol, CommandBody, CommandResponse, DecodeResult, Encoder, JobExitedEvent, JobStatusEvent, JobStatusKind,
-    ONE_SHOT_FLAG, ResizeNotification, RpcMessageKind, WorkspaceRef,
-};
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod cache_key;
 mod cli;
