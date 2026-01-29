@@ -183,7 +183,6 @@ pub(crate) struct EventLoop {
     // request: Arc<MioChannel>,
     // timed_ready_count: u32,
     // timed_timeout_count: u32,
-    wait_thread: std::thread::JoinHandle<()>,
 }
 
 pub(crate) enum ReadResult {
@@ -579,23 +578,17 @@ impl EventLoop {
 
         command.env("CARGO_TERM_COLOR", "always").current_dir(path).envs(tc.envvar.iter().copied());
         command.process_group(0);
-        // PR_SET_PDEATHSIG is a nice fallback for auto termination, however pre_exec
-        // causes spawn to use a custom spawn that has a bug that introduces a panic:
-        // https://github.com/rust-lang/rust/issues/110317
-        //
-        // unsafe {
-        //     command.pre_exec(|| {
-        //         // Create process group to allow nested cleanup
-        //         if libc::setpgid(0, 0) != 0 {
-        //             return Err(std::io::Error::last_os_error());
-        //         }
-        //         #[cfg(target_os = "linux")]
-        //         if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
-        //             return Err(std::io::Error::last_os_error());
-        //         }
-        //         Ok(())
-        //     });
-        // }
+
+        // Set parent-death signal to SIGTERM so that if this manager process dies,
+        // we automatically kill the managed processed. This is just a fallback,
+        // devsm will already automatically kill managed processed when it can.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            command.pre_exec(|| {
+                let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
 
         let stdin = if sh_script.is_some() { Stdio::piped() } else { Stdio::null() };
         command.stdin(stdin);
@@ -609,7 +602,6 @@ impl EventLoop {
             let _ = stdin.flush();
             drop(stdin);
         }
-        self.wait_thread.thread().unpark();
         if let Some(stdout) = &mut child.stdout {
             unsafe {
                 if libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) == -1 {
@@ -733,10 +725,6 @@ pub(crate) enum ProcessRequest {
     },
     ClientExited {
         index: usize,
-    },
-    ProcessExited {
-        pid: u32,
-        status: u32,
     },
     AttachSelfLogsClient {
         stdout: File,
@@ -990,115 +978,6 @@ impl EventLoop {
                 }
                 true
             }
-            ProcessRequest::ProcessExited { pid, status } => {
-                for (index, process) in &mut self.state.processes {
-                    if process.child.id() != pid {
-                        continue;
-                    }
-                    kvlog::info!("Process Exited", pid, status, job_index = process.job_index);
-                    if let Some(stdin) = process.child.stdout.take() {
-                        let mut buffer = process
-                            .stdout_buffer
-                            .take()
-                            .unwrap_or_else(|| Buffer { data: self.buffer_pool.pop().unwrap_or_default(), read: 0 });
-
-                        loop {
-                            match try_read(stdin.as_raw_fd(), &mut buffer.data) {
-                                ReadResult::Done | ReadResult::WouldBlock | ReadResult::EOF => {
-                                    break;
-                                }
-                                ReadResult::More => continue,
-                                ReadResult::OtherError(err) => {
-                                    kvlog::error!("Read failed with unexpected error", ?err);
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(workspace) = self.state.workspaces.get_mut(process.workspace_index as usize) {
-                            while let Some(line) = buffer.readline() {
-                                process.append_line(line, &mut workspace.line_writer);
-                            }
-                            if !buffer.remaining_slice().is_empty() {
-                                process.append_line(buffer.remaining_slice(), &mut workspace.line_writer);
-                            }
-                        }
-
-                        buffer.reset();
-                        self.buffer_pool.push(buffer.data);
-                        if let Err(err) = self.state.poll.registry().deregister(&mut SourceFd(&stdin.as_raw_fd())) {
-                            kvlog::error!("Failed to unregister fd", ?err);
-                        }
-                    }
-                    if let Some(stderr) = process.child.stderr.take() {
-                        let mut buffer = process
-                            .stderr_buffer
-                            .take()
-                            .unwrap_or_else(|| Buffer { data: self.buffer_pool.pop().unwrap_or_default(), read: 0 });
-
-                        loop {
-                            match try_read(stderr.as_raw_fd(), &mut buffer.data) {
-                                ReadResult::Done | ReadResult::WouldBlock | ReadResult::EOF => {
-                                    break;
-                                }
-                                ReadResult::More => continue,
-                                ReadResult::OtherError(err) => {
-                                    kvlog::error!("Read failed with unexpected error", ?err);
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(workspace) = self.state.workspaces.get_mut(process.workspace_index as usize) {
-                            while let Some(line) = buffer.readline() {
-                                process.append_line(line, &mut workspace.line_writer);
-                            }
-                            if !buffer.remaining_slice().is_empty() {
-                                process.append_line(buffer.remaining_slice(), &mut workspace.line_writer);
-                            }
-                        }
-                        buffer.reset();
-                        self.buffer_pool.push(buffer.data);
-                        if let Err(err) = self.state.poll.registry().deregister(&mut SourceFd(&stderr.as_raw_fd())) {
-                            kvlog::error!("Failed to unregister fd", ?err);
-                        }
-                    }
-                    let ws_idx = process.workspace_index;
-                    let job_idx = process.job_index;
-                    let cause = process.pending_exit_cause.unwrap_or(ExitCause::Unknown);
-                    let exit_code =
-                        if libc::WIFEXITED(status as i32) { libc::WEXITSTATUS(status as i32) as u32 } else { u32::MAX };
-                    let rpc_cause = match cause {
-                        ExitCause::Unknown => crate::rpc::ExitCause::Unknown,
-                        ExitCause::Killed => crate::rpc::ExitCause::Killed,
-                        ExitCause::Restarted => crate::rpc::ExitCause::Restarted,
-                        ExitCause::SpawnFailed => crate::rpc::ExitCause::SpawnFailed,
-                        ExitCause::ProfileConflict => crate::rpc::ExitCause::ProfileConflict,
-                        ExitCause::Timeout => crate::rpc::ExitCause::Timeout,
-                    };
-                    if let Some(workspace) = self.state.workspaces.get(ws_idx as usize) {
-                        let mut ws = workspace.handle.state.write().unwrap();
-                        ws.update_job_status(
-                            job_idx,
-                            JobStatus::Exited {
-                                finished_at: std::time::Instant::now(),
-                                log_end: workspace.line_writer.tail(),
-                                cause,
-                                status: exit_code,
-                            },
-                        );
-                    }
-                    if process.ready_checker.as_ref().is_some_and(|rc| rc.timeout_at.is_some()) {
-                        self.state.timed_ready_count -= 1;
-                    }
-                    if process.timeout_tracker.is_some() {
-                        self.state.timed_timeout_count -= 1;
-                    }
-                    self.state.processes.remove(index);
-                    self.broadcast_job_exited(ws_idx, job_idx, exit_code as i32, rpc_cause);
-                    return false;
-                }
-                kvlog::info!("Didn't Find ProcessExited");
-                false
-            }
             ProcessRequest::Spawn { task, job_id, workspace_id, job_index } => {
                 if let Err(err) = self.spawn(workspace_id, job_id, job_index, task) {
                     kvlog::error!("Failed to spawn process", ?err, ?job_id);
@@ -1121,7 +1000,7 @@ impl EventLoop {
                 false
             }
             ProcessRequest::RpcMessage { socket, fds, kind, correlation, one_shot, ws_data, payload, remaining } => {
-                use rpc_handlers::{RpcOutcome, RpcError};
+                use rpc_handlers::{RpcError, RpcOutcome};
 
                 match self.handle_rpc_request(socket, fds, kind, correlation, one_shot, &ws_data, &payload, remaining) {
                     Ok(RpcOutcome::Attached) => {}
@@ -1154,6 +1033,126 @@ impl EventLoop {
                 false
             }
         }
+    }
+
+    fn reap_children(&mut self) {
+        loop {
+            let mut status: i32 = 0;
+            let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+            if pid <= 0 {
+                break;
+            }
+            self.handle_process_exited(pid as u32, status as u32);
+        }
+    }
+
+    fn handle_process_exited(&mut self, pid: u32, status: u32) {
+        for (index, process) in &mut self.state.processes {
+            if process.child.id() != pid {
+                continue;
+            }
+            kvlog::info!("Process Exited", pid, status, job_index = process.job_index);
+            if let Some(stdout) = process.child.stdout.take() {
+                let mut buffer = process
+                    .stdout_buffer
+                    .take()
+                    .unwrap_or_else(|| Buffer { data: self.buffer_pool.pop().unwrap_or_default(), read: 0 });
+
+                loop {
+                    match try_read(stdout.as_raw_fd(), &mut buffer.data) {
+                        ReadResult::Done | ReadResult::WouldBlock | ReadResult::EOF => {
+                            break;
+                        }
+                        ReadResult::More => continue,
+                        ReadResult::OtherError(err) => {
+                            kvlog::error!("Read failed with unexpected error", ?err);
+                            break;
+                        }
+                    }
+                }
+                if let Some(workspace) = self.state.workspaces.get_mut(process.workspace_index as usize) {
+                    while let Some(line) = buffer.readline() {
+                        process.append_line(line, &mut workspace.line_writer);
+                    }
+                    if !buffer.remaining_slice().is_empty() {
+                        process.append_line(buffer.remaining_slice(), &mut workspace.line_writer);
+                    }
+                }
+
+                buffer.reset();
+                self.buffer_pool.push(buffer.data);
+                if let Err(err) = self.state.poll.registry().deregister(&mut SourceFd(&stdout.as_raw_fd())) {
+                    kvlog::error!("Failed to unregister fd", ?err);
+                }
+            }
+            if let Some(stderr) = process.child.stderr.take() {
+                let mut buffer = process
+                    .stderr_buffer
+                    .take()
+                    .unwrap_or_else(|| Buffer { data: self.buffer_pool.pop().unwrap_or_default(), read: 0 });
+
+                loop {
+                    match try_read(stderr.as_raw_fd(), &mut buffer.data) {
+                        ReadResult::Done | ReadResult::WouldBlock | ReadResult::EOF => {
+                            break;
+                        }
+                        ReadResult::More => continue,
+                        ReadResult::OtherError(err) => {
+                            kvlog::error!("Read failed with unexpected error", ?err);
+                            break;
+                        }
+                    }
+                }
+                if let Some(workspace) = self.state.workspaces.get_mut(process.workspace_index as usize) {
+                    while let Some(line) = buffer.readline() {
+                        process.append_line(line, &mut workspace.line_writer);
+                    }
+                    if !buffer.remaining_slice().is_empty() {
+                        process.append_line(buffer.remaining_slice(), &mut workspace.line_writer);
+                    }
+                }
+                buffer.reset();
+                self.buffer_pool.push(buffer.data);
+                if let Err(err) = self.state.poll.registry().deregister(&mut SourceFd(&stderr.as_raw_fd())) {
+                    kvlog::error!("Failed to unregister fd", ?err);
+                }
+            }
+            let ws_idx = process.workspace_index;
+            let job_idx = process.job_index;
+            let cause = process.pending_exit_cause.unwrap_or(ExitCause::Unknown);
+            let exit_code =
+                if libc::WIFEXITED(status as i32) { libc::WEXITSTATUS(status as i32) as u32 } else { u32::MAX };
+            let rpc_cause = match cause {
+                ExitCause::Unknown => crate::rpc::ExitCause::Unknown,
+                ExitCause::Killed => crate::rpc::ExitCause::Killed,
+                ExitCause::Restarted => crate::rpc::ExitCause::Restarted,
+                ExitCause::SpawnFailed => crate::rpc::ExitCause::SpawnFailed,
+                ExitCause::ProfileConflict => crate::rpc::ExitCause::ProfileConflict,
+                ExitCause::Timeout => crate::rpc::ExitCause::Timeout,
+            };
+            if let Some(workspace) = self.state.workspaces.get(ws_idx as usize) {
+                let mut ws = workspace.handle.state.write().unwrap();
+                ws.update_job_status(
+                    job_idx,
+                    JobStatus::Exited {
+                        finished_at: std::time::Instant::now(),
+                        log_end: workspace.line_writer.tail(),
+                        cause,
+                        status: exit_code,
+                    },
+                );
+            }
+            if process.ready_checker.as_ref().is_some_and(|rc| rc.timeout_at.is_some()) {
+                self.state.timed_ready_count -= 1;
+            }
+            if process.timeout_tracker.is_some() {
+                self.state.timed_timeout_count -= 1;
+            }
+            self.state.processes.remove(index);
+            self.broadcast_job_exited(ws_idx, job_idx, exit_code as i32, rpc_cause);
+            return;
+        }
+        kvlog::info!("Didn't Find ProcessExited", pid);
     }
 
     fn register_client(
@@ -1460,7 +1459,7 @@ impl EventLoop {
     }
 }
 
-pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread::JoinHandle<()>, poll: Poll) {
+pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
     let mut events = Events::with_capacity(128);
     let mut job_manager = EventLoop {
         buffer_pool: Vec::new(),
@@ -1474,7 +1473,6 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
             timed_ready_count: 0,
             timed_timeout_count: 0,
         },
-        wait_thread,
     };
     loop {
         if TERMINATED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1498,6 +1496,10 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, wait_thread: std::thread:
         if TERMINATED.load(std::sync::atomic::Ordering::Relaxed) {
             job_manager.handle_request(ProcessRequest::GlobalTermination);
             return;
+        }
+
+        if CHILD_EXITED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            job_manager.reap_children();
         }
 
         for event in &events {
@@ -1583,29 +1585,18 @@ impl From<TokenHandle> for Token {
 
 pub(crate) const CHANNEL_TOKEN: Token = Token(1 << 30);
 
-fn wait_thread(req: Arc<MioChannel>) {
-    loop {
-        let mut status: libc::c_int = 0;
-        unsafe {
-            let pid = libc::wait(&mut status);
-            if pid > 0 {
-                req.send(ProcessRequest::ProcessExited { pid: pid as u32, status: status as u32 });
-            } else if pid == -1 {
-                // let errno = *libc::__errno_location();
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if errno == libc::ECHILD {
-                    std::thread::park();
-                } else {
-                    kvlog::error!("Error calling wait", ?errno);
-                }
-            }
-        }
+static TERMINATED: AtomicBool = AtomicBool::new(false);
+static CHILD_EXITED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn term_handler(_sig: i32) {
+    TERMINATED.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(waker) = GLOBAL_WAKER.get() {
+        let _ = waker.wake();
     }
 }
 
-static TERMINATED: AtomicBool = AtomicBool::new(false);
-extern "C" fn term_handler(_sig: i32) {
-    TERMINATED.store(true, std::sync::atomic::Ordering::Relaxed);
+extern "C" fn sigchld_handler(_sig: i32) {
+    CHILD_EXITED.store(true, std::sync::atomic::Ordering::Relaxed);
     if let Some(waker) = GLOBAL_WAKER.get() {
         let _ = waker.wake();
     }
@@ -1663,6 +1654,7 @@ impl ProcessManagerHandle {
 
         setup_signal_handler(libc::SIGTERM, term_handler)?;
         setup_signal_handler(libc::SIGINT, term_handler)?;
+        setup_signal_handler(libc::SIGCHLD, sigchld_handler)?;
         let poll = Poll::new()?;
         let waker = Box::leak(Box::new(Waker::new(poll.registry(), CHANNEL_TOKEN)?));
         if GLOBAL_WAKER.set(waker).is_err() {
@@ -1670,13 +1662,6 @@ impl ProcessManagerHandle {
         }
         let request = Arc::new(MioChannel { waker, events: Mutex::new(Vec::new()) });
         let r = request.clone();
-        let r2 = r.clone();
-        let wait_thread = std::thread::Builder::new()
-            .name("PID-Poller".into())
-            .spawn(move || {
-                wait_thread(r2);
-            })
-            .unwrap();
 
         let handle = ProcessManagerHandle { request };
 
@@ -1686,7 +1671,7 @@ impl ProcessManagerHandle {
                 func(handle);
             })
             .unwrap();
-        process_worker(r, wait_thread, poll);
+        process_worker(r, poll);
         Ok(())
     }
 }

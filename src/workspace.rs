@@ -1328,6 +1328,9 @@ impl WorkspaceState {
             (S::Running { .. }, S::Exited { .. }) => {
                 jobs_list.set_terminal(job_index);
             }
+            (S::Starting, S::Exited { .. }) => {
+                jobs_list.set_terminal(job_index);
+            }
             (S::Starting, S::Running { .. }) => {}
             (prev, to) => {
                 let caller = std::panic::Location::caller();
