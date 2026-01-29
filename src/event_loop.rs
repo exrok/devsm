@@ -1121,7 +1121,36 @@ impl EventLoop {
                 false
             }
             ProcessRequest::RpcMessage { socket, fds, kind, correlation, one_shot, ws_data, payload, remaining } => {
-                self.handle_rpc_request(socket, fds, kind, correlation, one_shot, &ws_data, &payload, remaining);
+                use rpc_handlers::{RpcOutcome, RpcError};
+
+                match self.handle_rpc_request(socket, fds, kind, correlation, one_shot, &ws_data, &payload, remaining) {
+                    Ok(RpcOutcome::Attached) => {}
+                    Ok(RpcOutcome::RawWrite { mut socket, data }) => {
+                        if let Err(e) = socket.write_all(&data) {
+                            kvlog::warn!("Failed to write RPC raw response", ?e);
+                        }
+                    }
+                    Ok(RpcOutcome::Respond { mut socket, encoder, register }) => {
+                        if let Err(e) = socket.write_all(encoder.output()) {
+                            kvlog::warn!("Failed to write RPC response", ?e);
+                        }
+                        if let Some((ws_index, partial)) = register {
+                            self.register_client(
+                                socket,
+                                ws_index,
+                                ClientKind::Rpc { subscriptions: RpcSubscriptions::default() },
+                                partial,
+                            );
+                        }
+                    }
+                    Err(RpcError { mut socket, error, correlation }) => {
+                        let mut encoder = crate::rpc::Encoder::new();
+                        crate::rpc::ResponseState::send_error(&mut encoder, correlation, &error);
+                        if let Err(e) = socket.write_all(encoder.output()) {
+                            kvlog::warn!("Failed to write RPC error response", ?e);
+                        }
+                    }
+                }
                 false
             }
         }

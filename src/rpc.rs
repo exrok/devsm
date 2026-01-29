@@ -579,7 +579,7 @@ impl<'a> ReceivedPayload<'a> {
 /// Manages a Unix socket connection with automatic event queuing.
 /// When waiting for a command response, subscription events are
 /// buffered and can be retrieved via [`Self::next_event`].
-/// Currenlty only used in tests.
+/// Currently only used in tests.
 pub struct WorkspaceClient {
     socket: std::os::unix::net::UnixStream,
     encoder: Encoder,
@@ -967,6 +967,105 @@ pub struct RunTaskResponse {
 pub struct ErrorResponsePayload {
     pub code: u32,
     pub message: Box<str>,
+}
+
+/// Proof that a response was sent. Can only be created by ResponseToken methods.
+pub struct ResponseSent(());
+
+/// Tracks response state for a single RPC message.
+/// Create this, pass a token to the handler, then call `finish()` with the result.
+pub struct ResponseState<'a> {
+    encoder: &'a mut Encoder,
+    correlation: u16,
+    responded: bool,
+}
+
+/// Token that must be consumed to send a response.
+/// Consuming the token (via respond methods) prevents double-response at compile time.
+/// Returns ResponseSent which must be returned in Ok(...) for compile-time proof.
+pub struct ResponseToken<'a, 'b> {
+    state: &'a mut ResponseState<'b>,
+}
+
+impl<'a> ResponseState<'a> {
+    pub fn new(encoder: &'a mut Encoder, correlation: u16) -> Self {
+        Self { encoder, correlation, responded: false }
+    }
+
+    /// Create a token for sending the response.
+    pub fn token(&mut self) -> ResponseToken<'_, 'a> {
+        ResponseToken { state: self }
+    }
+
+    /// Send an error response directly without going through the handler flow.
+    /// Use this for early validation errors before the handler is called.
+    pub fn send_error(encoder: &mut Encoder, correlation: u16, error: &HandlerError) {
+        encoder.encode_response(
+            RpcMessageKind::ErrorResponse,
+            correlation,
+            &ErrorResponsePayload { code: error.code(), message: error.message().into() },
+        );
+    }
+
+    /// Complete the RPC handling. If handler returned an error and no response
+    /// was sent, sends an error response.
+    pub fn finish(mut self, result: Result<ResponseSent, HandlerError>) {
+        match result {
+            Ok(_sent) => {
+                debug_assert!(self.responded, "ResponseSent returned but responded flag not set");
+            }
+            Err(e) => {
+                if self.responded {
+                    kvlog::error!(
+                        "RPC handler returned error after sending response",
+                        code = e.code(),
+                        message = e.message()
+                    );
+                } else {
+                    self.encoder.encode_response(
+                        RpcMessageKind::ErrorResponse,
+                        self.correlation,
+                        &ErrorResponsePayload { code: e.code(), message: e.message().into() },
+                    );
+                    self.responded = true;
+                }
+            }
+        }
+    }
+}
+
+impl<'a, 'b> ResponseToken<'a, 'b> {
+    /// Consume token to send a response with payload. Returns proof of response.
+    pub fn respond<T: jsony::ToBinary>(self, kind: RpcMessageKind, payload: &T) -> ResponseSent {
+        self.state.encoder.encode_response(kind, self.state.correlation, payload);
+        self.state.responded = true;
+        ResponseSent(())
+    }
+
+    /// Consume token to send an empty response. Returns proof of response.
+    pub fn respond_empty(self, kind: RpcMessageKind) -> ResponseSent {
+        self.state.encoder.encode_empty(kind, self.state.correlation);
+        self.state.responded = true;
+        ResponseSent(())
+    }
+}
+
+/// Handler error type - can be converted to error response.
+pub struct HandlerError {
+    code: u32,
+    message: Box<str>,
+}
+
+impl HandlerError {
+    pub fn new(code: u32, message: impl Into<Box<str>>) -> Self {
+        Self { code, message: message.into() }
+    }
+    pub fn code(&self) -> u32 {
+        self.code
+    }
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 /// Workspace reference for RPC commands.
