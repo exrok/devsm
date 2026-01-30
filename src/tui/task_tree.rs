@@ -603,7 +603,7 @@ impl TaskTreeState {
     }
 
     pub fn render_secondary(&mut self, out: &mut DoubleBuffer, mut rect: Rect, ws: &WorkspaceState) {
-        let now = std::time::Instant::now();
+        let now = crate::clock::now();
         let sel = match self.selection_state(ws) {
             Some(sel) => sel,
             None => return,

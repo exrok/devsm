@@ -7,10 +7,7 @@ use std::{
     collections::VecDeque,
     fs::File,
     io::{IsTerminal, Write},
-    os::{
-        fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::net::UnixStream,
-    },
+    os::{fd::AsRawFd, unix::net::UnixStream},
     sync::Arc,
     time::Instant,
 };
@@ -118,13 +115,6 @@ fn run_simple_mode(
     stdout.write_all(&buf)?;
     buf.clear();
 
-    let mut pipe_fds = [0i32; 2];
-    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == -1 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let dummy_read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
-    let _dummy_write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
-
     loop {
         if channel.is_terminated() {
             send_termination(&mut encoder, &mut socket);
@@ -146,7 +136,7 @@ fn run_simple_mode(
             break;
         }
 
-        let _ = extui::event::poll_with_custom_waker(&dummy_read_fd, Some(&channel.waker), None);
+        let _ = channel.waker.wait();
     }
 
     Ok(())
@@ -310,10 +300,10 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
 
         if new_status != display.status {
             if new_status == TestJobStatus::Running && display.started_at.is_none() {
-                display.started_at = Some(Instant::now());
+                display.started_at = Some(crate::clock::now());
             }
             if matches!(new_status, TestJobStatus::Passed | TestJobStatus::Failed(_)) {
-                display.finished_at = Some(Instant::now());
+                display.finished_at = Some(crate::clock::now());
                 display.timeout_info = timeout_info;
             }
             display.status = new_status;

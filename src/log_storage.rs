@@ -478,7 +478,7 @@ impl LogWriter {
             line_entries,
             line_count: AtomicUsize::new(0),
             start_line_id: 0,
-            start_time: Instant::now(),
+            start_time: crate::clock::now(),
         };
         LogWriter {
             buffer: Arc::new(RwLock::new(line_buffer)),

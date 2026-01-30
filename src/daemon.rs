@@ -316,6 +316,15 @@ pub fn worker() -> anyhow::Result<()> {
 
     let mut buffer = [0u8; 4096 * 16];
 
+    #[cfg(feature = "fuzz")]
+    if let Ok(fuzz_socket) = std::env::var("DEVSM_FUZZ_SOCKET") {
+        crate::clock::enable_fuzz();
+        std::thread::Builder::new()
+            .name("fuzz-server".into())
+            .spawn(move || crate::fuzz_server::run(&fuzz_socket))
+            .expect("spawn fuzz server");
+    }
+
     let _ = ProcessManagerHandle::global_block_on(move |pm| {
         loop {
             #[cfg(target_os = "linux")]

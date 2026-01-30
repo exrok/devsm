@@ -113,11 +113,11 @@ struct StatusMessage {
 
 impl StatusMessage {
     fn info(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: false, created_at: Instant::now() }
+        Self { text: text.into(), is_error: false, created_at: crate::clock::now() }
     }
 
     fn error(text: impl Into<String>) -> Self {
-        Self { text: text.into(), is_error: true, created_at: Instant::now() }
+        Self { text: text.into(), is_error: true, created_at: crate::clock::now() }
     }
 
     fn is_visible(&self) -> bool {

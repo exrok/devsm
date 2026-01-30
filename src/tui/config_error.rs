@@ -50,7 +50,7 @@ impl ConfigErrorState {
             workspace_path,
             user_mtime,
             workspace_mtime,
-            last_poll: Instant::now(),
+            last_poll: crate::clock::now(),
         }
     }
 
@@ -59,7 +59,7 @@ impl ConfigErrorState {
     }
 
     pub fn check_file_changed(&mut self) -> bool {
-        let now = Instant::now();
+        let now = crate::clock::now();
         if now.duration_since(self.last_poll) < Self::poll_interval() {
             return false;
         }

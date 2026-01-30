@@ -1035,7 +1035,7 @@ impl WorkspaceState {
             process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
             log_group: job_id,
             task: task.clone(),
-            started_at: Instant::now(),
+            started_at: crate::clock::now(),
             log_start,
             cache_key,
             spawn_profile: profile.to_string(),
@@ -1084,7 +1084,7 @@ impl WorkspaceState {
             process_status: JobStatus::Scheduled { after },
             log_group: job_id,
             task,
-            started_at: Instant::now(),
+            started_at: crate::clock::now(),
             log_start,
             cache_key,
             spawn_profile: profile.to_string(),
@@ -2141,7 +2141,7 @@ impl Workspace {
                 process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
                 log_group: job_id,
                 task: task_config.clone(),
-                started_at: Instant::now(),
+                started_at: crate::clock::now(),
                 log_start,
                 cache_key,
                 spawn_profile: String::new(),
@@ -2168,7 +2168,7 @@ impl Workspace {
             }
         }
 
-        let test_run = TestRun { run_id, started_at: Instant::now(), test_jobs };
+        let test_run = TestRun { run_id, started_at: crate::clock::now(), test_jobs };
         state.active_test_run =
             Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
 
@@ -2367,7 +2367,7 @@ impl Workspace {
                 process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
                 log_group: job_id,
                 task: task_config.clone(),
-                started_at: Instant::now(),
+                started_at: crate::clock::now(),
                 log_start,
                 cache_key,
                 spawn_profile,
@@ -2394,7 +2394,7 @@ impl Workspace {
             }
         }
 
-        let test_run = TestRun { run_id, started_at: Instant::now(), test_jobs };
+        let test_run = TestRun { run_id, started_at: crate::clock::now(), test_jobs };
         state.active_test_run =
             Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
 

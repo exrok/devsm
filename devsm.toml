@@ -61,4 +61,4 @@ cmd = ["typos", "--color", "always"]
 cmd = ["cargo", "check"]
 
 [test.cargo-test]
-cmd = ["cargo", "test"]
+cmd = ["cargo", "test", "--features=fuzz"]

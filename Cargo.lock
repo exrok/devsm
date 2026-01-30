@@ -133,7 +133,7 @@ dependencies = [
 [[package]]
 name = "extui"
 version = "0.1.2"
-source = "git+https://github.com/exrok/extui?rev=787c46bc2ddd634aa37221e5cf8f1c9c541ee321#787c46bc2ddd634aa37221e5cf8f1c9c541ee321"
+source = "git+https://github.com/exrok/extui?rev=504f4bbb419bb154a083a5f174908dadba8ad9b8#504f4bbb419bb154a083a5f174908dadba8ad9b8"
 dependencies = [
  "bitflags",
  "itoap",
@@ -313,6 +313,10 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "test-app"
+version = "0.1.0"
 
 [[package]]
 name = "toml-spanner"

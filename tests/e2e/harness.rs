@@ -8,9 +8,11 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use std::os::unix::net::UnixListener;
+
 use crate::rpc::{
-    ClientProtocol, DecodeResult, ExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind,
-    encode_attach_rpc,
+    ClientProtocol, DebugTraceEvent, DecodeResult, ExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind,
+    RpcMessageKind, encode_attach_rpc,
 };
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -41,6 +43,8 @@ impl ClientResult {
 pub struct TestHarness {
     pub temp_dir: PathBuf,
     pub socket_path: PathBuf,
+    #[cfg_attr(not(feature = "fuzz"), allow(dead_code))]
+    pub fuzz_socket_path: PathBuf,
     pub server_log_path: PathBuf,
     pub server: Option<Child>,
 }
@@ -54,9 +58,10 @@ impl TestHarness {
         fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
 
         let socket_path = temp_dir.join("devsm.socket");
+        let fuzz_socket_path = temp_dir.join("fuzz.socket");
         let server_log_path = temp_dir.join("server.log");
 
-        Self { temp_dir, socket_path, server_log_path, server: None }
+        Self { temp_dir, socket_path, fuzz_socket_path, server_log_path, server: None }
     }
 
     /// Writes a devsm.toml configuration file.
@@ -106,6 +111,44 @@ impl TestHarness {
 
         self.server = Some(server);
         self
+    }
+
+    /// Spawns the server with fuzz time enabled.
+    ///
+    /// Sets `DEVSM_FUZZ_SOCKET` so the daemon uses simulated time controlled
+    /// via the fuzz socket.
+    #[cfg(feature = "fuzz")]
+    pub fn spawn_fuzz_server(&mut self) -> &mut Self {
+        let log_file = fs::File::create(&self.server_log_path).expect("Failed to create server log");
+        let log_file_err = log_file.try_clone().expect("Failed to clone log file");
+
+        let server = Command::new(cargo_bin_path())
+            .arg("server")
+            .current_dir(&self.temp_dir)
+            .env("DEVSM_SOCKET", &self.socket_path)
+            .env("DEVSM_FUZZ_SOCKET", &self.fuzz_socket_path)
+            .env("DEVSM_LOG_STDOUT", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log_file))
+            .stderr(Stdio::from(log_file_err))
+            .spawn()
+            .expect("Failed to spawn server");
+
+        self.server = Some(server);
+        self
+    }
+
+    /// Waits for the fuzz socket file to exist, with timeout.
+    #[cfg(feature = "fuzz")]
+    pub fn wait_for_fuzz_socket(&self, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if self.fuzz_socket_path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
     }
 
     /// Runs a client command with isolated configuration.
@@ -199,6 +242,7 @@ impl Drop for TestHarness {
 pub enum RpcEvent {
     JobStatus { job_index: u32, status: JobStatusKind },
     JobExited { job_index: u32, exit_code: i32, cause: ExitCause },
+    DebugTrace { tag: String, job_index: u32 },
     WorkspaceOpened,
     Disconnect,
     Other { kind: RpcMessageKind },
@@ -265,6 +309,11 @@ impl RpcSubscriber {
                                 let e: JobExitedEvent = jsony::from_binary(payload).expect("invalid JobExitedEvent");
                                 RpcEvent::JobExited { job_index: e.job_index, exit_code: e.exit_code, cause: e.cause }
                             }
+                            RpcMessageKind::DebugTrace => {
+                                let e: DebugTraceEvent =
+                                    jsony::from_binary(payload).expect("invalid DebugTraceEvent");
+                                RpcEvent::DebugTrace { tag: e.tag.to_string(), job_index: e.job_index }
+                            }
                             RpcMessageKind::Disconnect => RpcEvent::Disconnect,
                             _ => RpcEvent::Other { kind },
                         };
@@ -310,6 +359,19 @@ impl RpcSubscriber {
             })
             .collect()
     }
+
+    /// Collects events until a debug trace with the given tag and job_index arrives.
+    #[cfg(feature = "fuzz")]
+    pub fn wait_for_trace(&mut self, tag: &str, job_index: u32, timeout: Duration) -> Vec<RpcEvent> {
+        self.collect_until(
+            |evs| {
+                evs.iter().any(|e| {
+                    matches!(e, RpcEvent::DebugTrace { tag: t, job_index: j } if t == tag && *j == job_index)
+                })
+            },
+            timeout,
+        )
+    }
 }
 
 /// Returns the path to the compiled binary.
@@ -321,4 +383,157 @@ pub fn cargo_bin_path() -> PathBuf {
     }
     path.push("devsm");
     path
+}
+
+// ── test-app protocol ──────────────────────────────────────────────────────
+
+const MAGIC: u32 = 0x7E57_0001;
+const HEADER_SIZE: usize = 10;
+
+const CONNECT: u16 = 0x01;
+const WRITE_STDOUT: u16 = 0x02;
+const EXIT: u16 = 0x04;
+
+pub struct TestAppServer {
+    pub listener: UnixListener,
+    pub path: PathBuf,
+}
+
+impl TestAppServer {
+    pub fn new(dir: &Path) -> Self {
+        let path = dir.join("ctrl.socket");
+        let listener = UnixListener::bind(&path).expect("Failed to bind controller socket");
+        listener.set_nonblocking(false).unwrap();
+        Self { listener, path }
+    }
+
+    pub fn accept(&self, timeout: Duration) -> TestAppConn {
+        self.listener.set_nonblocking(true).unwrap();
+        let start = Instant::now();
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let mut conn = TestAppConn { stream, args: Vec::new() };
+                    conn.read_connect();
+                    return conn;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("accept error: {e}"),
+            }
+            if start.elapsed() >= timeout {
+                panic!("Timed out waiting for test-app connection");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+pub struct TestAppConn {
+    stream: UnixStream,
+    pub args: Vec<String>,
+}
+
+impl TestAppConn {
+    fn read_connect(&mut self) {
+        let mut hdr = [0u8; HEADER_SIZE];
+        self.stream.read_exact(&mut hdr).expect("Failed to read connect header");
+
+        let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+        let kind = u16::from_le_bytes(hdr[4..6].try_into().unwrap());
+        let len = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
+
+        assert_eq!(magic, MAGIC, "bad magic in connect message");
+        assert_eq!(kind, CONNECT, "expected CONNECT message");
+
+        let mut payload = vec![0u8; len];
+        if len > 0 {
+            self.stream.read_exact(&mut payload).expect("Failed to read connect payload");
+        }
+
+        let mut pos = 0;
+        let pwd_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2 + pwd_len;
+
+        let argc = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+
+        self.args.clear();
+        for _ in 0..argc {
+            let arg_len = u16::from_le_bytes(payload[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            let arg = String::from_utf8_lossy(&payload[pos..pos + arg_len]).to_string();
+            pos += arg_len;
+            self.args.push(arg);
+        }
+    }
+
+    pub fn write_stdout(&mut self, data: &[u8]) {
+        let mut msg = Vec::with_capacity(HEADER_SIZE + data.len());
+        msg.extend_from_slice(&MAGIC.to_le_bytes());
+        msg.extend_from_slice(&WRITE_STDOUT.to_le_bytes());
+        msg.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        msg.extend_from_slice(data);
+        self.stream.write_all(&msg).expect("Failed to write stdout message");
+    }
+
+    pub fn exit(&mut self, code: i32) {
+        let payload = code.to_le_bytes();
+        let mut msg = Vec::with_capacity(HEADER_SIZE + payload.len());
+        msg.extend_from_slice(&MAGIC.to_le_bytes());
+        msg.extend_from_slice(&EXIT.to_le_bytes());
+        msg.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        msg.extend_from_slice(&payload);
+        self.stream.write_all(&msg).expect("Failed to write exit message");
+    }
+
+    pub fn name(&self) -> &str {
+        self.args.get(1).map(|s| s.as_str()).unwrap_or("<unknown>")
+    }
+}
+
+// ── fuzz clock client ──────────────────────────────────────────────────────
+
+#[cfg(feature = "fuzz")]
+const CMD_ADVANCE: u8 = 0x01;
+
+#[cfg(feature = "fuzz")]
+pub struct FuzzClock {
+    stream: UnixStream,
+}
+
+#[cfg(feature = "fuzz")]
+impl FuzzClock {
+    pub fn connect(harness: &TestHarness) -> Self {
+        assert!(harness.wait_for_fuzz_socket(Duration::from_secs(5)), "Fuzz socket not created");
+        let stream = UnixStream::connect(&harness.fuzz_socket_path).expect("Failed to connect fuzz socket");
+        Self { stream }
+    }
+
+    pub fn advance_secs(&mut self, secs: f64) {
+        let nanos = (secs * 1_000_000_000.0) as u64;
+        let mut msg = [0u8; 9];
+        msg[0] = CMD_ADVANCE;
+        msg[1..9].copy_from_slice(&nanos.to_le_bytes());
+        self.stream.write_all(&msg).expect("Failed to send advance");
+        let mut resp = [0u8; 1];
+        self.stream.read_exact(&mut resp).expect("Failed to read advance response");
+    }
+}
+
+// ── helpers ────────────────────────────────────────────────────────────────
+
+#[cfg(feature = "fuzz")]
+pub fn find_exit_event(events: &[RpcEvent], job_index: u32) -> Option<(i32, ExitCause)> {
+    events.iter().find_map(|e| match e {
+        RpcEvent::JobExited { job_index: j, exit_code, cause } if *j == job_index => {
+            Some((*exit_code, cause.clone()))
+        }
+        _ => None,
+    })
+}
+
+#[cfg(feature = "fuzz")]
+pub fn has_job_exit(events: &[RpcEvent], job_index: u32) -> bool {
+    events.iter().any(|e| matches!(e, RpcEvent::JobExited { job_index: j, .. } if *j == job_index))
 }

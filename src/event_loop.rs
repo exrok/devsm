@@ -323,7 +323,7 @@ impl EventLoop {
                 }
 
                 if let Some(ref mut tracker) = process.timeout_tracker {
-                    let now = std::time::Instant::now();
+                    let now = crate::clock::now();
                     tracker.last_output_at = now;
 
                     if tracker.conditional_timeout_at.is_none()
@@ -351,7 +351,10 @@ impl EventLoop {
             }
         }
 
+        self.broadcast_debug_trace(ws_index, "output", job_index);
+
         if ready_matched {
+            self.broadcast_debug_trace(ws_index, "ready_matched", job_index);
             self.mark_service_ready(ws_index, job_index);
         }
 
@@ -401,7 +404,7 @@ impl EventLoop {
                             libc::kill(pgid_to_kill, libc::SIGINT);
                         }
                         process.alive = false;
-                        process.kill_sent_at = Some(std::time::Instant::now());
+                        process.kill_sent_at = Some(crate::clock::now());
                     }
                     break;
                 }
@@ -442,19 +445,25 @@ impl EventLoop {
     }
 
     fn check_ready_timeouts(&mut self) {
-        let now = std::time::Instant::now();
+        let now = crate::clock::now();
+        let mut timed_out = Vec::new();
         for (_, process) in &mut self.state.processes {
             if let Some(ref checker) = process.ready_checker
                 && checker.timeout_at.is_some_and(|t| now > t)
             {
                 self.state.timed_ready_count -= 1;
                 process.ready_checker = None;
+                timed_out.push((process.workspace_index, process.job_index));
             }
+        }
+        for (ws_index, job_index) in timed_out {
+            self.broadcast_debug_trace(ws_index, "ready_timeout", job_index);
+            self.mark_service_ready(ws_index, job_index);
         }
     }
 
     fn check_timeouts(&mut self) {
-        let now = std::time::Instant::now();
+        let now = crate::clock::now();
         let mut to_kill: Vec<(usize, u32)> = Vec::new();
 
         for (index, process) in &self.state.processes {
@@ -505,7 +514,7 @@ impl EventLoop {
 
     fn check_kill_escalation(&mut self) {
         const SIGKILL_ESCALATION_SECS: u64 = 20;
-        let now = std::time::Instant::now();
+        let now = crate::clock::now();
 
         for (_index, process) in &mut self.state.processes {
             let Some(kill_sent_at) = process.kill_sent_at else {
@@ -633,7 +642,7 @@ impl EventLoop {
                 needle: match &rc.when {
                     ReadyPredicate::OutputContains(s) => s.to_string(),
                 },
-                timeout_at: rc.timeout.map(|secs| std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)),
+                timeout_at: rc.timeout.map(|secs| crate::clock::now() + std::time::Duration::from_secs_f64(secs)),
             }
         });
         if ready_checker.as_ref().is_some_and(|rc| rc.timeout_at.is_some()) {
@@ -641,7 +650,7 @@ impl EventLoop {
         }
         let ready_state = ready_checker.as_ref().map(|_| false);
 
-        let now = std::time::Instant::now();
+        let now = crate::clock::now();
         let timeout_tracker = tc.timeout.as_ref().map(|tc| {
             use crate::config::TimeoutPredicate;
             TimeoutTracker {
@@ -901,7 +910,7 @@ impl EventLoop {
                     }
                 }
                 process.alive = false;
-                process.kill_sent_at = Some(std::time::Instant::now());
+                process.kill_sent_at = Some(crate::clock::now());
                 false
             }
             ProcessRequest::AttachClient { stdin, stdout, socket, workspace_config, kind } => {
@@ -988,7 +997,7 @@ impl EventLoop {
                         ws.update_job_status(
                             job_index,
                             JobStatus::Exited {
-                                finished_at: std::time::Instant::now(),
+                                finished_at: crate::clock::now(),
                                 log_end,
                                 cause: ExitCause::SpawnFailed,
                                 status: 127,
@@ -1136,7 +1145,7 @@ impl EventLoop {
                 ws.update_job_status(
                     job_idx,
                     JobStatus::Exited {
-                        finished_at: std::time::Instant::now(),
+                        finished_at: crate::clock::now(),
                         log_end: workspace.line_writer.tail(),
                         cause,
                         status: exit_code,
@@ -1455,6 +1464,24 @@ impl EventLoop {
             let _ = client.socket.write_all(output);
         }
     }
+
+    fn broadcast_debug_trace(&mut self, ws_index: WorkspaceIndex, tag: &str, job_index: JobIndex) {
+        if !crate::clock::is_fuzz() {
+            return;
+        }
+        let event = crate::rpc::DebugTraceEvent { tag, job_index: job_index.as_u32() };
+        let mut encoder = crate::rpc::Encoder::new();
+        encoder.encode_push(RpcMessageKind::DebugTrace, &event);
+        let output = encoder.output();
+
+        for (_, client) in &mut self.clients {
+            if client.workspace != ws_index {
+                continue;
+            }
+            let ClientKind::Rpc { .. } = &client.kind else { continue };
+            let _ = client.socket.write_all(output);
+        }
+    }
 }
 
 pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
@@ -1478,7 +1505,11 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
             return;
         }
 
-        let poll_timeout = if job_manager.state.timed_ready_count > 0 || job_manager.state.timed_timeout_count > 0 {
+        let has_timed = job_manager.state.timed_ready_count > 0 || job_manager.state.timed_timeout_count > 0;
+        let poll_timeout = if crate::clock::is_fuzz() {
+            crate::clock::set_wake_needed(has_timed);
+            None
+        } else if has_timed {
             Some(std::time::Duration::from_millis(500))
         } else {
             None
@@ -1530,6 +1561,12 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
             job_manager.check_timeouts();
         }
         job_manager.check_kill_escalation();
+
+        if crate::clock::is_fuzz() {
+            for ws_idx in 0..job_manager.state.workspaces.len() {
+                job_manager.broadcast_debug_trace(ws_idx as WorkspaceIndex, "tick", JobIndex::from_usize(0));
+            }
+        }
 
         for (_, client) in &job_manager.clients {
             let _ = client.channel.wake();
@@ -1616,7 +1653,7 @@ fn setup_signal_handler(sig: i32, handler: unsafe extern "C" fn(i32)) -> anyhow:
     Ok(())
 }
 
-static GLOBAL_WAKER: std::sync::OnceLock<&'static Waker> = std::sync::OnceLock::new();
+pub(crate) static GLOBAL_WAKER: std::sync::OnceLock<&'static Waker> = std::sync::OnceLock::new();
 static GLOBAL_KEYBINDS: std::sync::OnceLock<Mutex<Arc<crate::keybinds::Keybinds>>> = std::sync::OnceLock::new();
 static GLOBAL_USER_CONFIG_LOADED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 

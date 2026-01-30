@@ -159,6 +159,7 @@ pub enum RpcMessageKind {
     // Events (0x03xx)
     JobStatus = 0x0301,
     JobExited = 0x0302,
+    DebugTrace = 0x0303,
     Disconnect = 0x03FF,
 }
 
@@ -192,6 +193,7 @@ impl RpcMessageKind {
             0x0210 => Some(Self::CommandAck),
             0x0301 => Some(Self::JobStatus),
             0x0302 => Some(Self::JobExited),
+            0x0303 => Some(Self::DebugTrace),
             0x03FF => Some(Self::Disconnect),
             _ => None,
         }
@@ -892,7 +894,7 @@ pub struct JobStatusEvent {
     pub status: JobStatusKind,
 }
 
-#[derive(Jsony, Debug, Clone, Copy)]
+#[derive(Jsony, Debug, Clone, Copy, PartialEq, Eq)]
 #[jsony(Binary)]
 #[repr(u8)]
 pub enum ExitCause {
@@ -910,6 +912,13 @@ pub struct JobExitedEvent {
     pub job_index: u32,
     pub exit_code: i32,
     pub cause: ExitCause,
+}
+
+#[derive(Jsony)]
+#[jsony(Binary)]
+pub struct DebugTraceEvent<'a> {
+    pub tag: &'a str,
+    pub job_index: u32,
 }
 
 /// Request to open a workspace by config path.

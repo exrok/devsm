@@ -18,11 +18,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod cache_key;
 mod cli;
+mod clock;
 mod collection;
 mod config;
 mod daemon;
 mod diagnostic;
 mod event_loop;
+#[cfg(feature = "fuzz")]
+mod fuzz_server;
 mod function;
 mod keybinds;
 mod line_width;
