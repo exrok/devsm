@@ -524,22 +524,19 @@ impl LogWidget {
         if rect.h == 0 || rect.w == 0 {
             return false;
         }
-        let (a, b) = view.logs.slices();
-        let mut total_height = 0u32;
         let limit = rect.h as u32;
-
-        for slice in [a, b] {
-            for entry in slice {
-                if !view.contains(entry) {
-                    continue;
-                }
-                total_height += get_entry_height(entry, style, rect.w as u32);
-                if total_height > limit {
-                    return true;
-                }
+        let mut total_height = 0u32;
+        let mut exceeded = false;
+        view.for_each_forward(view.logs.head(), &mut |_log_id, entry| {
+            total_height += get_entry_height(entry, style, rect.w as u32);
+            if total_height > limit {
+                exceeded = true;
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
             }
-        }
-        false
+        });
+        exceeded
     }
 
     pub fn check_resize_revert_to_tail(&mut self, view: &LogView, style: &LogStyle, rect: Rect) -> bool {
@@ -555,16 +552,7 @@ impl LogWidget {
     pub fn scrollify(&mut self, view: &LogView, style: &LogStyle) -> &mut scroll_widget::LogScrollWidget {
         if let LogWidget::Tail(tail) = self {
             let mut ids = Vec::new();
-            let mut line_id = view.logs.head();
-            let (a, b) = view.logs.slices_range(LogId(0), view.tail);
-            for slice in [a, b] {
-                for entry in slice {
-                    if view.contains(entry) {
-                        ids.push(line_id);
-                    }
-                    line_id.0 += 1;
-                }
-            }
+            view.collect_forward(view.logs.head(), &mut ids);
 
             let logs = view.logs.indexer();
             let mut remaining_height = tail.previous.h as i32;
@@ -588,7 +576,7 @@ impl LogWidget {
                 min_index: 0,
                 ids,
                 scroll_shift_up: if remaining_height < 0 { (-remaining_height) as u16 } else { 0 },
-                tail: LogId(line_id.0),
+                tail: view.tail,
                 previous: Rect { x: tail.previous.x, y: tail.previous.y, w: tail.previous.w, h: tail.previous.h },
                 last_highlight: None,
             };
@@ -598,19 +586,9 @@ impl LogWidget {
         match self {
             LogWidget::Scroll(scroll_view) => {
                 if scroll_view.tail < view.tail {
-                    let mut start = view.logs.head().max(LogId(scroll_view.tail.0));
+                    let start = view.logs.head().max(LogId(scroll_view.tail.0));
                     kvlog::info!("more: {}", x = view.tail.0, start = start.0);
-
-                    let (a, b) = view.logs.slices_range(start, view.tail);
-                    kvlog::info!("added", ?a, ?b);
-                    for slice in [a, b] {
-                        for entry in slice {
-                            if view.contains(entry) {
-                                scroll_view.ids.push(start);
-                            }
-                            start.0 += 1;
-                        }
-                    }
+                    view.collect_forward(start, &mut scroll_view.ids);
                     scroll_view.tail = view.tail;
                 }
                 scroll_view
@@ -957,26 +935,13 @@ fn handle_scroll_render(
 
 fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) -> u16 {
     let mut displayed: Vec<(LogId, LogEntry)> = Vec::new();
-    let (a, b) = view.logs.slices();
-    let head = view.logs.head();
     let mut remaining_v_space = rect.h as i32;
 
-    let a_len = a.len();
-
-    'outer: for (slice, base_offset) in [(b, a_len), (a, 0)] {
-        for (rev_idx, entry) in slice.iter().rev().enumerate() {
-            if !view.contains(entry) {
-                continue;
-            }
-            let line_count = get_entry_height(entry, style, rect.w as u32);
-            remaining_v_space -= line_count as i32;
-            let log_id = LogId(head.0 + base_offset + (slice.len() - 1 - rev_idx));
-            displayed.push((log_id, *entry));
-            if remaining_v_space <= 0 {
-                break 'outer;
-            }
-        }
-    }
+    view.for_each_rev(view.logs.head(), &mut |log_id, entry| {
+        remaining_v_space -= get_entry_height(entry, style, rect.w as u32) as i32;
+        displayed.push((log_id, *entry));
+        if remaining_v_space <= 0 { std::ops::ControlFlow::Break(()) } else { std::ops::ControlFlow::Continue(()) }
+    });
 
     let use_batch_clear = rect.y == 0 && !style.assume_blank;
 

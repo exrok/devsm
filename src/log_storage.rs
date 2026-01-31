@@ -49,6 +49,20 @@ pub enum LogFilter {
     /// Filter to logs from tasks in the given set.
     IsInSet(BaseTaskSet),
 }
+impl LogFilter {
+    /// Guarantees that the pointer returned will (if some) will be the from the provided iterator
+    #[inline]
+    pub fn next<'b>(&self, iter: &mut impl Iterator<Item = &'b LogGroup>) -> Option<&'b LogGroup> {
+        match self {
+            LogFilter::All => iter.next(),
+            LogFilter::IsGroup(lg) => iter.find(|g| *g == lg),
+            LogFilter::NotGroup(lg) => iter.find(|g| *g != lg),
+            LogFilter::IsBaseTask(bt) => iter.find(|g| g.base_task_index() == *bt),
+            LogFilter::NotBaseTask(bt) => iter.find(|g| g.base_task_index() != *bt),
+            LogFilter::IsInSet(set) => iter.find(|g| set.contains(g.base_task_index())),
+        }
+    }
+}
 
 impl<'a> LogView<'a> {
     pub fn contains(&self, line: &LogEntry) -> bool {
@@ -61,7 +75,157 @@ impl<'a> LogView<'a> {
             LogFilter::IsInSet(set) => set.contains(line.log_group.base_task_index()),
         }
     }
+
+    pub fn collect_forward(&self, from: LogId, ids: &mut Vec<LogId>) {
+        /// Optimized filter collection routine, use when initializing the scroll buffer.
+        /// note passing next_id and write as out pointer produces better codegen
+        /// in rust version 0.93
+        unsafe fn branchfree_chunk_loop(
+            array: &[LogGroup],
+            next_id: &mut usize,
+            write: &mut *mut LogId,
+            predicate: impl Fn(LogGroup) -> bool,
+        ) {
+            let (chunks, remainder) = array.as_chunks::<8>();
+            for chunk in chunks {
+                unsafe {
+                    {
+                        let v0 = predicate(chunk[0]) as usize;
+                        let v1 = predicate(chunk[1]) as usize;
+                        let v2 = predicate(chunk[2]) as usize;
+                        let v3 = predicate(chunk[3]) as usize;
+                        **write = LogId(*next_id);
+                        *write = (*write).add(v0);
+                        **write = LogId(*next_id + 1);
+                        *write = (*write).add(v1);
+                        **write = LogId(*next_id + 2);
+                        *write = (*write).add(v2);
+                        **write = LogId(*next_id + 3);
+                        *write = (*write).add(v3);
+                    }
+                    {
+                        let v4 = predicate(chunk[4]) as usize;
+                        let v5 = predicate(chunk[5]) as usize;
+                        let v6 = predicate(chunk[6]) as usize;
+                        let v7 = predicate(chunk[7]) as usize;
+                        **write = LogId(*next_id + 4);
+                        *write = (*write).add(v4);
+                        **write = LogId(*next_id + 5);
+                        *write = (*write).add(v5);
+                        **write = LogId(*next_id + 6);
+                        *write = (*write).add(v6);
+                        **write = LogId(*next_id + 7);
+                        *write = (*write).add(v7);
+                    }
+                }
+                *next_id += 8;
+            }
+            for &group in remainder {
+                unsafe {
+                    let v = predicate(group) as usize;
+                    **write = LogId(*next_id);
+                    *write = (*write).add(v);
+                }
+                *next_id += 1;
+            }
+        }
+        let (ga, gb) = self.logs.group_slices_range(from, self.tail);
+        let base = from.0.max(self.logs.start_line_id);
+        let total_len = ga.len() + gb.len();
+        // unsafe version
+        // if matches!(self.filter, LogFilter::All) {
+        //     let old_len = ids.len();
+        //     unsafe {
+        //         let mut write = ids.as_mut_ptr().add(old_len);
+        //         for i in 0..total_len {
+        //             write.write(LogId(base + i));
+        //             write = write.add(1);
+        //         }
+        //         ids.set_len(old_len + total_len);
+        //     }
+        //     return;
+        // }
+        if matches!(self.filter, LogFilter::All) {
+            ids.extend((base..total_len + base).map(LogId));
+            return;
+        }
+        ids.reserve(total_len.checked_add(8).unwrap());
+
+        let mut write = unsafe { ids.as_mut_ptr().add(ids.len()) };
+        let mut next_id = base;
+        for array in &[ga, gb] {
+            let id = &mut next_id;
+            let w = &mut write;
+            unsafe {
+                use LogFilter::*;
+                match &self.filter {
+                    // handled above
+                    All => std::hint::unreachable_unchecked(),
+                    &IsGroup(lg) => branchfree_chunk_loop(array, id, w, move |g| g == lg),
+                    &NotGroup(lg) => branchfree_chunk_loop(array, id, w, move |g| g != lg),
+                    &IsBaseTask(bt) => branchfree_chunk_loop(array, id, w, move |g| g.base_task_index() == bt),
+                    &NotBaseTask(bt) => branchfree_chunk_loop(array, id, w, move |g| g.base_task_index() != bt),
+                    IsInSet(set) => branchfree_chunk_loop(array, id, w, |g| set.contains(g.base_task_index())),
+                }
+            }
+        }
+        unsafe {
+            let new_len = write.offset_from(ids.as_ptr()) as usize;
+            ids.set_len(new_len);
+        }
+    }
+
+    pub fn for_each_forward(
+        &self,
+        from: LogId,
+        callback: &mut dyn FnMut(LogId, &LogEntry) -> std::ops::ControlFlow<()>,
+    ) {
+        let (ga, gb) = self.logs.group_slices_range(from, self.tail);
+        let epoch = self.logs.start_line_id & !(MAX_LINES - 1);
+        let index_start = self.logs.start_line_id & (MAX_LINES - 1);
+        for array in [ga, gb] {
+            if array.is_empty() {
+                continue;
+            }
+            let first_physical = unsafe { array.as_ptr().offset_from(self.logs.log_groups.as_ptr()) as usize };
+            let id_base = epoch + if first_physical < index_start { MAX_LINES } else { 0 };
+            let mut iter = array.iter();
+            while let Some(group) = self.filter.next(&mut iter) {
+                unsafe {
+                    let physical = (group as *const LogGroup).offset_from(self.logs.log_groups.as_ptr()) as usize;
+                    let entry = self.logs.line_entries.add(physical).as_ref();
+                    if callback(LogId(id_base + physical), entry).is_break() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn for_each_rev(&self, from: LogId, callback: &mut dyn FnMut(LogId, &LogEntry) -> std::ops::ControlFlow<()>) {
+        let (ga, gb) = self.logs.group_slices_range(from, self.tail);
+        let epoch = self.logs.start_line_id & !(MAX_LINES - 1);
+        let index_start = self.logs.start_line_id & (MAX_LINES - 1);
+        for slice in [gb, ga] {
+            if slice.is_empty() {
+                continue;
+            }
+            let first_physical = unsafe { slice.as_ptr().offset_from(self.logs.log_groups.as_ptr()) as usize };
+            let id_base = epoch + if first_physical < index_start { MAX_LINES } else { 0 };
+            let mut iter = slice.iter().rev();
+            while let Some(group) = self.filter.next(&mut iter) {
+                unsafe {
+                    let physical = (group as *const LogGroup).offset_from(self.logs.log_groups.as_ptr()) as usize;
+                    let entry = self.logs.line_entries.add(physical).as_ref();
+                    if callback(LogId(id_base + physical), entry).is_break() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
+
 #[derive(Clone)]
 pub struct LogView<'a> {
     pub(crate) logs: &'a Logs,
@@ -108,9 +272,9 @@ impl LogEntry {
 }
 
 #[cfg(not(test))]
-const MAX_LINES: usize = 16 * 4096;
+const MAX_LINES: usize = 256 * 1024;
 #[cfg(not(test))]
-const MAX_CAPACITY: usize = 16 * 1024 * 1024;
+const MAX_CAPACITY: usize = 32 * 1024 * 1024;
 
 #[cfg(test)]
 const MAX_LINES: usize = 16;
@@ -127,6 +291,8 @@ impl Drop for Logs {
             std::alloc::dealloc(self.buffer.as_ptr(), layout);
             let layout = std::alloc::Layout::array::<LogEntry>(MAX_LINES).unwrap();
             std::alloc::dealloc(self.line_entries.as_ptr() as *mut u8, layout);
+            let layout = std::alloc::Layout::array::<LogGroup>(MAX_LINES).unwrap();
+            std::alloc::dealloc(self.log_groups.as_ptr() as *mut u8, layout);
         }
     }
 }
@@ -139,6 +305,7 @@ struct WrappingBufferRange {
 pub struct Logs {
     buffer: NonNull<u8>,
     line_entries: NonNull<LogEntry>,
+    log_groups: NonNull<LogGroup>,
     // This MUST be atomic as it's modified under a read lock.
     line_count: AtomicUsize,
     /// The absolute, ever-increasing LineId of the first line in the buffer.
@@ -255,98 +422,64 @@ impl Logs {
         }
     }
 
-    #[cfg(test)]
-    pub fn for_each(&self, mut func: impl FnMut(LogId, LogGroup, &str, u32) -> std::ops::ControlFlow<(), ()>) {
-        let (a, b) = self.slices();
-        let first_id = self.start_line_id;
-        let mut logical_index = 0;
-        for array in [a, b] {
-            for entry in array.iter() {
-                let data = unsafe {
-                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                        self.buffer.add(entry.start as usize).as_ptr(),
-                        entry.len as usize,
-                    ))
-                };
-                match func(LogId(first_id + logical_index), entry.log_group, data, entry.width) {
-                    std::ops::ControlFlow::Continue(_) => (),
-                    std::ops::ControlFlow::Break(_) => return,
-                }
-                logical_index += 1;
+    #[allow(dead_code)]
+    pub fn group_slices(&self) -> (&[LogGroup], &[LogGroup]) {
+        let len = self.line_count.load(Ordering::Acquire);
+        let start = self.index_start();
+        if start + len <= MAX_LINES {
+            unsafe {
+                let slice = std::slice::from_raw_parts(self.log_groups.as_ptr().add(start), len);
+                return (slice, &[]);
             }
+        }
+        let first_len = MAX_LINES - start;
+        unsafe {
+            let a = std::slice::from_raw_parts(self.log_groups.as_ptr().add(start), first_len);
+            let b = std::slice::from_raw_parts(self.log_groups.as_ptr(), len - first_len);
+            (a, b)
         }
     }
 
-    #[cfg(test)]
-    pub fn for_each_from(
-        &self,
-        start_id: LogId,
-        mut func: impl FnMut(LogId, LogGroup, &str, u32) -> std::ops::ControlFlow<(), ()>,
-    ) -> LogId {
+    pub fn group_slices_range(&self, min: LogId, max: LogId) -> (&[LogGroup], &[LogGroup]) {
+        if min.0 > max.0 {
+            return (&[], &[]);
+        }
+
         let first_id = self.start_line_id;
         let len = self.line_count.load(Ordering::Acquire);
 
         if len == 0 {
-            return start_id;
+            return (&[], &[]);
         }
 
-        let end_line_id = first_id + len;
-        let start_logical_offset = start_id.0.saturating_sub(first_id);
+        let last_id = first_id + len - 1;
 
-        if start_logical_offset >= len {
-            // The requested start_id is past the end of our buffer.
-            // The next valid ID to request is the one after our last line.
-            return LogId(end_line_id);
+        let start_id = min.0.max(first_id);
+        let end_id = max.0.min(last_id);
+
+        if start_id > end_id {
+            return (&[], &[]);
         }
 
-        let physical_start_index = (first_id + start_logical_offset) & (MAX_LINES - 1);
-        let num_lines_to_iterate = len - start_logical_offset;
+        let count = end_id - start_id + 1;
 
-        let (a, b) = if physical_start_index + num_lines_to_iterate <= MAX_LINES {
+        let start_offset = start_id - first_id;
+        let physical_start = (self.index_start() + start_offset) & (MAX_LINES - 1);
+
+        if physical_start + count <= MAX_LINES {
             unsafe {
-                (
-                    std::slice::from_raw_parts(
-                        self.line_entries.as_ptr().add(physical_start_index),
-                        num_lines_to_iterate,
-                    ),
-                    &[][..],
-                )
+                let slice = std::slice::from_raw_parts(self.log_groups.as_ptr().add(physical_start), count);
+                (slice, &[])
             }
         } else {
-            let first_slice_len = MAX_LINES - physical_start_index;
+            let first_len = MAX_LINES - physical_start;
+            let second_len = count - first_len;
             unsafe {
-                (
-                    std::slice::from_raw_parts(self.line_entries.as_ptr().add(physical_start_index), first_slice_len),
-                    std::slice::from_raw_parts(self.line_entries.as_ptr(), num_lines_to_iterate - first_slice_len),
-                )
-            }
-        };
-
-        let mut current_logical_offset = start_logical_offset;
-        for array in [a, b] {
-            for entry in array.iter() {
-                let data = unsafe {
-                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(
-                        self.buffer.add(entry.start as usize).as_ptr(),
-                        entry.len as usize,
-                    ))
-                };
-                let current_line_id = LogId(first_id + current_logical_offset);
-                match func(current_line_id, entry.log_group, data, entry.width) {
-                    std::ops::ControlFlow::Continue(_) => (),
-                    std::ops::ControlFlow::Break(_) => {
-                        // Iteration was stopped early. The next ID to start from
-                        // is the one after the line we just processed.
-                        return LogId(current_line_id.0 + 1);
-                    }
-                }
-                current_logical_offset += 1;
+                let a = std::slice::from_raw_parts(self.log_groups.as_ptr().add(physical_start), first_len);
+                let b = std::slice::from_raw_parts(self.log_groups.as_ptr(), second_len);
+                (a, b)
             }
         }
-
-        // If we finished the whole loop, the next ID to start from is
-        // the one after the very last line in the buffer.
-        LogId(end_line_id)
     }
 
     fn free_lines(&mut self, amount: usize) -> WrappingBufferRange {
@@ -446,6 +579,7 @@ fn write_line_unchecked(buf: &Logs, start: u32, line: &str, width: u32, job_id: 
             style,
             time,
         });
+        buf.log_groups.add(next).write(job_id);
         buf.line_count.fetch_add(1, Ordering::Release);
     }
 }
@@ -474,9 +608,18 @@ impl LogWriter {
             }
             NonNull::new(ptr as *mut LogEntry).unwrap()
         };
+        let log_groups = {
+            let layout = std::alloc::Layout::array::<LogGroup>(MAX_LINES).unwrap();
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            NonNull::new(ptr as *mut LogGroup).unwrap()
+        };
         let line_buffer = Logs {
             buffer,
             line_entries,
+            log_groups,
             line_count: AtomicUsize::new(0),
             start_line_id: 0,
             start_time: crate::clock::now(),
@@ -529,23 +672,25 @@ mod tests {
     use super::*;
     use std::ops::ControlFlow;
 
-    // Helper to collect all lines from the buffer for easy assertion.
     fn collect_lines(reader: &Arc<RwLock<Logs>>) -> Vec<(LogId, LogGroup, String, u32)> {
-        let mut lines = Vec::new();
         let buffer = reader.read().unwrap();
-        buffer.for_each(|id, job, data, width| {
-            lines.push((id, job, data.to_string(), width));
+        let view = buffer.view_all();
+        let mut lines = Vec::new();
+        view.for_each_forward(buffer.head(), &mut |id, entry| {
+            let text = unsafe { entry.text(&buffer) }.to_string();
+            lines.push((id, entry.log_group, text, entry.width));
             ControlFlow::Continue(())
         });
         lines
     }
 
-    // Helper to collect lines from a specific starting ID.
     fn collect_lines_from(reader: &Arc<RwLock<Logs>>, start_id: LogId) -> Vec<(LogId, LogGroup, String, u32)> {
-        let mut lines = Vec::new();
         let buffer = reader.read().unwrap();
-        buffer.for_each_from(start_id, |id, job, data, width| {
-            lines.push((id, job, data.to_string(), width));
+        let view = buffer.view_all();
+        let mut lines = Vec::new();
+        view.for_each_forward(start_id, &mut |id, entry| {
+            let text = unsafe { entry.text(&buffer) }.to_string();
+            lines.push((id, entry.log_group, text, entry.width));
             ControlFlow::Continue(())
         });
         lines
@@ -702,6 +847,50 @@ mod tests {
         let lines_from_8 = collect_lines_from(&reader, LogId(8));
         assert_eq!(lines_from_8.len(), 12);
         assert_eq!(lines_from_8[0].0, LogId(8));
+    }
+
+    fn collect_lines_rev(reader: &Arc<RwLock<Logs>>) -> Vec<(LogId, LogGroup, String, u32)> {
+        let buffer = reader.read().unwrap();
+        let view = buffer.view_all();
+        let mut lines = Vec::new();
+        view.for_each_rev(buffer.head(), &mut |id, entry| {
+            let text = unsafe { entry.text(&buffer) }.to_string();
+            lines.push((id, entry.log_group, text, entry.width));
+            ControlFlow::Continue(())
+        });
+        lines
+    }
+
+    #[test]
+    fn test_for_each_rev_matches_forward() {
+        let mut writer = LogWriter::new();
+        let reader = writer.reader();
+
+        for i in 0..5 {
+            writer.push_line(&format!("Line {}", i), 10, LogGroup(i as u32), Style::DEFAULT);
+        }
+
+        let fwd = collect_lines(&reader);
+        let mut rev = collect_lines_rev(&reader);
+        rev.reverse();
+        assert_eq!(fwd, rev);
+    }
+
+    #[test]
+    fn test_for_each_rev_after_rotation() {
+        let mut writer = LogWriter::new();
+        let reader = writer.reader();
+
+        for i in 0..20 {
+            writer.push_line(&format!("line_{}", i), 10, LogGroup(i as u32), Style::DEFAULT);
+        }
+
+        let fwd = collect_lines(&reader);
+        let mut rev = collect_lines_rev(&reader);
+        rev.reverse();
+        assert_eq!(fwd, rev);
+        assert_eq!(fwd[0].0, LogId(8));
+        assert_eq!(fwd.last().unwrap().0, LogId(19));
     }
 
     #[test]

@@ -30,9 +30,7 @@ impl LogTailWidget {
             self.tail = view.tail;
             return;
         }
-        let (a, b) = view.logs.slices_range(self.tail, view.tail);
-
-        if rect.h == 0 || (a.is_empty() && b.is_empty()) {
+        if rect.h == 0 || self.tail >= view.tail {
             self.tail = view.tail;
             return;
         }
@@ -46,10 +44,7 @@ impl LogTailWidget {
             vt::MoveCursor(rect.x, rect.y + self.next_screen_offset - 1).write_to_buffer(buf);
         }
         let mut offset = self.next_screen_offset as u32;
-        for entry in a.iter().chain(b.iter()) {
-            if !view.contains(entry) {
-                continue;
-            }
+        view.for_each_forward(self.tail, &mut |_log_id, entry| {
             offset += get_entry_height(entry, style, rect.w as u32);
             if first {
                 first = false
@@ -102,7 +97,8 @@ impl LogTailWidget {
                 }
                 vt::CLEAR_STYLE.write_to_buffer(buf);
             }
-        }
+            std::ops::ControlFlow::Continue(())
+        });
 
         vt::ScrollRegion::RESET.write_to_buffer(buf);
         if offset > rect.h as u32 {
