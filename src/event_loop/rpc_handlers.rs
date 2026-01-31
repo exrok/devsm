@@ -437,6 +437,10 @@ impl EventLoop {
             return self.handle_get_self_logs(socket, fds, payload, correlation);
         }
 
+        if kind == RpcMessageKind::GetWorkspaces {
+            return self.handle_get_workspaces(socket, payload, correlation);
+        }
+
         // Resolve workspace for all other commands
         let ws_index = match resolve_workspace_from_header_result(&mut self.state, ws_data) {
             Ok(idx) => idx,
@@ -493,6 +497,42 @@ impl EventLoop {
             let logs = crate::self_log::get_daemon_logs().unwrap_or_default();
             Ok(RpcOutcome::RawWrite { socket, data: logs })
         }
+    }
+
+    fn handle_get_workspaces(
+        &mut self,
+        socket: UnixStream,
+        payload: &[u8],
+        correlation: u16,
+    ) -> Result<RpcOutcome, RpcError> {
+        let Ok(_) = jsony::from_binary::<rpc::GetWorkspacesRequest>(payload) else {
+            return Err(RpcError::new(socket, 2, "Invalid GetWorkspaces payload", correlation));
+        };
+
+        let db_workspaces = self.state.db.workspaces();
+        let loaded_paths: hashbrown::HashSet<&Path> = self.state.workspace_map.keys().map(|p| p.as_ref()).collect();
+
+        let infos: Vec<rpc::WorkspaceInfo> = db_workspaces
+            .into_iter()
+            .map(|w| {
+                let currently_loaded = loaded_paths.contains(Path::new(w.config_path.as_str()));
+                rpc::WorkspaceInfo {
+                    config_path: w.config_path.into(),
+                    last_loaded_ms: w.last_loaded.ms(),
+                    currently_loaded,
+                }
+            })
+            .collect();
+
+        let body = CommandBody::Message(jsony::to_json(&rpc::GetWorkspacesResponse { workspaces: infos }).into());
+
+        let mut encoder = rpc::Encoder::new();
+        encoder.encode_response(
+            RpcMessageKind::CommandAck,
+            correlation,
+            &rpc::CommandResponse { workspace_id: 0, body },
+        );
+        Ok(RpcOutcome::Respond { socket, encoder, register: None })
     }
 
     /// Try to handle attach commands. Returns the socket back if not an attach command.

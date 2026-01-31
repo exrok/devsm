@@ -82,6 +82,7 @@ impl TestHarness {
             .arg("server")
             .current_dir(&self.temp_dir)
             .env("DEVSM_SOCKET", &self.socket_path)
+            .env("DEVSM_DB", "/dev/null")
             .env("DEVSM_LOG_STDOUT", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
@@ -102,6 +103,7 @@ impl TestHarness {
             .arg("server")
             .current_dir(cwd)
             .env("DEVSM_SOCKET", &self.socket_path)
+            .env("DEVSM_DB", "/dev/null")
             .env("DEVSM_LOG_STDOUT", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
@@ -126,6 +128,7 @@ impl TestHarness {
             .arg("server")
             .current_dir(&self.temp_dir)
             .env("DEVSM_SOCKET", &self.socket_path)
+            .env("DEVSM_DB", "/dev/null")
             .env("DEVSM_FUZZ_SOCKET", &self.fuzz_socket_path)
             .env("DEVSM_LOG_STDOUT", "1")
             .stdin(Stdio::null())
@@ -163,6 +166,7 @@ impl TestHarness {
         cmd.args(args)
             .current_dir(&self.temp_dir)
             .env("DEVSM_SOCKET", &self.socket_path)
+            .env("DEVSM_DB", "/dev/null")
             .env("DEVSM_NO_AUTO_SPAWN", "1")
             .env("DEVSM_CONNECT_TIMEOUT_MS", "5000")
             .stdin(Stdio::piped())
@@ -310,8 +314,7 @@ impl RpcSubscriber {
                                 RpcEvent::JobExited { job_index: e.job_index, exit_code: e.exit_code, cause: e.cause }
                             }
                             RpcMessageKind::DebugTrace => {
-                                let e: DebugTraceEvent =
-                                    jsony::from_binary(payload).expect("invalid DebugTraceEvent");
+                                let e: DebugTraceEvent = jsony::from_binary(payload).expect("invalid DebugTraceEvent");
                                 RpcEvent::DebugTrace { tag: e.tag.to_string(), job_index: e.job_index }
                             }
                             RpcMessageKind::Disconnect => RpcEvent::Disconnect,
@@ -365,9 +368,8 @@ impl RpcSubscriber {
     pub fn wait_for_trace(&mut self, tag: &str, job_index: u32, timeout: Duration) -> Vec<RpcEvent> {
         self.collect_until(
             |evs| {
-                evs.iter().any(|e| {
-                    matches!(e, RpcEvent::DebugTrace { tag: t, job_index: j } if t == tag && *j == job_index)
-                })
+                evs.iter()
+                    .any(|e| matches!(e, RpcEvent::DebugTrace { tag: t, job_index: j } if t == tag && *j == job_index))
             },
             timeout,
         )
@@ -526,9 +528,7 @@ impl FuzzClock {
 #[cfg(feature = "fuzz")]
 pub fn find_exit_event(events: &[RpcEvent], job_index: u32) -> Option<(i32, ExitCause)> {
     events.iter().find_map(|e| match e {
-        RpcEvent::JobExited { job_index: j, exit_code, cause } if *j == job_index => {
-            Some((*exit_code, cause.clone()))
-        }
+        RpcEvent::JobExited { job_index: j, exit_code, cause } if *j == job_index => Some((*exit_code, cause.clone())),
         _ => None,
     })
 }

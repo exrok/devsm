@@ -80,6 +80,7 @@ pub struct GlobalArguments<'a> {
 pub enum Command<'a> {
     Help,
     Tui,
+    Global,
     Server,
     RestartSelected,
     Spawn { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
@@ -140,6 +141,7 @@ pub enum GetResource {
     WorkspaceConfigPath,
     DefaultUserConfig,
     LoggedRustPanics,
+    Workspaces { json: bool },
 }
 
 /// Filter for test selection.
@@ -562,6 +564,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                 bail!("Dangling value found: {:?}", value)
             }
             Component::Term(command) => match command {
+                "global" => break 'command Command::Global,
                 "server" => break 'command Command::Server,
                 "restart-selected" => break 'command Command::RestartSelected,
                 "spawn" => break 'command parse_spawn(&mut parser)?,
@@ -635,6 +638,25 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                         }
                         "logged-rust-panics" => {
                             break 'command Command::Get { resource: GetResource::LoggedRustPanics };
+                        }
+                        "workspaces" => {
+                            let mut json = false;
+                            for component in parser.by_ref() {
+                                match component {
+                                    Component::Long(long) => match long {
+                                        "json" => json = true,
+                                        _ => bail!("Unknown flag --{} in get workspaces", long),
+                                    },
+                                    Component::Flags(flags) => {
+                                        if let Some(flag) = flags.chars().next() {
+                                            bail!("Unknown flag -{} in get workspaces", flag);
+                                        }
+                                    }
+                                    Component::Term(arg) => bail!("Unexpected argument: {:?}", arg),
+                                    Component::Value(val) => bail!("Unexpected value: {:?}", val),
+                                }
+                            }
+                            break 'command Command::Get { resource: GetResource::Workspaces { json } };
                         }
                         _ => bail!("Unknown resource: {}", resource),
                     }

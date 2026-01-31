@@ -22,11 +22,13 @@ mod clock;
 mod collection;
 mod config;
 mod daemon;
+mod db;
 mod diagnostic;
 mod event_loop;
+mod function;
 #[cfg(feature = "fuzz")]
 mod fuzz_server;
-mod function;
+mod global_tui;
 mod keybinds;
 mod line_width;
 mod log_fowarder_ui;
@@ -59,7 +61,23 @@ fn main() {
         }
         cli::Command::Tui => {
             let _log_guard = self_log::init_client_logging();
-            if let Err(err) = client() {
+            let cwd = std::env::current_dir().unwrap_or_else(|err| {
+                eprintln!("error: failed to get current directory: {}", err);
+                std::process::exit(1);
+            });
+            if config::find_config_path_from(&cwd).is_some() {
+                if let Err(err) = client() {
+                    eprintln!("error: {}", err);
+                    std::process::exit(1);
+                }
+            } else if let Err(err) = global_client() {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
+        }
+        cli::Command::Global => {
+            let _log_guard = self_log::init_client_logging();
+            if let Err(err) = global_client() {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -170,6 +188,12 @@ fn main() {
             }
             cli::GetResource::LoggedRustPanics => {
                 if let Err(err) = get_logged_rust_panics_command() {
+                    eprintln!("error: {}", err);
+                    std::process::exit(1);
+                }
+            }
+            cli::GetResource::Workspaces { json } => {
+                if let Err(err) = get_workspaces_command(json) {
                     eprintln!("error: {}", err);
                     std::process::exit(1);
                 }
@@ -477,6 +501,35 @@ fn get_logged_rust_panics_command() -> anyhow::Result<()> {
     handle_command_response(response)
 }
 
+fn get_workspaces_command(json: bool) -> anyhow::Result<()> {
+    let mut socket = connect_or_spawn_daemon()?;
+
+    let mut encoder = rpc::Encoder::new();
+    encoder.encode_one_shot(RpcMessageKind::GetWorkspaces, 1 | ONE_SHOT_FLAG, &rpc::GetWorkspacesRequest {});
+    socket.write_all(encoder.output())?;
+
+    let response = rpc_read_response(&mut socket)?;
+    if json {
+        return handle_command_response(response);
+    }
+    match response.body {
+        CommandBody::Empty => Ok(()),
+        CommandBody::Message(msg) => {
+            let Ok(resp) = jsony::from_json::<rpc::GetWorkspacesResponse>(&msg) else {
+                println!("{msg}");
+                return Ok(());
+            };
+            for ws in &resp.workspaces {
+                let status = if ws.currently_loaded { "LIVE" } else { "DEAD" };
+                let path = ws.config_path.strip_suffix("/devsm.toml").unwrap_or(&ws.config_path);
+                println!("{status} {path}");
+            }
+            Ok(())
+        }
+        CommandBody::Error(err) => bail!("{err}"),
+    }
+}
+
 fn handle_command_response(response: CommandResponse) -> anyhow::Result<()> {
     match response.body {
         CommandBody::Empty => Ok(()),
@@ -488,11 +541,26 @@ fn handle_command_response(response: CommandResponse) -> anyhow::Result<()> {
     }
 }
 
+fn global_client() -> anyhow::Result<()> {
+    let stdin = std::fs::File::open("/dev/tty")?;
+    let stdout = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
+    match global_tui::run(stdin, stdout)? {
+        global_tui::Selection::Quit => Ok(()),
+        global_tui::Selection::Workspace(config_path) => {
+            let cwd = config_path.parent().unwrap_or(&config_path).to_path_buf();
+            client_with_config(&cwd, &config_path)
+        }
+    }
+}
+
 fn client() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let config = config::find_config_path_from(&cwd)
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+    client_with_config(&cwd, &config)
+}
 
+fn client_with_config(cwd: &std::path::Path, config: &std::path::Path) -> anyhow::Result<()> {
     setup_signal_handler(libc::SIGTERM, term_handler)?;
     setup_signal_handler(libc::SIGINT, term_handler)?;
     setup_signal_handler(libc::SIGWINCH, winch_handler)?;
@@ -500,10 +568,7 @@ fn client() -> anyhow::Result<()> {
     let mut socket = connect_or_spawn_daemon()?;
 
     socket.send_with_fd(
-        &jsony::to_binary(&daemon::RequestMessage {
-            cwd: &cwd,
-            request: daemon::Request::AttachTui { config: &config },
-        }),
+        &jsony::to_binary(&daemon::RequestMessage { cwd, request: daemon::Request::AttachTui { config } }),
         &[0, 1],
     )?;
 
@@ -871,6 +936,7 @@ fn get_self_logs(follow: bool) -> anyhow::Result<()> {
 fn print_completions(context: cli::CompleteContext) -> bool {
     match context {
         cli::CompleteContext::Commands => {
+            println!("global\tOpen global workspace selector");
             println!("run\tRun a task and display output");
             println!("exec\tExecute task directly, bypassing daemon");
             println!("restart\tRestart a task via daemon");
@@ -1004,6 +1070,7 @@ fn print_completions(context: cli::CompleteContext) -> bool {
         cli::CompleteContext::GetResources => {
             println!("self-logs\tRetrieve daemon logs");
             println!("workspace\tWorkspace resources");
+            println!("workspaces\tList known workspaces");
             println!("default-user-config\tPrint default user config");
             println!("logged-rust-panics\tShow logged Rust panics");
             true
@@ -1025,7 +1092,8 @@ devsm - TUI development service manager
 Usage: devsm [OPTIONS] [COMMAND]
 
 Commands:
-  (default)          Launch the TUI interface
+  (default)          Launch the TUI interface (or workspace selector if not in a workspace)
+  global             Open global workspace selector
   run <job>          Run a job and display its output
   exec <job>         Execute a task directly, bypassing the daemon
   spawn <job>        Spawn a job via the daemon
@@ -1074,6 +1142,7 @@ Logs Options:
 Get Resources:
   self-logs [-f]         Retrieve daemon logs (-f/--follow to tail)
   workspace config-path  Get config file path
+  workspaces [--json]    List known workspaces (sorted by last loaded)
   default-user-config    Print default user config (keybindings)
   logged-rust-panics     Show logged Rust panics from daemon
 

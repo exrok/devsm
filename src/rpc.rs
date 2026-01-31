@@ -145,6 +145,7 @@ pub enum RpcMessageKind {
     GetSelfLogs = 0x0118,
     RestartSelected = 0x0119,
     GetLoggedRustPanics = 0x011A,
+    GetWorkspaces = 0x011B,
 
     // Legacy responses
     OpenWorkspaceAck = 0x0200,
@@ -185,6 +186,7 @@ impl RpcMessageKind {
             0x0118 => Some(Self::GetSelfLogs),
             0x0119 => Some(Self::RestartSelected),
             0x011A => Some(Self::GetLoggedRustPanics),
+            0x011B => Some(Self::GetWorkspaces),
             0x0200 => Some(Self::OpenWorkspaceAck),
             0x0201 => Some(Self::SubscribeAck),
             0x0203 => Some(Self::RunTaskAck),
@@ -209,6 +211,7 @@ impl RpcMessageKind {
                 | Self::CallFunction
                 | Self::RestartSelected
                 | Self::GetLoggedRustPanics
+                | Self::GetWorkspaces
         )
     }
 }
@@ -1210,6 +1213,27 @@ pub struct RestartSelectedRequest {}
 #[jsony(Binary)]
 pub struct GetLoggedRustPanicsRequest {}
 
+/// Request to get all known workspaces.
+#[derive(Jsony, Debug, Default)]
+#[jsony(Binary)]
+pub struct GetWorkspacesRequest {}
+
+/// A workspace entry in the get workspaces response.
+#[derive(Jsony, Debug)]
+#[jsony(Binary, ToJson, FromJson)]
+pub struct WorkspaceInfo {
+    pub config_path: Box<str>,
+    pub last_loaded_ms: u64,
+    pub currently_loaded: bool,
+}
+
+/// Response to a [`GetWorkspacesRequest`].
+#[derive(Jsony, Debug)]
+#[jsony(Binary, ToJson, FromJson)]
+pub struct GetWorkspacesResponse {
+    pub workspaces: Vec<WorkspaceInfo>,
+}
+
 /// Body of a command response.
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
@@ -1319,6 +1343,15 @@ impl RpcRequest<'_> for RestartSelectedRequest {
 
 impl RpcRequest<'_> for GetLoggedRustPanicsRequest {
     const KIND: RpcMessageKind = RpcMessageKind::GetLoggedRustPanics;
+    type Ack<'l> = CommandResponse;
+}
+
+impl RpcResponse<'_> for GetWorkspacesResponse {
+    const KIND: RpcMessageKind = RpcMessageKind::CommandAck;
+}
+
+impl RpcRequest<'_> for GetWorkspacesRequest {
+    const KIND: RpcMessageKind = RpcMessageKind::GetWorkspaces;
     type Ack<'l> = CommandResponse;
 }
 

@@ -166,6 +166,7 @@ struct State {
     request: Arc<MioChannel>,
     timed_ready_count: u32,
     timed_timeout_count: u32,
+    db: crate::db::Db,
 }
 
 pub(crate) struct EventLoop {
@@ -865,6 +866,7 @@ impl State {
         let entry = WorkspaceEntry { line_writer, handle: handle.clone() };
         let index = self.workspaces.insert(entry) as WorkspaceIndex;
         self.workspace_map.insert(workspace_config.to_path_buf().into_boxed_path(), index);
+        self.db.record_workspace(&workspace_config);
         Ok(index)
     }
 }
@@ -1479,6 +1481,7 @@ impl EventLoop {
 
 pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
     let mut events = Events::with_capacity(128);
+    let db = crate::db::Db::open();
     let mut job_manager = EventLoop {
         buffer_pool: Vec::new(),
         clients: Slab::new(),
@@ -1490,6 +1493,7 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
             poll,
             timed_ready_count: 0,
             timed_timeout_count: 0,
+            db,
         },
     };
     loop {
