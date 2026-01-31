@@ -992,13 +992,11 @@ impl EventLoop {
                 if let Err(err) = self.spawn(workspace_id, job_id, job_index, task) {
                     kvlog::error!("Failed to spawn process", ?err, ?job_id);
                     if let Some(workspace) = self.state.workspaces.get(workspace_id as usize) {
-                        let log_end = workspace.line_writer.tail();
                         let mut ws = workspace.handle.state.write().unwrap();
                         ws.update_job_status(
                             job_index,
                             JobStatus::Exited {
                                 finished_at: crate::clock::now(),
-                                log_end,
                                 cause: ExitCause::SpawnFailed,
                                 status: 127,
                             },
@@ -1144,12 +1142,7 @@ impl EventLoop {
                 let mut ws = workspace.handle.state.write().unwrap();
                 ws.update_job_status(
                     job_idx,
-                    JobStatus::Exited {
-                        finished_at: crate::clock::now(),
-                        log_end: workspace.line_writer.tail(),
-                        cause,
-                        status: exit_code,
-                    },
+                    JobStatus::Exited { finished_at: crate::clock::now(), cause, status: exit_code },
                 );
             }
             if process.ready_checker.as_ref().is_some_and(|rc| rc.timeout_at.is_some()) {

@@ -6,7 +6,7 @@ use crate::{
     },
     event_loop::MioChannel,
     function::FunctionAction,
-    log_storage::{LogGroup, LogId, Logs},
+    log_storage::{LogGroup, Logs},
 };
 pub use job_index_list::JobIndexList;
 use jsony_value::ValueMap;
@@ -137,8 +137,6 @@ pub struct Job {
     pub log_group: LogGroup,
     pub task: TaskConfigRc,
     pub started_at: Instant,
-    #[expect(unused, reason = "TODO use an optimization for log filtering")]
-    pub log_start: LogId,
     /// Computed cache key for cache invalidation. Empty string means no key-based caching.
     pub cache_key: String,
     /// Profile used when spawning this job.
@@ -240,8 +238,6 @@ pub enum JobStatus {
     },
     Exited {
         finished_at: Instant,
-        #[expect(unused, reason = "TODO optimization in log filtering")]
-        log_end: LogId,
         cause: ExitCause,
         status: u32,
     },
@@ -833,7 +829,6 @@ impl WorkspaceState {
         workspace_id: u32,
         channel: &MioChannel,
         base_task: BaseTaskIndex,
-        log_start: LogId,
         params: ValueMap,
         profile: &str,
         reason: ScheduleReason,
@@ -889,7 +884,6 @@ impl WorkspaceState {
                             workspace_id,
                             channel,
                             dep_base_task,
-                            log_start,
                             dep_params.clone(),
                             dep_profile,
                             ScheduleReason::Dependency,
@@ -906,7 +900,6 @@ impl WorkspaceState {
                             workspace_id,
                             channel,
                             dep_base_task,
-                            log_start,
                             dep_params,
                             dep_profile,
                             ScheduleReason::Dependency,
@@ -953,7 +946,6 @@ impl WorkspaceState {
                         workspace_id,
                         channel,
                         dep_base_task,
-                        log_start,
                         dep_params,
                         dep_profile,
                         ScheduleReason::Dependency,
@@ -979,7 +971,6 @@ impl WorkspaceState {
                         workspace_id,
                         channel,
                         dep_base_task,
-                        log_start,
                         dep_params,
                         dep_profile,
                         ScheduleReason::Dependency,
@@ -1036,7 +1027,6 @@ impl WorkspaceState {
             log_group: job_id,
             task: task.clone(),
             started_at: crate::clock::now(),
-            log_start,
             cache_key,
             spawn_profile: profile.to_string(),
             spawn_params: params.to_owned(),
@@ -1057,7 +1047,6 @@ impl WorkspaceState {
     fn schedule_queued_service(
         &mut self,
         base_task: BaseTaskIndex,
-        log_start: LogId,
         params: ValueMap,
         profile: &str,
         blocked_by: JobIndex,
@@ -1085,7 +1074,6 @@ impl WorkspaceState {
             log_group: job_id,
             task,
             started_at: crate::clock::now(),
-            log_start,
             cache_key,
             spawn_profile: profile.to_string(),
             spawn_params: params.to_owned(),
@@ -1148,7 +1136,6 @@ impl WorkspaceState {
         workspace_id: u32,
         channel: &MioChannel,
         name: &str,
-        log_start: LogId,
         params: ValueMap,
         profile: &str,
     ) -> Result<(BaseTaskIndex, JobIndex), String> {
@@ -1157,8 +1144,7 @@ impl WorkspaceState {
         };
         self.change_number = self.change_number.wrapping_add(1);
         self.refresh_config();
-        let job_index =
-            self.spawn_task(workspace_id, channel, base_index, log_start, params, profile, ScheduleReason::Requested);
+        let job_index = self.spawn_task(workspace_id, channel, base_index, params, profile, ScheduleReason::Requested);
         Ok((base_index, job_index))
     }
 
@@ -1487,7 +1473,6 @@ impl WorkspaceState {
         workspace_id: u32,
         channel: &MioChannel,
         batch: &mut SpawnBatch<T>,
-        log_start: LogId,
     ) {
         let reqs: Vec<_> = batch
             .pending_requirements
@@ -1539,15 +1524,8 @@ impl WorkspaceState {
                         continue;
                     }
 
-                    let new_job = self.spawn_task(
-                        workspace_id,
-                        channel,
-                        base_task,
-                        log_start,
-                        params,
-                        &profile,
-                        ScheduleReason::Dependency,
-                    );
+                    let new_job =
+                        self.spawn_task(workspace_id, channel, base_task, params, &profile, ScheduleReason::Dependency);
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Service => {
@@ -1566,8 +1544,7 @@ impl WorkspaceState {
                                     running_profile,
                                     requested_profile,
                                 );
-                                let queued_job =
-                                    self.schedule_queued_service(base_task, log_start, params, &profile, running_job);
+                                let queued_job = self.schedule_queued_service(base_task, params, &profile, running_job);
                                 batch.mark_resolved(key, ResolvedRequirement::Pending(queued_job));
                                 continue;
                             }
@@ -1575,15 +1552,8 @@ impl WorkspaceState {
                         }
                     }
 
-                    let new_job = self.spawn_task(
-                        workspace_id,
-                        channel,
-                        base_task,
-                        log_start,
-                        params,
-                        &profile,
-                        ScheduleReason::Dependency,
-                    );
+                    let new_job =
+                        self.spawn_task(workspace_id, channel, base_task, params, &profile, ScheduleReason::Dependency);
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Test => {
@@ -1711,7 +1681,6 @@ impl Workspace {
             self.workspace_id,
             &self.process_channel,
             base_task,
-            self.logs.read().unwrap().tail(),
             params,
             profile,
             ScheduleReason::Requested,
@@ -1762,10 +1731,9 @@ impl Workspace {
     /// Acquires state lock, looks up task, and spawns it.
     #[expect(unused, reason = "public API for programmatic restart without cache checking")]
     pub fn restart_task_by_name(&self, name: &str, params: ValueMap, profile: &str) -> Result<JobIndex, String> {
-        let log_start = self.logs.read().unwrap().tail();
         let state = &mut *self.state.write().unwrap();
         let (_, job_index) =
-            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, log_start, params, profile)?;
+            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
         Ok(job_index)
     }
 
@@ -1784,8 +1752,6 @@ impl Workspace {
         profile: &str,
         cached: bool,
     ) -> Result<Option<String>, String> {
-        let log_start = self.logs.read().unwrap().tail();
-
         if cached {
             // Phase 1: Gather info needed for cache key computation (hold lock briefly)
             let cache_info = {
@@ -1797,27 +1763,15 @@ impl Workspace {
                 let Some(cache_config) = &bt.config.cache else {
                     drop(state);
                     let state = &mut *self.state.write().unwrap();
-                    let (_, _) = state.lookup_and_spawn_task(
-                        self.workspace_id,
-                        &self.process_channel,
-                        name,
-                        log_start,
-                        params,
-                        profile,
-                    )?;
+                    let (_, _) =
+                        state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
                     return Ok(None);
                 };
                 if cache_config.never {
                     drop(state);
                     let state = &mut *self.state.write().unwrap();
-                    let (_, _) = state.lookup_and_spawn_task(
-                        self.workspace_id,
-                        &self.process_channel,
-                        name,
-                        log_start,
-                        params,
-                        profile,
-                    )?;
+                    let (_, _) =
+                        state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
                     return Ok(None);
                 };
 
@@ -1853,25 +1807,13 @@ impl Workspace {
                 return Ok(Some(msg));
             }
 
-            let (_, _job_index) = state.lookup_and_spawn_task(
-                self.workspace_id,
-                &self.process_channel,
-                name,
-                log_start,
-                params,
-                profile,
-            )?;
+            let (_, _job_index) =
+                state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
             Ok(None)
         } else {
             let state = &mut *self.state.write().unwrap();
-            let (_, _job_index) = state.lookup_and_spawn_task(
-                self.workspace_id,
-                &self.process_channel,
-                name,
-                log_start,
-                params,
-                profile,
-            )?;
+            let (_, _job_index) =
+                state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
             Ok(None)
         }
     }
@@ -1880,10 +1822,9 @@ impl Workspace {
     ///
     /// Acquires state lock, looks up task, spawns it, and records it as a test group.
     pub fn spawn_task_as_test(&self, name: &str, params: ValueMap, profile: &str) -> Result<(), String> {
-        let log_start = self.logs.read().unwrap().tail();
         let state = &mut *self.state.write().unwrap();
         let (base_index, job_index) =
-            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, log_start, params, profile)?;
+            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
         state.record_test_group(base_index, job_index);
         Ok(())
     }
@@ -1903,7 +1844,6 @@ impl Workspace {
         use crate::config::FunctionDefAction;
         use crate::function::FunctionAction;
 
-        let log_start = self.logs.read().unwrap().tail();
         let state = &mut *self.state.write().unwrap();
 
         if let Some(FunctionAction::RestartCaptured { task_name, profile }) = state.session_functions.get(name).cloned()
@@ -1912,7 +1852,6 @@ impl Workspace {
                 self.workspace_id,
                 &self.process_channel,
                 &task_name,
-                log_start,
                 ValueMap::new(),
                 &profile,
             )?;
@@ -1927,7 +1866,6 @@ impl Workspace {
                             self.workspace_id,
                             &self.process_channel,
                             task,
-                            log_start,
                             ValueMap::new(),
                             "",
                         )?;
@@ -1941,7 +1879,6 @@ impl Workspace {
                                 self.workspace_id,
                                 &self.process_channel,
                                 &task_call.name,
-                                log_start,
                                 task_call.vars.clone(),
                                 task_call.profile.unwrap_or(""),
                             )?;
@@ -1967,7 +1904,6 @@ impl Workspace {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
         state.refresh_config();
-        let log_start = self.logs.read().unwrap().tail();
 
         let run_id = state.active_test_run.as_ref().map_or(0, |r| r.run_id + 1);
 
@@ -2094,7 +2030,7 @@ impl Workspace {
             });
         }
 
-        state.resolve_batch_requirements(self.workspace_id, &self.process_channel, &mut batch, log_start);
+        state.resolve_batch_requirements(self.workspace_id, &self.process_channel, &mut batch);
 
         let tasks = batch.take_tasks();
         let mut test_jobs = Vec::new();
@@ -2142,7 +2078,6 @@ impl Workspace {
                 log_group: job_id,
                 task: task_config.clone(),
                 started_at: crate::clock::now(),
-                log_start,
                 cache_key,
                 spawn_profile: String::new(),
                 spawn_params: ValueMap::new(),
@@ -2188,7 +2123,6 @@ impl Workspace {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
         state.refresh_config();
-        let log_start = self.logs.read().unwrap().tail();
 
         let run_id = state.active_test_run.as_ref().map_or(0, |r| r.run_id + 1);
 
@@ -2318,7 +2252,7 @@ impl Workspace {
             });
         }
 
-        state.resolve_batch_requirements(self.workspace_id, &self.process_channel, &mut batch, log_start);
+        state.resolve_batch_requirements(self.workspace_id, &self.process_channel, &mut batch);
 
         let tasks = batch.take_tasks();
         let mut test_jobs = Vec::new();
@@ -2368,7 +2302,6 @@ impl Workspace {
                 log_group: job_id,
                 task: task_config.clone(),
                 started_at: crate::clock::now(),
-                log_start,
                 cache_key,
                 spawn_profile,
                 spawn_params,
@@ -2537,7 +2470,7 @@ mod scheduling_tests {
         assert!(JobStatus::Starting.is_pending_completion());
         assert!(JobStatus::Running { process_index: 0, ready_state: None }.is_pending_completion());
         assert!(
-            !JobStatus::Exited { finished_at: Instant::now(), log_end: LogId(0), cause: ExitCause::Unknown, status: 0 }
+            !JobStatus::Exited { finished_at: Instant::now(), cause: ExitCause::Unknown, status: 0 }
                 .is_pending_completion()
         );
         assert!(!JobStatus::Cancelled.is_pending_completion());
@@ -2551,12 +2484,12 @@ mod scheduling_tests {
         assert!(!JobStatus::Cancelled.is_successful_completion());
 
         assert!(
-            JobStatus::Exited { finished_at: Instant::now(), log_end: LogId(0), cause: ExitCause::Unknown, status: 0 }
+            JobStatus::Exited { finished_at: Instant::now(), cause: ExitCause::Unknown, status: 0 }
                 .is_successful_completion()
         );
 
         assert!(
-            !JobStatus::Exited { finished_at: Instant::now(), log_end: LogId(0), cause: ExitCause::Unknown, status: 1 }
+            !JobStatus::Exited { finished_at: Instant::now(), cause: ExitCause::Unknown, status: 1 }
                 .is_successful_completion()
         );
 
@@ -2564,7 +2497,7 @@ mod scheduling_tests {
         // The ScheduleRequirement::status method does check for Killed separately
         // when evaluating the TerminatedNaturallyAndSuccessfully predicate.
         assert!(
-            JobStatus::Exited { finished_at: Instant::now(), log_end: LogId(0), cause: ExitCause::Killed, status: 0 }
+            JobStatus::Exited { finished_at: Instant::now(), cause: ExitCause::Killed, status: 0 }
                 .is_successful_completion()
         );
     }

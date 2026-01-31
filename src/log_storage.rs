@@ -451,6 +451,7 @@ fn write_line_unchecked(buf: &Logs, start: u32, line: &str, width: u32, job_id: 
 }
 
 impl LogWriter {
+    #[allow(unused)]
     pub fn tail(&self) -> LogId {
         let buf = self.buffer.read().unwrap();
         let len = buf.line_count.load(Ordering::Acquire);
