@@ -881,6 +881,9 @@ fn process_key(
         Command::PrevFailInTestGroup => {
             jump_to_fail_in_test_group(tui, workspace, false);
         }
+        Command::Shell(ref script) => {
+            spawn_shell_command(script, tui, workspace);
+        }
     }
     ProcessKeyResult::Continue
 }
@@ -1096,6 +1099,51 @@ fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {
         tui.task_tree.select_job(new_job, &ws);
     }
     tui.status_message = Some(StatusMessage::info("Task Restarted"));
+}
+
+fn spawn_shell_command(script: &str, tui: &mut TuiState, workspace: &Workspace) {
+    let ws = workspace.state();
+    let mut env_vars: Vec<(Box<str>, Box<str>)> = Vec::new();
+
+    let base_path = ws.config.current.base_path.to_string_lossy();
+    env_vars.push(("DEVSM_WORKSPACE_ROOT".into(), base_path.into()));
+
+    if let Some(sel) = tui.task_tree.selection_state(&ws) {
+        if let Some(bti) = sel.base_task {
+            env_vars.push(("DEVSM_SELECTED_TASK".into(), ws.base_tasks[bti.idx()].name.into()));
+
+            let pwd = if let Some(ji) = sel.job {
+                let tc = ws[ji].task.config();
+                Some(ws.config.current.base_path.join(tc.pwd))
+            } else if let Some(&ji) = ws.base_tasks[bti.idx()].jobs.all().last() {
+                let tc = ws[ji].task.config();
+                Some(ws.config.current.base_path.join(tc.pwd))
+            } else if let crate::config::StringExpr::Literal(lit) = ws.base_tasks[bti.idx()].config.pwd {
+                Some(ws.config.current.base_path.join(lit))
+            } else {
+                None
+            };
+            if let Some(pwd) = pwd {
+                let pwd = pwd.to_string_lossy().into_owned();
+                env_vars.push(("DEVSM_SELECTED_PWD".into(), pwd.into()));
+            }
+        }
+
+        if let Some(job_index) = sel.job {
+            let job = &ws[job_index];
+            env_vars.push(("DEVSM_SELECTED_PROFILE".into(), job.spawn_profile.clone().into()));
+            env_vars.push(("DEVSM_SELECTED_STATUS".into(), job_status_str(&job.process_status).into()));
+        }
+
+        if let Some(kind) = sel.meta_group {
+            env_vars.push(("DEVSM_SELECTED_META_GROUP".into(), meta_group_kind_str(kind).into()));
+        }
+    }
+
+    workspace.process_channel.send(crate::event_loop::ProcessRequest::ShellSpawn {
+        script: script.into(),
+        env_vars,
+    });
 }
 
 #[derive(Debug)]

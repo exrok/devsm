@@ -741,6 +741,10 @@ pub(crate) enum ProcessRequest {
         stdout: File,
         socket: UnixStream,
     },
+    ShellSpawn {
+        script: Box<str>,
+        env_vars: Vec<(Box<str>, Box<str>)>,
+    },
     GlobalTermination,
 }
 
@@ -974,6 +978,29 @@ impl EventLoop {
             }
             ProcessRequest::AttachSelfLogsClient { stdout, socket } => {
                 self.attach_self_logs_client(stdout, socket);
+                false
+            }
+            ProcessRequest::ShellSpawn { script, env_vars } => {
+                let mut cmd = std::process::Command::new("/bin/sh");
+                cmd.arg("-c").arg(&*script);
+                cmd.envs(env_vars.iter().map(|(k, v)| (&**k, &**v)));
+                cmd.stdin(Stdio::null());
+                cmd.stdout(Stdio::null());
+                cmd.stderr(Stdio::null());
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::setsid();
+                        Ok(())
+                    });
+                }
+                match cmd.spawn() {
+                    Ok(_child) => {
+                        kvlog::info!("Shell command spawned", script = &*script);
+                    }
+                    Err(err) => {
+                        kvlog::error!("Failed to spawn shell command", ?err, script = &*script);
+                    }
+                }
                 false
             }
             ProcessRequest::GlobalTermination => {

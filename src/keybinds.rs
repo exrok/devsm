@@ -206,6 +206,8 @@ pub enum Command {
         name: Box<str>,
         action: SetFunctionAction,
     },
+    /// Run a shell command (fire-and-forget).
+    Shell(Box<str>),
 }
 
 impl FromStr for Command {
@@ -669,6 +671,7 @@ impl Command {
             Command::SetFunction { name, .. } if &**name == "fn1" => "Set fn1",
             Command::SetFunction { name, .. } if &**name == "fn2" => "Set fn2",
             Command::SetFunction { .. } => "Set Function",
+            Command::Shell(_) => "Shell",
         }
     }
 
@@ -710,6 +713,7 @@ impl Command {
             Command::CallFunction(name) if &**name == "fn2" => "CallFunction2",
             Command::CallFunction(_) => "CallFunction",
             Command::SetFunction { .. } => "SetFunction",
+            Command::Shell(_) => "Shell",
         }
     }
 }

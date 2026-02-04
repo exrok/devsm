@@ -147,6 +147,16 @@ fn parse_table_binding(
     for (key, value) in table.iter() {
         let key_name = key.name.as_ref();
 
+        if key_name == "sh" {
+            let Some(script) = value.as_str() else {
+                let diagnostic = Diagnostic::error()
+                    .with_message("sh must be a string like {sh = \"...\"}")
+                    .with_label(DiagnosticLabel::primary(span));
+                return Err(render_diagnostic(file_name, content, &diagnostic));
+            };
+            return Ok(Some(Command::Shell(script.into())));
+        }
+
         if key_name == "set_function" {
             let Some(inner_table) = value.as_table() else {
                 let diagnostic = Diagnostic::error()
@@ -184,7 +194,7 @@ fn parse_table_binding(
     let diagnostic = Diagnostic::error()
         .with_message("unrecognized table binding")
         .with_label(DiagnosticLabel::primary(span))
-        .with_note("expected {set_function.<name> = \"...\"}");
+        .with_note("expected {sh = \"...\"} or {set_function.<name> = \"...\"}");
     Err(render_diagnostic(file_name, content, &diagnostic))
 }
 
@@ -344,10 +354,17 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                             render_diagnostic(file_name, content, &diagnostic)
                         })?;
                         insert_chain_binding(&mut keybinds, mode, &keys, BindingEntry::Command(cmd));
+                    } else if let Some(cmd_table) = cmd_value.as_table() {
+                        let cmd = parse_table_binding(cmd_table, cmd_value.span.into(), file_name, content)?;
+                        if let Some(cmd) = cmd {
+                            insert_chain_binding(&mut keybinds, mode, &keys, BindingEntry::Command(cmd));
+                        }
                     } else {
                         let span: std::ops::Range<usize> = cmd_value.span.into();
                         let diagnostic = Diagnostic::error()
-                            .with_message("chain bindings must map to command string or {Label = \"...\"}")
+                            .with_message(
+                                "chain bindings must map to command string, {sh = \"...\"}, or {Label = \"...\"}",
+                            )
                             .with_label(DiagnosticLabel::primary(span));
                         return Err(render_diagnostic(file_name, content, &diagnostic));
                     }
@@ -583,5 +600,68 @@ mod tests {
             matches!(r_entry, Some(BindingEntry::Command(Command::RerunTestGroup))),
             "SPACE t r should map to RerunTestGroup"
         );
+    }
+
+    #[test]
+    fn parse_shell_binding() {
+        let config = parse_user_config_for_daemon(
+            r#"
+            [bind.task_tree]
+            o = {sh = "touch /tmp/test"}
+            "#,
+            "test.toml",
+        )
+        .unwrap();
+
+        let o: InputEvent = "o".parse().unwrap();
+        let cmd = config.keybinds.lookup(Mode::TaskTree, o);
+        assert_eq!(cmd, Some(Command::Shell("touch /tmp/test".into())));
+    }
+
+    #[test]
+    fn parse_shell_chain_binding() {
+        let config = parse_user_config_for_daemon(
+            r#"
+            [bind.task_tree]
+            "SPACE o".Label = "Open"
+            "SPACE o t" = {sh = "footclient"}
+            "#,
+            "test.toml",
+        )
+        .unwrap();
+
+        let space: InputEvent = "SPACE".parse().unwrap();
+        let o: InputEvent = "o".parse().unwrap();
+        let t: InputEvent = "t".parse().unwrap();
+
+        let Some(BindingEntry::Chain(space_idx)) = config.keybinds.lookup_entry(Mode::TaskTree, space) else {
+            panic!("SPACE should be a chain");
+        };
+
+        let space_group = config.keybinds.chain(*space_idx).expect("chain should exist");
+        let Some(BindingEntry::Chain(o_idx)) = space_group.lookup(o) else {
+            panic!("SPACE o should be a chain");
+        };
+
+        let o_group = config.keybinds.chain(*o_idx).expect("o chain should exist");
+        assert_eq!(o_group.label.as_deref(), Some("Open"));
+
+        let t_entry = o_group.lookup(t);
+        assert!(
+            matches!(t_entry, Some(BindingEntry::Command(Command::Shell(s))) if &**s == "footclient"),
+            "SPACE o t should map to Shell command"
+        );
+    }
+
+    #[test]
+    fn parse_shell_binding_non_string_error() {
+        let result = parse_user_config_for_daemon(
+            r#"
+            [bind.task_tree]
+            o = {sh = 42}
+            "#,
+            "test.toml",
+        );
+        assert!(result.is_err(), "sh with non-string value should error");
     }
 }
