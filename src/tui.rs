@@ -1073,7 +1073,12 @@ fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {
         let job = &ws[job_index];
         Some((job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone()))
     } else if let Some(bti) = sel.base_task {
-        Some((bti, ValueMap::new(), String::new()))
+        if let Some(&last_ji) = ws.base_tasks[bti.idx()].jobs.all().last() {
+            let job = &ws[last_ji];
+            Some((bti, job.spawn_params.clone(), job.spawn_profile.clone()))
+        } else {
+            Some((bti, ValueMap::new(), String::new()))
+        }
     } else if let Some(kind) = sel.meta_group {
         let jobs = ws.jobs_by_kind(kind.task_kind());
         if let Some(&last_ji) = jobs.last() {
