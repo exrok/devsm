@@ -806,9 +806,6 @@ fn process_key(
                 let Some(bti) = sel.base_task else {
                     return ProcessKeyResult::Continue;
                 };
-                if ws.base_tasks[bti.idx()].config.profiles.is_empty() {
-                    return ProcessKeyResult::Continue;
-                }
                 let mut state = TaskLauncherState::with_task(&ws, bti);
                 match state.try_auto_start(&ws) {
                     LauncherAction::Start { base_task, profile, params } => {

@@ -648,7 +648,7 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
     let workspace_config = config::load_from_env()?;
-    let (name, _profile) = job.rsplit_once(':').unwrap_or((job, "default"));
+    let (name, _profile) = job.rsplit_once(':').unwrap_or((job, ""));
     if name != "~cargo"
         && let Some((_, expr)) = workspace_config.tasks.iter().find(|(n, _)| *n == name)
         && expr.managed == Some(false)
@@ -750,7 +750,7 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
 /// Executes a task directly, bypassing the daemon and ignoring dependencies.
 fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
     let workspace_config = config::load_from_env()?;
-    let (name, profile) = job.rsplit_once(':').unwrap_or((job, "default"));
+    let (name, profile) = job.rsplit_once(':').unwrap_or((job, ""));
 
     let task_expr = if name == "~cargo" {
         &config::CARGO_AUTO_EXPR
@@ -770,6 +770,11 @@ fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
         );
     }
 
+    let profile = if profile.is_empty() {
+        task_expr.profiles.first().copied().unwrap_or("")
+    } else {
+        profile
+    };
     let env = config::Environment { profile, param: params, vars: task_expr.vars };
     let task = task_expr.eval(&env).map_err(|e| anyhow::anyhow!("Failed to evaluate task: {:?}", e))?;
     let tc = task.config();

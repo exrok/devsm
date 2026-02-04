@@ -390,7 +390,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
             StringListExpr::Literal("cargo"),
             StringListExpr::Var("args"),
         ])),
-        profiles: &["default"],
+        profiles: &[],
         envvar: &[],
         require: EMPTY_TASK_CALLS,
         cache: None,

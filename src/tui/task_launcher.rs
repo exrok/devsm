@@ -157,7 +157,7 @@ impl TaskLauncherState {
     /// Attempts to auto-start if only one profile exists.
     /// Returns `Start` if no variables needed, otherwise advances to Variable mode.
     pub fn try_auto_start(&mut self, ws: &WorkspaceState) -> LauncherAction {
-        if self.available_profiles.len() == 1 {
+        if self.available_profiles.len() <= 1 {
             return self.handle_confirm(ws);
         }
         LauncherAction::None
@@ -235,8 +235,8 @@ impl TaskLauncherState {
     }
 
     fn switch_to_profile_mode(&mut self) {
-        if self.available_profiles.len() == 1 {
-            self.confirmed_profile = Some(self.available_profiles[0]);
+        if self.available_profiles.len() <= 1 {
+            self.confirmed_profile = self.available_profiles.first().copied();
             self.switch_to_variable_mode();
         } else {
             self.mode = LauncherMode::Profile;
@@ -247,10 +247,6 @@ impl TaskLauncherState {
     fn accept_profile_autocomplete(&mut self) {
         let profile = if let Some(entry) = self.results.get(self.selected) {
             self.available_profiles.get(entry.index()).copied()
-        } else if self.available_profiles.len() == 1 {
-            Some(self.available_profiles[0])
-        } else if self.available_profiles.contains(&"default") {
-            Some("default")
         } else {
             self.available_profiles.first().copied()
         };
@@ -288,7 +284,7 @@ impl TaskLauncherState {
 
     fn try_build_launch(&self) -> Option<LauncherAction> {
         let (base_task, _) = self.confirmed_task?;
-        let profile = self.confirmed_profile.unwrap_or("default").to_string();
+        let profile = self.confirmed_profile.unwrap_or("").to_string();
 
         let mut params = ValueMap::new();
         for (name, value) in &self.completed_vars {
@@ -427,11 +423,7 @@ impl TaskLauncherState {
                     return LauncherAction::Cancel;
                 }
                 self.accept_task_autocomplete(ws);
-                self.confirmed_profile = Some(if self.available_profiles.contains(&"default") {
-                    "default"
-                } else {
-                    self.available_profiles.first().copied().unwrap_or("default")
-                });
+                self.confirmed_profile = self.available_profiles.first().copied();
                 return self.try_build_launch().unwrap_or(LauncherAction::Cancel);
             }
             LauncherMode::Profile => {

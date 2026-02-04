@@ -332,7 +332,6 @@ fn parse_task<'a>(
 ) -> Result<TaskConfigExpr<'a>, ()> {
     let mut pwd = StringExpr::Literal("./");
     let mut profiles_vec = bumpalo::collections::Vec::new_in(alloc);
-    profiles_vec.push("default");
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut require: &[TaskCall<'a>] = &[];
     let mut cache: Option<CacheConfig<'a>> = None;
@@ -356,7 +355,6 @@ fn parse_task<'a>(
                     mismatched_in_object(re, "array", value, "profiles");
                     return Err(());
                 };
-                profiles_vec.clear();
                 for item in arr {
                     let Some(s) = item.as_str() else {
                         mismatched_in_object(re, "string", item, "profile");

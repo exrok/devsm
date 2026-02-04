@@ -180,13 +180,11 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
 
     for (name, _) in config.tests.iter() {
         task_names.insert(name);
-        task_profiles.insert((name, "default"));
     }
 
     for (group_name, calls) in config.groups.iter() {
         for call in calls.iter() {
             let task_name: &str = &call.name;
-            let profile = call.profile.unwrap_or("default");
 
             if !task_names.contains(task_name) {
                 if let Some(span) = find_group_item_span(root, group_name, task_name) {
@@ -197,7 +195,8 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                             .with_notes(vec![format!("in group '{}'", group_name)]),
                     );
                 }
-            } else if !task_profiles.contains(&(task_name, profile))
+            } else if let Some(profile) = call.profile
+                && !task_profiles.contains(&(task_name, profile))
                 && let Some(span) = find_group_item_span(root, group_name, task_name)
             {
                 let available: Vec<_> =
@@ -215,7 +214,6 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
     for (task_name, task_expr) in config.tasks.iter() {
         for call in task_expr.require.iter() {
             let required_name: &str = &call.name;
-            let profile = call.profile.unwrap_or("default");
 
             if !task_names.contains(required_name) {
                 if let Some(span) = find_require_span(root, task_name, required_name) {
@@ -226,7 +224,8 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                             .with_notes(vec![format!("in task '{}'", task_name)]),
                     );
                 }
-            } else if !task_profiles.contains(&(required_name, profile))
+            } else if let Some(profile) = call.profile
+                && !task_profiles.contains(&(required_name, profile))
                 && let Some(span) = find_require_span(root, task_name, required_name)
             {
                 let available: Vec<_> =
@@ -263,7 +262,6 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
         for test_expr in test_variants.iter() {
             for call in test_expr.require.iter() {
                 let required_name: &str = &call.name;
-                let profile = call.profile.unwrap_or("default");
 
                 if !task_names.contains(required_name) {
                     if let Some(span) = find_test_require_span(root, test_name, required_name) {
@@ -274,7 +272,8 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                                 .with_notes(vec![format!("in test '{}'", test_name)]),
                         );
                     }
-                } else if !task_profiles.contains(&(required_name, profile))
+                } else if let Some(profile) = call.profile
+                    && !task_profiles.contains(&(required_name, profile))
                     && let Some(span) = find_test_require_span(root, test_name, required_name)
                 {
                     let available: Vec<_> =

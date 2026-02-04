@@ -122,7 +122,7 @@ require = [
   "simple_cmd",
   "full_basic:debug",
   [
-    "with_var:default",
+    "with_var",
     { dir = "/tmp" },
   ],
 ]
