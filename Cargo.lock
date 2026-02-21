@@ -309,22 +309,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "smallvec"
-version = "1.15.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
 name = "test-app"
 version = "0.1.0"
 
 [[package]]
 name = "toml-spanner"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "324adb53286bfd3237d6a23bccd2d67fd0c3b827f151eb96c462bfaf6eba90f0"
+version = "0.3.0"
 dependencies = [
- "smallvec",
+ "foldhash",
 ]
 
 [[package]]

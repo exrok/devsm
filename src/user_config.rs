@@ -139,13 +139,13 @@ pub fn reload_user_config() -> Result<UserConfig, String> {
 }
 
 fn parse_table_binding(
-    table: &toml_spanner::value::Table<'_>,
+    table: &toml_spanner::Table<'_>,
     span: std::ops::Range<usize>,
     file_name: &str,
     content: &str,
 ) -> Result<Option<Command>, String> {
-    for (key, value) in table.iter() {
-        let key_name = key.name.as_ref();
+    for (key, value) in table.entries() {
+        let key_name = key.name;
 
         if key_name == "sh" {
             let Some(script) = value.as_str() else {
@@ -165,8 +165,8 @@ fn parse_table_binding(
                 return Err(render_diagnostic(file_name, content, &diagnostic));
             };
 
-            if let Some((fn_key, action_value)) = inner_table.iter().next() {
-                let fn_name = fn_key.name.as_ref();
+            if let Some((fn_key, action_value)) = inner_table.entries().iter().next() {
+                let fn_name = fn_key.name;
 
                 let Some(action_str) = action_value.as_str() else {
                     let diagnostic = Diagnostic::error()
@@ -271,21 +271,17 @@ fn set_chain_label(keybinds: &mut Keybinds, mode: Mode, keys: &[InputEvent], lab
 }
 
 fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserConfig, String> {
-    let toml = toml_spanner::parse(content).map_err(|e| {
+    let arena = toml_spanner::Arena::new();
+    let toml = toml_spanner::parse(content, &arena).map_err(|e| {
         let diagnostic = toml_error_to_diagnostic(&e);
         render_diagnostic(file_name, content, &diagnostic)
     })?;
 
     let mut keybinds = Keybinds::default();
 
-    let root_table = toml.as_table().ok_or_else(|| {
-        let diagnostic = Diagnostic::error()
-            .with_message("expected table at root")
-            .with_label(DiagnosticLabel::primary(0..content.len().min(1)));
-        render_diagnostic(file_name, content, &diagnostic)
-    })?;
+    let root_table = toml.table();
 
-    for (key, _value) in root_table.iter() {
+    for (key, _value) in root_table {
         if key.name != "bind" {
             let span: std::ops::Range<usize> = key.span.into();
             let diagnostic = Diagnostic::error()
@@ -298,13 +294,13 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
 
     if let Some(bind_value) = root_table.get("bind") {
         let bind_table = bind_value.as_table().ok_or_else(|| {
-            let span: std::ops::Range<usize> = bind_value.span.into();
+            let span: std::ops::Range<usize> = bind_value.span().into();
             let diagnostic =
                 Diagnostic::error().with_message("'bind' must be a table").with_label(DiagnosticLabel::primary(span));
             render_diagnostic(file_name, content, &diagnostic)
         })?;
 
-        for (mode_key, mode_value) in bind_table.iter() {
+        for (mode_key, mode_value) in bind_table {
             let mode: Mode = mode_key.name.parse().map_err(|e: String| {
                 let span: std::ops::Range<usize> = mode_key.span.into();
                 let diagnostic = Diagnostic::error().with_message(e).with_label(DiagnosticLabel::primary(span));
@@ -312,19 +308,19 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
             })?;
 
             let bindings = mode_value.as_table().ok_or_else(|| {
-                let span: std::ops::Range<usize> = mode_value.span.into();
+                let span: std::ops::Range<usize> = mode_value.span().into();
                 let diagnostic = Diagnostic::error()
                     .with_message(format!("'bind.{}' must be a table", mode_key.name))
                     .with_label(DiagnosticLabel::primary(span));
                 render_diagnostic(file_name, content, &diagnostic)
             })?;
 
-            for (key_str, cmd_value) in bindings.iter() {
-                let key_span: std::ops::Range<usize> = key_str.span.into();
-                let is_chain = key_str.name.as_ref().contains(' ');
+            for (key, cmd_value) in bindings {
+                let key_span: std::ops::Range<usize> = key.span.into();
+                let is_chain = key.name.contains(' ');
 
                 if is_chain {
-                    let keys = parse_chain_keys(&key_str.name, key_span.clone(), file_name, content)?;
+                    let keys = parse_chain_keys(&key.name, key_span.clone(), file_name, content)?;
                     if keys.is_empty() {
                         let diagnostic = Diagnostic::error()
                             .with_message("empty key binding")
@@ -336,7 +332,7 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                         && let Some(label_value) = label_table.get("Label")
                     {
                         let label_str = label_value.as_str().ok_or_else(|| {
-                            let span: std::ops::Range<usize> = label_value.span.into();
+                            let span: std::ops::Range<usize> = label_value.span().into();
                             let diagnostic = Diagnostic::error()
                                 .with_message("Label must be a string")
                                 .with_label(DiagnosticLabel::primary(span));
@@ -348,19 +344,19 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
 
                     if let Some(cmd_str) = cmd_value.as_str() {
                         let cmd: Command = cmd_str.parse().map_err(|e: String| {
-                            let span: std::ops::Range<usize> = cmd_value.span.into();
+                            let span: std::ops::Range<usize> = cmd_value.span().into();
                             let diagnostic =
                                 Diagnostic::error().with_message(e).with_label(DiagnosticLabel::primary(span));
                             render_diagnostic(file_name, content, &diagnostic)
                         })?;
                         insert_chain_binding(&mut keybinds, mode, &keys, BindingEntry::Command(cmd));
                     } else if let Some(cmd_table) = cmd_value.as_table() {
-                        let cmd = parse_table_binding(cmd_table, cmd_value.span.into(), file_name, content)?;
+                        let cmd = parse_table_binding(cmd_table, cmd_value.span().into(), file_name, content)?;
                         if let Some(cmd) = cmd {
                             insert_chain_binding(&mut keybinds, mode, &keys, BindingEntry::Command(cmd));
                         }
                     } else {
-                        let span: std::ops::Range<usize> = cmd_value.span.into();
+                        let span: std::ops::Range<usize> = cmd_value.span().into();
                         let diagnostic = Diagnostic::error()
                             .with_message(
                                 "chain bindings must map to command string, {sh = \"...\"}, or {Label = \"...\"}",
@@ -369,7 +365,7 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                         return Err(render_diagnostic(file_name, content, &diagnostic));
                     }
                 } else {
-                    let input: InputEvent = key_str.name.parse().map_err(|e: String| {
+                    let input: InputEvent = key.name.parse().map_err(|e: String| {
                         let diagnostic =
                             Diagnostic::error().with_message(e).with_label(DiagnosticLabel::primary(key_span.clone()));
                         render_diagnostic(file_name, content, &diagnostic)
@@ -379,7 +375,7 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                         && let Some(label_value) = label_table.get("Label")
                     {
                         let label_str = label_value.as_str().ok_or_else(|| {
-                            let span: std::ops::Range<usize> = label_value.span.into();
+                            let span: std::ops::Range<usize> = label_value.span().into();
                             let diagnostic = Diagnostic::error()
                                 .with_message("Label must be a string")
                                 .with_label(DiagnosticLabel::primary(span));
@@ -389,11 +385,11 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                         continue;
                     }
 
-                    let command = if let Some(f) = cmd_value.as_float() {
+                    let command = if let Some(f) = cmd_value.as_f64() {
                         if f.is_nan() {
                             None
                         } else {
-                            let span: std::ops::Range<usize> = cmd_value.span.into();
+                            let span: std::ops::Range<usize> = cmd_value.span().into();
                             let diagnostic = Diagnostic::error()
                                 .with_message("expected command string, table, or nan to unbind")
                                 .with_label(DiagnosticLabel::primary(span));
@@ -401,16 +397,16 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                         }
                     } else if let Some(cmd_str) = cmd_value.as_str() {
                         let cmd: Command = cmd_str.parse().map_err(|e: String| {
-                            let span: std::ops::Range<usize> = cmd_value.span.into();
+                            let span: std::ops::Range<usize> = cmd_value.span().into();
                             let diagnostic =
                                 Diagnostic::error().with_message(e).with_label(DiagnosticLabel::primary(span));
                             render_diagnostic(file_name, content, &diagnostic)
                         })?;
                         Some(cmd)
                     } else if let Some(cmd_table) = cmd_value.as_table() {
-                        parse_table_binding(cmd_table, cmd_value.span.into(), file_name, content)?
+                        parse_table_binding(cmd_table, cmd_value.span().into(), file_name, content)?
                     } else {
-                        let span: std::ops::Range<usize> = cmd_value.span.into();
+                        let span: std::ops::Range<usize> = cmd_value.span().into();
                         let diagnostic = Diagnostic::error()
                             .with_message("expected command string, table, or nan to unbind")
                             .with_label(DiagnosticLabel::primary(span));
@@ -428,21 +424,23 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
 
 #[cfg(test)]
 fn parse_user_config(content: &str) -> Result<UserConfig, String> {
-    let toml = toml_spanner::parse(content).map_err(|e| format!("TOML parse error: {e}"))?;
+    let arena = toml_spanner::Arena::new();
+    let toml = toml_spanner::parse(content, &arena).map_err(|e| format!("TOML parse error: {e}"))?;
+    let toml = toml.table();
 
     let mut keybinds = Keybinds::default();
 
-    if let Some(bind_table) = toml.as_table().and_then(|t| t.get("bind")) {
-        let bind_table = bind_table.as_table().ok_or("'bind' must be a table")?;
+    if let Some(bind_value) = toml.get("bind") {
+        let bind_table = bind_value.as_table().ok_or("'bind' must be a table")?;
 
-        for (mode_name, mode_value) in bind_table.iter() {
+        for (mode_name, mode_value) in bind_table {
             let mode: Mode = mode_name.name.parse().map_err(|e: String| e)?;
             let bindings = mode_value.as_table().ok_or_else(|| format!("'bind.{}' must be a table", mode_name.name))?;
 
-            for (key_str, cmd_value) in bindings.iter() {
+            for (key_str, cmd_value) in bindings {
                 let input: InputEvent = key_str.name.parse().map_err(|e: String| e)?;
 
-                let command = if let Some(f) = cmd_value.as_float() {
+                let command = if let Some(f) = cmd_value.as_f64() {
                     if f.is_nan() {
                         None // Unbind
                     } else {

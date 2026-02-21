@@ -1,11 +1,8 @@
+use bumpalo::Bump;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
-
-use bumpalo::Bump;
-use toml_spanner::Value as TomlValue;
-use toml_spanner::span::Span;
-use toml_spanner::value::{Table, ValueInner};
+use toml_spanner::{Item, Span, Table, Value};
 
 use crate::config::toml_handler;
 use crate::config::{StringExpr, WorkspaceConfig};
@@ -33,7 +30,8 @@ pub fn validate_config(path: &Path, options: &ValidateOptions) -> anyhow::Result
 fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
     let file_name = path.display().to_string();
 
-    let toml = match toml_spanner::parse(content) {
+    let arena = toml_spanner::Arena::new();
+    let root = match toml_spanner::parse(content, &arena) {
         Ok(value) => value,
         Err(err) => {
             let diagnostic = toml_error_to_diagnostic(&err);
@@ -41,6 +39,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
             return Ok(false);
         }
     };
+    let root = root.table();
 
     let mut has_errors = false;
     let mut emit = |diag: Diagnostic| {
@@ -48,20 +47,18 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
         emit_diagnostic(&file_name, content, &diag);
     };
 
-    let root = toml.as_table().unwrap();
-
     if let Some(bind_value) = root.get("bind") {
         let Some(bind_table) = bind_value.as_table() else {
             emit(
                 Diagnostic::error()
                     .with_message("'bind' must be a table")
-                    .with_labels(vec![DiagnosticLabel::primary(span_to_range(bind_value.span))]),
+                    .with_labels(vec![DiagnosticLabel::primary(span_to_range(bind_value.span()))]),
             );
             return Ok(false);
         };
 
         let valid_modes = ["global", "joblist", "log", "search", "group_select"];
-        for (mode_key, mode_value) in bind_table.iter() {
+        for (mode_key, mode_value) in bind_table {
             let mode_name = mode_key.name.as_ref();
             if !valid_modes.contains(&mode_name) {
                 emit(
@@ -77,19 +74,19 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
                 emit(
                     Diagnostic::error()
                         .with_message(format!("'bind.{}' must be a table", mode_name))
-                        .with_labels(vec![DiagnosticLabel::primary(span_to_range(mode_value.span))]),
+                        .with_labels(vec![DiagnosticLabel::primary(span_to_range(mode_value.span()))]),
                 );
                 continue;
             };
 
-            for (key_str, cmd_value) in bindings.iter() {
-                if let Some(f) = cmd_value.as_float() {
+            for (key_str, cmd_value) in bindings {
+                if let Some(f) = cmd_value.as_f64() {
                     if !f.is_nan() {
                         emit(
                             Diagnostic::error()
                                 .with_message("invalid binding value")
                                 .with_labels(vec![
-                                    DiagnosticLabel::primary(span_to_range(cmd_value.span))
+                                    DiagnosticLabel::primary(span_to_range(cmd_value.span()))
                                         .with_message("expected command string or nan"),
                                 ])
                                 .with_notes(vec!["use nan to unbind a key".to_string()]),
@@ -100,7 +97,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
                         Diagnostic::error()
                             .with_message("invalid binding value")
                             .with_labels(vec![
-                                DiagnosticLabel::primary(span_to_range(cmd_value.span))
+                                DiagnosticLabel::primary(span_to_range(cmd_value.span()))
                                     .with_message("expected command string or nan"),
                             ])
                             .with_notes(vec![format!("binding for key '{}'", key_str.name)]),
@@ -110,8 +107,8 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
         }
     }
 
-    for (key, _value) in root.iter() {
-        let key_name = key.name.as_ref();
+    for (key, _value) in root {
+        let key_name = key.name;
         if key_name != "bind" {
             emit(
                 Diagnostic::warning()
@@ -147,16 +144,16 @@ fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptio
         Err(_) => return Ok(false),
     };
 
-    let toml = match toml_spanner::parse(content) {
+    let arena = toml_spanner::Arena::new();
+    let root = match toml_spanner::parse(content, &arena) {
         Ok(value) => value,
         Err(_) => return Ok(false),
     };
-    let root = toml.as_table().unwrap();
 
-    validate_cross_references(&workspace_config, root, &mut emit);
+    validate_cross_references(&workspace_config, root.table(), &mut emit);
 
     if !options.skip_path_checks {
-        validate_pwd_paths(&workspace_config, base_path, root, &mut emit);
+        validate_pwd_paths(&workspace_config, base_path, root.table(), &mut emit);
     }
 
     if has_errors {
@@ -334,14 +331,10 @@ fn find_group_item_span(root: &Table, group_name: &str, task_name: &str) -> Opti
     let group_array = group_table.get(group_name)?.as_array()?;
 
     for item in group_array {
-        let item_name = match &item.value {
-            ValueInner::String(s) => {
-                let s = s.as_ref();
-                s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s)
-            }
-            ValueInner::Array(arr) if !arr.is_empty() => {
-                if let ValueInner::String(s) = &arr[0].value {
-                    let s = s.as_ref();
+        let item_name = match item.value() {
+            Value::String(s) => s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s),
+            Value::Array(arr) if !arr.is_empty() => {
+                if let Value::String(s) = arr.as_slice()[0].value() {
                     s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s)
                 } else {
                     continue;
@@ -351,7 +344,7 @@ fn find_group_item_span(root: &Table, group_name: &str, task_name: &str) -> Opti
         };
 
         if item_name == task_name {
-            return Some(span_to_range(item.span));
+            return Some(span_to_range(item.span()));
         }
     }
     None
@@ -383,11 +376,11 @@ fn find_test_require_span(root: &Table, test_name: &str, required_name: &str) ->
         None
     };
 
-    match &test_value.value {
-        ValueInner::Table(table) => search_require(table),
-        ValueInner::Array(arr) => {
+    match test_value.value() {
+        Value::Table(table) => search_require(table),
+        Value::Array(arr) => {
             for item in arr {
-                if let ValueInner::Table(table) = &item.value
+                if let Value::Table(table) = item.value()
                     && let Some(span) = search_require(table)
                 {
                     return Some(span);
@@ -399,15 +392,11 @@ fn find_test_require_span(root: &Table, test_name: &str, required_name: &str) ->
     }
 }
 
-fn match_task_call_span(item: &TomlValue, target_name: &str) -> Option<Range<usize>> {
-    let item_name = match &item.value {
-        ValueInner::String(s) => {
-            let s = s.as_ref();
-            s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s)
-        }
-        ValueInner::Array(arr) if !arr.is_empty() => {
-            if let ValueInner::String(s) = &arr[0].value {
-                let s = s.as_ref();
+fn match_task_call_span(item: &Item, target_name: &str) -> Option<Range<usize>> {
+    let item_name = match item.value() {
+        Value::String(s) => s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s),
+        Value::Array(arr) if !arr.is_empty() => {
+            if let Value::String(s) = arr.as_slice()[0].value() {
                 s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s)
             } else {
                 return None;
@@ -416,7 +405,7 @@ fn match_task_call_span(item: &TomlValue, target_name: &str) -> Option<Range<usi
         _ => return None,
     };
 
-    if item_name == target_name { Some(span_to_range(item.span)) } else { None }
+    if item_name == target_name { Some(span_to_range(item.span())) } else { None }
 }
 
 fn table_by_task_name<'a>(root: &'a Table<'a>, task_name: &str) -> Option<&'a Table<'a>> {
@@ -432,14 +421,14 @@ fn table_by_task_name<'a>(root: &'a Table<'a>, task_name: &str) -> Option<&'a Ta
 
 fn find_profile_changed_span(root: &Table, task_name: &str, ref_task: &str) -> Option<Range<usize>> {
     let task = table_by_task_name(root, task_name)?;
-    let keys = task.get("cache")?.as_table()?.get("key")?.as_array()?;
+    let keys = task["cache"]["key"].as_array()?;
     for item in keys {
         if let Some(item_table) = item.as_table()
             && let Some(pc_value) = item_table.get("profile_changed")
             && let Some(pc_str) = pc_value.as_str()
             && pc_str == ref_task
         {
-            return Some(span_to_range(pc_value.span));
+            return Some(span_to_range(pc_value.span()));
         }
     }
     None
@@ -448,23 +437,18 @@ fn find_profile_changed_span(root: &Table, task_name: &str, ref_task: &str) -> O
 fn find_task_pwd_span(root: &Table, task_name: &str) -> Option<Range<usize>> {
     let task = table_by_task_name(root, task_name)?;
     if let Some(pwd_value) = task.get("pwd") {
-        return Some(span_to_range(pwd_value.span));
+        return Some(span_to_range(pwd_value.span()));
     }
     None
 }
 
 fn find_test_pwd_span(root: &Table, test_name: &str) -> Option<Range<usize>> {
-    let test_table = root.get("test")?.as_table()?;
-    let test_value = test_table.get(test_name)?;
-
-    match &test_value.value {
-        ValueInner::Table(table) => table.get("pwd").map(|v| span_to_range(v.span)),
-        ValueInner::Array(arr) => {
+    match root["test"][test_name].value()? {
+        Value::Table(table) => Some(span_to_range(table["pwd"].span()?)),
+        Value::Array(arr) => {
             for item in arr {
-                if let ValueInner::Table(table) = &item.value
-                    && let Some(pwd_value) = table.get("pwd")
-                {
-                    return Some(span_to_range(pwd_value.span));
+                if let Some(span) = item["pwd"].span() {
+                    return Some(span_to_range(span));
                 }
             }
             None

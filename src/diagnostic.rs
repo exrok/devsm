@@ -204,13 +204,13 @@ pub fn toml_error_to_diagnostic(err: &toml_spanner::Error) -> Diagnostic {
             ])
         }
 
-        ErrorKind::UnexpectedKeys { keys, expected } => {
+        ErrorKind::UnexpectedKeys { keys } => {
             let mut labels: Vec<_> = keys.iter().map(|(_, s)| DiagnosticLabel::secondary((*s).into())).collect();
             if !labels.is_empty() {
                 labels[0].style = LabelStyle::Primary;
             }
             Diagnostic::error()
-                .with_message(format!("found {} unexpected keys, expected: {expected:?}", keys.len()))
+                .with_message(format!("found {} unexpected keys", keys.len()))
                 .with_labels(labels)
         }
 

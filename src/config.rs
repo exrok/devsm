@@ -1,4 +1,5 @@
 use std::{
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -242,6 +243,7 @@ pub fn load_workspace_config_from_path(
     config_path: &Path,
     content: &'static str,
 ) -> anyhow::Result<WorkspaceConfig<'static>> {
+    let elapsed = kvlog::Timer::start();
     let bump = Box::leak(Box::new(Bump::new()));
     let base_path = Box::leak(Box::new(base_path.to_path_buf()));
     let file_name = config_path.display().to_string();
@@ -250,7 +252,10 @@ pub fn load_workspace_config_from_path(
         emit_config_error(&file_name, content, &diagnostic);
         had_error = true;
     }) {
-        Ok(value) => Ok(value),
+        Ok(value) => {
+            kvlog::info!("Workspace config loaded", path = config_path.as_os_str().as_bytes(), elapsed);
+            Ok(value)
+        }
         Err(_) => {
             if !had_error {
                 eprintln!("error: failed to parse {}", file_name);
@@ -277,6 +282,7 @@ pub fn load_workspace_config_capturing(
     config_path: &Path,
     content: &'static str,
 ) -> Result<WorkspaceConfig<'static>, ConfigError> {
+    let elapsed = kvlog::Timer::start();
     let bump = Box::leak(Box::new(Bump::new()));
     let base_path = config_path.parent().unwrap_or(Path::new("."));
     let base_path = Box::leak(Box::new(base_path.to_path_buf()));
@@ -285,7 +291,10 @@ pub fn load_workspace_config_capturing(
     match toml_handler::parse(base_path, bump, content, &mut |diagnostic| {
         errors.push_str(&format_config_error(&file_name, content, &diagnostic));
     }) {
-        Ok(value) => Ok(value),
+        Ok(value) => {
+            kvlog::info!("Workspace config loaded", path = config_path.as_os_str().as_bytes(), elapsed);
+            Ok(value)
+        }
         Err(_) => {
             if errors.is_empty() {
                 errors = format!("error: failed to parse {}\n", file_name);

@@ -1,9 +1,5 @@
 use bumpalo::Bump;
-use std::borrow::Cow;
-use toml_spanner::{
-    Value as TomlValue,
-    value::{Table, ValueInner},
-};
+use toml_spanner::{Item, Table, Value};
 
 use crate::config::{
     Alias, CacheConfig, CacheKeyInput, CommandExpr, FunctionDef, FunctionDefAction, If, Predicate, ReadyConfig,
@@ -12,13 +8,13 @@ use crate::config::{
 };
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, toml_error_to_diagnostic};
 
-fn mismatched_in_object(report_error: &mut dyn FnMut(Diagnostic), expected: &str, found: &TomlValue, key: &str) {
+fn mismatched_in_object(report_error: &mut dyn FnMut(Diagnostic), expected: &str, found: &Item, key: &str) {
     report_error(
         Diagnostic::error()
             .with_message("mismatched types")
             .with_label(
-                DiagnosticLabel::primary(found.span.into())
-                    .with_message(format!("expected `{expected}`, found `{}`", found.value.type_str())),
+                DiagnosticLabel::primary(found.span().into())
+                    .with_message(format!("expected `{expected}`, found `{}`", found.type_str())),
             )
             .with_note(format!("The {key:?} property should be a `{expected}`")),
     );
@@ -36,18 +32,14 @@ fn table<'a, 'b>(table: &'b Table<'a>, key: &str, re: &mut dyn FnMut(Diagnostic)
     }
 }
 
-fn as_str<'a>(cow: &'a Cow<'a, str>) -> &'a str {
-    cow.as_ref()
-}
-
 fn parse_string_expr<'a>(
     alloc: &'a Bump,
-    value: &TomlValue<'a>,
+    value: &Item<'a>,
     re: &mut dyn FnMut(Diagnostic),
 ) -> Result<StringExpr<'a>, ()> {
-    match &value.value {
-        ValueInner::String(s) => Ok(StringExpr::Literal(alloc.alloc_str(as_str(s)))),
-        ValueInner::Table(table) => {
+    match value.value() {
+        Value::String(s) => Ok(StringExpr::Literal(alloc.alloc_str(s))),
+        Value::Table(table) => {
             if let Some(var_val) = table.get("var") {
                 let Some(var_name) = var_val.as_str() else {
                     mismatched_in_object(re, "string", var_val, "var");
@@ -79,7 +71,7 @@ fn parse_string_expr<'a>(
             }
             re(Diagnostic::error()
                 .with_message("invalid string expression")
-                .with_label(DiagnosticLabel::primary(value.span.into())));
+                .with_label(DiagnosticLabel::primary(value.span().into())));
             Err(())
         }
         _ => {
@@ -89,11 +81,7 @@ fn parse_string_expr<'a>(
     }
 }
 
-fn parse_var_meta<'a>(
-    alloc: &'a Bump,
-    value: &TomlValue<'a>,
-    re: &mut dyn FnMut(Diagnostic),
-) -> Result<VarMeta<'a>, ()> {
+fn parse_var_meta<'a>(alloc: &'a Bump, value: &Item<'a>, re: &mut dyn FnMut(Diagnostic)) -> Result<VarMeta<'a>, ()> {
     let Some(table) = value.as_table() else {
         mismatched_in_object(re, "table", value, "var");
         return Err(());
@@ -102,7 +90,7 @@ fn parse_var_meta<'a>(
     let mut description = None;
     let mut default = None;
 
-    for (key, val) in table.iter() {
+    for (key, val) in table {
         match key.name.as_ref() {
             "description" => {
                 let Some(s) = val.as_str() else {
@@ -121,7 +109,7 @@ fn parse_var_meta<'a>(
             unknown => {
                 re(Diagnostic::error()
                     .with_message(format!("unknown key `{}` in var definition", unknown))
-                    .with_label(DiagnosticLabel::primary(val.span.into())));
+                    .with_label(DiagnosticLabel::primary(val.span().into())));
                 return Err(());
             }
         }
@@ -130,16 +118,16 @@ fn parse_var_meta<'a>(
     Ok(VarMeta { description, default })
 }
 
-fn parse_duration_value(value: &TomlValue, key: &str, re: &mut dyn FnMut(Diagnostic)) -> Result<f64, ()> {
-    match &value.value {
-        ValueInner::Float(f) => Ok(*f),
-        ValueInner::Integer(i) => Ok(*i as f64),
-        ValueInner::String(s) => match parse_duration(as_str(s)) {
+fn parse_duration_value(value: &Item, key: &str, re: &mut dyn FnMut(Diagnostic)) -> Result<f64, ()> {
+    match value.value() {
+        Value::Float(&f) => Ok(f),
+        Value::Integer(&i) => Ok(i as f64),
+        Value::String(s) => match parse_duration(s) {
             Ok(secs) => Ok(secs),
             Err(err) => {
                 re(Diagnostic::error()
                     .with_message(format!("invalid duration for `{}`: {}", key, err))
-                    .with_label(DiagnosticLabel::primary(value.span.into())));
+                    .with_label(DiagnosticLabel::primary(value.span().into())));
                 Err(())
             }
         },
@@ -153,7 +141,7 @@ fn parse_duration_value(value: &TomlValue, key: &str, re: &mut dyn FnMut(Diagnos
 fn parse_timeout_predicate<'a>(
     alloc: &'a Bump,
     when_table: &Table<'a>,
-    when_value: &TomlValue<'a>,
+    when_value: &Item<'a>,
     re: &mut dyn FnMut(Diagnostic),
 ) -> Result<TimeoutPredicate<'a>, ()> {
     if let Some(output_contains_val) = when_table.get("output_contains") {
@@ -165,37 +153,37 @@ fn parse_timeout_predicate<'a>(
     }
     re(Diagnostic::error()
         .with_message("`timeout.when` must specify a predicate (e.g., `output_contains`)")
-        .with_label(DiagnosticLabel::primary(when_value.span.into())));
+        .with_label(DiagnosticLabel::primary(when_value.span().into())));
     Err(())
 }
 
 fn parse_timeout_config<'a>(
     alloc: &'a Bump,
-    value: &TomlValue<'a>,
+    value: &Item<'a>,
     re: &mut dyn FnMut(Diagnostic),
 ) -> Result<TimeoutConfig<'a>, ()> {
-    match &value.value {
-        ValueInner::String(s) => {
-            let max = match parse_duration(as_str(s)) {
+    match value.value() {
+        Value::String(s) => {
+            let max = match parse_duration(s) {
                 Ok(secs) => secs,
                 Err(err) => {
                     re(Diagnostic::error()
                         .with_message(format!("invalid duration for `timeout`: {}", err))
-                        .with_label(DiagnosticLabel::primary(value.span.into())));
+                        .with_label(DiagnosticLabel::primary(value.span().into())));
                     return Err(());
                 }
             };
             Ok(TimeoutConfig { when: None, conditional: None, max: Some(max), idle: None })
         }
-        ValueInner::Float(f) => Ok(TimeoutConfig { when: None, conditional: None, max: Some(*f), idle: None }),
-        ValueInner::Integer(i) => Ok(TimeoutConfig { when: None, conditional: None, max: Some(*i as f64), idle: None }),
-        ValueInner::Table(timeout_table) => {
+        Value::Float(&f) => Ok(TimeoutConfig { when: None, conditional: None, max: Some(f), idle: None }),
+        Value::Integer(&i) => Ok(TimeoutConfig { when: None, conditional: None, max: Some(i as f64), idle: None }),
+        Value::Table(timeout_table) => {
             let mut when: Option<TimeoutPredicate<'a>> = None;
             let mut conditional: Option<f64> = None;
             let mut max: Option<f64> = None;
             let mut idle: Option<f64> = None;
 
-            for (key, val) in timeout_table.iter() {
+            for (key, val) in timeout_table {
                 let key_str = key.name.as_ref();
                 match key_str {
                     "when" => {
@@ -217,7 +205,7 @@ fn parse_timeout_config<'a>(
                     _ => {
                         re(Diagnostic::error()
                             .with_message(format!("unknown key `{}` in timeout configuration", key_str))
-                            .with_label(DiagnosticLabel::primary(val.span.into())));
+                            .with_label(DiagnosticLabel::primary(val.span().into())));
                         return Err(());
                     }
                 }
@@ -226,7 +214,7 @@ fn parse_timeout_config<'a>(
             if conditional.is_some() && when.is_none() {
                 re(Diagnostic::error()
                     .with_message("`timeout.conditional` requires `timeout.when` to be specified")
-                    .with_label(DiagnosticLabel::primary(value.span.into())));
+                    .with_label(DiagnosticLabel::primary(value.span().into())));
                 return Err(());
             }
 
@@ -241,19 +229,19 @@ fn parse_timeout_config<'a>(
 
 fn parse_string_list_expr<'a>(
     alloc: &'a Bump,
-    value: &TomlValue<'a>,
+    value: &Item<'a>,
     re: &mut dyn FnMut(Diagnostic),
 ) -> Result<StringListExpr<'a>, ()> {
-    match &value.value {
-        ValueInner::String(s) => Ok(StringListExpr::Literal(alloc.alloc_str(as_str(s)))),
-        ValueInner::Array(arr) => {
+    match value.value() {
+        Value::String(s) => Ok(StringListExpr::Literal(alloc.alloc_str(s))),
+        Value::Array(arr) => {
             let mut items_vec = bumpalo::collections::Vec::new_in(alloc);
             for item in arr {
                 items_vec.push(parse_string_list_expr(alloc, item, re)?);
             }
             Ok(StringListExpr::List(items_vec.into_bump_slice()))
         }
-        ValueInner::Table(table) => {
+        Value::Table(table) => {
             if let Some(var_val) = table.get("var") {
                 let Some(var_name) = var_val.as_str() else {
                     mismatched_in_object(re, "string", var_val, "var");
@@ -285,7 +273,7 @@ fn parse_string_list_expr<'a>(
             }
             re(Diagnostic::error()
                 .with_message("invalid string list expression")
-                .with_label(DiagnosticLabel::primary(value.span.into())));
+                .with_label(DiagnosticLabel::primary(value.span().into())));
             Err(())
         }
         _ => {
@@ -297,16 +285,16 @@ fn parse_string_list_expr<'a>(
 
 fn parse_string_or_array<'a>(
     alloc: &'a Bump,
-    value: &TomlValue<'a>,
+    value: &Item<'a>,
     field_name: &str,
     re: &mut dyn FnMut(Diagnostic),
 ) -> Result<&'a [&'a str], ()> {
-    match &value.value {
-        ValueInner::String(s) => {
-            let s: &'a str = alloc.alloc_str(as_str(s));
+    match value.value() {
+        Value::String(s) => {
+            let s: &'a str = alloc.alloc_str(s);
             Ok(alloc.alloc_slice_copy(&[s]))
         }
-        ValueInner::Array(arr) => {
+        Value::Array(arr) => {
             let mut items = bumpalo::collections::Vec::new_in(alloc);
             for item in arr {
                 let Some(s) = item.as_str() else {
@@ -344,7 +332,7 @@ fn parse_task<'a>(
     let mut hidden = ServiceHidden::Never;
     let mut vars_vec = bumpalo::collections::Vec::new_in(alloc);
 
-    for (key, value) in task_table.iter() {
+    for (key, value) in task_table {
         let key_str = key.name.as_ref();
         match key_str {
             "pwd" => {
@@ -375,7 +363,7 @@ fn parse_task<'a>(
                     return Err(());
                 };
                 envvar_vec.clear();
-                for (env_key, env_value) in env_table.iter() {
+                for (env_key, env_value) in env_table {
                     let key_str = alloc.alloc_str(env_key.name.as_ref()) as &str;
                     let val_expr = parse_string_expr(alloc, env_value, re)?;
                     envvar_vec.push((key_str, val_expr));
@@ -402,11 +390,11 @@ fn parse_task<'a>(
                 let mut never = false;
 
                 if let Some(never_value) = cache_table.get("never") {
-                    let ValueInner::Boolean(b) = &never_value.value else {
+                    let Value::Boolean(&b) = never_value.value() else {
                         mismatched_in_object(re, "boolean", never_value, "never");
                         return Err(());
                     };
-                    never = *b;
+                    never = b;
                 }
 
                 if let Some(key_value) = cache_table.get("key") {
@@ -436,7 +424,7 @@ fn parse_task<'a>(
                         } else {
                             re(Diagnostic::error()
                                 .with_message("cache key input must have either `modified` or `profile_changed`")
-                                .with_label(DiagnosticLabel::primary(item.span.into())));
+                                .with_label(DiagnosticLabel::primary(item.span().into())));
                             return Err(());
                         }
                     }
@@ -446,13 +434,13 @@ fn parse_task<'a>(
             "before" => {
                 re(Diagnostic::error()
                     .with_message("`before` is deprecated, use `require` instead")
-                    .with_label(DiagnosticLabel::primary(value.span.into())));
+                    .with_label(DiagnosticLabel::primary(value.span().into())));
                 return Err(());
             }
             "before_once" => {
                 re(Diagnostic::error()
                     .with_message("`before_once` is deprecated, use `require` with `cache = {}` instead")
-                    .with_label(DiagnosticLabel::primary(value.span.into())));
+                    .with_label(DiagnosticLabel::primary(value.span().into())));
                 return Err(());
             }
             "info" => {
@@ -466,7 +454,7 @@ fn parse_task<'a>(
                 if kind != TaskKind::Service {
                     re(Diagnostic::error()
                         .with_message("`ready` is only valid for services")
-                        .with_label(DiagnosticLabel::primary(value.span.into())));
+                        .with_label(DiagnosticLabel::primary(value.span().into())));
                     return Err(());
                 }
                 let Some(ready_table) = value.as_table() else {
@@ -476,7 +464,7 @@ fn parse_task<'a>(
                 let Some(when_value) = ready_table.get("when") else {
                     re(Diagnostic::error()
                         .with_message("`ready` requires a `when` field")
-                        .with_label(DiagnosticLabel::primary(value.span.into())));
+                        .with_label(DiagnosticLabel::primary(value.span().into())));
                     return Err(());
                 };
                 let Some(when_table) = when_value.as_table() else {
@@ -492,13 +480,13 @@ fn parse_task<'a>(
                 } else {
                     re(Diagnostic::error()
                         .with_message("`ready.when` must specify a predicate (e.g., `output_contains`)")
-                        .with_label(DiagnosticLabel::primary(when_value.span.into())));
+                        .with_label(DiagnosticLabel::primary(when_value.span().into())));
                     return Err(());
                 };
                 let ready_timeout = if let Some(timeout_val) = ready_table.get("timeout") {
-                    match &timeout_val.value {
-                        ValueInner::Float(f) => Some(*f),
-                        ValueInner::Integer(i) => Some(*i as f64),
+                    match timeout_val.value() {
+                        Value::Float(&f) => Some(f),
+                        Value::Integer(&i) => Some(i as f64),
                         _ => {
                             mismatched_in_object(re, "number", timeout_val, "timeout");
                             return Err(());
@@ -513,17 +501,17 @@ fn parse_task<'a>(
                 timeout = Some(parse_timeout_config(alloc, value, re)?);
             }
             "managed" => {
-                let ValueInner::Boolean(b) = &value.value else {
+                let Value::Boolean(&b) = value.value() else {
                     mismatched_in_object(re, "boolean", value, "managed");
                     return Err(());
                 };
-                managed = Some(*b);
+                managed = Some(b);
             }
             "hidden" => {
                 if kind != TaskKind::Service {
                     re(Diagnostic::error()
                         .with_message("`hidden` is only valid for services")
-                        .with_label(DiagnosticLabel::primary(value.span.into())));
+                        .with_label(DiagnosticLabel::primary(value.span().into())));
                     return Err(());
                 }
                 let Some(hidden_str) = value.as_str() else {
@@ -539,7 +527,7 @@ fn parse_task<'a>(
                                 "unknown hidden value `{}`, expected `never` or `until_ran`",
                                 hidden_str
                             ))
-                            .with_label(DiagnosticLabel::primary(value.span.into())));
+                            .with_label(DiagnosticLabel::primary(value.span().into())));
                         return Err(());
                     }
                 };
@@ -549,7 +537,7 @@ fn parse_task<'a>(
                     mismatched_in_object(re, "table", value, "var");
                     return Err(());
                 };
-                for (var_key, var_value) in var_table.iter() {
+                for (var_key, var_value) in var_table {
                     let var_name = alloc.alloc_str(var_key.name.as_ref()) as &str;
                     let meta = parse_var_meta(alloc, var_value, re)?;
                     vars_vec.push((var_name, meta));
@@ -558,7 +546,7 @@ fn parse_task<'a>(
             _ => {
                 re(Diagnostic::error()
                     .with_message(format!("unknown key `{}` in task definition", key_str))
-                    .with_label(DiagnosticLabel::primary(value.span.into())));
+                    .with_label(DiagnosticLabel::primary(value.span().into())));
                 return Err(());
             }
         }
@@ -609,11 +597,11 @@ fn parse_cache_config<'a>(
     let mut never = false;
 
     if let Some(never_value) = cache_table.get("never") {
-        let ValueInner::Boolean(b) = &never_value.value else {
+        let Value::Boolean(&b) = never_value.value() else {
             mismatched_in_object(re, "boolean", never_value, "never");
             return Err(());
         };
-        never = *b;
+        never = b;
     }
 
     if let Some(key_value) = cache_table.get("key") {
@@ -643,7 +631,7 @@ fn parse_cache_config<'a>(
             } else {
                 re(Diagnostic::error()
                     .with_message("cache key input must have either `modified` or `profile_changed`")
-                    .with_label(DiagnosticLabel::primary(item.span.into())));
+                    .with_label(DiagnosticLabel::primary(item.span().into())));
                 return Err(());
             }
         }
@@ -670,7 +658,7 @@ fn parse_test<'a>(
     let mut sh: Option<StringExpr> = None;
     let mut vars_vec = bumpalo::collections::Vec::new_in(alloc);
 
-    for (key, value) in test_table.iter() {
+    for (key, value) in test_table {
         let key_str = key.name.as_ref();
         match key_str {
             "pwd" => {
@@ -688,7 +676,7 @@ fn parse_test<'a>(
                     return Err(());
                 };
                 envvar_vec.clear();
-                for (env_key, env_value) in env_table.iter() {
+                for (env_key, env_value) in env_table {
                     let key_str = alloc.alloc_str(env_key.name.as_ref()) as &str;
                     let val_expr = parse_string_expr(alloc, env_value, re)?;
                     envvar_vec.push((key_str, val_expr));
@@ -705,11 +693,11 @@ fn parse_test<'a>(
                 }
                 require = calls.into_bump_slice();
             }
-            "tag" => match &value.value {
-                ValueInner::String(s) => {
-                    tags_vec.push(alloc.alloc_str(as_str(s)) as &str);
+            "tag" => match value.value() {
+                Value::String(s) => {
+                    tags_vec.push(alloc.alloc_str(s) as &str);
                 }
-                ValueInner::Array(arr) => {
+                Value::Array(arr) => {
                     for item in arr {
                         let Some(s) = item.as_str() else {
                             mismatched_in_object(re, "string", item, "tag");
@@ -745,7 +733,7 @@ fn parse_test<'a>(
                     mismatched_in_object(re, "table", value, "var");
                     return Err(());
                 };
-                for (var_key, var_value) in var_table.iter() {
+                for (var_key, var_value) in var_table {
                     let var_name = alloc.alloc_str(var_key.name.as_ref()) as &str;
                     let meta = parse_var_meta(alloc, var_value, re)?;
                     vars_vec.push((var_name, meta));
@@ -754,7 +742,7 @@ fn parse_test<'a>(
             _ => {
                 re(Diagnostic::error()
                     .with_message(format!("unknown key `{}` in test definition", key_str))
-                    .with_label(DiagnosticLabel::primary(value.span.into())));
+                    .with_label(DiagnosticLabel::primary(value.span().into())));
                 return Err(());
             }
         }
@@ -790,40 +778,36 @@ fn parse_test<'a>(
     })
 }
 
-fn parse_task_call<'a>(
-    alloc: &'a Bump,
-    value: &TomlValue<'a>,
-    re: &mut dyn FnMut(Diagnostic),
-) -> Result<TaskCall<'a>, ()> {
-    match &value.value {
-        ValueInner::String(s) => {
-            let s_str = as_str(s);
+fn parse_task_call<'a>(alloc: &'a Bump, value: &Item<'a>, re: &mut dyn FnMut(Diagnostic)) -> Result<TaskCall<'a>, ()> {
+    match value.value() {
+        Value::String(s) => {
+            let s_str = s;
             let (name_str, profile_str) =
-                if let Some((n, p)) = s_str.rsplit_once(':') { (n, Some(p)) } else { (s_str, None) };
+                if let Some((n, p)) = s_str.rsplit_once(':') { (n, Some(p)) } else { (*s_str, None) };
             let name = alloc.alloc_str(name_str) as &str;
             let profile = profile_str.map(|p| alloc.alloc_str(p) as &str);
             Ok(TaskCall { name: Alias(name), profile, vars: jsony_value::ValueMap::new() })
         }
-        ValueInner::Array(arr) => {
+        Value::Array(arr) => {
             if arr.is_empty() {
                 re(Diagnostic::error()
                     .with_message("task call array cannot be empty")
-                    .with_label(DiagnosticLabel::primary(value.span.into())));
+                    .with_label(DiagnosticLabel::primary(value.span().into())));
                 return Err(());
             }
             if arr.len() > 2 {
                 re(Diagnostic::error()
                     .with_message("task call array can have at most 2 elements")
-                    .with_label(DiagnosticLabel::primary(value.span.into())));
+                    .with_label(DiagnosticLabel::primary(value.span().into())));
                 return Err(());
             }
 
-            let first = &arr[0];
-            let (name, profile) = match &first.value {
-                ValueInner::String(s) => {
-                    let s_str = as_str(s);
+            let first = &arr.as_slice()[0];
+            let (name, profile) = match first.value() {
+                Value::String(s) => {
+                    let s_str = s;
                     let (name_str, profile_str) =
-                        if let Some((n, p)) = s_str.rsplit_once(':') { (n, Some(p)) } else { (s_str, None) };
+                        if let Some((n, p)) = s_str.rsplit_once(':') { (n, Some(p)) } else { (*s_str, None) };
                     let name = alloc.alloc_str(name_str) as &str;
                     let profile = profile_str.map(|p| alloc.alloc_str(p) as &str);
                     (name, profile)
@@ -836,19 +820,19 @@ fn parse_task_call<'a>(
 
             let mut vars = jsony_value::ValueMap::new();
             if arr.len() == 2 {
-                let second = &arr[1];
+                let second = &arr.as_slice()[1];
                 let Some(vars_table) = second.as_table() else {
                     mismatched_in_object(re, "table", second, "variables");
                     return Err(());
                 };
-                for (key, val) in vars_table.iter() {
-                    let val_str = match &val.value {
-                        ValueInner::String(s) => as_str(s).to_string(),
-                        ValueInner::Integer(i) => i.to_string(),
-                        ValueInner::Boolean(b) => b.to_string(),
+                for (key, val) in vars_table {
+                    let val_str = match val.value() {
+                        Value::String(s) => s.to_string(),
+                        Value::Integer(i) => i.to_string(),
+                        Value::Boolean(b) => b.to_string(),
                         _ => continue,
                     };
-                    vars.insert(key.name.as_ref().to_string().into(), val_str.into());
+                    vars.insert(key.name.into(), val_str.into());
                 }
             }
 
@@ -864,7 +848,7 @@ fn parse_task_call<'a>(
 fn parse_function_action<'a>(
     alloc: &'a Bump,
     func_table: &Table<'a>,
-    func_value: &TomlValue<'a>,
+    func_value: &Item<'a>,
     re: &mut dyn FnMut(Diagnostic),
 ) -> Result<FunctionDefAction<'a>, ()> {
     if let Some(restart_val) = func_table.get("restart") {
@@ -884,15 +868,15 @@ fn parse_function_action<'a>(
     }
 
     if let Some(spawn_val) = func_table.get("spawn") {
-        let tasks = match &spawn_val.value {
-            ValueInner::Array(arr) => {
+        let tasks = match spawn_val.value() {
+            Value::Array(arr) => {
                 let mut calls = bumpalo::collections::Vec::new_in(alloc);
                 for item in arr {
                     calls.push(parse_task_call(alloc, item, re)?);
                 }
                 calls.into_bump_slice()
             }
-            ValueInner::String(_) => {
+            Value::String(_) => {
                 let call = parse_task_call(alloc, spawn_val, re)?;
                 std::slice::from_ref(alloc.alloc(call))
             }
@@ -906,7 +890,7 @@ fn parse_function_action<'a>(
 
     re(Diagnostic::error()
         .with_message("function must have 'restart', 'kill', or 'spawn' action")
-        .with_label(DiagnosticLabel::primary(func_value.span.into())));
+        .with_label(DiagnosticLabel::primary(func_value.span().into())));
     Err(())
 }
 
@@ -920,7 +904,7 @@ fn parse_functions<'a>(
     let mut has_fn2 = false;
 
     if let Some(func_table) = func_table {
-        for (name, func_value) in func_table.iter() {
+        for (name, func_value) in func_table {
             let name_str = name.name.as_ref();
             if name_str == "fn1" {
                 has_fn1 = true;
@@ -938,7 +922,7 @@ fn parse_functions<'a>(
                             "unknown function action: '{}', expected 'restart-selected' or a table",
                             s
                         ))
-                        .with_label(DiagnosticLabel::primary(func_value.span.into())));
+                        .with_label(DiagnosticLabel::primary(func_value.span().into())));
                     return Err(());
                 }
             } else if let Some(table) = func_value.as_table() {
@@ -968,7 +952,9 @@ pub fn parse<'a>(
     data: &'a str,
     re: &mut dyn FnMut(Diagnostic),
 ) -> Result<WorkspaceConfig<'a>, ()> {
-    let value = match toml_spanner::parse(data) {
+    // todo don't leak this
+    let arena = Box::leak(Box::new(toml_spanner::Arena::new()));
+    let value = match toml_spanner::parse(data, arena) {
         Ok(value) => value,
         Err(err) => {
             re(toml_error_to_diagnostic(&err));
@@ -976,14 +962,14 @@ pub fn parse<'a>(
         }
     };
 
-    let root = value.as_table().unwrap();
+    let root = value.table();
 
     let mut tasks_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut tests_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut groups_vec = bumpalo::collections::Vec::new_in(alloc);
 
     if let Some(action_table) = table(root, "action", re)? {
-        for (name, task_value) in action_table.iter() {
+        for (name, task_value) in action_table {
             let Some(task_table) = task_value.as_table() else {
                 mismatched_in_object(re, "table", task_value, name.name.as_ref());
                 return Err(());
@@ -995,7 +981,7 @@ pub fn parse<'a>(
     }
 
     if let Some(service_table) = table(root, "service", re)? {
-        for (name, task_value) in service_table.iter() {
+        for (name, task_value) in service_table {
             let Some(task_table) = task_value.as_table() else {
                 mismatched_in_object(re, "table", task_value, name.name.as_ref());
                 return Err(());
@@ -1007,7 +993,7 @@ pub fn parse<'a>(
     }
 
     if let Some(group_table) = table(root, "group", re)? {
-        for (name, group_value) in group_table.iter() {
+        for (name, group_value) in group_table {
             let Some(group_array) = group_value.as_array() else {
                 mismatched_in_object(re, "array", group_value, name.name.as_ref());
                 return Err(());
@@ -1022,15 +1008,15 @@ pub fn parse<'a>(
     }
 
     if let Some(test_table) = table(root, "test", re)? {
-        for (name, test_value) in test_table.iter() {
+        for (name, test_value) in test_table {
             let name_str = alloc.alloc_str(name.name.as_ref()) as &str;
-            match &test_value.value {
-                ValueInner::Table(single_test_table) => {
+            match test_value.value() {
+                Value::Table(single_test_table) => {
                     let test = parse_test(alloc, name_str, single_test_table, re)?;
                     let test_slice = std::slice::from_ref(alloc.alloc(test));
                     tests_vec.push((name_str, test_slice));
                 }
-                ValueInner::Array(arr) => {
+                Value::Array(arr) => {
                     let mut test_array = bumpalo::collections::Vec::new_in(alloc);
                     for item in arr {
                         let Some(item_table) = item.as_table() else {
@@ -1069,8 +1055,8 @@ mod test {
     #[test]
     fn test_parse_string_expr() {
         let text = r#"hello = "world""#;
-        let value = toml_spanner::parse(text).unwrap();
-        let table = value.as_table().unwrap();
+        let arena = toml_spanner::Arena::new();
+        let table = toml_spanner::parse(text, &arena).unwrap().into_table();
         let bump = Bump::new();
         let mut errors = Vec::new();
         let mut error = |diag: Diagnostic| {
@@ -1089,8 +1075,8 @@ mod test {
     #[test]
     fn test_parse_var_expr() {
         let text = r#"path = { var = "dir" }"#;
-        let value = toml_spanner::parse(text).unwrap();
-        let table = value.as_table().unwrap();
+        let arena = toml_spanner::Arena::new();
+        let table = toml_spanner::parse(text, &arena).unwrap().into_table();
         let bump = Bump::new();
         let mut errors = Vec::new();
         let mut error = |diag: Diagnostic| {
@@ -1109,8 +1095,8 @@ mod test {
     #[test]
     fn test_parse_if_expr() {
         let text = r#"arg = { if.profile = "verbose", then = "-al" }"#;
-        let value = toml_spanner::parse(text).unwrap();
-        let table = value.as_table().unwrap();
+        let arena = toml_spanner::Arena::new();
+        let table = toml_spanner::parse(text, &arena).unwrap().into_table();
         let bump = Bump::new();
         let mut errors = Vec::new();
         let mut error = |diag: Diagnostic| {

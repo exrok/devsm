@@ -834,11 +834,7 @@ impl WorkspaceState {
         reason: ScheduleReason,
     ) -> JobIndex {
         let bt = &mut self.base_tasks[base_task.idx()];
-        let profile = if profile.is_empty() {
-            bt.config.profiles.first().copied().unwrap_or("")
-        } else {
-            profile
-        };
+        let profile = if profile.is_empty() { bt.config.profiles.first().copied().unwrap_or("") } else { profile };
         bt.update_profile_tracking(profile);
         let mut pred = Vec::new();
 
@@ -1058,11 +1054,8 @@ impl WorkspaceState {
     ) -> JobIndex {
         let (task_name, task, pc) = {
             let spawner = &self.base_tasks[base_task.idx()];
-            let profile = if profile.is_empty() {
-                spawner.config.profiles.first().copied().unwrap_or("")
-            } else {
-                profile
-            };
+            let profile =
+                if profile.is_empty() { spawner.config.profiles.first().copied().unwrap_or("") } else { profile };
             let env = Environment { profile, param: params.clone(), vars: spawner.config.vars };
             let task = spawner.config.eval(&env).expect("Failed to eval queued service config");
             (spawner.name, task, spawner.jobs.len())
@@ -1770,11 +1763,8 @@ impl Workspace {
                     return Err(format!("Task '{}' not found", name));
                 };
                 let bt = &state.base_tasks[base_index.idx()];
-                let profile = if profile.is_empty() {
-                    bt.config.profiles.first().copied().unwrap_or("")
-                } else {
-                    profile
-                };
+                let profile =
+                    if profile.is_empty() { bt.config.profiles.first().copied().unwrap_or("") } else { profile };
                 let Some(cache_config) = &bt.config.cache else {
                     drop(state);
                     let state = &mut *self.state.write().unwrap();
