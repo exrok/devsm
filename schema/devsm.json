@@ -412,6 +412,14 @@
           "type": "boolean",
           "description": "Controls execution mode: true = must use 'devsm run' (for complex dependencies), false = must use 'devsm exec' (for interactive commands). Omit for default behavior (either allowed)."
         },
+        "allow_multiple": {
+          "description": "Controls whether multiple instances of this task can run concurrently. false (default): only one instance at a time. true: unlimited concurrent instances. 'distinct_profiles': multiple instances but each must have a different profile. 'single_profile': multiple instances but all must share the same profile.",
+          "oneOf": [
+            { "type": "boolean" },
+            { "type": "string", "enum": ["distinct_profiles", "single_profile"] }
+          ],
+          "default": false
+        },
         "var": {
           "type": "object",
           "description": "Variable metadata table (e.g., var.myvar = { description = '...', default = '...' })",
@@ -488,6 +496,14 @@
           "$ref": "#/definitions/cacheConfig",
           "description": "Cache configuration - caches running services within a session"
         },
+        "allow_multiple": {
+          "description": "Controls whether multiple instances of this service can run concurrently. false (default): only one instance at a time. true: unlimited concurrent instances. 'distinct_profiles': multiple instances but each must have a different profile. 'single_profile': multiple instances but all must share the same profile.",
+          "oneOf": [
+            { "type": "boolean" },
+            { "type": "string", "enum": ["distinct_profiles", "single_profile"] }
+          ],
+          "default": false
+        },
         "var": {
           "type": "object",
           "description": "Variable metadata table (e.g., var.myvar = { description = '...', default = '...' })",
@@ -557,6 +573,14 @@
         "timeout": {
           "$ref": "#/definitions/timeoutConfig",
           "description": "Timeout configuration - terminates the test if it exceeds the specified duration"
+        },
+        "allow_multiple": {
+          "description": "Controls whether multiple instances of this test can run concurrently. false (default): only one instance at a time. true: unlimited concurrent instances. 'distinct_profiles': multiple instances but each must have a different profile. 'single_profile': multiple instances but all must share the same profile.",
+          "oneOf": [
+            { "type": "boolean" },
+            { "type": "string", "enum": ["distinct_profiles", "single_profile"] }
+          ],
+          "default": false
         },
         "var": {
           "type": "object",

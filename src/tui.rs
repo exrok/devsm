@@ -606,7 +606,7 @@ fn process_key(
                             }
                             drop(ws1);
                             for (task, vars, profile) in new_tasks {
-                                workspace.restart_task(task, vars, profile);
+                                workspace.start_task(task, vars, profile);
                             }
                             tui.status_message = Some(StatusMessage::info("Group Started"));
                         }
@@ -648,7 +648,7 @@ fn process_key(
                 }
                 LauncherAction::Start { base_task, profile, params } => {
                     drop(ws);
-                    workspace.restart_task(base_task, params, &profile);
+                    workspace.start_task(base_task, params, &profile);
                     tui.overlay = FocusOverlap::None;
                     tui.status_message = Some(StatusMessage::info("Task Spawned"));
                 }
@@ -810,7 +810,7 @@ fn process_key(
                 match state.try_auto_start(&ws) {
                     LauncherAction::Start { base_task, profile, params } => {
                         drop(ws);
-                        workspace.restart_task(base_task, params, &profile);
+                        workspace.start_task(base_task, params, &profile);
                     }
                     _ => tui.overlay = FocusOverlap::TaskLauncher { state },
                 }
@@ -930,7 +930,7 @@ fn call_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str) {
                     for call in *tasks {
                         if let Some(&bti) = workspace.state().name_map.get(&*call.name) {
                             let profile = call.profile.unwrap_or("");
-                            workspace.restart_task(bti, call.vars.clone(), profile);
+                            workspace.start_task(bti, call.vars.clone(), profile);
                         }
                     }
                     tui.status_message = Some(StatusMessage::info(format!("{} spawned tasks", fn_name)));

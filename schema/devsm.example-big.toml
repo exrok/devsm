@@ -158,6 +158,28 @@ cache.key = [
 cmd = ["./always-run.sh"]
 cache.never = true
 
+# Action with allow_multiple = true (unlimited concurrent instances)
+[action.with_allow_multiple_true]
+cmd = ["./worker.sh"]
+allow_multiple = true
+
+# Action with allow_multiple = false (default, only one instance at a time)
+[action.with_allow_multiple_false]
+cmd = ["./single-worker.sh"]
+allow_multiple = false
+
+# Action with allow_multiple = "distinct_profiles" (one instance per profile)
+[action.with_allow_multiple_distinct]
+cmd = ["cargo", "build", { if.profile = "release", then = "--release" }]
+profiles = ["default", "release"]
+allow_multiple = "distinct_profiles"
+
+# Action with allow_multiple = "single_profile" (multiple instances, same profile only)
+[action.with_allow_multiple_single]
+cmd = ["./parallel-test.sh"]
+profiles = ["default", "ci"]
+allow_multiple = "single_profile"
+
 # Action with simple timeout (string duration, equivalent to timeout.max)
 [action.with_simple_timeout]
 cmd = ["./long-running-script.sh"]
@@ -265,6 +287,12 @@ info = "Main backend HTTP server"
 cmd = ["./ephemeral-worker"]
 cache.never = true
 info = "Worker that must restart fresh for each dependent task"
+
+# Service with allow_multiple = "distinct_profiles" (one instance per profile)
+[service.multi_profile_service]
+cmd = ["./server", "--env", { if.profile = "staging", then = "staging", or_else = "dev" }]
+profiles = ["dev", "staging"]
+allow_multiple = "distinct_profiles"
 
 # Service with environment variables
 [service.service_with_env]

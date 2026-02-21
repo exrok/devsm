@@ -243,3 +243,264 @@ require = ["svc"]
         harness.server_log()
     );
 }
+
+// ---------------------------------------------------------------------------
+// allow_multiple tests
+// ---------------------------------------------------------------------------
+
+/// allow_multiple = true: two instances of the same service run concurrently.
+#[test]
+fn allow_multiple_true_concurrent() {
+    let mut harness = TestHarness::new("allow_multi_true");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+allow_multiple = true
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    std::thread::scope(|s| {
+        let h1 = s.spawn(|| harness.run_client(&["run", "svc"]));
+
+        let mut svc1 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc1.name(), "svc");
+
+        let h2 = s.spawn(|| harness.run_client(&["run", "svc"]));
+
+        let mut svc2 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc2.name(), "svc");
+
+        svc1.exit(0);
+        svc2.exit(0);
+
+        let r1 = h1.join().expect("client 1 panicked");
+        let r2 = h2.join().expect("client 2 panicked");
+        assert!(r1.success(), "client 1: stdout={}, stderr={}", r1.stdout, r1.stderr);
+        assert!(r2.success(), "client 2: stdout={}, stderr={}", r2.stdout, r2.stderr);
+    });
+}
+
+/// allow_multiple = false (default): spawning same service kills old instance.
+#[test]
+fn allow_multiple_false_kills_old() {
+    let mut harness = TestHarness::new("allow_multi_false");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+allow_multiple = false
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    std::thread::scope(|s| {
+        let _h1 = s.spawn(|| harness.run_client(&["run", "svc"]));
+        let _svc1 = ctrl.accept(Duration::from_secs(10));
+
+        let h2 = s.spawn(|| harness.run_client(&["run", "svc"]));
+
+        let mut svc2 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc2.name(), "svc");
+        svc2.exit(0);
+
+        let r2 = h2.join().expect("client 2 panicked");
+        assert!(r2.success(), "client 2: stdout={}, stderr={}", r2.stdout, r2.stderr);
+    });
+}
+
+/// allow_multiple = "distinct_profiles": different profiles run concurrently.
+#[test]
+fn allow_multiple_distinct_profiles_different_keeps() {
+    let mut harness = TestHarness::new("allow_multi_dp_diff");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+allow_multiple = "distinct_profiles"
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    std::thread::scope(|s| {
+        let h1 = s.spawn(|| harness.run_client(&["run", "svc:alpha"]));
+
+        let mut svc1 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc1.name(), "svc");
+
+        let h2 = s.spawn(|| harness.run_client(&["run", "svc:beta"]));
+
+        let mut svc2 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc2.name(), "svc");
+
+        svc1.exit(0);
+        svc2.exit(0);
+
+        let r1 = h1.join().expect("client 1 panicked");
+        let r2 = h2.join().expect("client 2 panicked");
+        assert!(r1.success(), "client 1: stdout={}, stderr={}", r1.stdout, r1.stderr);
+        assert!(r2.success(), "client 2: stdout={}, stderr={}", r2.stdout, r2.stderr);
+    });
+}
+
+/// allow_multiple = "distinct_profiles": same profile kills old instance.
+#[test]
+fn allow_multiple_distinct_profiles_same_kills() {
+    let mut harness = TestHarness::new("allow_multi_dp_same");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+allow_multiple = "distinct_profiles"
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    std::thread::scope(|s| {
+        let _h1 = s.spawn(|| harness.run_client(&["run", "svc:alpha"]));
+        let _svc1 = ctrl.accept(Duration::from_secs(10));
+
+        let h2 = s.spawn(|| harness.run_client(&["run", "svc:alpha"]));
+
+        let mut svc2 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc2.name(), "svc");
+        svc2.exit(0);
+
+        let r2 = h2.join().expect("client 2 panicked");
+        assert!(r2.success(), "client 2: stdout={}, stderr={}", r2.stdout, r2.stderr);
+    });
+}
+
+/// allow_multiple = "single_profile": same profile runs concurrently.
+#[test]
+fn allow_multiple_single_profile_same_coexists() {
+    let mut harness = TestHarness::new("allow_multi_sp_same");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+allow_multiple = "single_profile"
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    std::thread::scope(|s| {
+        let h1 = s.spawn(|| harness.run_client(&["run", "svc:alpha"]));
+
+        let mut svc1 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc1.name(), "svc");
+
+        let h2 = s.spawn(|| harness.run_client(&["run", "svc:alpha"]));
+
+        let mut svc2 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc2.name(), "svc");
+
+        svc1.exit(0);
+        svc2.exit(0);
+
+        let r1 = h1.join().expect("client 1 panicked");
+        let r2 = h2.join().expect("client 2 panicked");
+        assert!(r1.success(), "client 1: stdout={}, stderr={}", r1.stdout, r1.stderr);
+        assert!(r2.success(), "client 2: stdout={}, stderr={}", r2.stdout, r2.stderr);
+    });
+}
+
+/// allow_multiple = "single_profile": different profile kills old instance.
+#[test]
+fn allow_multiple_single_profile_different_kills() {
+    let mut harness = TestHarness::new("allow_multi_sp_diff");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+allow_multiple = "single_profile"
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    std::thread::scope(|s| {
+        let _h1 = s.spawn(|| harness.run_client(&["run", "svc:alpha"]));
+        let _svc1 = ctrl.accept(Duration::from_secs(10));
+
+        let h2 = s.spawn(|| harness.run_client(&["run", "svc:beta"]));
+
+        let mut svc2 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc2.name(), "svc");
+        svc2.exit(0);
+
+        let r2 = h2.join().expect("client 2 panicked");
+        assert!(r2.success(), "client 2: stdout={}, stderr={}", r2.stdout, r2.stderr);
+    });
+}
+
+/// allow_multiple = true with actions: concurrent action instances.
+#[test]
+fn allow_multiple_true_action_concurrent() {
+    let mut harness = TestHarness::new("allow_multi_action");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[action.task]
+cmd = ["test-app", "task"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+allow_multiple = true
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    std::thread::scope(|s| {
+        let h1 = s.spawn(|| harness.run_client(&["run", "task"]));
+        let mut t1 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(t1.name(), "task");
+
+        let h2 = s.spawn(|| harness.run_client(&["run", "task"]));
+        let mut t2 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(t2.name(), "task");
+
+        t1.exit(0);
+        t2.exit(0);
+
+        let r1 = h1.join().expect("client 1 panicked");
+        let r2 = h2.join().expect("client 2 panicked");
+        assert!(r1.success(), "client 1: stdout={}, stderr={}", r1.stdout, r1.stderr);
+        assert!(r2.success(), "client 2: stdout={}, stderr={}", r2.stdout, r2.stderr);
+    });
+}

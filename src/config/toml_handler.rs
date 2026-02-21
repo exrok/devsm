@@ -2,8 +2,9 @@ use bumpalo::Bump;
 use toml_spanner::{Item, Table, Value};
 
 use crate::config::{
-    Alias, CacheConfig, CacheKeyInput, CommandExpr, FunctionDef, FunctionDefAction, If, Predicate, ReadyConfig,
-    ReadyPredicate, ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr,
+    Alias, AllowMultiple, CacheConfig, CacheKeyInput, CommandExpr, FunctionDef, FunctionDefAction, If, Predicate,
+    ReadyConfig, ReadyPredicate, ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind,
+    TestConfigExpr,
     TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, toml_error_to_diagnostic};
@@ -330,6 +331,7 @@ fn parse_task<'a>(
     let mut sh: Option<StringExpr> = None;
     let mut managed: Option<bool> = None;
     let mut hidden = ServiceHidden::Never;
+    let mut allow_multiple = AllowMultiple::False;
     let mut vars_vec = bumpalo::collections::Vec::new_in(alloc);
 
     for (key, value) in task_table {
@@ -532,6 +534,32 @@ fn parse_task<'a>(
                     }
                 };
             }
+            "allow_multiple" => {
+                match value.value() {
+                    Value::Boolean(&b) => {
+                        allow_multiple = if b { AllowMultiple::True } else { AllowMultiple::False };
+                    }
+                    _ => {
+                        let Some(s) = value.as_str() else {
+                            mismatched_in_object(re, "boolean or string", value, "allow_multiple");
+                            return Err(());
+                        };
+                        allow_multiple = match s {
+                            "distinct_profiles" => AllowMultiple::DistinctProfiles,
+                            "single_profile" => AllowMultiple::SingleProfile,
+                            _ => {
+                                re(Diagnostic::error()
+                                    .with_message(format!(
+                                        "unknown allow_multiple value `{}`, expected `distinct_profiles` or `single_profile`",
+                                        s
+                                    ))
+                                    .with_label(DiagnosticLabel::primary(value.span().into())));
+                                return Err(());
+                            }
+                        };
+                    }
+                }
+            }
             "var" => {
                 let Some(var_table) = value.as_table() else {
                     mismatched_in_object(re, "table", value, "var");
@@ -583,6 +611,7 @@ fn parse_task<'a>(
         tags: &[],
         managed,
         hidden,
+        allow_multiple,
         vars: vars_vec.into_bump_slice(),
     })
 }

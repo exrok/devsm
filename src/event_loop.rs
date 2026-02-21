@@ -1252,7 +1252,7 @@ impl EventLoop {
                 return;
             };
             drop(state);
-            ws.handle.restart_task(base_index, params, profile);
+            ws.handle.start_task(base_index, params, profile);
 
             let state = ws.handle.state.read().unwrap();
             let bt = &state.base_tasks[base_index.idx()];

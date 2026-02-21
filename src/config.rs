@@ -65,6 +65,20 @@ pub enum ServiceHidden {
     UntilRan,
 }
 
+/// Controls whether multiple instances of a task can run concurrently.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AllowMultiple {
+    /// Only one instance at a time (default). Starting a new instance kills the old one.
+    #[default]
+    False,
+    /// Multiple instances allowed, but each must have a distinct profile.
+    DistinctProfiles,
+    /// Multiple instances allowed, but all must share the same profile.
+    SingleProfile,
+    /// Multiple instances with no restrictions.
+    True,
+}
+
 /// A single cache key input that contributes to cache invalidation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheKeyInput<'a> {
@@ -346,6 +360,8 @@ pub struct TaskConfigExpr<'a> {
     /// Controls when this service is visible in the task list.
     /// Only meaningful for services; ignored for actions and tests.
     pub hidden: ServiceHidden,
+    /// Controls whether multiple instances of this task can run concurrently.
+    pub allow_multiple: AllowMultiple,
     /// Variable metadata (description, default) for variables used in this task.
     pub vars: &'a [(&'a str, VarMeta<'a>)],
 }
@@ -385,6 +401,7 @@ impl TestConfigExpr<'static> {
             tags: self.tags,
             managed: None,
             hidden: ServiceHidden::Never,
+            allow_multiple: AllowMultiple::False,
             vars: self.vars,
         }))
     }
@@ -408,6 +425,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         tags: &[],
         managed: None,
         hidden: ServiceHidden::Never,
+        allow_multiple: AllowMultiple::False,
         vars: &[],
     }
 };
@@ -771,6 +789,7 @@ mod tests {
             tags: &[],
             managed: None,
             hidden: ServiceHidden::Never,
+            allow_multiple: AllowMultiple::False,
             vars: &[],
         };
         let vars = TEST_EXPR.collect_variables();
@@ -799,6 +818,7 @@ mod tests {
             tags: &[],
             managed: None,
             hidden: ServiceHidden::Never,
+            allow_multiple: AllowMultiple::False,
             vars: &[],
         };
         let vars = TEST_EXPR.collect_variables();

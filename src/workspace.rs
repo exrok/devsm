@@ -2,7 +2,8 @@ use crate::{
     cache_key::CacheKeyHasher,
     cli::TestFilter,
     config::{
-        CARGO_AUTO_EXPR, CacheKeyInput, Command, Environment, TaskConfigExpr, TaskConfigRc, TaskKind, WorkspaceConfig,
+        AllowMultiple, CARGO_AUTO_EXPR, CacheKeyInput, Command, Environment, TaskConfigExpr, TaskConfigRc, TaskKind,
+        WorkspaceConfig,
     },
     event_loop::MioChannel,
     function::FunctionAction,
@@ -832,6 +833,7 @@ impl WorkspaceState {
         params: ValueMap,
         profile: &str,
         reason: ScheduleReason,
+        force_restart: bool,
     ) -> JobIndex {
         let bt = &mut self.base_tasks[base_task.idx()];
         let profile = if profile.is_empty() { bt.config.profiles.first().copied().unwrap_or("") } else { profile };
@@ -840,28 +842,108 @@ impl WorkspaceState {
 
         let task_kind = bt.config.kind;
         let task_name = bt.name;
+        let allow_multiple = if force_restart { AllowMultiple::False } else { bt.config.allow_multiple };
 
-        for &job_index in bt.jobs.terminate_scheduled() {
-            self.jobs[job_index.idx()].process_status = JobStatus::Cancelled;
-            match task_kind {
-                TaskKind::Action => self.action_jobs.set_terminal(job_index),
-                TaskKind::Test => self.test_jobs.set_terminal(job_index),
-                TaskKind::Service => self.service_jobs.set_terminal(job_index),
+        match allow_multiple {
+            AllowMultiple::False => {
+                for &job_index in bt.jobs.terminate_scheduled() {
+                    self.jobs[job_index.idx()].process_status = JobStatus::Cancelled;
+                    match task_kind {
+                        TaskKind::Action => self.action_jobs.set_terminal(job_index),
+                        TaskKind::Test => self.test_jobs.set_terminal(job_index),
+                        TaskKind::Service => self.service_jobs.set_terminal(job_index),
+                    }
+                    self.service_dependents.remove_from_all(job_index);
+                }
+
+                for &job_index in bt.jobs.running() {
+                    let job = &mut self.jobs[job_index.idx()];
+                    let JobStatus::Running { process_index, .. } = &job.process_status else {
+                        continue;
+                    };
+                    pred.push(ScheduleRequirement { job: job_index, predicate: JobPredicate::Terminated });
+                    channel.send(crate::event_loop::ProcessRequest::TerminateJob {
+                        job_id: job.log_group,
+                        process_index: *process_index,
+                        exit_cause: ExitCause::Restarted,
+                    });
+                }
             }
-            self.service_dependents.remove_from_all(job_index);
-        }
+            AllowMultiple::True => {
+                // No killing — new instance spawns alongside existing ones.
+            }
+            AllowMultiple::DistinctProfiles => {
+                // Kill instances with the SAME profile. Keep different-profile instances.
+                let to_cancel: Vec<_> =
+                    bt.jobs.scheduled().iter().filter(|ji| self.jobs[ji.idx()].spawn_profile == profile).copied().collect();
+                for job_index in &to_cancel {
+                    self.jobs[job_index.idx()].process_status = JobStatus::Cancelled;
+                    let bt = &mut self.base_tasks[base_task.idx()];
+                    bt.jobs.set_terminal(*job_index);
+                    match task_kind {
+                        TaskKind::Action => self.action_jobs.set_terminal(*job_index),
+                        TaskKind::Test => self.test_jobs.set_terminal(*job_index),
+                        TaskKind::Service => self.service_jobs.set_terminal(*job_index),
+                    }
+                    self.service_dependents.remove_from_all(*job_index);
+                }
 
-        for &job_index in bt.jobs.running() {
-            let job = &mut self.jobs[job_index.idx()];
-            let JobStatus::Running { process_index, .. } = &job.process_status else {
-                continue;
-            };
-            pred.push(ScheduleRequirement { job: job_index, predicate: JobPredicate::Terminated });
-            channel.send(crate::event_loop::ProcessRequest::TerminateJob {
-                job_id: job.log_group,
-                process_index: *process_index,
-                exit_cause: ExitCause::Restarted,
-            });
+                let to_terminate: Vec<_> = self.base_tasks[base_task.idx()]
+                    .jobs
+                    .running()
+                    .iter()
+                    .filter(|ji| self.jobs[ji.idx()].spawn_profile == profile)
+                    .copied()
+                    .collect();
+                for job_index in to_terminate {
+                    let job = &self.jobs[job_index.idx()];
+                    let JobStatus::Running { process_index, .. } = &job.process_status else {
+                        continue;
+                    };
+                    pred.push(ScheduleRequirement { job: job_index, predicate: JobPredicate::Terminated });
+                    channel.send(crate::event_loop::ProcessRequest::TerminateJob {
+                        job_id: job.log_group,
+                        process_index: *process_index,
+                        exit_cause: ExitCause::Restarted,
+                    });
+                }
+            }
+            AllowMultiple::SingleProfile => {
+                // Kill instances with DIFFERENT profiles. Keep same-profile instances.
+                let to_cancel: Vec<_> =
+                    bt.jobs.scheduled().iter().filter(|ji| self.jobs[ji.idx()].spawn_profile != profile).copied().collect();
+                for job_index in &to_cancel {
+                    self.jobs[job_index.idx()].process_status = JobStatus::Cancelled;
+                    let bt = &mut self.base_tasks[base_task.idx()];
+                    bt.jobs.set_terminal(*job_index);
+                    match task_kind {
+                        TaskKind::Action => self.action_jobs.set_terminal(*job_index),
+                        TaskKind::Test => self.test_jobs.set_terminal(*job_index),
+                        TaskKind::Service => self.service_jobs.set_terminal(*job_index),
+                    }
+                    self.service_dependents.remove_from_all(*job_index);
+                }
+
+                let to_terminate: Vec<_> = self.base_tasks[base_task.idx()]
+                    .jobs
+                    .running()
+                    .iter()
+                    .filter(|ji| self.jobs[ji.idx()].spawn_profile != profile)
+                    .copied()
+                    .collect();
+                for job_index in to_terminate {
+                    let job = &self.jobs[job_index.idx()];
+                    let JobStatus::Running { process_index, .. } = &job.process_status else {
+                        continue;
+                    };
+                    pred.push(ScheduleRequirement { job: job_index, predicate: JobPredicate::Terminated });
+                    channel.send(crate::event_loop::ProcessRequest::TerminateJob {
+                        job_id: job.log_group,
+                        process_index: *process_index,
+                        exit_cause: ExitCause::Restarted,
+                    });
+                }
+            }
         }
 
         let bt = &mut self.base_tasks[base_task.idx()];
@@ -888,6 +970,7 @@ impl WorkspaceState {
                             dep_params.clone(),
                             dep_profile,
                             ScheduleReason::Dependency,
+                            false,
                         );
                         pred.push(ScheduleRequirement {
                             job: new_job,
@@ -904,6 +987,7 @@ impl WorkspaceState {
                             dep_params,
                             dep_profile,
                             ScheduleReason::Dependency,
+                            false,
                         );
                         pred.push(ScheduleRequirement {
                             job: new_job,
@@ -950,6 +1034,7 @@ impl WorkspaceState {
                         dep_params,
                         dep_profile,
                         ScheduleReason::Dependency,
+                        false,
                     );
                     pred.push(ScheduleRequirement {
                         job: new_job,
@@ -975,6 +1060,7 @@ impl WorkspaceState {
                         dep_params,
                         dep_profile,
                         ScheduleReason::Dependency,
+                        false,
                     );
                     pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
                 }
@@ -1141,13 +1227,15 @@ impl WorkspaceState {
         name: &str,
         params: ValueMap,
         profile: &str,
+        force_restart: bool,
     ) -> Result<(BaseTaskIndex, JobIndex), String> {
         let Some(base_index) = self.base_index_by_name(name) else {
             return Err(format!("Task '{}' not found", name));
         };
         self.change_number = self.change_number.wrapping_add(1);
         self.refresh_config();
-        let job_index = self.spawn_task(workspace_id, channel, base_index, params, profile, ScheduleReason::Requested);
+        let job_index =
+            self.spawn_task(workspace_id, channel, base_index, params, profile, ScheduleReason::Requested, force_restart);
         Ok((base_index, job_index))
     }
 
@@ -1452,16 +1540,27 @@ impl WorkspaceState {
     ) -> ServiceCompatibility {
         let spawner = &self.base_tasks[base_task.idx()];
 
-        if let Some(&ji) = spawner.jobs.running().iter().next() {
+        for &ji in spawner.jobs.running() {
             let job = &self.jobs[ji.idx()];
             if service_matches_require(job, requested_profile, requested_params) {
                 return ServiceCompatibility::Compatible(ji);
             }
-            return ServiceCompatibility::Conflict {
-                running_job: ji,
-                running_profile: job.spawn_profile.clone(),
-                requested_profile: requested_profile.to_string(),
-            };
+        }
+
+        if let Some(&ji) = spawner.jobs.running().iter().next() {
+            let job = &self.jobs[ji.idx()];
+            match spawner.config.allow_multiple {
+                AllowMultiple::True | AllowMultiple::DistinctProfiles => {
+                    return ServiceCompatibility::Available;
+                }
+                AllowMultiple::False | AllowMultiple::SingleProfile => {
+                    return ServiceCompatibility::Conflict {
+                        running_job: ji,
+                        running_profile: job.spawn_profile.clone(),
+                        requested_profile: requested_profile.to_string(),
+                    };
+                }
+            }
         }
 
         ServiceCompatibility::Available
@@ -1528,7 +1627,7 @@ impl WorkspaceState {
                     }
 
                     let new_job =
-                        self.spawn_task(workspace_id, channel, base_task, params, &profile, ScheduleReason::Dependency);
+                        self.spawn_task(workspace_id, channel, base_task, params, &profile, ScheduleReason::Dependency, false);
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Service => {
@@ -1556,7 +1655,7 @@ impl WorkspaceState {
                     }
 
                     let new_job =
-                        self.spawn_task(workspace_id, channel, base_task, params, &profile, ScheduleReason::Dependency);
+                        self.spawn_task(workspace_id, channel, base_task, params, &profile, ScheduleReason::Dependency, false);
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Test => {
@@ -1687,6 +1786,22 @@ impl Workspace {
             params,
             profile,
             ScheduleReason::Requested,
+            true,
+        )
+    }
+
+    pub fn start_task(&self, base_task: BaseTaskIndex, params: ValueMap, profile: &str) -> JobIndex {
+        let state = &mut *self.state.write().unwrap();
+        state.change_number = state.change_number.wrapping_add(1);
+        state.refresh_config();
+        state.spawn_task(
+            self.workspace_id,
+            &self.process_channel,
+            base_task,
+            params,
+            profile,
+            ScheduleReason::Requested,
+            false,
         )
     }
 
@@ -1736,7 +1851,7 @@ impl Workspace {
     pub fn restart_task_by_name(&self, name: &str, params: ValueMap, profile: &str) -> Result<JobIndex, String> {
         let state = &mut *self.state.write().unwrap();
         let (_, job_index) =
-            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
+            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, true)?;
         Ok(job_index)
     }
 
@@ -1769,14 +1884,14 @@ impl Workspace {
                     drop(state);
                     let state = &mut *self.state.write().unwrap();
                     let (_, _) =
-                        state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
+                        state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
                     return Ok(None);
                 };
                 if cache_config.never {
                     drop(state);
                     let state = &mut *self.state.write().unwrap();
                     let (_, _) =
-                        state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
+                        state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
                     return Ok(None);
                 };
 
@@ -1813,12 +1928,12 @@ impl Workspace {
             }
 
             let (_, _job_index) =
-                state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
+                state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
             Ok(None)
         } else {
             let state = &mut *self.state.write().unwrap();
             let (_, _job_index) =
-                state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
+                state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
             Ok(None)
         }
     }
@@ -1829,7 +1944,7 @@ impl Workspace {
     pub fn spawn_task_as_test(&self, name: &str, params: ValueMap, profile: &str) -> Result<(), String> {
         let state = &mut *self.state.write().unwrap();
         let (base_index, job_index) =
-            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile)?;
+            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
         state.record_test_group(base_index, job_index);
         Ok(())
     }
@@ -1859,6 +1974,7 @@ impl Workspace {
                 &task_name,
                 ValueMap::new(),
                 &profile,
+                true,
             )?;
             return Ok(None);
         }
@@ -1873,6 +1989,7 @@ impl Workspace {
                             task,
                             ValueMap::new(),
                             "",
+                            true,
                         )?;
                     }
                     FunctionDefAction::Kill { task } => {
@@ -1886,6 +2003,7 @@ impl Workspace {
                                 &task_call.name,
                                 task_call.vars.clone(),
                                 task_call.profile.unwrap_or(""),
+                                false,
                             )?;
                         }
                     }
