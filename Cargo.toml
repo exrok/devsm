@@ -22,7 +22,9 @@ bumpalo = { version = "3.19.0", features = ["collections"] }
 memchr = "2.7.6"
 sendfd = "0.4.4"
 jsony_value = "0.0.1"
-toml-spanner = "0.4"
+toml-spanner.version = "1"
+toml-spanner.default-features = false
+toml-spanner.features = ["from-toml"]
 hashbrown = { version = "0.16.1", default-features = false, features = [
     "default-hasher",
 ] }

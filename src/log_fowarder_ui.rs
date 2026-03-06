@@ -239,6 +239,8 @@ pub fn run_logs(
     dump_logs(&mut stdout, workspace, &config, &mut ansi_buffer)?;
 
     let mut last_log_id = workspace.logs.read().unwrap().tail();
+    let stdin_is_tty = unsafe { libc::isatty(stdin.as_raw_fd()) == 1 };
+    let mut stdin_closed = !stdin_is_tty;
 
     loop {
         if channel.is_terminated() {
@@ -249,17 +251,24 @@ pub fn run_logs(
 
         forward_logs_filtered(&mut stdout, workspace, &config, &mut last_log_id, &mut ansi_buffer)?;
 
-        match extui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), None) {
-            Ok(extui::event::Polled::ReadReady) => {
-                let mut buf = [0u8; 64];
-                let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n == 0 {
-                    forward_logs_filtered(&mut stdout, workspace, &config, &mut last_log_id, &mut ansi_buffer)?;
-                    send_termination(&mut encoder, &mut socket);
-                    break;
+        if stdin_closed {
+            let _ = channel.waker.wait();
+        } else {
+            match extui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), None) {
+                Ok(extui::event::Polled::ReadReady) => {
+                    let mut buf = [0u8; 64];
+                    let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n == 0 {
+                        if stdin_is_tty {
+                            forward_logs_filtered(&mut stdout, workspace, &config, &mut last_log_id, &mut ansi_buffer)?;
+                            send_termination(&mut encoder, &mut socket);
+                            break;
+                        }
+                        stdin_closed = true;
+                    }
                 }
+                Ok(extui::event::Polled::Woken) | Ok(extui::event::Polled::TimedOut) | Err(_) => {}
             }
-            Ok(extui::event::Polled::Woken) | Ok(extui::event::Polled::TimedOut) | Err(_) => {}
         }
     }
 
@@ -446,6 +455,8 @@ pub fn run(
     let mut phase = Phase::Initial;
     let mut encoder = Encoder::new();
     let mut current_job: Option<JobIndex> = None;
+    let stdin_is_tty = unsafe { libc::isatty(stdin.as_raw_fd()) == 1 };
+    let mut stdin_closed = !stdin_is_tty;
 
     loop {
         if channel.is_terminated() {
@@ -482,27 +493,34 @@ pub fn run(
             break;
         }
 
-        match extui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), None) {
-            Ok(extui::event::Polled::ReadReady) => {
-                let mut buf = [0u8; 64];
-                let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n == 0 {
-                    forward_new_logs(
-                        &mut encoder,
-                        &mut stdout,
-                        &mut socket,
-                        workspace,
-                        log_group,
-                        &mut last_log_id,
-                        &mut phase,
-                        &mut current_job,
-                    )?;
-                    let _ = stdout.write_all(b"Detached. Task will continue running in background.\n");
-                    send_termination(&mut encoder, &mut socket);
-                    break;
+        if stdin_closed {
+            let _ = channel.waker.wait();
+        } else {
+            match extui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), None) {
+                Ok(extui::event::Polled::ReadReady) => {
+                    let mut buf = [0u8; 64];
+                    let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n == 0 {
+                        if stdin_is_tty {
+                            forward_new_logs(
+                                &mut encoder,
+                                &mut stdout,
+                                &mut socket,
+                                workspace,
+                                log_group,
+                                &mut last_log_id,
+                                &mut phase,
+                                &mut current_job,
+                            )?;
+                            let _ = stdout.write_all(b"Detached. Task will continue running in background.\n");
+                            send_termination(&mut encoder, &mut socket);
+                            break;
+                        }
+                        stdin_closed = true;
+                    }
                 }
+                Ok(extui::event::Polled::Woken) | Ok(extui::event::Polled::TimedOut) | Err(_) => {}
             }
-            Ok(extui::event::Polled::Woken) | Ok(extui::event::Polled::TimedOut) | Err(_) => {}
         }
     }
 

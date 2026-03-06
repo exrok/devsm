@@ -4,8 +4,7 @@ use toml_spanner::{Item, Table, Value};
 use crate::config::{
     Alias, AllowMultiple, CacheConfig, CacheKeyInput, CommandExpr, FunctionDef, FunctionDefAction, If, Predicate,
     ReadyConfig, ReadyPredicate, ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind,
-    TestConfigExpr,
-    TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
+    TestConfigExpr, TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, toml_error_to_diagnostic};
 
@@ -122,7 +121,7 @@ fn parse_var_meta<'a>(alloc: &'a Bump, value: &Item<'a>, re: &mut dyn FnMut(Diag
 fn parse_duration_value(value: &Item, key: &str, re: &mut dyn FnMut(Diagnostic)) -> Result<f64, ()> {
     match value.value() {
         Value::Float(&f) => Ok(f),
-        Value::Integer(&i) => Ok(i as f64),
+        Value::Integer(&i) => Ok(i.as_i128() as f64),
         Value::String(s) => match parse_duration(s) {
             Ok(secs) => Ok(secs),
             Err(err) => {
@@ -177,7 +176,7 @@ fn parse_timeout_config<'a>(
             Ok(TimeoutConfig { when: None, conditional: None, max: Some(max), idle: None })
         }
         Value::Float(&f) => Ok(TimeoutConfig { when: None, conditional: None, max: Some(f), idle: None }),
-        Value::Integer(&i) => Ok(TimeoutConfig { when: None, conditional: None, max: Some(i as f64), idle: None }),
+        Value::Integer(&i) => Ok(TimeoutConfig { when: None, conditional: None, max: Some(i.as_f64()), idle: None }),
         Value::Table(timeout_table) => {
             let mut when: Option<TimeoutPredicate<'a>> = None;
             let mut conditional: Option<f64> = None;
@@ -488,7 +487,7 @@ fn parse_task<'a>(
                 let ready_timeout = if let Some(timeout_val) = ready_table.get("timeout") {
                     match timeout_val.value() {
                         Value::Float(&f) => Some(f),
-                        Value::Integer(&i) => Some(i as f64),
+                        Value::Integer(&i) => Some(i.as_f64()),
                         _ => {
                             mismatched_in_object(re, "number", timeout_val, "timeout");
                             return Err(());
@@ -534,32 +533,30 @@ fn parse_task<'a>(
                     }
                 };
             }
-            "allow_multiple" => {
-                match value.value() {
-                    Value::Boolean(&b) => {
-                        allow_multiple = if b { AllowMultiple::True } else { AllowMultiple::False };
-                    }
-                    _ => {
-                        let Some(s) = value.as_str() else {
-                            mismatched_in_object(re, "boolean or string", value, "allow_multiple");
-                            return Err(());
-                        };
-                        allow_multiple = match s {
-                            "distinct_profiles" => AllowMultiple::DistinctProfiles,
-                            "single_profile" => AllowMultiple::SingleProfile,
-                            _ => {
-                                re(Diagnostic::error()
+            "allow_multiple" => match value.value() {
+                Value::Boolean(&b) => {
+                    allow_multiple = if b { AllowMultiple::True } else { AllowMultiple::False };
+                }
+                _ => {
+                    let Some(s) = value.as_str() else {
+                        mismatched_in_object(re, "boolean or string", value, "allow_multiple");
+                        return Err(());
+                    };
+                    allow_multiple = match s {
+                        "distinct_profiles" => AllowMultiple::DistinctProfiles,
+                        "single_profile" => AllowMultiple::SingleProfile,
+                        _ => {
+                            re(Diagnostic::error()
                                     .with_message(format!(
                                         "unknown allow_multiple value `{}`, expected `distinct_profiles` or `single_profile`",
                                         s
                                     ))
                                     .with_label(DiagnosticLabel::primary(value.span().into())));
-                                return Err(());
-                            }
-                        };
-                    }
+                            return Err(());
+                        }
+                    };
                 }
-            }
+            },
             "var" => {
                 let Some(var_table) = value.as_table() else {
                     mismatched_in_object(re, "table", value, "var");

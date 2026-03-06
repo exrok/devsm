@@ -296,8 +296,8 @@ fn render<'a>(
                 FocusOverlap::LogSearch { .. } => Mode::LogSearch,
                 FocusOverlap::TaskLauncher { .. } => Mode::TaskLauncher,
                 FocusOverlap::TestFilterLauncher { .. } => Mode::TestFilterLauncher,
-                FocusOverlap::ConfigError { .. } => Mode::Global,
-                FocusOverlap::None => Mode::Global,
+                FocusOverlap::ConfigError { .. } => Mode::Pager,
+                FocusOverlap::None => Mode::TaskTree,
             };
             let chain_idx = if matches!(tui.overlay, FocusOverlap::None) { tui.chain.current } else { None };
             render_help_menu(&mut tui.frame, help_rect, keybinds, &mut tui.help, current_mode, chain_idx);

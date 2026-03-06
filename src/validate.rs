@@ -2,15 +2,11 @@ use bumpalo::Bump;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
-use toml_spanner::{Item, Span, Table, Value};
+use toml_spanner::{Item, Table, Value};
 
 use crate::config::toml_handler;
 use crate::config::{StringExpr, WorkspaceConfig};
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, emit_diagnostic, toml_error_to_diagnostic};
-
-fn span_to_range(span: Span) -> Range<usize> {
-    (span.start as usize)..(span.end as usize)
-}
 
 pub struct ValidateOptions {
     pub skip_path_checks: bool,
@@ -52,7 +48,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
             emit(
                 Diagnostic::error()
                     .with_message("'bind' must be a table")
-                    .with_labels(vec![DiagnosticLabel::primary(span_to_range(bind_value.span()))]),
+                    .with_labels(vec![DiagnosticLabel::primary(bind_value.span().range())]),
             );
             return Ok(false);
         };
@@ -64,7 +60,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
                 emit(
                     Diagnostic::error()
                         .with_message(format!("unknown mode '{}'", mode_name))
-                        .with_labels(vec![DiagnosticLabel::primary(span_to_range(mode_key.span))])
+                        .with_labels(vec![DiagnosticLabel::primary(mode_key.span.range())])
                         .with_notes(vec![format!("valid modes are: {}", valid_modes.join(", "))]),
                 );
                 continue;
@@ -74,7 +70,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
                 emit(
                     Diagnostic::error()
                         .with_message(format!("'bind.{}' must be a table", mode_name))
-                        .with_labels(vec![DiagnosticLabel::primary(span_to_range(mode_value.span()))]),
+                        .with_labels(vec![DiagnosticLabel::primary(mode_value.span().range())]),
                 );
                 continue;
             };
@@ -86,7 +82,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
                             Diagnostic::error()
                                 .with_message("invalid binding value")
                                 .with_labels(vec![
-                                    DiagnosticLabel::primary(span_to_range(cmd_value.span()))
+                                    DiagnosticLabel::primary(cmd_value.span().range())
                                         .with_message("expected command string or nan"),
                                 ])
                                 .with_notes(vec!["use nan to unbind a key".to_string()]),
@@ -97,7 +93,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
                         Diagnostic::error()
                             .with_message("invalid binding value")
                             .with_labels(vec![
-                                DiagnosticLabel::primary(span_to_range(cmd_value.span()))
+                                DiagnosticLabel::primary(cmd_value.span().range())
                                     .with_message("expected command string or nan"),
                             ])
                             .with_notes(vec![format!("binding for key '{}'", key_str.name)]),
@@ -113,7 +109,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
             emit(
                 Diagnostic::warning()
                     .with_message(format!("unknown top-level key '{}'", key_name))
-                    .with_labels(vec![DiagnosticLabel::primary(span_to_range(key.span))])
+                    .with_labels(vec![DiagnosticLabel::primary(key.span.range())])
                     .with_notes(vec!["user config only supports the 'bind' section".to_string()]),
             );
         }
@@ -344,7 +340,7 @@ fn find_group_item_span(root: &Table, group_name: &str, task_name: &str) -> Opti
         };
 
         if item_name == task_name {
-            return Some(span_to_range(item.span()));
+            return Some(item.span().range());
         }
     }
     None
@@ -405,7 +401,7 @@ fn match_task_call_span(item: &Item, target_name: &str) -> Option<Range<usize>> 
         _ => return None,
     };
 
-    if item_name == target_name { Some(span_to_range(item.span())) } else { None }
+    if item_name == target_name { Some(item.span().range()) } else { None }
 }
 
 fn table_by_task_name<'a>(root: &'a Table<'a>, task_name: &str) -> Option<&'a Table<'a>> {
@@ -428,7 +424,7 @@ fn find_profile_changed_span(root: &Table, task_name: &str, ref_task: &str) -> O
             && let Some(pc_str) = pc_value.as_str()
             && pc_str == ref_task
         {
-            return Some(span_to_range(pc_value.span()));
+            return Some(pc_value.span().range());
         }
     }
     None
@@ -437,19 +433,17 @@ fn find_profile_changed_span(root: &Table, task_name: &str, ref_task: &str) -> O
 fn find_task_pwd_span(root: &Table, task_name: &str) -> Option<Range<usize>> {
     let task = table_by_task_name(root, task_name)?;
     if let Some(pwd_value) = task.get("pwd") {
-        return Some(span_to_range(pwd_value.span()));
+        return Some(pwd_value.span().range());
     }
     None
 }
 
 fn find_test_pwd_span(root: &Table, test_name: &str) -> Option<Range<usize>> {
     match root["test"][test_name].value()? {
-        Value::Table(table) => Some(span_to_range(table["pwd"].span()?)),
+        Value::Table(table) => Some(table["pwd"].span().range()),
         Value::Array(arr) => {
             for item in arr {
-                if let Some(span) = item["pwd"].span() {
-                    return Some(span_to_range(span));
-                }
+                return Some(item["pwd"].span().range());
             }
             None
         }

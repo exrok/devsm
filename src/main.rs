@@ -649,7 +649,21 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
 
     let workspace_config = config::load_from_env()?;
     let (name, _profile) = job.rsplit_once(':').unwrap_or((job, ""));
+
+    let (job, as_test) = if let Some(test_name) = name.strip_prefix("test.") {
+        let has_test = workspace_config.tests.iter().any(|(n, _)| {
+            *n == test_name || test_name.starts_with(&format!("{n}."))
+        });
+        if !has_test {
+            bail!("Test not found: {}", test_name);
+        }
+        (format!("~test/{}", &job["test.".len()..]), true)
+    } else {
+        (job.to_owned(), as_test)
+    };
+
     if name != "~cargo"
+        && !as_test
         && let Some((_, expr)) = workspace_config.tasks.iter().find(|(n, _)| *n == name)
         && expr.managed == Some(false)
     {
@@ -657,7 +671,7 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
             "Task '{}' has managed = false and must be run with exec.\n\
                      Use 'devsm exec {}' instead.",
             name,
-            job
+            &job
         );
     }
 
@@ -669,7 +683,7 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
     socket.send_with_fd(
         &jsony::to_binary(&daemon::RequestMessage {
             cwd: &cwd,
-            request: daemon::Request::AttachRun { config: &config, name: job.into(), params, as_test },
+            request: daemon::Request::AttachRun { config: &config, name: (&*job).into(), params, as_test },
         }),
         &[0, 1],
     )?;
@@ -752,7 +766,35 @@ fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
     let workspace_config = config::load_from_env()?;
     let (name, profile) = job.rsplit_once(':').unwrap_or((job, ""));
 
-    let task_expr = if name == "~cargo" {
+    let task_expr = if let Some(test_name) = name.strip_prefix("test.") {
+        let (base_name, variant_suffix) = test_name.rsplit_once('.').unwrap_or((test_name, ""));
+        let variant_index: Option<usize> = variant_suffix.parse().ok();
+
+        let lookup_name = if variant_index.is_some() { base_name } else { test_name };
+
+        let Some((_, variants)) = workspace_config.tests.iter().find(|(n, _)| *n == lookup_name) else {
+            bail!("Test not found: {}", test_name);
+        };
+
+        if let Some(idx) = variant_index {
+            if idx >= variants.len() {
+                bail!("Test '{}' has {} variant(s), index {} is out of range", lookup_name, variants.len(), idx);
+            }
+            variants[idx].to_task_config_expr()
+        } else {
+            if variants.len() > 1 {
+                bail!(
+                    "Test '{}' has {} variants, specify one with test.{}.0 .. test.{}.{}",
+                    test_name,
+                    variants.len(),
+                    test_name,
+                    test_name,
+                    variants.len() - 1
+                );
+            }
+            variants[0].to_task_config_expr()
+        }
+    } else if name == "~cargo" {
         &config::CARGO_AUTO_EXPR
     } else {
         let Some((_, expr)) = workspace_config.tasks.iter().find(|(n, _)| *n == name) else {

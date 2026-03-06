@@ -117,121 +117,20 @@ pub fn emit_diagnostic(file_name: &str, content: &str, diagnostic: &Diagnostic) 
 }
 
 pub fn toml_error_to_diagnostic(err: &toml_spanner::Error) -> Diagnostic {
-    use toml_spanner::ErrorKind;
-
-    let span: Range<usize> = err.span.into();
-
-    match &err.kind {
-        ErrorKind::UnexpectedEof => {
-            Diagnostic::error().with_message("unexpected end of file").with_label(DiagnosticLabel::primary(span))
+    let mut labels = Vec::new();
+    if let Some((span, name)) = err.primary_label() {
+        let mut label = DiagnosticLabel::primary(span.range());
+        if name.is_empty() {
+            label = label.with_message(name);
         }
-
-        ErrorKind::FileTooLarge => Diagnostic::error()
-            .with_message("file is too large (maximum 4GiB)")
-            .with_label(DiagnosticLabel::primary(span)),
-
-        ErrorKind::InvalidCharInString(c) => {
-            Diagnostic::error().with_message("invalid character in string").with_label(
-                DiagnosticLabel::primary(span).with_message(format!("invalid character '{}'", escape_char(*c))),
-            )
-        }
-
-        ErrorKind::InvalidEscape(c) => Diagnostic::error()
-            .with_message("invalid escape character")
-            .with_label(DiagnosticLabel::primary(span).with_message(format!("invalid escape '{}'", escape_char(*c)))),
-
-        ErrorKind::InvalidHexEscape(c) => Diagnostic::error().with_message("invalid hex escape").with_label(
-            DiagnosticLabel::primary(span).with_message(format!("invalid hex escape '{}'", escape_char(*c))),
-        ),
-
-        ErrorKind::InvalidEscapeValue(_) => Diagnostic::error()
-            .with_message("invalid escape value")
-            .with_label(DiagnosticLabel::primary(span).with_message("invalid escape value")),
-
-        ErrorKind::Unexpected(c) => Diagnostic::error()
-            .with_message("unexpected character")
-            .with_label(DiagnosticLabel::primary(span).with_message(format!("unexpected '{}'", escape_char(*c)))),
-
-        ErrorKind::UnterminatedString => Diagnostic::error()
-            .with_message("unterminated string")
-            .with_label(DiagnosticLabel::primary(span).with_message("eof reached before string terminator")),
-
-        ErrorKind::InvalidNumber => Diagnostic::error()
-            .with_message("invalid number")
-            .with_label(DiagnosticLabel::primary(span).with_message("unable to parse number")),
-
-        ErrorKind::OutOfRange(kind) => Diagnostic::error()
-            .with_message(format!("number is out of range of '{kind}'"))
-            .with_label(DiagnosticLabel::primary(span)),
-
-        ErrorKind::Wanted { expected, .. } => Diagnostic::error()
-            .with_message(format!("expected {expected}"))
-            .with_label(DiagnosticLabel::primary(span).with_message(format!("expected {expected}"))),
-
-        ErrorKind::DuplicateTable { name, first } => {
-            let first_span: Range<usize> = (*first).into();
-            Diagnostic::error().with_message(format!("redefinition of table `{name}`")).with_labels(vec![
-                DiagnosticLabel::secondary(first_span).with_message("first table instance"),
-                DiagnosticLabel::primary(span).with_message("duplicate table"),
-            ])
-        }
-
-        ErrorKind::DuplicateKey { key, first } => {
-            let first_span: Range<usize> = (*first).into();
-            Diagnostic::error().with_message(format!("duplicate key: `{key}`")).with_labels(vec![
-                DiagnosticLabel::secondary(first_span).with_message("first key instance"),
-                DiagnosticLabel::primary(span).with_message("duplicate key"),
-            ])
-        }
-
-        ErrorKind::RedefineAsArray => {
-            Diagnostic::error().with_message("table redefined as array").with_label(DiagnosticLabel::primary(span))
-        }
-
-        ErrorKind::MultilineStringKey => Diagnostic::error()
-            .with_message("multiline strings are not allowed for key")
-            .with_label(DiagnosticLabel::primary(span).with_message("multiline keys are not allowed")),
-
-        ErrorKind::Custom(message) => {
-            Diagnostic::error().with_message(message.to_string()).with_label(DiagnosticLabel::primary(span))
-        }
-
-        ErrorKind::DottedKeyInvalidType { first } => {
-            let first_span: Range<usize> = (*first).into();
-            Diagnostic::error().with_message("dotted key attempted to extend non-table type").with_labels(vec![
-                DiagnosticLabel::primary(span).with_message("attempted to extend table here"),
-                DiagnosticLabel::secondary(first_span).with_message("non-table"),
-            ])
-        }
-
-        ErrorKind::UnexpectedKeys { keys } => {
-            let mut labels: Vec<_> = keys.iter().map(|(_, s)| DiagnosticLabel::secondary((*s).into())).collect();
-            if !labels.is_empty() {
-                labels[0].style = LabelStyle::Primary;
-            }
-            Diagnostic::error()
-                .with_message(format!("found {} unexpected keys", keys.len()))
-                .with_labels(labels)
-        }
-
-        ErrorKind::UnquotedString => Diagnostic::error()
-            .with_message("unquoted string")
-            .with_label(DiagnosticLabel::primary(span).with_message("string is not quoted")),
-
-        ErrorKind::MissingField(field) => Diagnostic::error()
-            .with_message(format!("missing field '{field}'"))
-            .with_label(DiagnosticLabel::primary(span).with_message("table with missing field")),
-
-        ErrorKind::Deprecated { new, .. } => Diagnostic::error()
-            .with_message(format!("deprecated field encountered, '{new}' should be used instead"))
-            .with_label(DiagnosticLabel::primary(span).with_message("deprecated field")),
-
-        ErrorKind::UnexpectedValue { expected, .. } => Diagnostic::error()
-            .with_message(format!("expected '{expected:?}'"))
-            .with_label(DiagnosticLabel::primary(span).with_message("unexpected value")),
+        labels.push(label);
     }
-}
-
-fn escape_char(c: char) -> String {
-    if c.is_whitespace() { c.escape_default().to_string() } else { c.to_string() }
+    if let Some((span, name)) = err.secondary_label() {
+        let mut label = DiagnosticLabel::secondary(span.range());
+        if name.is_empty() {
+            label = label.with_message(name);
+        }
+        labels.push(label);
+    }
+    Diagnostic { level: DiagnosticLevel::Error, message: err.message(""), labels, notes: Vec::new() }
 }

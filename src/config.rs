@@ -440,6 +440,41 @@ fn get_var_default<'a>(vars: &[(&str, VarMeta<'a>)], name: &str) -> Option<&'a s
     vars.iter().find(|(n, _)| *n == name).and_then(|(_, meta)| meta.default)
 }
 
+impl Environment<'_> {
+    fn resolve_special(&self, name: &str) -> Option<&str> {
+        let name = name.strip_prefix('$')?;
+        match name {
+            "profile" => Some(self.profile),
+            _ => None,
+        }
+    }
+
+    fn var_str<'a>(&self, name: &str, bump: &'a Bump) -> Result<&'a str, EvalError> {
+        if let Some(s) = self.resolve_special(name) {
+            return Ok(bump.alloc_str(s));
+        }
+        match self.param[name].as_ref() {
+            ValueRef::String(s) | ValueRef::Other(s) => Ok(bump.alloc_str(s)),
+            _ => get_var_default(self.vars, name).map(|s| bump.alloc_str(s) as &str).ok_or(EvalError::Todo),
+        }
+    }
+
+    fn var_append<'a>(&self, name: &str, bump: &'a Bump, target: &mut bumpalo::collections::Vec<&'a str>) {
+        if let Some(s) = self.resolve_special(name) {
+            target.push(bump.alloc_str(s));
+            return;
+        }
+        match self.param[name].as_ref() {
+            ValueRef::Null(_) => {
+                if let Some(default) = get_var_default(self.vars, name) {
+                    target.push(bump.alloc_str(default));
+                }
+            }
+            _ => append_value(&self.param[name], bump, target).unwrap(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum EvalError {
     Todo,
@@ -512,10 +547,7 @@ impl<'a> BumpEval<'a> for StringExpr<'static> {
     fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<&'a str, EvalError> {
         match self {
             StringExpr::Literal(s) => Ok(*s),
-            StringExpr::Var(var_name) => match env.param[*var_name].as_ref() {
-                ValueRef::String(value_string) | ValueRef::Other(value_string) => Ok(bump.alloc_str(value_string)),
-                _ => get_var_default(env.vars, var_name).map(|s| bump.alloc_str(s) as &str).ok_or(EvalError::Todo),
-            },
+            StringExpr::Var(var_name) => env.var_str(var_name, bump),
             StringExpr::If(if_expr) => Ok(if_expr.bump_eval(env, bump)?),
         }
     }
@@ -579,14 +611,7 @@ fn eval_append_str<'a>(
                 eval_append_str(item, env, bump, target);
             }
         }
-        Expr::Var(key) => match env.param[key].as_ref() {
-            ValueRef::Null(_) => {
-                if let Some(default) = get_var_default(env.vars, key) {
-                    target.push(bump.alloc_str(default));
-                }
-            }
-            _ => append_value(&env.param[key], bump, target).unwrap(),
-        },
+        Expr::Var(key) => env.var_append(key, bump, target),
         Expr::If(branch) => {
             if branch.cond.eval(env) {
                 eval_append_str(&branch.then, env, bump, target);
@@ -656,7 +681,7 @@ fn collect_string_expr_vars(expr: &StringExpr<'static>, out: &mut Vec<&'static s
     match expr {
         StringExpr::Literal(_) => {}
         StringExpr::Var(name) => {
-            if !out.contains(name) {
+            if !name.starts_with('$') && !out.contains(name) {
                 out.push(name);
             }
         }
@@ -673,7 +698,7 @@ fn collect_string_list_expr_vars(expr: &StringListExpr<'static>, out: &mut Vec<&
     match expr {
         StringListExpr::Literal(_) => {}
         StringListExpr::Var(name) => {
-            if !out.contains(name) {
+            if !name.starts_with('$') && !out.contains(name) {
                 out.push(name);
             }
         }
@@ -824,6 +849,53 @@ mod tests {
         let vars = TEST_EXPR.collect_variables();
         assert!(vars.contains(&"then_var"), "should find then_var: {:?}", vars);
         assert!(vars.contains(&"else_var"), "should find else_var: {:?}", vars);
+    }
+
+    #[test]
+    fn special_var_profile_resolves_in_string_expr() {
+        let bump = Bump::new();
+        let env = Environment { profile: "production", param: ValueMap::new(), vars: &[] };
+        let expr = StringExpr::Var("$profile");
+        let result = expr.bump_eval(&env, &bump).unwrap();
+        assert_eq!(result, "production");
+    }
+
+    #[test]
+    fn special_var_profile_resolves_in_string_list_expr() {
+        let bump = Bump::new();
+        let env = Environment { profile: "staging", param: ValueMap::new(), vars: &[] };
+        let expr = StringListExpr::List(&[StringListExpr::Literal("echo"), StringListExpr::Var("$profile")]);
+        let result = expr.bump_eval(&env, &bump).unwrap();
+        assert_eq!(result, &["echo", "staging"]);
+    }
+
+    #[test]
+    fn collect_variables_excludes_special_vars() {
+        static TEST_EXPR: TaskConfigExpr<'static> = TaskConfigExpr {
+            kind: TaskKind::Action,
+            info: "",
+            pwd: StringExpr::Var("$profile"),
+            command: CommandExpr::Cmd(StringListExpr::List(&[
+                StringListExpr::Literal("echo"),
+                StringListExpr::Var("$profile"),
+                StringListExpr::Var("user_var"),
+            ])),
+            profiles: &[],
+            envvar: &[],
+            require: EMPTY_TASK_CALLS,
+            cache: None,
+            ready: None,
+            timeout: None,
+            tags: &[],
+            managed: None,
+            hidden: ServiceHidden::Never,
+            allow_multiple: AllowMultiple::False,
+            vars: &[],
+        };
+        let vars = TEST_EXPR.collect_variables();
+        assert!(!vars.contains(&"$profile"), "should exclude $profile: {:?}", vars);
+        assert!(vars.contains(&"user_var"), "should include user_var: {:?}", vars);
+        assert_eq!(vars.len(), 1);
     }
 
     #[test]
