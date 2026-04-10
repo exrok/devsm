@@ -135,12 +135,11 @@ fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptio
         emit_diagnostic(&file_name, content, &diag);
     };
 
-    let workspace_config = match toml_handler::parse(base_path, &bump, content, &mut emit) {
+    let arena = toml_spanner::Arena::new();
+    let workspace_config = match toml_handler::parse_with_arena(base_path, &bump, content, &arena, &mut emit) {
         Ok(config) => config,
         Err(_) => return Ok(false),
     };
-
-    let arena = toml_spanner::Arena::new();
     let root = match toml_spanner::parse(content, &arena) {
         Ok(value) => value,
         Err(_) => return Ok(false),

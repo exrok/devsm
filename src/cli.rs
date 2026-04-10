@@ -1,5 +1,6 @@
 use anyhow::{Context, bail};
 use jsony_value::{Value, ValueMap};
+use std::borrow::Cow;
 
 struct ArgParser<'a> {
     args: std::slice::Iter<'a, String>,
@@ -150,9 +151,9 @@ pub enum GetResource {
 /// - `name`: Include tests with this name (OR combined with other includes)
 #[derive(Debug, Clone)]
 pub enum TestFilter<'a> {
-    IncludeTag(&'a str),
-    ExcludeTag(&'a str),
-    IncludeName(&'a str),
+    IncludeTag(Cow<'a, str>),
+    ExcludeTag(Cow<'a, str>),
+    IncludeName(Cow<'a, str>),
 }
 
 /// Parses a job name and parameters from remaining arguments.
@@ -329,11 +330,11 @@ fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<
         match component {
             Component::Term(arg) => {
                 if let Some(tag) = arg.strip_prefix('+') {
-                    filters.push(TestFilter::IncludeTag(tag));
+                    filters.push(TestFilter::IncludeTag(tag.into()));
                 } else if let Some(tag) = arg.strip_prefix('-') {
-                    filters.push(TestFilter::ExcludeTag(tag));
+                    filters.push(TestFilter::ExcludeTag(tag.into()));
                 } else {
-                    filters.push(TestFilter::IncludeName(arg));
+                    filters.push(TestFilter::IncludeName(arg.into()));
                 }
             }
             Component::Long(long) => {
@@ -343,7 +344,7 @@ fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<
                 // Check if this is actually a negative tag filter (e.g., -slow)
                 // Single-character flags starting with a letter are treated as exclude tags
                 if !flags.is_empty() && flags.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
-                    filters.push(TestFilter::ExcludeTag(flags));
+                    filters.push(TestFilter::ExcludeTag(flags.into()));
                 } else if let Some(flag) = flags.chars().next() {
                     bail!("Unknown flag -{}", flag);
                 }

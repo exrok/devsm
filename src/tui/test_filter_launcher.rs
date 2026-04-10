@@ -19,7 +19,7 @@ use crate::{
 };
 
 struct TestInfo {
-    name: &'static str,
+    name: Box<str>,
     tags: Vec<&'static str>,
 }
 
@@ -75,13 +75,12 @@ pub struct TestFilterLauncherState {
 
 impl TestFilterLauncherState {
     pub fn new(ws: &WorkspaceState) -> Self {
-        let mut test_map: std::collections::HashMap<&'static str, Vec<&'static str>> = std::collections::HashMap::new();
+        let mut test_map: std::collections::HashMap<Box<str>, Vec<&'static str>> = std::collections::HashMap::new();
         for bt in &ws.base_tasks {
             if bt.removed || bt.config.kind != TaskKind::Test {
                 continue;
             }
-            // TODO: The test launcher needs to be entirely rethough
-            let tags = test_map.entry(bt.name).or_default();
+            let tags = test_map.entry(bt.name.clone()).or_default();
             for &tag in bt.config.tags {
                 if !tags.contains(&tag) {
                     tags.push(tag);
@@ -96,7 +95,7 @@ impl TestFilterLauncherState {
 
         let mut searcher = FatSearch::default();
         for test in &tests {
-            searcher.insert(test.name);
+            searcher.insert(test.name.as_ref());
         }
 
         let mut results = Vec::new();
@@ -127,7 +126,7 @@ impl TestFilterLauncherState {
                 if bt.removed || bt.config.kind != TaskKind::Test {
                     return false;
                 }
-                self.matches_filters(bt.name, bt.config.tags)
+                self.matches_filters(bt.name.as_ref(), bt.config.tags)
             })
             .count()
     }
@@ -139,7 +138,8 @@ impl TestFilterLauncherState {
     fn matches_filters(&self, name: &str, tags: &[&str]) -> bool {
         let has_name_filter = self.filters.iter().any(|f| matches!(f, TestFilter::IncludeName(_)));
         if has_name_filter {
-            let name_matches = self.filters.iter().any(|f| matches!(f, TestFilter::IncludeName(n) if *n == name));
+            let name_matches =
+                self.filters.iter().any(|f| matches!(f, TestFilter::IncludeName(n) if n.as_ref() == name));
             if !name_matches {
                 return false;
             }
@@ -147,13 +147,15 @@ impl TestFilterLauncherState {
 
         let has_include_tag = self.filters.iter().any(|f| matches!(f, TestFilter::IncludeTag(_)));
         if has_include_tag {
-            let tag_matches = self.filters.iter().any(|f| matches!(f, TestFilter::IncludeTag(t) if tags.contains(t)));
+            let tag_matches =
+                self.filters.iter().any(|f| matches!(f, TestFilter::IncludeTag(t) if tags.contains(&t.as_ref())));
             if !tag_matches {
                 return false;
             }
         }
 
-        let has_excluded = self.filters.iter().any(|f| matches!(f, TestFilter::ExcludeTag(t) if tags.contains(t)));
+        let has_excluded =
+            self.filters.iter().any(|f| matches!(f, TestFilter::ExcludeTag(t) if tags.contains(&t.as_ref())));
         if has_excluded {
             return false;
         }
@@ -166,7 +168,7 @@ impl TestFilterLauncherState {
         match self.mode {
             FilterMode::Name => {
                 for test in &self.tests {
-                    self.searcher.insert(test.name);
+                    self.searcher.insert(test.name.as_ref());
                 }
             }
             FilterMode::IncludeTag | FilterMode::ExcludeTag => {
@@ -191,9 +193,11 @@ impl TestFilterLauncherState {
         let Some(entry) = self.results.get(selected) else { return };
 
         let filter = match self.mode {
-            FilterMode::Name => self.tests.get(entry.index()).map(|t| TestFilter::IncludeName(t.name)),
-            FilterMode::IncludeTag => self.all_tags.get(entry.index()).map(|&t| TestFilter::IncludeTag(t)),
-            FilterMode::ExcludeTag => self.all_tags.get(entry.index()).map(|&t| TestFilter::ExcludeTag(t)),
+            FilterMode::Name => {
+                self.tests.get(entry.index()).map(|t| TestFilter::IncludeName(t.name.to_string().into()))
+            }
+            FilterMode::IncludeTag => self.all_tags.get(entry.index()).map(|&t| TestFilter::IncludeTag(t.into())),
+            FilterMode::ExcludeTag => self.all_tags.get(entry.index()).map(|&t| TestFilter::ExcludeTag(t.into())),
         };
         if let Some(filter) = filter {
             self.filters.push(filter);
@@ -225,7 +229,7 @@ impl TestFilterLauncherState {
             TestFilter::IncludeTag(t) => (t, FilterMode::IncludeTag),
             TestFilter::ExcludeTag(t) => (t, FilterMode::ExcludeTag),
         };
-        self.input = text.to_string();
+        self.input = text.into_owned();
         self.cursor = self.input.len();
         self.mode = mode;
         self.rebuild_searcher();
@@ -356,7 +360,7 @@ impl TestFilterLauncherState {
                     if let Some(test) = self.tests.get(entry.index()) {
                         let substyle =
                             if is_selected { AnsiColor::Grey[5].with_bg(AnsiColor(153)) } else { AnsiColor::Grey[14].as_fg() };
-                        let r = entry_rect.with(style).text(out, test.name);
+                        let r = entry_rect.with(style).text(out, test.name.as_ref());
                         if !test.tags.is_empty() {
                             let tags_str = test.tags.join(", ");
                             r.with(substyle).text(out, " [").text(out, &tags_str).text(out, "]");
@@ -379,9 +383,9 @@ impl TestFilterLauncherState {
         let mut prefix = String::new();
         for filter in &self.filters {
             let (sigil, text) = match filter {
-                TestFilter::IncludeName(name) => ("", *name),
-                TestFilter::IncludeTag(tag) => ("+", *tag),
-                TestFilter::ExcludeTag(tag) => ("-", *tag),
+                TestFilter::IncludeName(name) => ("", name.as_ref()),
+                TestFilter::IncludeTag(tag) => ("+", tag.as_ref()),
+                TestFilter::ExcludeTag(tag) => ("-", tag.as_ref()),
             };
             let _ = write!(prefix, "{sigil}{text} ");
         }

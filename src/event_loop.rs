@@ -448,7 +448,7 @@ impl EventLoop {
                     workspace::Scheduled::Ready(job_index) => {
                         let job = &state.jobs[job_index.idx()];
                         let job_correlation = job.log_group;
-                        let job_task = job.task.clone();
+                        let job_task = job.task().clone();
                         drop(state);
                         let _ = self.spawn(wsi as WorkspaceIndex, job_correlation, job_index, job_task);
                         continue 'outer;
@@ -567,7 +567,7 @@ impl EventLoop {
                 JobStatus::Exited { .. } => bail!("Attempt start already exited job"),
                 JobStatus::Cancelled => return Ok(()),
             }
-            ws.config.current.base_path.join(tc.pwd)
+            ws.config.current.base_path().join(tc.pwd)
         };
 
         let (mut command, sh_script) = match &tc.command {
@@ -1257,13 +1257,13 @@ impl EventLoop {
         let test_filters: Vec<crate::cli::TestFilter> = {
             let mut v = Vec::new();
             for tag in &filters.exclude_tags {
-                v.push(crate::cli::TestFilter::ExcludeTag(tag));
+                v.push(crate::cli::TestFilter::ExcludeTag(std::borrow::Cow::Borrowed(*tag)));
             }
             for tag in &filters.include_tags {
-                v.push(crate::cli::TestFilter::IncludeTag(tag));
+                v.push(crate::cli::TestFilter::IncludeTag(std::borrow::Cow::Borrowed(*tag)));
             }
             for name in &filters.include_names {
-                v.push(crate::cli::TestFilter::IncludeName(name));
+                v.push(crate::cli::TestFilter::IncludeName(std::borrow::Cow::Borrowed(*name)));
             }
             v
         };

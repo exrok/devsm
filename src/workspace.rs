@@ -2,18 +2,18 @@ use crate::{
     cache_key::CacheKeyHasher,
     cli::TestFilter,
     config::{
-        AllowMultiple, CARGO_AUTO_EXPR, CacheKeyInput, Command, Environment, TaskConfigExpr, TaskConfigRc, TaskKind,
-        WorkspaceConfig,
+        AllowMultiple, CARGO_AUTO_EXPR, CacheKeyInput, Command, ConfigGeneration, Environment, TaskConfigRc,
+        TaskConfigSource, TaskKind,
     },
     event_loop::MioChannel,
     function::FunctionAction,
     log_storage::{LogGroup, Logs},
 };
 pub use job_index_list::JobIndexList;
-use jsony_value::ValueMap;
+use jsony_value::{Value, ValueMap, ValueNumber, ValueRef};
 use std::{
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, Weak},
     time::{Instant, SystemTime},
 };
 mod job_index_list;
@@ -64,10 +64,104 @@ fn compute_cache_key_standalone(inputs: &[CacheKeyInfoItem], profile: &str, para
         for (k, v) in params.entries() {
             hasher.update(k.as_bytes());
             hasher.update(b"=");
-            hasher.update(v.to_string().as_bytes());
+            hash_value(&mut hasher, v);
         }
     }
     hasher.finalize_hex()
+}
+
+/// Byte sink for structural hashing. Implemented by both `CacheKeyHasher`
+/// (used for user-visible cache keys) and `blake3::Hasher` (used for
+/// internal cache-bucket keys).
+trait HashByteSink {
+    fn update(&mut self, bytes: &[u8]);
+}
+
+impl HashByteSink for CacheKeyHasher {
+    fn update(&mut self, bytes: &[u8]) {
+        CacheKeyHasher::update(self, bytes)
+    }
+}
+
+impl HashByteSink for blake3::Hasher {
+    fn update(&mut self, bytes: &[u8]) {
+        blake3::Hasher::update(self, bytes);
+    }
+}
+
+fn hash_len_prefixed(hasher: &mut impl HashByteSink, bytes: &[u8]) {
+    let len: u32 = bytes.len().try_into().expect("hash input too large");
+    hasher.update(&len.to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_value(hasher: &mut impl HashByteSink, value: &Value<'_>) {
+    match value.as_ref() {
+        ValueRef::Null(_) => hasher.update(b"n"),
+        ValueRef::Number(number) => {
+            hasher.update(b"d");
+            match number {
+                ValueNumber::U64(value) => {
+                    hasher.update(b"u");
+                    hasher.update(&value.to_le_bytes());
+                }
+                ValueNumber::I64(value) => {
+                    hasher.update(b"i");
+                    hasher.update(&value.to_le_bytes());
+                }
+                ValueNumber::F64(value) => {
+                    hasher.update(b"f");
+                    hasher.update(&value.to_bits().to_le_bytes());
+                }
+            }
+        }
+        ValueRef::String(value) => {
+            hasher.update(b"s");
+            hash_len_prefixed(hasher, value.as_bytes());
+        }
+        ValueRef::Other(value) => {
+            hasher.update(b"o");
+            hash_len_prefixed(hasher, value.as_bytes());
+        }
+        ValueRef::Map(map) => {
+            hasher.update(b"m");
+            let len: u32 = map.entries().len().try_into().expect("hash map too large");
+            hasher.update(&len.to_le_bytes());
+            for (key, value) in map.entries() {
+                hash_len_prefixed(hasher, key.as_bytes());
+                hash_value(hasher, value);
+            }
+        }
+        ValueRef::List(list) => {
+            hasher.update(b"l");
+            let len: u32 = list.as_slice().len().try_into().expect("hash list too large");
+            hasher.update(&len.to_le_bytes());
+            for value in list.as_slice() {
+                hash_value(hasher, value);
+            }
+        }
+        ValueRef::Boolean(value) => {
+            if value.value == 0 {
+                hasher.update(b"b0");
+            } else {
+                hasher.update(b"b1");
+            }
+        }
+    }
+}
+
+fn hash_value_map(hasher: &mut impl HashByteSink, params: &ValueMap) {
+    let len: u32 = params.entries().len().try_into().expect("hash map too large");
+    hasher.update(&len.to_le_bytes());
+    for (key, value) in params.entries() {
+        hash_len_prefixed(hasher, key.as_bytes());
+        hash_value(hasher, value);
+    }
+}
+
+fn blake3_to_u64(hasher: &blake3::Hasher) -> u64 {
+    let bytes = hasher.finalize();
+    u64::from_le_bytes(bytes.as_bytes()[..8].try_into().unwrap())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -136,14 +230,32 @@ impl ExitCause {
 pub struct Job {
     pub process_status: JobStatus,
     pub log_group: LogGroup,
-    pub task: TaskConfigRc,
     pub started_at: Instant,
     /// Computed cache key for cache invalidation. Empty string means no key-based caching.
     pub cache_key: String,
-    /// Profile used when spawning this job.
-    pub spawn_profile: String,
-    /// Parameters used when spawning this job.
-    pub spawn_params: ValueMap<'static>,
+    pub spawn: Arc<ResolvedSpawnSpec>,
+}
+
+pub struct ResolvedSpawnSpec {
+    pub generation_id: u64,
+    pub base_task: BaseTaskIndex,
+    pub task: TaskConfigRc,
+    pub profile: Box<str>,
+    pub params: Arc<ValueMap<'static>>,
+}
+
+impl Job {
+    pub fn task(&self) -> &TaskConfigRc {
+        &self.spawn.task
+    }
+
+    pub fn spawn_profile(&self) -> &str {
+        &self.spawn.profile
+    }
+
+    pub fn spawn_params(&self) -> &ValueMap<'static> {
+        self.spawn.params.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,7 +391,7 @@ impl JobStatus {
 pub struct LatestConfig {
     modified_time: SystemTime,
     path: PathBuf,
-    pub current: WorkspaceConfig<'static>,
+    pub current: Arc<ConfigGeneration>,
 }
 
 impl LatestConfig {
@@ -290,12 +402,10 @@ impl LatestConfig {
         let modified_time = metadata.modified().map_err(|e| crate::config::ConfigError {
             message: format!("error: failed to get modification time for {}: {}\n", path.display(), e),
         })?;
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| crate::config::ConfigError {
-                message: format!("error: failed to read {}: {}\n", path.display(), e),
-            })?
-            .leak();
-        let current = crate::config::load_workspace_config_capturing(&path, content)?;
+        let content = std::fs::read_to_string(&path).map_err(|e| crate::config::ConfigError {
+            message: format!("error: failed to read {}: {}\n", path.display(), e),
+        })?;
+        let current = crate::config::load_workspace_generation_capturing(&path, content)?;
         Ok(Self { modified_time, path, current })
     }
     fn refresh(&mut self) -> anyhow::Result<bool> {
@@ -304,9 +414,8 @@ impl LatestConfig {
         if self.modified_time == modified {
             return Ok(false);
         }
-        let content = std::fs::read_to_string(&self.path)?.leak();
-        let config_path = self.current.base_path.join("devsm.toml");
-        let new_config = crate::config::load_workspace_config_capturing(&config_path, content)
+        let content = std::fs::read_to_string(&self.path)?;
+        let new_config = crate::config::load_workspace_generation_capturing(&self.path, content)
             .map_err(|e| anyhow::anyhow!("{}", e.message))?;
         self.current = new_config;
         self.modified_time = modified;
@@ -323,11 +432,8 @@ impl LatestConfig {
 
         let content = std::fs::read_to_string(&self.path)
             .map_err(|e| format!("Failed to read {}: {}", self.path.display(), e))?;
-        let content: &'static str = content.leak();
-
-        let config_path = self.current.base_path.join("devsm.toml");
         let new_config =
-            crate::config::load_workspace_config_capturing(&config_path, content).map_err(|e| e.message)?;
+            crate::config::load_workspace_generation_capturing(&self.path, content).map_err(|e| e.message)?;
 
         self.current = new_config;
         self.modified_time = modified;
@@ -341,67 +447,54 @@ impl LatestConfig {
     pub fn update_base_tasks(
         &self,
         base_tasks: &mut Vec<BaseTask>,
-        name_map: &mut hashbrown::HashMap<&'static str, BaseTaskIndex>,
+        name_map: &mut hashbrown::HashMap<Box<str>, BaseTaskIndex>,
     ) {
         for base_task in base_tasks.iter_mut() {
             base_task.removed = true;
         }
-        for (name, config) in self.current.tasks {
-            match name_map.entry(name) {
-                hashbrown::hash_map::Entry::Occupied(occupied_entry) => {
-                    let base_task = &mut base_tasks[occupied_entry.get().idx()];
-                    base_task.removed = false;
-                    base_task.config = config;
-                }
-                hashbrown::hash_map::Entry::Vacant(vacant_entry) => {
-                    if base_tasks.len() > u32::MAX as usize {
-                        panic!("Too many base tasks");
-                    }
-                    vacant_entry.insert(BaseTaskIndex(base_tasks.len() as u32));
-                    base_tasks.push(BaseTask {
-                        name,
-                        config,
-                        removed: false,
-                        jobs: JobIndexList::default(),
-                        profile_change_counter: 0,
-                        last_profile: None,
-                        has_run_this_session: false,
-                    });
-                }
+        let generation = self.current.clone();
+        for (task_index, (name, _)) in self.current.workspace().tasks.iter().enumerate() {
+            let config = TaskConfigSource::from_workspace_task(generation.clone(), task_index);
+            if let Some(&index) = name_map.get(*name) {
+                let base_task = &mut base_tasks[index.idx()];
+                base_task.removed = false;
+                base_task.config = config;
+                continue;
             }
+            if base_tasks.len() > u32::MAX as usize {
+                panic!("Too many base tasks");
+            }
+            let index = BaseTaskIndex(base_tasks.len() as u32);
+            name_map.insert((*name).into(), index);
+            base_tasks.push(BaseTask {
+                name: (*name).into(),
+                config,
+                removed: false,
+                jobs: JobIndexList::default(),
+                profile_change_counter: 0,
+                last_profile: None,
+                has_run_this_session: false,
+            });
         }
-        for (base_name, variants) in self.current.tests {
-            for (variant_index, config) in variants.iter().enumerate() {
-                let task_name: &'static str =
-                    if variants.len() == 1 { base_name } else { format!("{}.{}", base_name, variant_index).leak() };
-
-                let entry_task_name: &'static str = if variants.len() == 1 {
-                    format!("~test/{}", base_name).leak()
-                } else {
-                    format!("~test/{}.{}", base_name, variant_index).leak()
-                };
-                let task_config = config.to_task_config_expr();
-
-                match name_map.entry(entry_task_name) {
-                    hashbrown::hash_map::Entry::Occupied(occupied_entry) => {
-                        let base_task = &mut base_tasks[occupied_entry.get().idx()];
-                        base_task.removed = false;
-                        base_task.config = task_config;
-                    }
-                    hashbrown::hash_map::Entry::Vacant(vacant_entry) => {
-                        vacant_entry.insert(BaseTaskIndex::new_or_panic(base_tasks.len()));
-                        base_tasks.push(BaseTask {
-                            name: task_name,
-                            config: task_config,
-                            removed: false,
-                            jobs: JobIndexList::default(),
-                            profile_change_counter: 0,
-                            last_profile: None,
-                            has_run_this_session: false,
-                        });
-                    }
-                }
+        for (derived_index, derived) in self.current.derived_tests.iter().enumerate() {
+            let config = TaskConfigSource::from_derived_test(generation.clone(), derived_index);
+            if let Some(&index) = name_map.get(derived.entry_name.as_ref()) {
+                let base_task = &mut base_tasks[index.idx()];
+                base_task.removed = false;
+                base_task.config = config;
+                continue;
             }
+            let index = BaseTaskIndex::new_or_panic(base_tasks.len());
+            name_map.insert(derived.entry_name.clone(), index);
+            base_tasks.push(BaseTask {
+                name: derived.display_name.clone(),
+                config,
+                removed: false,
+                jobs: JobIndexList::default(),
+                profile_change_counter: 0,
+                last_profile: None,
+                has_run_this_session: false,
+            });
         }
     }
 }
@@ -422,8 +515,8 @@ pub struct LoggedPanic {
 }
 
 pub struct BaseTask {
-    pub name: &'static str,
-    pub config: &'static TaskConfigExpr<'static>,
+    pub name: Box<str>,
+    pub config: TaskConfigSource,
     pub removed: bool,
     pub jobs: JobIndexList,
     /// Counter incremented when the task's profile changes (not on first run).
@@ -453,6 +546,15 @@ impl BaseTask {
         }
         self.last_profile = Some(profile.into());
     }
+}
+
+fn spawn_spec_cache_key(generation_id: u64, base_task: BaseTaskIndex, profile: &str, params: &ValueMap) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&generation_id.to_le_bytes());
+    hasher.update(&base_task.0.to_le_bytes());
+    hash_len_prefixed(&mut hasher, profile.as_bytes());
+    hash_value_map(&mut hasher, params);
+    blake3_to_u64(&hasher)
 }
 
 /// Status of a test job execution.
@@ -488,10 +590,10 @@ struct MatchedTest {
 
 /// Checks if a running service job matches the required profile and parameters.
 fn service_matches_require(job: &Job, require_profile: &str, require_params: &ValueMap) -> bool {
-    if !require_profile.is_empty() && job.spawn_profile != require_profile {
+    if !require_profile.is_empty() && job.spawn_profile() != require_profile {
         return false;
     }
-    require_params == &job.spawn_params
+    require_params == job.spawn_params()
 }
 
 /// Tracks which jobs depend on each service (reverse dependency tracking).
@@ -540,22 +642,22 @@ pub enum ServiceCompatibility {
 }
 
 /// Key for deduplicating requirements across a batch of spawns.
+///
+/// `params_digest` is the full 256-bit blake3 digest of the params, not a
+/// truncated hash — this key is used as an identity (via derived `Eq`), so
+/// truncation would fold distinct requirements into one.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct RequirementKey {
     pub base_task: BaseTaskIndex,
     pub profile: String,
-    pub params_hash: u64,
+    pub params_digest: [u8; blake3::OUT_LEN],
 }
 
 impl RequirementKey {
     pub fn new(base_task: BaseTaskIndex, profile: &str, params: &ValueMap) -> Self {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        for (k, v) in params.entries() {
-            k.hash(&mut hasher);
-            v.to_string().hash(&mut hasher);
-        }
-        Self { base_task, profile: profile.to_string(), params_hash: hasher.finish() }
+        let mut hasher = blake3::Hasher::new();
+        hash_value_map(&mut hasher, params);
+        Self { base_task, profile: profile.to_string(), params_digest: *hasher.finalize().as_bytes() }
     }
 }
 
@@ -685,7 +787,7 @@ pub struct WorkspaceState {
     pub config: LatestConfig,
     pub base_tasks: Vec<BaseTask>,
     pub change_number: u32,
-    pub name_map: hashbrown::HashMap<&'static str, BaseTaskIndex>,
+    pub name_map: hashbrown::HashMap<Box<str>, BaseTaskIndex>,
     pub jobs: Vec<Job>,
     pub active_test_run: Option<TestRun>,
     pub action_jobs: JobIndexList,
@@ -698,6 +800,7 @@ pub struct WorkspaceState {
     /// The most recent test group (persists across runs for rerun functionality).
     pub last_test_group: Option<TestGroup>,
     cache_key_hasher: CacheKeyHasher,
+    spawn_specs: hashbrown::HashMap<u64, Vec<Weak<ResolvedSpawnSpec>>>,
 }
 
 impl WorkspaceState {
@@ -730,7 +833,7 @@ impl WorkspaceState {
                 CacheKeyInput::Modified { paths, ignore } => {
                     self.cache_key_hasher.update(b"modified:");
                     for path in *paths {
-                        let full_path = self.config.current.base_path.join(path);
+                        let full_path = self.config.current.base_path().join(path);
                         self.cache_key_hasher.hash_path(&full_path, ignore);
                     }
                 }
@@ -766,7 +869,7 @@ impl WorkspaceState {
                 CacheKeyInput::Modified { paths, ignore } => {
                     self.cache_key_hasher.update(b"modified:");
                     for path in *paths {
-                        let full_path = self.config.current.base_path.join(path);
+                        let full_path = self.config.current.base_path().join(path);
                         self.cache_key_hasher.hash_path(&full_path, ignore);
                     }
                 }
@@ -792,7 +895,7 @@ impl WorkspaceState {
             for (k, v) in params.entries() {
                 self.cache_key_hasher.update(k.as_bytes());
                 self.cache_key_hasher.update(b"=");
-                self.cache_key_hasher.update(v.to_string().as_bytes());
+                hash_value(&mut self.cache_key_hasher, v);
             }
         }
         self.cache_key_hasher.finalize_hex()
@@ -805,8 +908,8 @@ impl WorkspaceState {
         if name == "~cargo" {
             let index = self.base_tasks.len();
             self.base_tasks.push(BaseTask {
-                name: "~cargo",
-                config: &CARGO_AUTO_EXPR,
+                name: "~cargo".into(),
+                config: TaskConfigSource::Static(&CARGO_AUTO_EXPR),
                 removed: false,
                 jobs: JobIndexList::default(),
                 profile_change_counter: 0,
@@ -817,7 +920,7 @@ impl WorkspaceState {
                 panic!("Too many base tasks");
             }
             let index = BaseTaskIndex(index as u32);
-            self.name_map.insert("~cargo", index);
+            self.name_map.insert("~cargo".into(), index);
             return Some(index);
         }
         None
@@ -829,7 +932,85 @@ impl WorkspaceState {
         };
         if changed {
             self.config.update_base_tasks(&mut self.base_tasks, &mut self.name_map);
+            self.spawn_specs.clear();
         }
+    }
+
+    fn get_or_create_spawn_spec(
+        &mut self,
+        base_task: BaseTaskIndex,
+        profile: &str,
+        params: ValueMap<'static>,
+    ) -> Arc<ResolvedSpawnSpec> {
+        let generation_id = self.base_tasks[base_task.idx()].config.generation_id();
+        if let Some(spec) = self.find_cached_spawn_spec(generation_id, base_task, profile, &params) {
+            return spec;
+        }
+        let config = self.base_tasks[base_task.idx()].config.clone();
+        let env = Environment { profile, param: params.clone(), vars: config.vars };
+        let task = config.eval(&env).unwrap();
+        self.insert_spawn_spec(generation_id, base_task, profile, params, task)
+    }
+
+    fn cache_spawn_spec(
+        &mut self,
+        base_task: BaseTaskIndex,
+        profile: &str,
+        params: ValueMap<'static>,
+        task: TaskConfigRc,
+    ) -> Arc<ResolvedSpawnSpec> {
+        let generation_id = self.base_tasks[base_task.idx()].config.generation_id();
+        if let Some(spec) = self.find_cached_spawn_spec(generation_id, base_task, profile, &params) {
+            return spec;
+        }
+        self.insert_spawn_spec(generation_id, base_task, profile, params, task)
+    }
+
+    fn find_cached_spawn_spec(
+        &mut self,
+        generation_id: u64,
+        base_task: BaseTaskIndex,
+        profile: &str,
+        params: &ValueMap<'static>,
+    ) -> Option<Arc<ResolvedSpawnSpec>> {
+        let cache_key = spawn_spec_cache_key(generation_id, base_task, profile, params);
+        let specs = self.spawn_specs.get_mut(&cache_key)?;
+        let mut found = None;
+        specs.retain(|spec| {
+            let Some(spec) = spec.upgrade() else {
+                return false;
+            };
+            if found.is_none()
+                && spec.generation_id == generation_id
+                && spec.base_task == base_task
+                && spec.profile.as_ref() == profile
+                && spec.params.as_ref() == params
+            {
+                found = Some(spec.clone());
+            }
+            true
+        });
+        found
+    }
+
+    fn insert_spawn_spec(
+        &mut self,
+        generation_id: u64,
+        base_task: BaseTaskIndex,
+        profile: &str,
+        params: ValueMap<'static>,
+        task: TaskConfigRc,
+    ) -> Arc<ResolvedSpawnSpec> {
+        let cache_key = spawn_spec_cache_key(generation_id, base_task, profile, &params);
+        let spec = Arc::new(ResolvedSpawnSpec {
+            generation_id,
+            base_task,
+            task,
+            profile: profile.into(),
+            params: Arc::new(params),
+        });
+        self.spawn_specs.entry(cache_key).or_default().push(Arc::downgrade(&spec));
+        spec
     }
 
     fn plan_conflicts(
@@ -869,14 +1050,16 @@ impl WorkspaceState {
                     });
                 }
             }
-            AllowMultiple::True => {}
+            AllowMultiple::True => {
+                // No killing — new instance spawns alongside existing ones.
+            }
             AllowMultiple::DistinctProfiles | AllowMultiple::SingleProfile => {
                 let match_same = matches!(allow_multiple, AllowMultiple::DistinctProfiles);
                 let to_cancel: Vec<_> = self.base_tasks[base_task.idx()]
                     .jobs
                     .scheduled()
                     .iter()
-                    .filter(|ji| (self.jobs[ji.idx()].spawn_profile == profile) == match_same)
+                    .filter(|ji| (self.jobs[ji.idx()].spawn_profile() == profile) == match_same)
                     .copied()
                     .collect();
                 for job_index in &to_cancel {
@@ -895,7 +1078,7 @@ impl WorkspaceState {
                     .jobs
                     .running()
                     .iter()
-                    .filter(|ji| (self.jobs[ji.idx()].spawn_profile == profile) == match_same)
+                    .filter(|ji| (self.jobs[ji.idx()].spawn_profile() == profile) == match_same)
                     .copied()
                     .collect();
                 for job_index in to_terminate {
@@ -926,14 +1109,18 @@ impl WorkspaceState {
         reason: ScheduleReason,
         force_restart: bool,
     ) -> JobIndex {
+        let profile = {
+            let bt = &self.base_tasks[base_task.idx()];
+            if profile.is_empty() { bt.config.profiles.first().copied().unwrap_or("") } else { profile }
+        }
+        .to_string();
+        let params = params.to_owned();
         let bt = &mut self.base_tasks[base_task.idx()];
-        let profile = if profile.is_empty() { bt.config.profiles.first().copied().unwrap_or("") } else { profile };
-        bt.update_profile_tracking(profile);
+        bt.update_profile_tracking(&profile);
 
-        let mut pred = self.plan_conflicts(base_task, profile, force_restart, channel);
-
-        let bt = &mut self.base_tasks[base_task.idx()];
-        let task = bt.config.eval(&Environment { profile, param: params.clone(), vars: bt.config.vars }).unwrap();
+        let mut pred = self.plan_conflicts(base_task, &profile, force_restart, channel);
+        let spec = self.get_or_create_spawn_spec(base_task, &profile, params.clone());
+        let task = spec.task.clone();
 
         let mut batch: SpawnBatch<()> = SpawnBatch::new();
         let mut req_keys = Vec::new();
@@ -975,9 +1162,9 @@ impl WorkspaceState {
             .config()
             .cache
             .as_ref()
-            .map_or(String::new(), |c| self.compute_cache_key_with_require(c.key, profile, &params));
+            .map_or(String::new(), |c| self.compute_cache_key_with_require(c.key, &profile, spec.params.as_ref()));
 
-        self.create_job(base_task, task, profile, params, pred, cache_key, channel, workspace_id, reason)
+        self.create_job(base_task, task, &profile, params, pred, cache_key, channel, workspace_id, reason)
     }
 
     /// Schedule a queued service that waits for a blocking service to terminate.
@@ -1001,14 +1188,19 @@ impl WorkspaceState {
             let env = Environment { profile: eval_profile, param: params.clone(), vars: spawner.config.vars };
             spawner.config.eval(&env).expect("Failed to eval queued service config")
         };
-
+        let profile = if profile.is_empty() {
+            self.base_tasks[base_task.idx()].config.profiles.first().copied().unwrap_or("").to_string()
+        } else {
+            profile.to_string()
+        };
+        let params = params.to_owned();
         let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
         let requirements = vec![ScheduleRequirement { job: blocked_by, predicate: JobPredicate::Terminated }];
 
         self.create_job(
             base_task,
             task,
-            profile,
+            &profile,
             params,
             requirements,
             cache_key,
@@ -1023,16 +1215,17 @@ impl WorkspaceState {
         base_task: BaseTaskIndex,
         task: TaskConfigRc,
         profile: &str,
-        params: ValueMap,
+        params: ValueMap<'static>,
         requirements: Vec<ScheduleRequirement>,
         cache_key: String,
         channel: &MioChannel,
         workspace_id: u32,
         reason: ScheduleReason,
     ) -> JobIndex {
+        let spec = self.cache_spawn_spec(base_task, profile, params, task.clone());
         let job_index = JobIndex(self.jobs.len() as u32);
         let bt = &mut self.base_tasks[base_task.idx()];
-        let task_name = bt.name;
+        let task_name = bt.name.clone();
         let pc = bt.jobs.len();
         let job_id = LogGroup::new(base_task, pc);
 
@@ -1067,17 +1260,15 @@ impl WorkspaceState {
         self.jobs.push(Job {
             process_status: if spawn { JobStatus::Starting } else { JobStatus::Scheduled { after: requirements } },
             log_group: job_id,
-            task: task.clone(),
             started_at: crate::clock::now(),
             cache_key,
-            spawn_profile: profile.to_string(),
-            spawn_params: params.to_owned(),
+            spawn: spec.clone(),
         });
 
         if spawn {
             channel.send(crate::event_loop::ProcessRequest::Spawn { task, job_index, workspace_id, job_id });
         } else {
-            kvlog::info!("Job scheduled", task_name, job_index, reason = reason.name());
+            kvlog::info!("Job scheduled", task_name = task_name.as_ref(), job_index, reason = reason.name());
         }
 
         job_index
@@ -1315,7 +1506,7 @@ impl WorkspaceState {
         let job = &mut self.jobs[job_index.idx()];
         let job_id = job.log_group;
         let base_task = &mut self.base_tasks[job_id.base_task_index().idx()];
-        let task_name = base_task.name;
+        let task_name = base_task.name.as_ref();
         let task_kind = base_task.config.kind;
         let jobs_list = &mut base_task.jobs;
 
@@ -1407,6 +1598,7 @@ impl WorkspaceState {
             session_functions: hashbrown::HashMap::new(),
             last_test_group: None,
             cache_key_hasher: CacheKeyHasher::new(),
+            spawn_specs: hashbrown::HashMap::new(),
         })
     }
 
@@ -1495,7 +1687,7 @@ impl WorkspaceState {
                 AllowMultiple::False | AllowMultiple::SingleProfile => {
                     return ServiceCompatibility::Conflict {
                         running_job: ji,
-                        running_profile: job.spawn_profile.clone(),
+                        running_profile: job.spawn_profile().to_string(),
                         requested_profile: requested_profile.to_string(),
                     };
                 }
@@ -1672,8 +1864,8 @@ impl WorkspaceState {
 
                 if let Some(existing_profile) = service_profiles.get(&dep_base_task) {
                     if *existing_profile != dep_profile {
-                        let test_name = self.base_tasks[matched.base_task_idx.idx()].name;
-                        let service_name = self.base_tasks[dep_base_task.idx()].name;
+                        let test_name = self.base_tasks[matched.base_task_idx.idx()].name.as_ref();
+                        let service_name = self.base_tasks[dep_base_task.idx()].name.as_ref();
                         return Err(format!(
                             "Test '{}' has conflicting service requirements: '{}:{}' and '{}:{}'",
                             test_name, service_name, existing_profile, service_name, dep_profile
@@ -1883,38 +2075,35 @@ impl Workspace {
             return Ok(None);
         }
 
-        for func_def in state.config.current.functions {
-            if func_def.name == name {
-                match &func_def.action {
-                    FunctionDefAction::Restart { task } => {
-                        state.lookup_and_spawn_task(
-                            self.workspace_id, &self.process_channel, task, ValueMap::new(), "", true,
-                        )?;
-                    }
-                    FunctionDefAction::Kill { task } => {
-                        state.lookup_and_terminate_task(&self.process_channel, task)?;
-                    }
-                    FunctionDefAction::Spawn { tasks } => {
-                        for task_call in *tasks {
-                            state.lookup_and_spawn_task(
-                                self.workspace_id,
-                                &self.process_channel,
-                                &task_call.name,
-                                task_call.vars.clone(),
-                                task_call.profile.unwrap_or(""),
-                                false,
-                            )?;
-                        }
-                    }
-                    FunctionDefAction::RestartSelected => {
-                        return Ok(Some(FunctionGlobalAction::RestartSelected));
-                    }
+        let generation = Arc::clone(&state.config.current);
+        let Some(func_def) = generation.workspace().functions.iter().find(|f| f.name == name) else {
+            return Err(format!("Function '{}' not configured", name));
+        };
+
+        match &func_def.action {
+            FunctionDefAction::Restart { task } => {
+                state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, task, ValueMap::new(), "", true)?;
+            }
+            FunctionDefAction::Kill { task } => {
+                state.lookup_and_terminate_task(&self.process_channel, task)?;
+            }
+            FunctionDefAction::Spawn { tasks } => {
+                for task_call in *tasks {
+                    state.lookup_and_spawn_task(
+                        self.workspace_id,
+                        &self.process_channel,
+                        &task_call.name,
+                        task_call.vars.clone().to_owned(),
+                        task_call.profile.unwrap_or(""),
+                        false,
+                    )?;
                 }
-                return Ok(None);
+            }
+            FunctionDefAction::RestartSelected => {
+                return Ok(Some(FunctionGlobalAction::RestartSelected));
             }
         }
-
-        Err(format!("Function '{}' not configured", name))
+        Ok(None)
     }
 
     pub fn rerun_test_group(&self, only_failed: bool) -> Result<TestRun, String> {
@@ -1958,7 +2147,7 @@ impl Workspace {
             }
             let (spawn_profile, spawn_params) = original_job
                 .and_then(|ji| state.jobs.get(ji.idx()))
-                .map(|job| (job.spawn_profile.clone(), job.spawn_params.clone()))
+                .map(|job| (job.spawn_profile().to_string(), job.spawn_params().clone()))
                 .unwrap_or_else(|| (String::new(), ValueMap::new()));
             let env = Environment {
                 profile: &spawn_profile,
@@ -1966,7 +2155,7 @@ impl Workspace {
                 vars: base_task.config.vars,
             };
             let Ok(task_config) = base_task.config.eval(&env) else {
-                kvlog::error!("Failed to evaluate test config", name = base_task.name);
+                kvlog::error!("Failed to evaluate test config", name = base_task.name.as_ref());
                 continue;
             };
             drop(env);
@@ -2035,12 +2224,13 @@ impl Workspace {
             .into_iter()
             .map(|p| {
                 let base_task_idx = p.log_group.base_task_index();
-                let task_name = state.base_tasks.get(base_task_idx.idx()).map(|bt| bt.name).unwrap_or("<unknown>");
+                let task_name =
+                    state.base_tasks.get(base_task_idx.idx()).map(|bt| bt.name.as_ref()).unwrap_or("<unknown>");
                 let job = state.jobs.iter().find(|job| job.log_group == p.log_group);
                 let (pwd, cmd) = match job {
                     Some(job) => {
-                        let config = job.task.config();
-                        let pwd = state.config.current.base_path.join(config.pwd).to_string_lossy().to_string();
+                        let config = job.task().config();
+                        let pwd = state.config.current.base_path().join(config.pwd).to_string_lossy().to_string();
                         let cmd = match &config.command {
                             Command::Cmd(args) => args.iter().map(|s| s.to_string()).collect(),
                             Command::Sh(sh) => vec!["sh".to_string(), "-c".to_string(), sh.to_string()],
@@ -2067,12 +2257,42 @@ impl Workspace {
     pub fn state(&self) -> std::sync::RwLockReadGuard<'_, WorkspaceState> {
         self.state.read().unwrap()
     }
+    pub fn restart_task(&self, base_task: BaseTaskIndex, params: ValueMap, profile: &str) -> JobIndex {
+        let mut state_guard = self.state.write().unwrap();
+        let state = &mut *state_guard;
+        state.change_number = state.change_number.wrapping_add(1);
+        state.refresh_config();
+        state.spawn_task(
+            self.workspace_id,
+            &self.process_channel,
+            base_task,
+            params,
+            profile,
+            ScheduleReason::Requested,
+            true,
+        )
+    }
+
+    pub fn start_task(&self, base_task: BaseTaskIndex, params: ValueMap, profile: &str) -> JobIndex {
+        let state = &mut *self.state.write().unwrap();
+        state.change_number = state.change_number.wrapping_add(1);
+        state.refresh_config();
+        state.spawn_task(
+            self.workspace_id,
+            &self.process_channel,
+            base_task,
+            params,
+            profile,
+            ScheduleReason::Requested,
+            false,
+        )
+    }
 
     pub fn terminate_tasks(&self, base_task: BaseTaskIndex) {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
 
-        let task_name = state.base_tasks[base_task.idx()].name;
+        let task_name = state.base_tasks[base_task.idx()].name.clone();
         let job_indices: Vec<JobIndex> = state.base_tasks[base_task.idx()].jobs.non_terminal().to_vec();
 
         let mut jobs_to_cancel = Vec::new();
@@ -2080,7 +2300,7 @@ impl Workspace {
             let job = &state.jobs[job_index.idx()];
             match &job.process_status {
                 JobStatus::Running { process_index, .. } => {
-                    kvlog::info!("Terminating running job", task_name, job_index, process_index);
+                    kvlog::info!("Terminating running job", task_name = task_name.as_ref(), job_index, process_index);
                     self.process_channel.send(crate::event_loop::ProcessRequest::TerminateJob {
                         job_id: job.log_group,
                         process_index: *process_index,
@@ -2090,12 +2310,12 @@ impl Workspace {
                 JobStatus::Starting => {
                     kvlog::warn!(
                         "Job is in Starting state during termination (spawn in progress)",
-                        task_name,
+                        task_name = task_name.as_ref(),
                         job_index
                     );
                 }
                 JobStatus::Scheduled { .. } => {
-                    kvlog::info!("Cancelling scheduled job", task_name, job_index);
+                    kvlog::info!("Cancelling scheduled job", task_name = task_name.as_ref(), job_index);
                     jobs_to_cancel.push(job_index);
                 }
                 JobStatus::Exited { .. } | JobStatus::Cancelled => {}
@@ -2160,7 +2380,7 @@ impl Workspace {
                     return Ok(None);
                 };
 
-                let base_path = state.config.current.base_path.to_path_buf();
+                let base_path = state.config.current.base_path().to_path_buf();
                 let cache_key_inputs: Vec<_> = cache_config
                     .key
                     .iter()
@@ -2226,12 +2446,12 @@ impl Workspace {
                 continue;
             }
             let tags = base_task.config.tags;
-            if !matches_test_filters(base_task.name, tags, filters) {
+            if !matches_test_filters(base_task.name.as_ref(), tags, filters) {
                 continue;
             }
             let env = Environment { profile: "", param: ValueMap::new(), vars: base_task.config.vars };
             let Ok(task_config) = base_task.config.eval(&env) else {
-                kvlog::error!("Failed to evaluate test config", name = base_task.name);
+                kvlog::error!("Failed to evaluate test config", name = base_task.name.as_ref());
                 continue;
             };
             matched_tests.push(MatchedTest {
@@ -2314,9 +2534,9 @@ fn matches_test_filters(name: &str, tags: &[&str], filters: &[TestFilter]) -> bo
 
     for filter in filters {
         match filter {
-            TestFilter::IncludeName(n) => include_names.push(n),
-            TestFilter::IncludeTag(t) => include_tags.push(t),
-            TestFilter::ExcludeTag(t) => exclude_tags.push(t),
+            TestFilter::IncludeName(n) => include_names.push(n.as_ref()),
+            TestFilter::IncludeTag(t) => include_tags.push(t.as_ref()),
+            TestFilter::ExcludeTag(t) => exclude_tags.push(t.as_ref()),
         }
     }
 
@@ -2507,7 +2727,7 @@ mod scheduling_tests {
             let key2 = RequirementKey::new(base_task, profile, &params);
 
             assert_eq!(key1, key2);
-            assert_eq!(key1.params_hash, key2.params_hash);
+            assert_eq!(key1.params_digest, key2.params_digest);
         }
 
         #[test]
@@ -2549,6 +2769,30 @@ mod scheduling_tests {
             set.insert(key3);
 
             assert_eq!(set.len(), 2);
+        }
+    }
+
+    mod spawn_spec_cache_tests {
+        use super::*;
+
+        fn manifest_path(relative: &str) -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+        }
+
+        #[test]
+        fn get_or_create_spawn_spec_reuses_cached_spec_before_eval() {
+            let mut state = WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).unwrap();
+            let base_task = state.name_map["simple_cmd"];
+            let failing_task = state.name_map["with_var"];
+
+            let config = state.base_tasks[base_task.idx()].config.clone();
+            let task = config.eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars }).unwrap();
+            let cached = state.cache_spawn_spec(base_task, "", ValueMap::new(), task);
+
+            state.base_tasks[base_task.idx()].config = state.base_tasks[failing_task.idx()].config.clone();
+
+            let reused = state.get_or_create_spawn_spec(base_task, "", ValueMap::new());
+            assert!(Arc::ptr_eq(&cached, &reused));
         }
     }
 

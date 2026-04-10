@@ -16,6 +16,8 @@ use std::{
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(test)]
+mod alloc_report;
 mod cache_key;
 mod cli;
 mod clock;
@@ -237,9 +239,9 @@ fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
     let mut include_names = Vec::new();
     for filter in &filters {
         match filter {
-            cli::TestFilter::IncludeTag(tag) => include_tags.push(*tag),
-            cli::TestFilter::ExcludeTag(tag) => exclude_tags.push(*tag),
-            cli::TestFilter::IncludeName(name) => include_names.push(*name),
+            cli::TestFilter::IncludeTag(tag) => include_tags.push(tag.as_ref()),
+            cli::TestFilter::ExcludeTag(tag) => exclude_tags.push(tag.as_ref()),
+            cli::TestFilter::IncludeName(name) => include_names.push(name.as_ref()),
         }
     }
 
@@ -651,9 +653,8 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
     let (name, _profile) = job.rsplit_once(':').unwrap_or((job, ""));
 
     let (job, as_test) = if let Some(test_name) = name.strip_prefix("test.") {
-        let has_test = workspace_config.tests.iter().any(|(n, _)| {
-            *n == test_name || test_name.starts_with(&format!("{n}."))
-        });
+        let has_test =
+            workspace_config.tests.iter().any(|(n, _)| *n == test_name || test_name.starts_with(&format!("{n}.")));
         if !has_test {
             bail!("Test not found: {}", test_name);
         }
@@ -812,11 +813,7 @@ fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
         );
     }
 
-    let profile = if profile.is_empty() {
-        task_expr.profiles.first().copied().unwrap_or("")
-    } else {
-        profile
-    };
+    let profile = if profile.is_empty() { task_expr.profiles.first().copied().unwrap_or("") } else { profile };
     let env = config::Environment { profile, param: params, vars: task_expr.vars };
     let task = task_expr.eval(&env).map_err(|e| anyhow::anyhow!("Failed to evaluate task: {:?}", e))?;
     let tc = task.config();

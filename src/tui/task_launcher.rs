@@ -22,7 +22,7 @@ use crate::{
 /// Information about a task for display in autocomplete.
 struct TaskInfo {
     bti: BaseTaskIndex,
-    name: &'static str,
+    name: Box<str>,
     kind: TaskKind,
     command_preview: &'static str,
 }
@@ -54,7 +54,7 @@ pub struct TaskLauncherState {
     selected: usize,
     scroll_offset: usize,
 
-    confirmed_task: Option<(BaseTaskIndex, &'static str)>,
+    confirmed_task: Option<(BaseTaskIndex, Box<str>)>,
     confirmed_profile: Option<&'static str>,
     completed_vars: Vec<(&'static str, String)>,
     current_var_name: Option<&'static str>,
@@ -75,7 +75,7 @@ impl TaskLauncherState {
             .filter(|(_, bt)| !bt.removed && bt.config.managed != Some(false))
             .map(|(i, bt)| TaskInfo {
                 bti: BaseTaskIndex(i as u32),
-                name: bt.name,
+                name: bt.name.clone(),
                 kind: bt.config.kind,
                 command_preview: bt.config.command_preview(),
             })
@@ -83,7 +83,7 @@ impl TaskLauncherState {
 
         let mut searcher = FatSearch::default();
         for task in &tasks {
-            searcher.insert(task.name);
+            searcher.insert(task.name.as_ref());
         }
 
         let mut results = Vec::new();
@@ -117,7 +117,7 @@ impl TaskLauncherState {
             .filter(|(_, bt)| !bt.removed && bt.config.managed != Some(false))
             .map(|(i, bt)| TaskInfo {
                 bti: BaseTaskIndex(i as u32),
-                name: bt.name,
+                name: bt.name.clone(),
                 kind: bt.config.kind,
                 command_preview: bt.config.command_preview(),
             })
@@ -143,7 +143,7 @@ impl TaskLauncherState {
             results,
             selected: 0,
             scroll_offset: 0,
-            confirmed_task: Some((bti, bt.name)),
+            confirmed_task: Some((bti, bt.name.clone())),
             confirmed_profile: None,
             completed_vars: Vec::new(),
             current_var_name: None,
@@ -174,8 +174,8 @@ impl TaskLauncherState {
     }
 
     /// Returns the confirmed task if any.
-    pub fn confirmed_task(&self) -> Option<(BaseTaskIndex, &'static str)> {
-        self.confirmed_task
+    pub fn confirmed_task(&self) -> Option<(BaseTaskIndex, &str)> {
+        self.confirmed_task.as_ref().map(|(bti, name)| (*bti, name.as_ref()))
     }
 
     /// Returns the confirmed profile if any.
@@ -191,7 +191,7 @@ impl TaskLauncherState {
     fn rebuild_task_searcher(&mut self) {
         self.searcher = FatSearch::default();
         for task in &self.tasks {
-            self.searcher.insert(task.name);
+            self.searcher.insert(task.name.as_ref());
         }
         self.searcher.query(&self.input, &mut self.results);
         self.selected = 0;
@@ -224,7 +224,7 @@ impl TaskLauncherState {
         let Some(entry) = self.results.get(self.selected) else { return };
         let Some(task) = self.tasks.get(entry.index()) else { return };
 
-        self.confirmed_task = Some((task.bti, task.name));
+        self.confirmed_task = Some((task.bti, task.name.clone()));
         self.input.clear();
         self.cursor = 0;
 
@@ -283,7 +283,8 @@ impl TaskLauncherState {
     }
 
     fn try_build_launch(&self) -> Option<LauncherAction> {
-        let (base_task, _) = self.confirmed_task?;
+        let (base_task, _) = self.confirmed_task.as_ref()?;
+        let base_task = *base_task;
         let profile = self.confirmed_profile.unwrap_or("").to_string();
 
         let mut params = ValueMap::new();
@@ -511,7 +512,7 @@ impl TaskLauncherState {
                         TaskKind::Action => "action",
                         TaskKind::Test => "test",
                     };
-                    entry_rect.take_left(name_col_width as i32).with(style).text(out, task.name);
+                    entry_rect.take_left(name_col_width as i32).with(style).text(out, task.name.as_ref());
                     entry_rect.take_left(kind_col_width).with(substyle).text(out, kind_str);
 
                     if !task.command_preview.is_empty() {
@@ -525,7 +526,7 @@ impl TaskLauncherState {
                     }
                 }
                 LauncherMode::Profile => {
-                    let task_name = self.confirmed_task.map(|(_, n)| n).unwrap_or("");
+                    let task_name = self.confirmed_task.as_ref().map(|(_, n)| n.as_ref()).unwrap_or("");
                     let profile = self.available_profiles.get(entry.index()).copied().unwrap_or("");
                     entry_rect.with(style).text(out, task_name).text(out, ":").text(out, profile);
                 }
@@ -558,7 +559,7 @@ impl TaskLauncherState {
     fn build_display_prefix(&self) -> String {
         let mut prefix = String::new();
 
-        if let Some((_, name)) = self.confirmed_task {
+        if let Some((_, name)) = self.confirmed_task.as_ref() {
             prefix.push_str(name);
             prefix.push(':');
         }
@@ -624,7 +625,7 @@ mod tests {
             results: Vec::new(),
             selected: 0,
             scroll_offset: 0,
-            confirmed_task: Some((BaseTaskIndex(0), "my_task")),
+            confirmed_task: Some((BaseTaskIndex(0), "my_task".into())),
             confirmed_profile: None,
             completed_vars: Vec::new(),
             current_var_name: None,
@@ -646,7 +647,7 @@ mod tests {
             results: Vec::new(),
             selected: 0,
             scroll_offset: 0,
-            confirmed_task: Some((BaseTaskIndex(0), "my_task")),
+            confirmed_task: Some((BaseTaskIndex(0), "my_task".into())),
             confirmed_profile: Some("release"),
             completed_vars: Vec::new(),
             current_var_name: None,
@@ -668,7 +669,7 @@ mod tests {
             results: Vec::new(),
             selected: 0,
             scroll_offset: 0,
-            confirmed_task: Some((BaseTaskIndex(0), "my_task")),
+            confirmed_task: Some((BaseTaskIndex(0), "my_task".into())),
             confirmed_profile: Some("default"),
             completed_vars: vec![("foo", "bar".to_string())],
             current_var_name: None,
@@ -690,7 +691,7 @@ mod tests {
             results: Vec::new(),
             selected: 0,
             scroll_offset: 0,
-            confirmed_task: Some((BaseTaskIndex(0), "my_task")),
+            confirmed_task: Some((BaseTaskIndex(0), "my_task".into())),
             confirmed_profile: Some("default"),
             completed_vars: Vec::new(),
             current_var_name: Some("message"),
@@ -724,7 +725,7 @@ mod tests {
 
         assert_eq!(state.mode(), LauncherMode::TaskName);
 
-        state.confirmed_task = Some((BaseTaskIndex(0), "test"));
+        state.confirmed_task = Some((BaseTaskIndex(0), "test".into()));
         state.switch_to_profile_mode();
         assert_eq!(state.mode(), LauncherMode::Profile);
 

@@ -223,8 +223,7 @@ require = ["svc"]
         let mut t1 = ctrl.accept(Duration::from_secs(10));
         let mut t2 = ctrl.accept(Duration::from_secs(10));
         assert!(
-            (t1.name() == "first" && t2.name() == "second")
-                || (t1.name() == "second" && t2.name() == "first"),
+            (t1.name() == "first" && t2.name() == "second") || (t1.name() == "second" && t2.name() == "first"),
             "expected first and second tests, got {} and {}",
             t1.name(),
             t2.name()

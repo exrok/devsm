@@ -603,7 +603,10 @@ impl TaskTreeState {
                         AnsiColor::Grey[16].as_fg()
                     };
                     let mut rem = line.with(style).fill(out).skip(1);
-                    rem = rem.text(out, task.name).with(HAlign::Right);
+                    if task.config.kind == TaskKind::Test {
+                        rem = rem.with(substyle).text(out, "test/").with(style);
+                    }
+                    rem = rem.text(out, task.name.as_ref()).with(HAlign::Right);
 
                     if let Some(fn_name) = fn_indicator {
                         rem = rem
@@ -706,7 +709,7 @@ impl TaskTreeState {
             let bti = job.log_group.base_task_index();
             let bt = &ws.base_tasks[bti.idx()];
 
-            let command = match &job.task.config().command {
+            let command = match &job.task().config().command {
                 Command::Cmd(args) => args.join(" "),
                 Command::Sh(script) => {
                     let prefix = if script.len() > 50 { format!("{}...", &script[..50]) } else { script.to_string() };
@@ -749,7 +752,7 @@ impl TaskTreeState {
 }
 
 fn get_bound_function(ws: &WorkspaceState, bti: BaseTaskIndex) -> Option<&str> {
-    let task_name = ws.base_tasks[bti.idx()].name;
+    let task_name = ws.base_tasks[bti.idx()].name.as_ref();
     for (fn_name, FunctionAction::RestartCaptured { task_name: captured, .. }) in &ws.session_functions {
         if captured == task_name {
             return Some(fn_name);

@@ -351,7 +351,7 @@ impl LogStack {
                 if selection_state.job.is_none() {
                     if let Some(bti) = selection_state.base_task {
                         let ws_state = ws.state();
-                        let name = ws_state.base_tasks[bti.idx()].name;
+                        let name = &ws_state.base_tasks[bti.idx()].name;
                         buf.extend_from_slice(b" NOT ");
                         buf.extend_from_slice(name.as_bytes());
                     } else if let Some(kind) = selection_state.meta_group {

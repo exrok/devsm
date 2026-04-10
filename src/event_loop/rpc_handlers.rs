@@ -86,8 +86,8 @@ fn restart_selected_from_clients(clients: &Slab<ClientEntry>, ws: &WorkspaceEntr
             let job = &ws_state[last_ji];
             let bti = job.log_group.base_task_index();
             let name = ws_state.spawn_name_for(bti);
-            let params = job.spawn_params.clone();
-            let profile = job.spawn_profile.clone();
+            let params = job.spawn_params().clone();
+            let profile = job.spawn_profile().to_string();
             drop(ws_state);
             if let Err(err) = ws.handle.submit(SpawnSpec::task(&name, &profile, params, true)) {
                 kvlog::warn!("RPC meta-group restart failed", name, profile, err);
@@ -101,8 +101,8 @@ fn restart_selected_from_clients(clients: &Slab<ClientEntry>, ws: &WorkspaceEntr
             let name = ws_state.spawn_name_for(bti);
             if let Some(&last_ji) = ws_state.base_tasks[bti.idx()].jobs.all().last() {
                 let job = &ws_state[last_ji];
-                let params = job.spawn_params.clone();
-                let profile = job.spawn_profile.clone();
+                let params = job.spawn_params().clone();
+                let profile = job.spawn_profile().to_string();
                 drop(ws_state);
                 if let Err(err) = ws.handle.submit(SpawnSpec::task(&name, &profile, params, true)) {
                     kvlog::warn!("RPC task restart failed", name, profile, err);

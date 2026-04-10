@@ -281,7 +281,7 @@ fn render<'a>(
         match &mut tui.overlay {
             FocusOverlap::Group { selection } => {
                 let ws = &*workspace.state();
-                let groups = &ws.config.current.groups;
+                let groups = ws.config.current.workspace().groups;
                 let max_name_width = groups.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 2;
                 selection.render(&mut tui.frame, task_tree_rect, "group> ", |out, mut rect, idx: usize, selected| {
                     let style = if selected { AnsiColor(153).with_fg(AnsiColor::Black) } else { Style::DEFAULT };
@@ -453,10 +453,10 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
         if let Some(job_idx) = sel.job {
             let job = &ws[job_idx];
             let bti = job.log_group.base_task_index();
-            let name = ws.base_tasks[bti.idx()].name;
+            let name = ws.base_tasks[bti.idx()].name.as_ref();
             format!(" {}:{} ", name, job_idx.idx())
         } else if let Some(bti) = sel.base_task {
-            format!(" {} ", ws.base_tasks[bti.idx()].name)
+            format!(" {} ", ws.base_tasks[bti.idx()].name.as_ref())
         } else if let Some(kind) = sel.meta_group {
             match kind {
                 MetaGroupKind::Services => " @services ".to_string(),
@@ -649,15 +649,18 @@ fn process_key(
                         workspace.refresh_config_if_changed();
                         let mut ws1 = workspace.state.write().unwrap();
                         let ws = &mut *ws1;
-                        if let Some((_, tasks)) = ws.config.current.groups.get(group) {
+                        if let Some((_, tasks)) = ws.config.current.workspace().groups.get(group) {
                             use crate::workspace::TaskSpec;
                             let spec = SpawnSpec {
-                                tasks: tasks.iter().map(|task| TaskSpec {
-                                    name: task.name.to_string(),
-                                    profile: task.profile.unwrap_or_default().to_string(),
-                                    params: task.vars.clone().to_owned(),
-                                    force_restart: false,
-                                }).collect(),
+                                tasks: tasks
+                                    .iter()
+                                    .map(|task| TaskSpec {
+                                        name: task.name.to_string(),
+                                        profile: task.profile.unwrap_or_default().to_string(),
+                                        params: task.vars.clone().to_owned(),
+                                        force_restart: false,
+                                    })
+                                    .collect(),
                                 test_group: false,
                             };
                             drop(ws1);
@@ -822,7 +825,8 @@ fn process_key(
         }
         Command::StartGroup => {
             let ws = workspace.state();
-            let entries = ws.config.current.groups.iter().enumerate().map(|(index, (name, _))| (index, name));
+            let entries =
+                ws.config.current.workspace().groups.iter().enumerate().map(|(index, (name, _))| (index, name));
             tui.overlay = FocusOverlap::Group { selection: entries.collect() }
         }
         Command::RestartTask => {
@@ -995,7 +999,7 @@ fn set_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str, action
                 && let Some(bti) = sel.base_task
             {
                 let task_name = ws.base_tasks[bti.idx()].name.to_string();
-                let profile = sel.job.map(|ji| ws[ji].spawn_profile.clone()).unwrap_or_default();
+                let profile = sel.job.map(|ji| ws[ji].spawn_profile().to_string()).unwrap_or_default();
                 drop(ws);
                 let mut ws = workspace.state.write().unwrap();
                 ws.session_functions.insert(
@@ -1110,11 +1114,11 @@ fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {
     let had_job_selected = sel.job.is_some();
     let Some((base_task, params, profile)) = (if let Some(job_index) = sel.job {
         let job = &ws[job_index];
-        Some((job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone()))
+        Some((job.log_group.base_task_index(), job.spawn_params().clone(), job.spawn_profile().to_string()))
     } else if let Some(bti) = sel.base_task {
         if let Some(&last_ji) = ws.base_tasks[bti.idx()].jobs.all().last() {
             let job = &ws[last_ji];
-            Some((bti, job.spawn_params.clone(), job.spawn_profile.clone()))
+            Some((bti, job.spawn_params().clone(), job.spawn_profile().to_string()))
         } else {
             Some((bti, ValueMap::new(), String::new()))
         }
@@ -1122,7 +1126,7 @@ fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {
         let jobs = ws.jobs_by_kind(kind.task_kind());
         if let Some(&last_ji) = jobs.last() {
             let job = &ws[last_ji];
-            Some((job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone()))
+            Some((job.log_group.base_task_index(), job.spawn_params().clone(), job.spawn_profile().to_string()))
         } else {
             let msg = match kind {
                 MetaGroupKind::Services => "No Service to Restart",
@@ -1164,21 +1168,21 @@ fn spawn_shell_command(script: &str, tui: &mut TuiState, workspace: &Workspace) 
     let ws = workspace.state();
     let mut env_vars: Vec<(Box<str>, Box<str>)> = Vec::new();
 
-    let base_path = ws.config.current.base_path.to_string_lossy();
+    let base_path = ws.config.current.base_path().to_string_lossy();
     env_vars.push(("DEVSM_WORKSPACE_ROOT".into(), base_path.into()));
 
     if let Some(sel) = tui.task_tree.selection_state(&ws) {
         if let Some(bti) = sel.base_task {
-            env_vars.push(("DEVSM_SELECTED_TASK".into(), ws.base_tasks[bti.idx()].name.into()));
+            env_vars.push(("DEVSM_SELECTED_TASK".into(), ws.base_tasks[bti.idx()].name.to_string().into()));
 
             let pwd = if let Some(ji) = sel.job {
-                let tc = ws[ji].task.config();
-                Some(ws.config.current.base_path.join(tc.pwd))
+                let tc = ws[ji].task().config();
+                Some(ws.config.current.base_path().join(tc.pwd))
             } else if let Some(&ji) = ws.base_tasks[bti.idx()].jobs.all().last() {
-                let tc = ws[ji].task.config();
-                Some(ws.config.current.base_path.join(tc.pwd))
+                let tc = ws[ji].task().config();
+                Some(ws.config.current.base_path().join(tc.pwd))
             } else if let crate::config::StringExpr::Literal(lit) = ws.base_tasks[bti.idx()].config.pwd {
-                Some(ws.config.current.base_path.join(lit))
+                Some(ws.config.current.base_path().join(lit))
             } else {
                 None
             };
@@ -1190,7 +1194,7 @@ fn spawn_shell_command(script: &str, tui: &mut TuiState, workspace: &Workspace) 
 
         if let Some(job_index) = sel.job {
             let job = &ws[job_index];
-            env_vars.push(("DEVSM_SELECTED_PROFILE".into(), job.spawn_profile.clone().into()));
+            env_vars.push(("DEVSM_SELECTED_PROFILE".into(), job.spawn_profile().to_string().into()));
             env_vars.push(("DEVSM_SELECTED_STATUS".into(), job_status_str(&job.process_status).into()));
         }
 
@@ -1302,7 +1306,7 @@ fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_
             FocusOverlap::Group { selection } => {
                 kind: "Group",
                 selection: selection.selected::<usize>(),
-                groups: [for (name, _) in ws.config.current.groups; name]
+                groups: [for (name, _) in ws.config.current.workspace().groups; name]
             },
             FocusOverlap::LogSearch { state } => {
                 kind: "LogSearch",

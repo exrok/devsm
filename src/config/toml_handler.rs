@@ -972,14 +972,13 @@ fn parse_functions<'a>(
     Ok(functions.into_bump_slice())
 }
 
-pub fn parse<'a>(
+pub fn parse_with_arena<'a>(
     base_path: &'a std::path::Path,
     alloc: &'a Bump,
     data: &'a str,
+    arena: &'a toml_spanner::Arena,
     re: &mut dyn FnMut(Diagnostic),
 ) -> Result<WorkspaceConfig<'a>, ()> {
-    // todo don't leak this
-    let arena = Box::leak(Box::new(toml_spanner::Arena::new()));
     let value = match toml_spanner::parse(data, arena) {
         Ok(value) => value,
         Err(err) => {
@@ -1070,6 +1069,16 @@ pub fn parse<'a>(
         groups: groups_vec.into_bump_slice(),
         functions,
     })
+}
+
+pub fn parse<'a>(
+    base_path: &'a std::path::Path,
+    alloc: &'a Bump,
+    data: &'a str,
+    re: &mut dyn FnMut(Diagnostic),
+) -> Result<WorkspaceConfig<'a>, ()> {
+    let arena = Box::leak(Box::new(toml_spanner::Arena::new()));
+    parse_with_arena(base_path, alloc, data, arena, re)
 }
 
 #[cfg(test)]

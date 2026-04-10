@@ -241,7 +241,7 @@ fn init_tui_state(test_run: &TestRun, workspace: &Workspace, width: u16, height:
         .iter()
         .map(|tj| {
             let job = &state.jobs[tj.job_index.idx()];
-            let command = format_command(&job.task.config().command);
+            let command = format_command(&job.task().config().command);
             TestDisplay {
                 base_task_index: tj.base_task_index,
                 job_index: tj.job_index,
@@ -288,7 +288,7 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
                     (TestJobStatus::Passed, None)
                 } else {
                     let timeout = if *cause == ExitCause::Timeout {
-                        job.task.config().timeout.as_ref().and_then(|t| t.max.or(t.idle).or(t.conditional))
+                        job.task().config().timeout.as_ref().and_then(|t| t.max.or(t.idle).or(t.conditional))
                     } else {
                         None
                     };
@@ -574,7 +574,7 @@ fn update_test_statuses(
                     (TestJobStatus::Passed, None)
                 } else {
                     let timeout = if *cause == ExitCause::Timeout {
-                        job.task.config().timeout.as_ref().and_then(|t| t.max.or(t.idle).or(t.conditional))
+                        job.task().config().timeout.as_ref().and_then(|t| t.max.or(t.idle).or(t.conditional))
                     } else {
                         None
                     };
@@ -593,8 +593,8 @@ fn update_test_statuses(
                     writeln!(buf, "=== PASS {}", display_name).ok();
                 }
                 TestJobStatus::Failed(code) => {
-                    let base_path = state.config.current.base_path;
-                    let config = job.task.config();
+                    let base_path = state.config.current.base_path();
+                    let config = job.task().config();
                     let mut path = base_path.join(config.pwd);
                     if let Ok(rel_path) = path.canonicalize() {
                         path = rel_path;

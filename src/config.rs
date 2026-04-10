@@ -1,7 +1,11 @@
 use std::{
+    ops::Deref,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::bail;
@@ -187,14 +191,30 @@ pub struct FunctionDef<'a> {
     pub name: &'a str,
     pub action: FunctionDefAction<'a>,
 }
+
+struct EvaluatedTaskConfig {
+    config: TaskConfig<'static>,
+    _bump: Bump,
+    _generation: Option<Arc<ConfigGeneration>>,
+}
+
 #[derive(Clone)]
-pub struct TaskConfigRc(Arc<(TaskConfig<'static>, Bump)>);
+pub struct TaskConfigRc(Arc<EvaluatedTaskConfig>);
 unsafe impl Send for TaskConfigRc {}
 unsafe impl Sync for TaskConfigRc {}
 
 impl TaskConfigRc {
     pub fn config<'a>(&'a self) -> &'a TaskConfig<'a> {
-        unsafe { std::mem::transmute::<&'a TaskConfig<'static>, &'a TaskConfig<'a>>(&self.0.0) }
+        unsafe { std::mem::transmute::<&'a TaskConfig<'static>, &'a TaskConfig<'a>>(&self.0.config) }
+    }
+
+    fn new(config: TaskConfig<'static>, bump: Bump, generation: Option<Arc<ConfigGeneration>>) -> Self {
+        TaskConfigRc(Arc::new(EvaluatedTaskConfig { config, _bump: bump, _generation: generation }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocated_bytes_including_metadata(&self) -> usize {
+        self.0._bump.allocated_bytes_including_metadata()
     }
 }
 
@@ -292,6 +312,7 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+#[cfg(test)]
 pub fn load_workspace_config_capturing(
     config_path: &Path,
     content: &'static str,
@@ -430,6 +451,184 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
     }
 };
 
+static NEXT_CONFIG_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) struct DerivedTestTask {
+    pub(crate) entry_name: Box<str>,
+    pub(crate) display_name: Box<str>,
+    pub(crate) expr: TaskConfigExpr<'static>,
+}
+
+pub struct ConfigGeneration {
+    id: u64,
+    _content: Box<str>,
+    _toml_arena: toml_spanner::Arena,
+    _parse_bump: Bump,
+    _base_path: PathBuf,
+    workspace: WorkspaceConfig<'static>,
+    pub(crate) derived_tests: Vec<DerivedTestTask>,
+}
+
+unsafe impl Send for ConfigGeneration {}
+unsafe impl Sync for ConfigGeneration {}
+
+impl ConfigGeneration {
+    fn new(
+        content: Box<str>,
+        toml_arena: toml_spanner::Arena,
+        parse_bump: Bump,
+        base_path: PathBuf,
+        workspace: WorkspaceConfig<'static>,
+    ) -> Arc<Self> {
+        let mut derived_tests = Vec::new();
+        for (base_name, variants) in workspace.tests {
+            for (variant_index, config) in variants.iter().enumerate() {
+                let (display_name, entry_name): (Box<str>, Box<str>) = if variants.len() == 1 {
+                    ((*base_name).into(), format!("~test/{base_name}").into_boxed_str())
+                } else {
+                    (
+                        format!("{base_name}.{variant_index}").into_boxed_str(),
+                        format!("~test/{base_name}.{variant_index}").into_boxed_str(),
+                    )
+                };
+                derived_tests.push(DerivedTestTask {
+                    entry_name,
+                    display_name,
+                    expr: TaskConfigExpr {
+                        kind: TaskKind::Test,
+                        info: config.info,
+                        pwd: config.pwd,
+                        command: config.command.clone(),
+                        profiles: &[],
+                        envvar: config.envvar,
+                        require: config.require,
+                        cache: config.cache.clone(),
+                        ready: None,
+                        timeout: config.timeout.clone(),
+                        tags: config.tags,
+                        managed: None,
+                        hidden: ServiceHidden::Never,
+                        allow_multiple: AllowMultiple::False,
+                        vars: config.vars,
+                    },
+                });
+            }
+        }
+        Arc::new(Self {
+            id: NEXT_CONFIG_GENERATION_ID.fetch_add(1, Ordering::Relaxed),
+            _content: content,
+            _toml_arena: toml_arena,
+            _parse_bump: parse_bump,
+            _base_path: base_path,
+            workspace,
+            derived_tests,
+        })
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub fn workspace<'a>(&'a self) -> &'a WorkspaceConfig<'a> {
+        unsafe { std::mem::transmute::<&'a WorkspaceConfig<'static>, &'a WorkspaceConfig<'a>>(&self.workspace) }
+    }
+
+    pub fn base_path(&self) -> &Path {
+        self.workspace().base_path
+    }
+
+    fn task_expr(&self, task_index: usize) -> &TaskConfigExpr<'static> {
+        &self.workspace.tasks[task_index].1
+    }
+
+    fn derived_test_expr(&self, derived_index: usize) -> &TaskConfigExpr<'static> {
+        &self.derived_tests[derived_index].expr
+    }
+}
+
+#[derive(Clone)]
+pub enum TaskConfigSource {
+    Static(&'static TaskConfigExpr<'static>),
+    WorkspaceTask { generation: Arc<ConfigGeneration>, task_index: usize },
+    DerivedTest { generation: Arc<ConfigGeneration>, derived_index: usize },
+}
+
+impl TaskConfigSource {
+    pub fn from_workspace_task(generation: Arc<ConfigGeneration>, task_index: usize) -> Self {
+        TaskConfigSource::WorkspaceTask { generation, task_index }
+    }
+
+    pub fn from_derived_test(generation: Arc<ConfigGeneration>, derived_index: usize) -> Self {
+        TaskConfigSource::DerivedTest { generation, derived_index }
+    }
+
+    pub fn generation_id(&self) -> u64 {
+        match self {
+            TaskConfigSource::Static(_) => 0,
+            TaskConfigSource::WorkspaceTask { generation, .. } | TaskConfigSource::DerivedTest { generation, .. } => {
+                generation.id()
+            }
+        }
+    }
+
+    fn generation(&self) -> Option<Arc<ConfigGeneration>> {
+        match self {
+            TaskConfigSource::Static(_) => None,
+            TaskConfigSource::WorkspaceTask { generation, .. } | TaskConfigSource::DerivedTest { generation, .. } => {
+                Some(generation.clone())
+            }
+        }
+    }
+
+    pub fn expr(&self) -> &TaskConfigExpr<'static> {
+        match self {
+            TaskConfigSource::Static(expr) => expr,
+            TaskConfigSource::WorkspaceTask { generation, task_index } => generation.task_expr(*task_index),
+            TaskConfigSource::DerivedTest { generation, derived_index } => generation.derived_test_expr(*derived_index),
+        }
+    }
+
+    pub fn eval(&self, env: &Environment) -> Result<TaskConfigRc, EvalError> {
+        self.expr().eval_with_generation(env, self.generation())
+    }
+}
+
+impl Deref for TaskConfigSource {
+    type Target = TaskConfigExpr<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        self.expr()
+    }
+}
+
+pub fn load_workspace_generation_capturing(
+    config_path: &Path,
+    content: String,
+) -> Result<Arc<ConfigGeneration>, ConfigError> {
+    let elapsed = kvlog::Timer::start();
+    let content = content.into_boxed_str();
+    let toml_arena = toml_spanner::Arena::new();
+    let parse_bump = Bump::new();
+    let base_path = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let file_name = config_path.display().to_string();
+    let mut errors = String::new();
+    match toml_handler::parse_with_arena(&base_path, &parse_bump, &content, &toml_arena, &mut |diagnostic| {
+        errors.push_str(&format_config_error(&file_name, &content, &diagnostic));
+    }) {
+        Ok(value) => {
+            let workspace = unsafe { std::mem::transmute::<WorkspaceConfig<'_>, WorkspaceConfig<'static>>(value) };
+            kvlog::info!("Workspace config loaded", path = config_path.as_os_str().as_bytes(), elapsed);
+            Ok(ConfigGeneration::new(content, toml_arena, parse_bump, base_path, workspace))
+        }
+        Err(_) => {
+            if errors.is_empty() {
+                errors = format!("error: failed to parse {}\n", file_name);
+            }
+            Err(ConfigError { message: errors })
+        }
+    }
+}
+
 pub struct Environment<'a> {
     pub profile: &'a str,
     pub param: jsony_value::ValueMap<'a>,
@@ -483,28 +682,18 @@ pub enum EvalError {
 
 impl TaskConfigExpr<'static> {
     pub fn eval(&self, env: &Environment) -> Result<TaskConfigRc, EvalError> {
-        #[allow(clippy::arc_with_non_send_sync)]
-        let mut new = Arc::new((
-            TaskConfig {
-                pwd: "",
-                command: Command::Cmd(&[]),
-                require: &[],
-                cache: None,
-                ready: None,
-                timeout: None,
-                envvar: &[],
-            },
-            Bump::new(),
-        ));
-        let alloc = Arc::get_mut(&mut new).unwrap();
-        {
-            let env = self.bump_eval(env, &alloc.1)?;
-            unsafe {
-                alloc.0 = std::mem::transmute::<TaskConfig<'_>, TaskConfig<'static>>(env);
-            }
-        }
+        self.eval_with_generation(env, None)
+    }
 
-        Ok(TaskConfigRc(new))
+    fn eval_with_generation(
+        &self,
+        env: &Environment,
+        generation: Option<Arc<ConfigGeneration>>,
+    ) -> Result<TaskConfigRc, EvalError> {
+        let bump = Bump::new();
+        let evaluated = self.bump_eval(env, &bump)?;
+        let config = unsafe { std::mem::transmute::<TaskConfig<'_>, TaskConfig<'static>>(evaluated) };
+        Ok(TaskConfigRc::new(config, bump, generation))
     }
 }
 
@@ -786,6 +975,7 @@ fn first_literal_from_string(expr: &StringExpr<'static>) -> Option<&'static str>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsony_value::ValueMap;
 
     #[test]
     fn cargo_auto_expr_collects_pwd_and_args() {

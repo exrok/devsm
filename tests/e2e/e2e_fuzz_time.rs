@@ -6,9 +6,7 @@
 
 use std::time::Duration;
 
-use crate::harness::{
-    FuzzClock, RpcSubscriber, TestAppServer, TestHarness, find_exit_event, has_job_exit,
-};
+use crate::harness::{FuzzClock, RpcSubscriber, TestAppServer, TestHarness, find_exit_event, has_job_exit};
 use crate::rpc::ExitCause;
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -292,10 +290,7 @@ timeout = {{ idle = 5 }}
         // Total time is 6s, but only 3s since last output — should still be alive.
         // Verify no exit yet by collecting with a short real-time timeout.
         let events = subscriber.collect_until(|evs| has_job_exit(evs, 0), Duration::from_millis(500));
-        assert!(
-            find_exit_event(&events, 0).is_none(),
-            "process should NOT have been killed yet: {events:?}"
-        );
+        assert!(find_exit_event(&events, 0).is_none(), "process should NOT have been killed yet: {events:?}");
 
         // Now advance another 6s without output (total 6s since last output > idle=5).
         clock.advance_secs(6.0);
