@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use extui::event::KeyEvent;
-use extui::{Color, DoubleBuffer, Rect, Style};
+use extui::{AnsiColor, DoubleBuffer, Rect, Style};
 
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 use crate::line_width::{Segment, apply_raw_display_mode_vt_to_style};
@@ -111,7 +111,7 @@ impl ConfigErrorState {
     }
 
     pub fn render(&mut self, out: &mut DoubleBuffer, mut rect: Rect) {
-        let header_style = Color::Red1.with_fg(Color::White);
+        let header_style = AnsiColor::Red1.with_fg(AnsiColor::White);
         let mut header_rect = rect.take_top(1);
         header_rect.with(header_style).fill(out);
 

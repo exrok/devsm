@@ -4,7 +4,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 use extui::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use extui::{Color, DoubleBuffer, HAlign, Rect, Style, TerminalFlags, vt};
+use extui::{AnsiColor, DoubleBuffer, HAlign, Rect, Style, TerminalFlags, vt};
 
 use crate::db::Db;
 use crate::searcher::{Entry, FatSearch};
@@ -189,8 +189,8 @@ fn render(
     scroll_offset: usize,
     items: &[WorkspaceItem],
 ) {
-    let label_style = Color::Grey[16].as_fg();
-    let dim_style = Color::Grey[10].as_fg();
+    let label_style = AnsiColor::Grey[16].as_fg();
+    let dim_style = AnsiColor::Grey[10].as_fg();
 
     let mut rect = frame.rect();
     rect.with(Style::DEFAULT).fill(frame);
@@ -211,7 +211,7 @@ fn render(
         w: 1,
         ..input_rect
     };
-    cursor_rect.with(Color::Grey[28].with_fg(Color::Grey[2])).fill(frame);
+    cursor_rect.with(AnsiColor::Grey[28].with_fg(AnsiColor::Grey[2])).fill(frame);
 
     if results.is_empty() {
         let msg = if pattern.is_empty() { "No workspaces found" } else { "No matches" };
@@ -227,7 +227,7 @@ fn render(
 
         let item = &items[entry.index()];
         let is_selected = i == selected;
-        let style = if is_selected { Color(153).with_fg(Color::Black) } else { Style::DEFAULT };
+        let style = if is_selected { AnsiColor(153).with_fg(AnsiColor::Black) } else { Style::DEFAULT };
         if is_selected {
             row.with(style).fill(frame);
         }

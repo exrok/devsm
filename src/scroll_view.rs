@@ -47,14 +47,14 @@ fn render_single_entry(
     style: &LogStyle,
     highlight: Option<LogHighlight>,
 ) -> u16 {
-    use extui::Color;
+    use extui::AnsiColor;
 
     if max_lines == 0 {
         return 0;
     }
 
     let highlight_info = highlight.filter(|h| h.log_id == log_id);
-    let highlight_style = Color::Grey[25].with_fg(Color::Black);
+    let highlight_style = AnsiColor::Grey[25].with_fg(AnsiColor::Black);
 
     let prefix = style.prefix(entry.log_group);
     let prefix_width = prefix.map(|p| p.width).unwrap_or(0) as u16;

@@ -13,7 +13,7 @@ use std::{
 };
 
 use extui::{
-    Color, TerminalFlags, splat,
+    AnsiColor, TerminalFlags, splat,
     vt::{self, BufferWrite},
 };
 
@@ -340,12 +340,12 @@ fn collect_recent_logs(logs: &crate::log_storage::Logs, log_group: LogGroup, max
     recent.into_iter().collect()
 }
 
-fn status_color(status: TestJobStatus) -> Color {
+fn status_color(status: TestJobStatus) -> AnsiColor {
     match status {
-        TestJobStatus::Pending => Color::Grey[17],
-        TestJobStatus::Running => Color::DarkOliveGreen,
-        TestJobStatus::Passed => Color::SpringGreen,
-        TestJobStatus::Failed(_) => Color::NeonRed,
+        TestJobStatus::Pending => AnsiColor::Grey[17],
+        TestJobStatus::Running => AnsiColor::DarkOliveGreen,
+        TestJobStatus::Passed => AnsiColor::SpringGreen,
+        TestJobStatus::Failed(_) => AnsiColor::NeonRed,
     }
 }
 
@@ -407,7 +407,7 @@ fn render_test_header(buf: &mut Vec<u8>, test: &TestDisplay, _width: u16, row: u
         TestJobStatus::Failed(_) => "FAIL",
     };
 
-    color.with_fg(Color::Black).write_to_buffer(buf);
+    color.with_fg(AnsiColor::Black).write_to_buffer(buf);
     write!(buf, " {} ", status_str).ok();
     buf.extend_from_slice(vt::CLEAR_STYLE);
 
@@ -415,13 +415,13 @@ fn render_test_header(buf: &mut Vec<u8>, test: &TestDisplay, _width: u16, row: u
 
     if let Some(started) = test.started_at {
         let elapsed = test.finished_at.unwrap_or_else(Instant::now).duration_since(started);
-        Color::Grey[14].as_fg().write_to_buffer(buf);
+        AnsiColor::Grey[14].as_fg().write_to_buffer(buf);
         write!(buf, " ({:.1}s)", elapsed.as_secs_f64()).ok();
         buf.extend_from_slice(vt::CLEAR_STYLE);
     }
 
     if let TestJobStatus::Failed(code) = test.status {
-        Color::Grey[14].as_fg().write_to_buffer(buf);
+        AnsiColor::Grey[14].as_fg().write_to_buffer(buf);
         if let Some(timeout_secs) = test.timeout_info {
             write!(buf, " terminated: exceeded timeout of {}", format_duration(timeout_secs)).ok();
         } else {
@@ -430,7 +430,7 @@ fn render_test_header(buf: &mut Vec<u8>, test: &TestDisplay, _width: u16, row: u
         buf.extend_from_slice(vt::CLEAR_STYLE);
     }
 
-    Color::Grey[14].as_fg().write_to_buffer(buf);
+    AnsiColor::Grey[14].as_fg().write_to_buffer(buf);
     write!(buf, " $ {}", test.command).ok();
     buf.extend_from_slice(vt::CLEAR_STYLE);
 }
@@ -452,23 +452,23 @@ fn render_status_line(buf: &mut Vec<u8>, state: &TuiState, row: u16) {
     let pending = state.tests.iter().filter(|t| t.status == TestJobStatus::Pending).count();
     let total = state.tests.len();
 
-    Color::Grey[4].with_fg(Color::Grey[25]).write_to_buffer(buf);
+    AnsiColor::Grey[4].with_fg(AnsiColor::Grey[25]).write_to_buffer(buf);
     write!(buf, " Tests: {}/{} ", passed + failed, total).ok();
 
     if running > 0 {
-        Color::DarkOliveGreen.with_fg(Color::Black).write_to_buffer(buf);
+        AnsiColor::DarkOliveGreen.with_fg(AnsiColor::Black).write_to_buffer(buf);
         write!(buf, " {} running ", running).ok();
     }
     if pending > 0 {
-        Color::Grey[17].with_fg(Color::Black).write_to_buffer(buf);
+        AnsiColor::Grey[17].with_fg(AnsiColor::Black).write_to_buffer(buf);
         write!(buf, " {} pending ", pending).ok();
     }
     if passed > 0 {
-        Color::SpringGreen.with_fg(Color::Black).write_to_buffer(buf);
+        AnsiColor::SpringGreen.with_fg(AnsiColor::Black).write_to_buffer(buf);
         write!(buf, " {} passed ", passed).ok();
     }
     if failed > 0 {
-        Color::NeonRed.with_fg(Color::Black).write_to_buffer(buf);
+        AnsiColor::NeonRed.with_fg(AnsiColor::Black).write_to_buffer(buf);
         write!(buf, " {} failed ", failed).ok();
     }
 
@@ -482,14 +482,14 @@ fn write_color_summary(buf: &mut Vec<u8>, state: &TuiState, workspace: &Workspac
     let passed = state.tests.iter().filter(|t| t.status == TestJobStatus::Passed).count();
     let failed: Vec<_> = state.tests.iter().filter(|t| matches!(t.status, TestJobStatus::Failed(_))).collect();
 
-    splat!(buf, "\n", "Tests: ", Color(2).as_fg(), passed, " passed", vt::CLEAR_STYLE);
+    splat!(buf, "\n", "Tests: ", AnsiColor(2).as_fg(), passed, " passed", vt::CLEAR_STYLE);
     if !failed.is_empty() {
-        splat!(buf, ", ", Color(1).as_fg(), failed.len(), " failed", vt::CLEAR_STYLE);
+        splat!(buf, ", ", AnsiColor(1).as_fg(), failed.len(), " failed", vt::CLEAR_STYLE);
     }
     writeln!(buf, " ({:.1}s)", elapsed.as_secs_f64()).ok();
 
     for test in &failed {
-        splat!(buf, "\n", Color(1).as_fg(), "FAIL ", test.name, vt::CLEAR_STYLE, "\n");
+        splat!(buf, "\n", AnsiColor(1).as_fg(), "FAIL ", test.name, vt::CLEAR_STYLE, "\n");
         splat!(buf, "  Command: ", test.command, "\n");
         if let TestJobStatus::Failed(code) = test.status {
             if let Some(timeout_secs) = test.timeout_info {
@@ -517,17 +517,17 @@ fn write_cancelled_summary(buf: &mut Vec<u8>, state: &TuiState) {
     let running = state.tests.iter().filter(|t| t.status == TestJobStatus::Running).count();
     let pending = state.tests.iter().filter(|t| t.status == TestJobStatus::Pending).count();
 
-    splat!(buf, b'\n', Color(3).as_fg(), "Tests cancelled.", vt::CLEAR_STYLE);
+    splat!(buf, b'\n', AnsiColor(3).as_fg(), "Tests cancelled.", vt::CLEAR_STYLE);
     writeln!(buf, " ({:.1}s)", elapsed.as_secs_f64()).ok();
     buf.extend_from_slice(b"  ");
     if passed > 0 {
-        splat!(buf, Color(2).as_fg(), passed, " passed", vt::CLEAR_STYLE);
+        splat!(buf, AnsiColor(2).as_fg(), passed, " passed", vt::CLEAR_STYLE);
     }
     if failed > 0 {
         if passed > 0 {
             buf.extend_from_slice(b", ");
         }
-        splat!(buf, Color(1).as_fg(), failed, " failed", vt::CLEAR_STYLE);
+        splat!(buf, AnsiColor(1).as_fg(), failed, " failed", vt::CLEAR_STYLE);
     }
     if running > 0 {
         if passed > 0 || failed > 0 {

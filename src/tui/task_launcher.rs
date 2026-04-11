@@ -5,7 +5,7 @@
 //! autocomplete at each stage.
 
 use extui::{
-    Color, DoubleBuffer, Rect, Style,
+    AnsiColor, DoubleBuffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
 use jsony_value::ValueMap;
@@ -456,9 +456,9 @@ impl TaskLauncherState {
         let label = "launch> ";
 
         input_rect
-            .with(Color::Grey[16].as_fg())
+            .with(AnsiColor::Grey[16].as_fg())
             .text(out, label)
-            .with(Color::Cyan1.as_fg())
+            .with(AnsiColor::Cyan1.as_fg())
             .text(out, &prefix)
             .with(Style::DEFAULT)
             .text(out, &self.input);
@@ -466,7 +466,7 @@ impl TaskLauncherState {
         let cursor_x =
             input_rect.x + label.width() as u16 + prefix.width() as u16 + self.input[..self.cursor].width() as u16;
         let cursor_rect = Rect { x: cursor_x, w: 1, ..input_rect };
-        cursor_rect.with(Color::Grey[28].with_fg(Color::Grey[2])).fill(out);
+        cursor_rect.with(AnsiColor::Grey[28].with_fg(AnsiColor::Grey[2])).fill(out);
 
         if self.mode == LauncherMode::Value {
             return;
@@ -495,7 +495,7 @@ impl TaskLauncherState {
             }
 
             let is_selected = i == self.selected;
-            let style = if is_selected { Color(153).with_fg(Color::Black) } else { Style::DEFAULT };
+            let style = if is_selected { AnsiColor(153).with_fg(AnsiColor::Black) } else { Style::DEFAULT };
             if is_selected {
                 entry_rect.with(style).fill(out);
             }
@@ -503,7 +503,7 @@ impl TaskLauncherState {
             match self.mode {
                 LauncherMode::TaskName => {
                     let substyle =
-                        if is_selected { Color::Grey[5].with_bg(Color(153)) } else { Color::Grey[14].as_fg() };
+                        if is_selected { AnsiColor::Grey[5].with_bg(AnsiColor(153)) } else { AnsiColor::Grey[14].as_fg() };
 
                     let Some(task) = self.task_at_entry(entry) else { continue };
                     let kind_str = match task.kind {
@@ -531,7 +531,7 @@ impl TaskLauncherState {
                 }
                 LauncherMode::Variable => {
                     let substyle =
-                        if is_selected { Color::Grey[5].with_bg(Color(153)) } else { Color::Grey[14].as_fg() };
+                        if is_selected { AnsiColor::Grey[5].with_bg(AnsiColor(153)) } else { AnsiColor::Grey[14].as_fg() };
                     let Some(&var) = self
                         .available_variables
                         .iter()

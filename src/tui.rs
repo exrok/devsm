@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use extui::event::{Event, KeyEvent};
 use extui::vt::BufferWrite;
-use extui::{Color, DoubleBuffer, HAlign, Rect, Style, TerminalFlags, vt};
+use extui::{AnsiColor, DoubleBuffer, HAlign, Rect, Style, TerminalFlags, vt};
 use jsony_value::ValueMap;
 
 use crate::config::{FunctionDefAction, TaskKind};
@@ -257,8 +257,9 @@ fn render<'a>(
                 let groups = &ws.config.current.groups;
                 let max_name_width = groups.iter().map(|(name, _)| name.len()).max().unwrap_or(0) + 2;
                 selection.render(&mut tui.frame, task_tree_rect, "group> ", |out, mut rect, idx: usize, selected| {
-                    let style = if selected { Color(153).with_fg(Color::Black) } else { Style::DEFAULT };
-                    let substyle = if selected { Color::Grey[5].with_bg(Color(153)) } else { Color::Grey[14].as_fg() };
+                    let style = if selected { AnsiColor(153).with_fg(AnsiColor::Black) } else { Style::DEFAULT };
+                    let substyle =
+                        if selected { AnsiColor::Grey[5].with_bg(AnsiColor(153)) } else { AnsiColor::Grey[14].as_fg() };
                     if selected {
                         rect.with(style).fill(out);
                     }
@@ -311,7 +312,7 @@ fn render<'a>(
 
 struct StatusBarData {
     mode_name: &'static str,
-    mode_bg: Color,
+    mode_bg: AnsiColor,
     selection_text: String,
     search_info: Option<(usize, usize)>,
     running: usize,
@@ -325,49 +326,51 @@ struct StatusBarData {
 }
 
 fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData) {
-    rect.with(Color::Grey[4].with_fg(Color::Grey[4])).fill(frame);
+    rect.with(AnsiColor::Grey[4].with_fg(AnsiColor::Grey[4])).fill(frame);
 
     let mode_text = format_args!(" {} ", data.mode_name);
-    let mut r = rect.with(data.mode_bg.with_fg(Color::Black)).fmt(frame, mode_text);
+    let mut r = rect.with(data.mode_bg.with_fg(AnsiColor::Black)).fmt(frame, mode_text);
 
     if let Some(label) = &data.chain_label {
         let label_text = format!(" {} ", label);
-        r = r.with(Color::LightGoldenrod1.with_fg(Color::Black)).text(frame, &label_text);
+        r = r.with(AnsiColor::LightGoldenrod1.with_fg(AnsiColor::Black)).text(frame, &label_text);
     } else if !data.selection_text.is_empty() {
-        r = r.with(Color::Grey[8].with_fg(Color::Grey[25])).text(frame, &data.selection_text);
+        r = r.with(AnsiColor::Grey[8].with_fg(AnsiColor::Grey[25])).text(frame, &data.selection_text);
     }
 
     if let Some((selected, total)) = data.search_info {
         let match_text = format_args!(" {}/{} ", selected + 1, total);
-        r = r.with(Color::Grey[6].with_fg(Color::Grey[20])).fmt(frame, match_text);
+        r = r.with(AnsiColor::Grey[6].with_fg(AnsiColor::Grey[20])).fmt(frame, match_text);
     }
 
     if data.is_scrolled {
         let scroll_text = " SCROLL ";
-        r = r.with(Color(215).with_fg(Color::Black)).text(frame, scroll_text);
+        r = r.with(AnsiColor(215).with_fg(AnsiColor::Black)).text(frame, scroll_text);
     }
 
     r = r.with(HAlign::Right);
 
     let view_mode = if data.is_collapsed { "C" } else { "E" };
-    r = r.with(Color::Grey[8].with_fg(Color::Grey[25])).fmt(frame, format_args!(" {} {} ", data.log_mode, view_mode));
+    r = r
+        .with(AnsiColor::Grey[8].with_fg(AnsiColor::Grey[25]))
+        .fmt(frame, format_args!(" {} {} ", data.log_mode, view_mode));
 
     let block_style = if data.running > 0 {
-        Color::DarkOliveGreen.with_fg(Color::Black)
+        AnsiColor::DarkOliveGreen.with_fg(AnsiColor::Black)
     } else if data.scheduled > 0 {
-        Color::Violet.with_fg(Color::Black)
+        AnsiColor::Violet.with_fg(AnsiColor::Black)
     } else {
-        Color::Grey[6].with_fg(Color::Grey[20])
+        AnsiColor::Grey[6].with_fg(AnsiColor::Grey[20])
     };
     r = r.with(block_style).fmt(frame, format_args!(" R:{} S:{} ", data.running, data.scheduled));
 
     if let Some(ts) = &data.test_summary {
         let test_style = if ts.running > 0 || ts.pending > 0 {
-            Color::Cyan1.with_fg(Color::Black)
+            AnsiColor::Cyan1.with_fg(AnsiColor::Black)
         } else if ts.failed > 0 {
-            Color::NeonRed.with_fg(Color::Black)
+            AnsiColor::NeonRed.with_fg(AnsiColor::Black)
         } else {
-            Color::SpringGreen.with_fg(Color::Black)
+            AnsiColor::SpringGreen.with_fg(AnsiColor::Black)
         };
         if ts.running > 0 {
             r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ({}) ", ts.passed, ts.total, ts.running));
@@ -378,8 +381,8 @@ fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData)
 
     if let Some((text, is_error)) = &data.status_message {
         let msg_text = format!(" {} ", text);
-        let fg_color = if *is_error { Color::Salmon } else { Color::Grey[14] };
-        r.with(Color::Grey[4].with_fg(fg_color)).text(frame, &msg_text);
+        let fg_color = if *is_error { AnsiColor::Salmon } else { AnsiColor::Grey[14] };
+        r.with(AnsiColor::Grey[4].with_fg(fg_color)).text(frame, &msg_text);
     }
 }
 
@@ -387,12 +390,12 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
     let ws = workspace.state();
 
     let (mode_name, mode_bg) = match &tui.overlay {
-        FocusOverlap::Group { .. } => ("GROUP", Color::Violet),
-        FocusOverlap::LogSearch { .. } => ("SEARCH", Color::LightSkyBlue1),
-        FocusOverlap::TaskLauncher { .. } => ("LAUNCH", Color::LightGoldenrod2),
-        FocusOverlap::TestFilterLauncher { .. } => ("TEST", Color::Cyan1),
-        FocusOverlap::ConfigError { .. } => ("ERROR", Color::Red1),
-        FocusOverlap::None => ("NORMAL", Color::DarkOliveGreen),
+        FocusOverlap::Group { .. } => ("GROUP", AnsiColor::Violet),
+        FocusOverlap::LogSearch { .. } => ("SEARCH", AnsiColor::LightSkyBlue1),
+        FocusOverlap::TaskLauncher { .. } => ("LAUNCH", AnsiColor::LightGoldenrod2),
+        FocusOverlap::TestFilterLauncher { .. } => ("TEST", AnsiColor::Cyan1),
+        FocusOverlap::ConfigError { .. } => ("ERROR", AnsiColor::Red1),
+        FocusOverlap::None => ("NORMAL", AnsiColor::DarkOliveGreen),
     };
 
     let sel = tui.task_tree.selection_state_readonly(&ws);
@@ -526,7 +529,7 @@ fn render_help_menu(
     }
 
     let header = rect.take_top(1);
-    header.with(Color::Grey[6].with_fg(Color::Grey[25])).fill(frame).skip(1).text(frame, &header_text);
+    header.with(AnsiColor::Grey[6].with_fg(AnsiColor::Grey[25])).fill(frame).skip(1).text(frame, &header_text);
 
     for (input, entry) in bindings.iter().skip(help.scroll) {
         let line_rect = rect.take_top(1);
@@ -538,7 +541,7 @@ fn render_help_menu(
         let display_name = entry.display_name();
 
         let mut styled = line_rect.with(Style::DEFAULT);
-        styled = styled.with(Color::Cyan1.as_fg()).text(frame, &key_str);
+        styled = styled.with(AnsiColor::Cyan1.as_fg()).text(frame, &key_str);
 
         let key_width = key_str.len();
         let pad_width = 10usize.saturating_sub(key_width);
@@ -546,7 +549,7 @@ fn render_help_menu(
             styled = styled.text(frame, " ");
         }
 
-        styled.with(Color::Grey[20].as_fg()).text(frame, display_name);
+        styled.with(AnsiColor::Grey[20].as_fg()).text(frame, display_name);
     }
 }
 
@@ -1142,10 +1145,7 @@ fn spawn_shell_command(script: &str, tui: &mut TuiState, workspace: &Workspace) 
         }
     }
 
-    workspace.process_channel.send(crate::event_loop::ProcessRequest::ShellSpawn {
-        script: script.into(),
-        env_vars,
-    });
+    workspace.process_channel.send(crate::event_loop::ProcessRequest::ShellSpawn { script: script.into(), env_vars });
 }
 
 #[derive(Debug)]

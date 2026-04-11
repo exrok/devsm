@@ -1,4 +1,4 @@
-use extui::{Color, DoubleBuffer, HAlign, Rect};
+use extui::{AnsiColor, DoubleBuffer, HAlign, Rect};
 
 use crate::{
     config::{Command, ServiceHidden, TaskKind},
@@ -72,30 +72,30 @@ impl StatusKind {
         }
     }
 
-    fn dark_bg(self) -> Color {
+    fn dark_bg(self) -> AnsiColor {
         use StatusKind::*;
         match self {
-            Null => Color::Grey[17],
-            Wait => Color::Violet,
-            Live => Color::DarkOliveGreen,
-            Skip => Color::LightGoldenrod2,
-            Done => Color(110),
-            Dead => Color(215),
-            Fail => Color::NeonRed,
-            Pass => Color::SpringGreen,
+            Null => AnsiColor::Grey[17],
+            Wait => AnsiColor::Violet,
+            Live => AnsiColor::DarkOliveGreen,
+            Skip => AnsiColor::LightGoldenrod2,
+            Done => AnsiColor(110),
+            Dead => AnsiColor(215),
+            Fail => AnsiColor::NeonRed,
+            Pass => AnsiColor::SpringGreen,
         }
     }
-    fn light_bg(self) -> Color {
+    fn light_bg(self) -> AnsiColor {
         use StatusKind::*;
         match self {
-            Null => Color::Grey[22],
-            Wait => Color::Thistle,
-            Live => Color::LightSeaGreen,
-            Skip => Color::Wheat1,
-            Done => Color(153),
-            Dead => Color(223),
-            Fail => Color::MistyRose,
-            Pass => Color(157),
+            Null => AnsiColor::Grey[22],
+            Wait => AnsiColor::Thistle,
+            Live => AnsiColor::LightSeaGreen,
+            Skip => AnsiColor::Wheat1,
+            Done => AnsiColor(153),
+            Dead => AnsiColor(223),
+            Fail => AnsiColor::MistyRose,
+            Pass => AnsiColor(157),
         }
     }
     fn padded_text(&self) -> &str {
@@ -513,17 +513,17 @@ impl TaskTreeState {
 
                     line.take_left(6)
                         .with(if is_selected {
-                            status.dark_bg().with_fg(Color::Black)
+                            status.dark_bg().with_fg(AnsiColor::Black)
                         } else {
-                            status.dark_bg().with_bg(Color::Grey[4])
+                            status.dark_bg().with_bg(AnsiColor::Grey[4])
                         })
                         .text(out, status.padded_text());
 
                     let fn_indicator = get_bound_function(ws, task_id);
 
-                    let style = if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() };
+                    let style = if is_selected { status.light_bg().with_fg(AnsiColor(236)) } else { AnsiColor(248).as_fg() };
                     let substyle =
-                        if is_selected { status.light_bg().with_fg(Color::Grey[7]) } else { Color::Grey[16].as_fg() };
+                        if is_selected { status.light_bg().with_fg(AnsiColor::Grey[7]) } else { AnsiColor::Grey[16].as_fg() };
                     let mut rem = line.with(style).fill(out).skip(1);
                     if task.config.kind == TaskKind::Test {
                         rem = rem.with(substyle).text(out, "test/").with(style);
@@ -533,9 +533,9 @@ impl TaskTreeState {
                     if let Some(fn_name) = fn_indicator {
                         rem = rem
                             .with(if is_selected {
-                                status.dark_bg().with_fg(Color::Black)
+                                status.dark_bg().with_fg(AnsiColor::Black)
                             } else {
-                                status.dark_bg().with_bg(Color::Grey[4])
+                                status.dark_bg().with_bg(AnsiColor::Grey[4])
                             })
                             .fmt(out, format_args!(" {} ", fn_name));
                     }
@@ -561,18 +561,18 @@ impl TaskTreeState {
 
                     line.take_left(6)
                         .with(if is_selected {
-                            status.dark_bg().with_fg(Color::Black)
+                            status.dark_bg().with_fg(AnsiColor::Black)
                         } else {
-                            status.dark_bg().with_bg(Color::Grey[4])
+                            status.dark_bg().with_bg(AnsiColor::Grey[4])
                         })
                         .text(out, status.padded_text());
 
-                    let style = if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() };
+                    let style = if is_selected { status.light_bg().with_fg(AnsiColor(236)) } else { AnsiColor(248).as_fg() };
                     let substyle =
-                        if is_selected { status.light_bg().with_fg(Color::Grey[7]) } else { Color::Grey[16].as_fg() };
+                        if is_selected { status.light_bg().with_fg(AnsiColor::Grey[7]) } else { AnsiColor::Grey[16].as_fg() };
 
                     let mut rem = line
-                        .with(if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() })
+                        .with(if is_selected { status.light_bg().with_fg(AnsiColor(236)) } else { AnsiColor(248).as_fg() })
                         .fill(out)
                         .skip(1)
                         .fmt(out, kind.display_name())
@@ -648,15 +648,15 @@ impl TaskTreeState {
 
             let status = StatusKind::of(&job.process_status, bt.config.kind);
             let substyle =
-                if is_selected { status.light_bg().with_fg(Color::Grey[7]) } else { Color::Grey[16].as_fg() };
+                if is_selected { status.light_bg().with_fg(AnsiColor::Grey[7]) } else { AnsiColor::Grey[16].as_fg() };
             line.take_left(6)
                 .with(if is_selected {
-                    status.dark_bg().with_fg(Color::Black)
+                    status.dark_bg().with_fg(AnsiColor::Black)
                 } else {
-                    status.dark_bg().with_bg(Color::Grey[4])
+                    status.dark_bg().with_bg(AnsiColor::Grey[4])
                 })
                 .text(out, status.padded_text());
-            let style = if is_selected { status.light_bg().with_fg(Color(236)) } else { Color(248).as_fg() };
+            let style = if is_selected { status.light_bg().with_fg(AnsiColor(236)) } else { AnsiColor(248).as_fg() };
             let mut rem = line.with(style).fill(out).skip(1);
 
             'no_time: {

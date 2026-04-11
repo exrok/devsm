@@ -1,5 +1,5 @@
 use extui::{
-    Color, DoubleBuffer, Rect, Style,
+    AnsiColor, DoubleBuffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
 use unicode_width::UnicodeWidthStr;
@@ -137,13 +137,13 @@ impl SelectSearch {
         // todo need to scroll text but is probably better to put this in a separate input boxk
         let input_rect = rect.take_top(1);
 
-        input_rect.with(Color::Grey[16].as_fg()).text(out, label).with(Style::DEFAULT).text(out, &self.pattern);
+        input_rect.with(AnsiColor::Grey[16].as_fg()).text(out, label).with(Style::DEFAULT).text(out, &self.pattern);
         let cursor_rect = Rect {
             x: input_rect.x + label.width() as u16 + self.pattern[..self.cursor].width() as u16,
             w: 1,
             ..input_rect
         };
-        cursor_rect.with(Color::Grey[28].with_fg(Color::Grey[2])).fill(out);
+        cursor_rect.with(AnsiColor::Grey[28].with_fg(AnsiColor::Grey[2])).fill(out);
 
         if self.results.is_empty() {
             return;

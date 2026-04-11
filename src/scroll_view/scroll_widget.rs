@@ -333,7 +333,7 @@ impl LogScrollWidget {
         let hl_start = highlight.start as usize;
         let hl_end = hl_start + highlight.len as usize;
 
-        let highlight_style = extui::Color::Grey[25].with_fg(extui::Color::Black);
+        let highlight_style = extui::AnsiColor::Grey[25].with_fg(extui::AnsiColor::Black);
 
         for pos in positions {
             if pos.line < base_skip {

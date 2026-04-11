@@ -133,7 +133,6 @@ dependencies = [
 [[package]]
 name = "extui"
 version = "0.1.2"
-source = "git+https://github.com/exrok/extui?rev=504f4bbb419bb154a083a5f174908dadba8ad9b8#504f4bbb419bb154a083a5f174908dadba8ad9b8"
 dependencies = [
  "bitflags",
  "itoap",

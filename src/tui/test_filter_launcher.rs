@@ -4,7 +4,7 @@
 //! in the format `name +tag -tag` with context-aware autocomplete.
 
 use extui::{
-    Color, DoubleBuffer, Rect, Style,
+    AnsiColor, DoubleBuffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
 use unicode_width::UnicodeWidthStr;
@@ -43,11 +43,11 @@ impl FilterMode {
         }
     }
 
-    fn color(self) -> Color {
+    fn color(self) -> AnsiColor {
         match self {
-            FilterMode::Name => Color::Grey[23],
-            FilterMode::IncludeTag => Color::Green1,
-            FilterMode::ExcludeTag => Color::Red1,
+            FilterMode::Name => AnsiColor::Grey[23],
+            FilterMode::IncludeTag => AnsiColor::Green1,
+            FilterMode::ExcludeTag => AnsiColor::Red1,
         }
     }
 }
@@ -311,9 +311,9 @@ impl TestFilterLauncherState {
         let mode_style = if self.mode == FilterMode::Name { Style::DEFAULT } else { self.mode.color().as_fg() };
 
         input_rect
-            .with(Color::Grey[16].as_fg())
+            .with(AnsiColor::Grey[16].as_fg())
             .text(out, label)
-            .with(Color::Cyan1.as_fg())
+            .with(AnsiColor::Cyan1.as_fg())
             .text(out, &prefix)
             .with(mode_style)
             .text(out, mode_indicator)
@@ -326,7 +326,7 @@ impl TestFilterLauncherState {
             + mode_indicator.width() as u16
             + self.input[..self.cursor].width() as u16;
         let cursor_rect = Rect { x: cursor_x, w: 1, ..input_rect };
-        cursor_rect.with(Color::Grey[28].with_fg(Color::Grey[2])).fill(out);
+        cursor_rect.with(AnsiColor::Grey[28].with_fg(AnsiColor::Grey[2])).fill(out);
 
         if self.results.is_empty() {
             return;
@@ -346,7 +346,7 @@ impl TestFilterLauncherState {
             }
 
             let is_selected = self.selected == Some(i);
-            let style = if is_selected { Color(153).with_fg(Color::Black) } else { Style::DEFAULT };
+            let style = if is_selected { AnsiColor(153).with_fg(AnsiColor::Black) } else { Style::DEFAULT };
             if is_selected {
                 entry_rect.with(style).fill(out);
             }
@@ -355,7 +355,7 @@ impl TestFilterLauncherState {
                 FilterMode::Name => {
                     if let Some(test) = self.tests.get(entry.index()) {
                         let substyle =
-                            if is_selected { Color::Grey[5].with_bg(Color(153)) } else { Color::Grey[14].as_fg() };
+                            if is_selected { AnsiColor::Grey[5].with_bg(AnsiColor(153)) } else { AnsiColor::Grey[14].as_fg() };
                         let r = entry_rect.with(style).text(out, test.name);
                         if !test.tags.is_empty() {
                             let tags_str = test.tags.join(", ");
@@ -366,7 +366,7 @@ impl TestFilterLauncherState {
                 FilterMode::IncludeTag | FilterMode::ExcludeTag => {
                     if let Some(&tag) = self.all_tags.get(entry.index()) {
                         let color = self.mode.color();
-                        let prefix_style = if is_selected { color.with_bg(Color(153)) } else { color.as_fg() };
+                        let prefix_style = if is_selected { color.with_bg(AnsiColor(153)) } else { color.as_fg() };
                         entry_rect.with(prefix_style).text(out, self.mode.prefix()).with(style).text(out, tag);
                     }
                 }

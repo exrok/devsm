@@ -1,5 +1,5 @@
 use extui::{
-    Color, DoubleBuffer, Rect, Style,
+    AnsiColor, DoubleBuffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
 use unicode_width::UnicodeWidthStr;
@@ -312,10 +312,10 @@ impl LogSearchState {
         self.flush();
 
         let input_rect = rect.take_top(1);
-        input_rect.with(Color::Grey[16].as_fg()).text(out, "/").with(Style::DEFAULT).text(out, &self.pattern);
+        input_rect.with(AnsiColor::Grey[16].as_fg()).text(out, "/").with(Style::DEFAULT).text(out, &self.pattern);
 
         let cursor_rect = Rect { x: input_rect.x + 1 + self.pattern[..self.cursor].width() as u16, w: 1, ..input_rect };
-        cursor_rect.with(Color::Grey[28].with_fg(Color::Grey[2])).fill(out);
+        cursor_rect.with(AnsiColor::Grey[28].with_fg(AnsiColor::Grey[2])).fill(out);
 
         if self.matches.is_empty() {
             return;
@@ -338,8 +338,8 @@ impl LogSearchState {
             let entry = indexer[log_match.log_id];
             let text = unsafe { entry.text(logs) };
 
-            let base_style = if is_selected { Color::LightSkyBlue1.with_fg(Color::Black) } else { Style::DEFAULT };
-            let highlight_style = Color::Grey[25].with_fg(Color::Black);
+            let base_style = if is_selected { AnsiColor::LightSkyBlue1.with_fg(AnsiColor::Black) } else { Style::DEFAULT };
+            let highlight_style = AnsiColor::Grey[25].with_fg(AnsiColor::Black);
 
             if is_selected {
                 entry_rect.with(base_style).fill(out);

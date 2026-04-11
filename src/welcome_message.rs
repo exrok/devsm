@@ -35,12 +35,12 @@ fn line_width(line: &WelcomeLine) -> usize {
 }
 
 fn render_line(buf: &mut Vec<u8>, line: &WelcomeLine) {
-    use extui::{Color, splat};
+    use extui::{AnsiColor, splat};
 
-    let section_style = Color::Grey[18].as_fg();
-    let text_style = Color::Grey[14].as_fg();
-    let key_style = Color::Grey[23].as_fg();
-    let desc_style = Color::Grey[14].as_fg();
+    let section_style = AnsiColor::Grey[18].as_fg();
+    let text_style = AnsiColor::Grey[14].as_fg();
+    let key_style = AnsiColor::Grey[23].as_fg();
+    let desc_style = AnsiColor::Grey[14].as_fg();
 
     match line {
         WelcomeLine::Text(s) | WelcomeLine::Dynamic(s) => splat!(buf, text_style, *s),
