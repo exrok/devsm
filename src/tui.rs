@@ -8,7 +8,7 @@ use extui::vt::BufferWrite;
 use extui::{AnsiColor, DoubleBuffer, HAlign, Rect, Style, TerminalFlags, vt};
 use jsony_value::ValueMap;
 
-use crate::config::{FunctionDefAction, TaskKind};
+use crate::config::TaskKind;
 use crate::event_loop::{Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_TESTS};
 use crate::function::{FunctionAction, SetFunctionAction};
 use crate::keybinds::{BindingEntry, Command, InputEvent, Keybinds, Mode};
@@ -20,7 +20,7 @@ use crate::tui::task_launcher::LauncherMode;
 use crate::tui::task_launcher::{LauncherAction, TaskLauncherState};
 use crate::tui::task_tree::{MetaGroupKind, SelectionState, TaskTreeState};
 use crate::tui::test_filter_launcher::{TestFilterAction, TestFilterLauncherState};
-use crate::workspace::{BaseTaskIndex, Workspace, WorkspaceState};
+use crate::workspace::{BaseTaskIndex, FunctionGlobalAction, SpawnSpec, Workspace, WorkspaceState};
 
 /// Constrains scroll offset to keep the selected item visible with padding.
 ///
@@ -621,16 +621,18 @@ fn process_key(
                         let mut ws1 = workspace.state.write().unwrap();
                         let ws = &mut *ws1;
                         if let Some((_, tasks)) = ws.config.current.groups.get(group) {
-                            let mut new_tasks = Vec::new();
-                            for task in *tasks {
-                                if let Some(bti) = ws.base_index_by_name(&task.name) {
-                                    new_tasks.push((bti, task.vars.clone(), task.profile.unwrap_or_default()));
-                                }
-                            }
+                            use crate::workspace::TaskSpec;
+                            let spec = SpawnSpec {
+                                tasks: tasks.iter().map(|task| TaskSpec {
+                                    name: task.name.to_string(),
+                                    profile: task.profile.unwrap_or_default().to_string(),
+                                    params: task.vars.clone().to_owned(),
+                                    force_restart: false,
+                                }).collect(),
+                                test_group: false,
+                            };
                             drop(ws1);
-                            for (task, vars, profile) in new_tasks {
-                                workspace.start_task(task, vars, profile);
-                            }
+                            let _ = workspace.submit(spec);
                             tui.status_message = Some(StatusMessage::info("Group Started"));
                         }
                     }
@@ -670,8 +672,9 @@ fn process_key(
                     tui.overlay = FocusOverlap::None;
                 }
                 LauncherAction::Start { base_task, profile, params } => {
+                    let name = ws.base_tasks[base_task.idx()].name.to_string();
                     drop(ws);
-                    workspace.start_task(base_task, params, &profile);
+                    let _ = workspace.submit(SpawnSpec::task(&name, &profile, params, false));
                     tui.overlay = FocusOverlap::None;
                     tui.status_message = Some(StatusMessage::info("Task Spawned"));
                 }
@@ -832,8 +835,9 @@ fn process_key(
                 let mut state = TaskLauncherState::with_task(&ws, bti);
                 match state.try_auto_start(&ws) {
                     LauncherAction::Start { base_task, profile, params } => {
+                        let name = ws.base_tasks[base_task.idx()].name.to_string();
                         drop(ws);
-                        workspace.start_task(base_task, params, &profile);
+                        let _ = workspace.submit(SpawnSpec::task(&name, &profile, params, false));
                     }
                     _ => tui.overlay = FocusOverlap::TaskLauncher { state },
                 }
@@ -909,66 +913,17 @@ fn process_key(
 }
 
 fn call_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str) {
-    workspace.refresh_config_if_changed();
-    let ws = workspace.state();
-    if let Some(FunctionAction::RestartCaptured { task_name, profile }) = ws.session_functions.get(fn_name) {
-        let task_name = task_name.clone();
-        let profile = profile.clone();
-        if let Some(&bti) = ws.name_map.get(task_name.as_str()) {
-            drop(ws);
-            workspace.restart_task(bti, ValueMap::new(), &profile);
-            tui.status_message = Some(StatusMessage::info(format!("{} restarted {}", fn_name, task_name)));
-        } else {
-            tui.status_message = Some(StatusMessage::error(format!("{} task '{}' not found", fn_name, task_name)));
+    match workspace.call_function(fn_name) {
+        Ok(Some(FunctionGlobalAction::RestartSelected)) => {
+            restart_selected_task(tui, workspace);
         }
-        return;
-    }
-
-    for func_def in ws.config.current.functions {
-        if func_def.name == fn_name {
-            match &func_def.action {
-                FunctionDefAction::Restart { task } => {
-                    let task_name = *task;
-                    if let Some(&bti) = ws.name_map.get(task_name) {
-                        drop(ws);
-                        workspace.restart_task(bti, ValueMap::new(), "");
-                        tui.status_message = Some(StatusMessage::info(format!("{} restarted {}", fn_name, task_name)));
-                    } else {
-                        tui.status_message =
-                            Some(StatusMessage::error(format!("{} task '{}' not found", fn_name, task_name)));
-                    }
-                }
-                FunctionDefAction::Kill { task } => {
-                    let task_name = *task;
-                    if let Some(&bti) = ws.name_map.get(task_name) {
-                        drop(ws);
-                        workspace.terminate_tasks(bti);
-                        tui.status_message = Some(StatusMessage::info(format!("{} killed {}", fn_name, task_name)));
-                    } else {
-                        tui.status_message =
-                            Some(StatusMessage::error(format!("{} task '{}' not found", fn_name, task_name)));
-                    }
-                }
-                FunctionDefAction::Spawn { tasks } => {
-                    drop(ws);
-                    for call in *tasks {
-                        if let Some(&bti) = workspace.state().name_map.get(&*call.name) {
-                            let profile = call.profile.unwrap_or("");
-                            workspace.start_task(bti, call.vars.clone(), profile);
-                        }
-                    }
-                    tui.status_message = Some(StatusMessage::info(format!("{} spawned tasks", fn_name)));
-                }
-                FunctionDefAction::RestartSelected => {
-                    drop(ws);
-                    restart_selected_task(tui, workspace);
-                }
-            }
-            return;
+        Ok(None) => {
+            tui.status_message = Some(StatusMessage::info(format!("{} executed", fn_name)));
+        }
+        Err(e) => {
+            tui.status_message = Some(StatusMessage::error(e));
         }
     }
-
-    tui.status_message = Some(StatusMessage::error(format!("{} not configured", fn_name)));
 }
 
 fn set_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str, action: SetFunctionAction) {
@@ -1118,11 +1073,15 @@ fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {
     }) else {
         return;
     };
+    let name = ws.base_tasks[base_task.idx()].name.to_string();
     drop(ws);
-    let new_job = workspace.restart_task(base_task, params, &profile);
-    if had_job_selected {
-        let ws = workspace.state();
-        tui.task_tree.select_job(new_job, &ws);
+    if let Ok(result) = workspace.submit(SpawnSpec::task(&name, &profile, params, true)) {
+        if had_job_selected {
+            if let Some(&(_, ji)) = result.jobs.first() {
+                let ws = workspace.state();
+                tui.task_tree.select_job(ji, &ws);
+            }
+        }
     }
     tui.status_message = Some(StatusMessage::info("Task Restarted"));
 }

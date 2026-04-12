@@ -1240,28 +1240,28 @@ impl EventLoop {
         params: Vec<u8>,
         as_test: bool,
     ) {
-        let params: ValueMap = jsony::from_binary(&params).unwrap_or_else(|_| ValueMap::new());
+        let params = jsony::from_binary::<ValueMap>(&params).unwrap_or_else(|_| ValueMap::new()).to_owned();
         let (name, profile) = task_name.rsplit_once(":").unwrap_or((task_name, ""));
 
         let ws = &self.state.workspaces[ws_index as usize];
-        let (base_index, job_index) = match ws.handle.start_task_by_name(name, params, profile) {
+
+        let mut spec = workspace::SpawnSpec::task(name, profile, params, false);
+        spec.test_group = as_test;
+        let result = match ws.handle.submit(spec) {
             Ok(result) => result,
             Err(e) => {
                 let _ = std::io::Write::write_all(&mut stdout, format!("{e}\n").as_bytes());
                 return;
             }
         };
+        let Some(&(_, job_index)) = result.jobs.first() else {
+            let _ = std::io::Write::write_all(&mut stdout, b"No job created\n");
+            return;
+        };
         let job_id = {
             let state = ws.handle.state.read().unwrap();
             state[job_index].log_group
         };
-
-        if as_test {
-            let mut state = ws.handle.state.write().unwrap();
-            let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
-            state.last_test_group =
-                Some(workspace::TestGroup { group_id, base_tasks: vec![base_index], job_indices: vec![job_index] });
-        }
         let forwarder_socket = socket.try_clone().ok();
         let (index, channel) = self.register_client(socket, ws_index, ClientKind::Run { log_group: job_id }, None);
         let ws = &self.state.workspaces[ws_index as usize]; // require ws to allow register_client to run

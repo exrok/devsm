@@ -479,6 +479,13 @@ pub struct TestRun {
     pub test_jobs: Vec<TestJob>,
 }
 
+struct MatchedTest {
+    base_task_idx: BaseTaskIndex,
+    task_config: TaskConfigRc,
+    spawn_profile: String,
+    spawn_params: ValueMap<'static>,
+}
+
 /// Checks if a running service job matches the required profile and parameters.
 fn service_matches_require(job: &Job, require_profile: &str, require_params: &ValueMap) -> bool {
     if !require_profile.is_empty() && job.spawn_profile != require_profile {
@@ -825,24 +832,17 @@ impl WorkspaceState {
         }
     }
 
-    fn spawn_task(
+    fn plan_conflicts(
         &mut self,
-        workspace_id: u32,
-        channel: &MioChannel,
         base_task: BaseTaskIndex,
-        params: ValueMap,
         profile: &str,
-        reason: ScheduleReason,
         force_restart: bool,
-    ) -> JobIndex {
+        channel: &MioChannel,
+    ) -> Vec<ScheduleRequirement> {
         let bt = &mut self.base_tasks[base_task.idx()];
-        let profile = if profile.is_empty() { bt.config.profiles.first().copied().unwrap_or("") } else { profile };
-        bt.update_profile_tracking(profile);
-        let mut pred = Vec::new();
-
         let task_kind = bt.config.kind;
-        let task_name = bt.name;
         let allow_multiple = if force_restart { AllowMultiple::False } else { bt.config.allow_multiple };
+        let mut pred = Vec::new();
 
         match allow_multiple {
             AllowMultiple::False => {
@@ -869,49 +869,16 @@ impl WorkspaceState {
                     });
                 }
             }
-            AllowMultiple::True => {
-                // No killing — new instance spawns alongside existing ones.
-            }
-            AllowMultiple::DistinctProfiles => {
-                // Kill instances with the SAME profile. Keep different-profile instances.
-                let to_cancel: Vec<_> =
-                    bt.jobs.scheduled().iter().filter(|ji| self.jobs[ji.idx()].spawn_profile == profile).copied().collect();
-                for job_index in &to_cancel {
-                    self.jobs[job_index.idx()].process_status = JobStatus::Cancelled;
-                    let bt = &mut self.base_tasks[base_task.idx()];
-                    bt.jobs.set_terminal(*job_index);
-                    match task_kind {
-                        TaskKind::Action => self.action_jobs.set_terminal(*job_index),
-                        TaskKind::Test => self.test_jobs.set_terminal(*job_index),
-                        TaskKind::Service => self.service_jobs.set_terminal(*job_index),
-                    }
-                    self.service_dependents.remove_from_all(*job_index);
-                }
-
-                let to_terminate: Vec<_> = self.base_tasks[base_task.idx()]
+            AllowMultiple::True => {}
+            AllowMultiple::DistinctProfiles | AllowMultiple::SingleProfile => {
+                let match_same = matches!(allow_multiple, AllowMultiple::DistinctProfiles);
+                let to_cancel: Vec<_> = self.base_tasks[base_task.idx()]
                     .jobs
-                    .running()
+                    .scheduled()
                     .iter()
-                    .filter(|ji| self.jobs[ji.idx()].spawn_profile == profile)
+                    .filter(|ji| (self.jobs[ji.idx()].spawn_profile == profile) == match_same)
                     .copied()
                     .collect();
-                for job_index in to_terminate {
-                    let job = &self.jobs[job_index.idx()];
-                    let JobStatus::Running { process_index, .. } = &job.process_status else {
-                        continue;
-                    };
-                    pred.push(ScheduleRequirement { job: job_index, predicate: JobPredicate::Terminated });
-                    channel.send(crate::event_loop::ProcessRequest::TerminateJob {
-                        job_id: job.log_group,
-                        process_index: *process_index,
-                        exit_cause: ExitCause::Restarted,
-                    });
-                }
-            }
-            AllowMultiple::SingleProfile => {
-                // Kill instances with DIFFERENT profiles. Keep same-profile instances.
-                let to_cancel: Vec<_> =
-                    bt.jobs.scheduled().iter().filter(|ji| self.jobs[ji.idx()].spawn_profile != profile).copied().collect();
                 for job_index in &to_cancel {
                     self.jobs[job_index.idx()].process_status = JobStatus::Cancelled;
                     let bt = &mut self.base_tasks[base_task.idx()];
@@ -928,7 +895,7 @@ impl WorkspaceState {
                     .jobs
                     .running()
                     .iter()
-                    .filter(|ji| self.jobs[ji.idx()].spawn_profile != profile)
+                    .filter(|ji| (self.jobs[ji.idx()].spawn_profile == profile) == match_same)
                     .copied()
                     .collect();
                 for job_index in to_terminate {
@@ -946,13 +913,35 @@ impl WorkspaceState {
             }
         }
 
+        pred
+    }
+
+    fn spawn_task(
+        &mut self,
+        workspace_id: u32,
+        channel: &MioChannel,
+        base_task: BaseTaskIndex,
+        params: ValueMap,
+        profile: &str,
+        reason: ScheduleReason,
+        force_restart: bool,
+    ) -> JobIndex {
+        let bt = &mut self.base_tasks[base_task.idx()];
+        let profile = if profile.is_empty() { bt.config.profiles.first().copied().unwrap_or("") } else { profile };
+        bt.update_profile_tracking(profile);
+
+        let mut pred = self.plan_conflicts(base_task, profile, force_restart, channel);
+
         let bt = &mut self.base_tasks[base_task.idx()];
         let task = bt.config.eval(&Environment { profile, param: params.clone(), vars: bt.config.vars }).unwrap();
 
-        'outer: for dep_call in task.config().require {
+        let mut batch: SpawnBatch<()> = SpawnBatch::new();
+        let mut req_keys = Vec::new();
+
+        for dep_call in task.config().require {
             let dep_name = &*dep_call.name;
             let dep_profile = dep_call.profile.unwrap_or("");
-            let dep_params = dep_call.vars.clone();
+            let dep_params = dep_call.vars.clone().to_owned();
 
             let Some(&dep_base_task) = self.name_map.get(dep_name) else {
                 kvlog::error!("unknown alias", dep_name);
@@ -960,111 +949,25 @@ impl WorkspaceState {
             };
             let dep_config = &self.base_tasks[dep_base_task.idx()].config;
 
-            match dep_config.kind {
-                TaskKind::Action => {
-                    let Some(cache_config) = dep_config.cache.as_ref() else {
-                        let new_job = self.spawn_task(
-                            workspace_id,
-                            channel,
-                            dep_base_task,
-                            dep_params.clone(),
-                            dep_profile,
-                            ScheduleReason::Dependency,
-                            false,
-                        );
-                        pred.push(ScheduleRequirement {
-                            job: new_job,
-                            predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
-                        });
-                        continue;
-                    };
+            let predicate = match dep_config.kind {
+                TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
+                TaskKind::Service => JobPredicate::Active,
+                TaskKind::Test => continue,
+            };
 
-                    if cache_config.never {
-                        let new_job = self.spawn_task(
-                            workspace_id,
-                            channel,
-                            dep_base_task,
-                            dep_params,
-                            dep_profile,
-                            ScheduleReason::Dependency,
-                            false,
-                        );
-                        pred.push(ScheduleRequirement {
-                            job: new_job,
-                            predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
-                        });
-                        continue;
-                    }
+            let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
+            req_keys.push((key, predicate));
+        }
 
-                    let expected_cache_key =
-                        self.compute_cache_key_with_require(cache_config.key, dep_profile, &dep_params);
-                    let spawner = &self.base_tasks[dep_base_task.idx()];
+        self.resolve_batch_requirements(workspace_id, channel, &mut batch);
 
-                    let mut found_pending = None;
-                    for ji in spawner.jobs.all().iter().rev() {
-                        let job = &self[*ji];
-                        if matches!(job.process_status, JobStatus::Cancelled) {
-                            continue;
-                        }
-                        if job.process_status.is_successful_completion() {
-                            if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
-                                continue 'outer;
-                            }
-                            continue;
-                        }
-                        if job.process_status.is_pending_completion() {
-                            if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
-                                found_pending = Some(*ji);
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-                    if let Some(pending_job) = found_pending {
-                        pred.push(ScheduleRequirement {
-                            job: pending_job,
-                            predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
-                        });
-                        continue 'outer;
-                    }
-                    let new_job = self.spawn_task(
-                        workspace_id,
-                        channel,
-                        dep_base_task,
-                        dep_params,
-                        dep_profile,
-                        ScheduleReason::Dependency,
-                        false,
-                    );
-                    pred.push(ScheduleRequirement {
-                        job: new_job,
-                        predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
-                    });
+        for (key, predicate) in &req_keys {
+            match batch.get_resolved(key) {
+                Some(ResolvedRequirement::Cached) => {}
+                Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
+                    pred.push(ScheduleRequirement { job: *ji, predicate: predicate.clone() });
                 }
-                TaskKind::Service => {
-                    let cache_never = dep_config.cache.as_ref().is_some_and(|c| c.never);
-                    if !cache_never {
-                        let spawner = &self.base_tasks[dep_base_task.idx()];
-                        for &ji in spawner.jobs.running() {
-                            let job = &self[ji];
-                            if service_matches_require(job, dep_profile, &dep_params) {
-                                pred.push(ScheduleRequirement { job: ji, predicate: JobPredicate::Active });
-                                continue 'outer;
-                            }
-                        }
-                    }
-                    let new_job = self.spawn_task(
-                        workspace_id,
-                        channel,
-                        dep_base_task,
-                        dep_params,
-                        dep_profile,
-                        ScheduleReason::Dependency,
-                        false,
-                    );
-                    pred.push(ScheduleRequirement { job: new_job, predicate: JobPredicate::Active });
-                }
-                TaskKind::Test => {}
+                None => {}
             }
         }
 
@@ -1074,56 +977,7 @@ impl WorkspaceState {
             .as_ref()
             .map_or(String::new(), |c| self.compute_cache_key_with_require(c.key, profile, &params));
 
-        let job_index = JobIndex(self.jobs.len() as u32);
-        let bt = &mut self.base_tasks[base_task.idx()];
-        let pc = bt.jobs.len();
-        let job_id = LogGroup::new(base_task, pc);
-
-        let spawn = pred.is_empty();
-        let task_kind = bt.config.kind;
-        if task_kind == TaskKind::Service {
-            bt.has_run_this_session = true;
-        }
-        if spawn {
-            bt.jobs.push_active(job_index);
-        } else {
-            bt.jobs.push_scheduled(job_index);
-        }
-
-        let global_list = match task_kind {
-            TaskKind::Action => Some(&mut self.action_jobs),
-            TaskKind::Test => Some(&mut self.test_jobs),
-            TaskKind::Service => Some(&mut self.service_jobs),
-        };
-        if let Some(list) = global_list {
-            if spawn {
-                list.push_active(job_index);
-            } else {
-                list.push_scheduled(job_index);
-            }
-        }
-
-        for req in &pred {
-            if matches!(req.predicate, JobPredicate::Active) {
-                self.service_dependents.add_dependent(req.job, job_index);
-            }
-        }
-
-        self.jobs.push(Job {
-            process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
-            log_group: job_id,
-            task: task.clone(),
-            started_at: crate::clock::now(),
-            cache_key,
-            spawn_profile: profile.to_string(),
-            spawn_params: params.to_owned(),
-        });
-        if spawn {
-            channel.send(crate::event_loop::ProcessRequest::Spawn { task, job_index, workspace_id, job_id });
-        } else {
-            kvlog::info!("Job scheduled", task_name, job_index, reason = reason.name());
-        }
-        job_index
+        self.create_job(base_task, task, profile, params, pred, cache_key, channel, workspace_id, reason)
     }
 
     /// Schedule a queued service that waits for a blocking service to terminate.
@@ -1137,38 +991,94 @@ impl WorkspaceState {
         params: ValueMap,
         profile: &str,
         blocked_by: JobIndex,
+        channel: &MioChannel,
+        workspace_id: u32,
     ) -> JobIndex {
-        let (task_name, task, pc) = {
+        let task = {
             let spawner = &self.base_tasks[base_task.idx()];
-            let profile =
+            let eval_profile =
                 if profile.is_empty() { spawner.config.profiles.first().copied().unwrap_or("") } else { profile };
-            let env = Environment { profile, param: params.clone(), vars: spawner.config.vars };
-            let task = spawner.config.eval(&env).expect("Failed to eval queued service config");
-            (spawner.name, task, spawner.jobs.len())
+            let env = Environment { profile: eval_profile, param: params.clone(), vars: spawner.config.vars };
+            spawner.config.eval(&env).expect("Failed to eval queued service config")
         };
 
         let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
+        let requirements = vec![ScheduleRequirement { job: blocked_by, predicate: JobPredicate::Terminated }];
 
+        self.create_job(
+            base_task,
+            task,
+            profile,
+            params,
+            requirements,
+            cache_key,
+            channel,
+            workspace_id,
+            ScheduleReason::ProfileConflict,
+        )
+    }
+
+    fn create_job(
+        &mut self,
+        base_task: BaseTaskIndex,
+        task: TaskConfigRc,
+        profile: &str,
+        params: ValueMap,
+        requirements: Vec<ScheduleRequirement>,
+        cache_key: String,
+        channel: &MioChannel,
+        workspace_id: u32,
+        reason: ScheduleReason,
+    ) -> JobIndex {
         let job_index = JobIndex(self.jobs.len() as u32);
+        let bt = &mut self.base_tasks[base_task.idx()];
+        let task_name = bt.name;
+        let pc = bt.jobs.len();
         let job_id = LogGroup::new(base_task, pc);
 
-        let after = vec![ScheduleRequirement { job: blocked_by, predicate: JobPredicate::Terminated }];
+        let spawn = requirements.is_empty();
+        let task_kind = bt.config.kind;
+        if task_kind == TaskKind::Service {
+            bt.has_run_this_session = true;
+        }
+        if spawn {
+            bt.jobs.push_active(job_index);
+        } else {
+            bt.jobs.push_scheduled(job_index);
+        }
 
-        let base_task_mut = &mut self.base_tasks[base_task.idx()];
-        base_task_mut.jobs.push_scheduled(job_index);
-        self.service_jobs.push_scheduled(job_index);
+        let global_list = match task_kind {
+            TaskKind::Action => &mut self.action_jobs,
+            TaskKind::Test => &mut self.test_jobs,
+            TaskKind::Service => &mut self.service_jobs,
+        };
+        if spawn {
+            global_list.push_active(job_index);
+        } else {
+            global_list.push_scheduled(job_index);
+        }
+
+        for req in &requirements {
+            if matches!(req.predicate, JobPredicate::Active) {
+                self.service_dependents.add_dependent(req.job, job_index);
+            }
+        }
 
         self.jobs.push(Job {
-            process_status: JobStatus::Scheduled { after },
+            process_status: if spawn { JobStatus::Starting } else { JobStatus::Scheduled { after: requirements } },
             log_group: job_id,
-            task,
+            task: task.clone(),
             started_at: crate::clock::now(),
             cache_key,
             spawn_profile: profile.to_string(),
             spawn_params: params.to_owned(),
         });
 
-        kvlog::info!("Job scheduled", task_name, job_index, reason = ScheduleReason::ProfileConflict.name());
+        if spawn {
+            channel.send(crate::event_loop::ProcessRequest::Spawn { task, job_index, workspace_id, job_id });
+        } else {
+            kvlog::info!("Job scheduled", task_name, job_index, reason = reason.name());
+        }
 
         job_index
     }
@@ -1235,8 +1145,15 @@ impl WorkspaceState {
             return Err(format!("Task '{}' not found", name));
         };
         self.change_number = self.change_number.wrapping_add(1);
-        let job_index =
-            self.spawn_task(workspace_id, channel, base_index, params, profile, ScheduleReason::Requested, force_restart);
+        let job_index = self.spawn_task(
+            workspace_id,
+            channel,
+            base_index,
+            params,
+            profile,
+            ScheduleReason::Requested,
+            force_restart,
+        );
         Ok((base_index, job_index))
     }
 
@@ -1359,11 +1276,6 @@ impl WorkspaceState {
         Ok(msg)
     }
 
-    /// Layer 2: Record a single task spawn as a test group.
-    pub fn record_test_group(&mut self, base_index: BaseTaskIndex, job_index: JobIndex) {
-        let group_id = self.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
-        self.last_test_group = Some(TestGroup { group_id, base_tasks: vec![base_index], job_indices: vec![job_index] });
-    }
 }
 impl std::ops::IndexMut<JobIndex> for WorkspaceState {
     fn index_mut(&mut self, index: JobIndex) -> &mut Self::Output {
@@ -1627,8 +1539,15 @@ impl WorkspaceState {
                         continue;
                     }
 
-                    let new_job =
-                        self.spawn_task(workspace_id, channel, base_task, params, &profile, ScheduleReason::Dependency, false);
+                    let new_job = self.spawn_task(
+                        workspace_id,
+                        channel,
+                        base_task,
+                        params,
+                        &profile,
+                        ScheduleReason::Dependency,
+                        false,
+                    );
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Service => {
@@ -1647,7 +1566,14 @@ impl WorkspaceState {
                                     running_profile,
                                     requested_profile,
                                 );
-                                let queued_job = self.schedule_queued_service(base_task, params, &profile, running_job);
+                                let queued_job = self.schedule_queued_service(
+                                    base_task,
+                                    params,
+                                    &profile,
+                                    running_job,
+                                    channel,
+                                    workspace_id,
+                                );
                                 batch.mark_resolved(key, ResolvedRequirement::Pending(queued_job));
                                 continue;
                             }
@@ -1655,8 +1581,15 @@ impl WorkspaceState {
                         }
                     }
 
-                    let new_job =
-                        self.spawn_task(workspace_id, channel, base_task, params, &profile, ScheduleReason::Dependency, false);
+                    let new_job = self.spawn_task(
+                        workspace_id,
+                        channel,
+                        base_task,
+                        params,
+                        &profile,
+                        ScheduleReason::Dependency,
+                        false,
+                    );
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Test => {
@@ -1664,6 +1597,166 @@ impl WorkspaceState {
                 }
             }
         }
+    }
+
+    fn run_test_batch(
+        &mut self,
+        matched_tests: Vec<MatchedTest>,
+        run_id: u32,
+        channel: &MioChannel,
+        workspace_id: u32,
+    ) -> Result<TestRun, String> {
+        struct TestRequirements {
+            base_task_idx: BaseTaskIndex,
+            task_config: TaskConfigRc,
+            spawn_profile: String,
+            spawn_params: ValueMap<'static>,
+            requirements: Vec<(RequirementKey, JobPredicate)>,
+        }
+
+        let mut batch: SpawnBatch<TestRequirements> = SpawnBatch::new();
+
+        for matched in matched_tests {
+            let task_config = &matched.task_config;
+            let mut requirements = Vec::new();
+
+            let mut service_profiles: hashbrown::HashMap<BaseTaskIndex, String> = hashbrown::HashMap::new();
+            let mut services_to_check: Vec<(String, String)> = task_config
+                .config()
+                .require
+                .iter()
+                .filter_map(|tc| {
+                    let dep_name = &*tc.name;
+                    let dep_base_task = self.name_map.get(dep_name)?;
+                    let dep_config = &self.base_tasks[dep_base_task.idx()].config;
+                    if dep_config.kind == TaskKind::Service {
+                        Some((dep_name.to_string(), tc.profile.unwrap_or("").to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let mut visited_services: hashbrown::HashSet<BaseTaskIndex> = hashbrown::HashSet::new();
+
+            while let Some((dep_name, dep_profile)) = services_to_check.pop() {
+                let Some(&dep_base_task) = self.name_map.get(&*dep_name) else {
+                    continue;
+                };
+                let dep_config = &self.base_tasks[dep_base_task.idx()].config;
+
+                if let Some(existing_profile) = service_profiles.get(&dep_base_task) {
+                    if *existing_profile != dep_profile {
+                        let test_name = self.base_tasks[matched.base_task_idx.idx()].name;
+                        let service_name = self.base_tasks[dep_base_task.idx()].name;
+                        return Err(format!(
+                            "Test '{}' has conflicting service requirements: '{}:{}' and '{}:{}'",
+                            test_name, service_name, existing_profile, service_name, dep_profile
+                        ));
+                    }
+                    continue;
+                }
+                service_profiles.insert(dep_base_task, dep_profile.clone());
+
+                if !visited_services.insert(dep_base_task) {
+                    continue;
+                }
+
+                let env = Environment { profile: &dep_profile, param: ValueMap::new(), vars: dep_config.vars };
+                if let Ok(srv_config) = dep_config.eval(&env) {
+                    for req in srv_config.config().require.iter() {
+                        let req_name = &*req.name;
+                        let Some(&req_base_task) = self.name_map.get(req_name) else {
+                            continue;
+                        };
+                        let req_config = &self.base_tasks[req_base_task.idx()].config;
+                        if req_config.kind == TaskKind::Service {
+                            services_to_check.push((req_name.to_string(), req.profile.unwrap_or("").to_string()));
+                        }
+                    }
+                }
+            }
+
+            for tc in task_config.config().require.iter() {
+                let dep_name = &*tc.name;
+                let dep_profile = tc.profile.unwrap_or("");
+                let dep_params = tc.vars.clone().to_owned();
+
+                let Some(&dep_base_task) = self.name_map.get(dep_name) else {
+                    continue;
+                };
+                let dep_config = &self.base_tasks[dep_base_task.idx()].config;
+
+                let predicate = match dep_config.kind {
+                    TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
+                    TaskKind::Service => JobPredicate::Active,
+                    TaskKind::Test => continue,
+                };
+
+                let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
+                requirements.push((key, predicate));
+            }
+
+            batch.add_task(TestRequirements {
+                base_task_idx: matched.base_task_idx,
+                task_config: task_config.clone(),
+                spawn_profile: matched.spawn_profile,
+                spawn_params: matched.spawn_params,
+                requirements,
+            });
+        }
+
+        self.resolve_batch_requirements(workspace_id, channel, &mut batch);
+
+        let tasks = batch.take_tasks();
+        let mut test_jobs = Vec::new();
+
+        for task in tasks {
+            let task_config = task.task_data.task_config;
+            let mut pred = Vec::new();
+
+            for (key, predicate) in &task.task_data.requirements {
+                match batch.get_resolved(key) {
+                    Some(ResolvedRequirement::Cached) => {}
+                    Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
+                        pred.push(ScheduleRequirement { job: *ji, predicate: predicate.clone() });
+                    }
+                    None => {}
+                }
+            }
+
+            let cache_key =
+                task_config.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
+
+            let job_index = self.create_job(
+                task.task_data.base_task_idx,
+                task_config,
+                &task.task_data.spawn_profile,
+                task.task_data.spawn_params,
+                pred,
+                cache_key,
+                channel,
+                workspace_id,
+                ScheduleReason::TestRun,
+            );
+
+            test_jobs.push(TestJob {
+                base_task_index: task.task_data.base_task_idx,
+                job_index,
+                status: TestJobStatus::Pending,
+            });
+        }
+
+        let test_run = TestRun { run_id, started_at: crate::clock::now(), test_jobs };
+        self.active_test_run =
+            Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
+
+        let group_id = self.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
+        let base_tasks_in_group: Vec<BaseTaskIndex> = test_run.test_jobs.iter().map(|tj| tj.base_task_index).collect();
+        let job_indices: Vec<JobIndex> = test_run.test_jobs.iter().map(|tj| tj.job_index).collect();
+
+        self.last_test_group = Some(TestGroup { group_id, base_tasks: base_tasks_in_group, job_indices });
+
+        Ok(test_run)
     }
 }
 
@@ -1689,6 +1782,173 @@ pub fn extract_rust_panic_from_line(line: &str) -> Option<(&str, &str, u64, u64)
 
 pub enum FunctionGlobalAction {
     RestartSelected,
+}
+
+pub struct TaskSpec {
+    pub name: String,
+    pub profile: String,
+    pub params: ValueMap<'static>,
+    pub force_restart: bool,
+}
+
+pub struct SpawnSpec {
+    pub tasks: Vec<TaskSpec>,
+    pub test_group: bool,
+}
+
+impl SpawnSpec {
+    pub fn task(name: &str, profile: &str, params: ValueMap<'static>, force_restart: bool) -> Self {
+        SpawnSpec {
+            tasks: vec![TaskSpec { name: name.into(), profile: profile.into(), params, force_restart }],
+            test_group: false,
+        }
+    }
+}
+
+pub struct SubmitResult {
+    pub jobs: Vec<(BaseTaskIndex, JobIndex)>,
+}
+
+impl Workspace {
+    pub fn submit(&self, spec: SpawnSpec) -> Result<SubmitResult, String> {
+        let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
+        state.change_number = state.change_number.wrapping_add(1);
+
+        let mut jobs = Vec::new();
+        for task in &spec.tasks {
+            let (bti, ji) = state.lookup_and_spawn_task(
+                self.workspace_id,
+                &self.process_channel,
+                &task.name,
+                task.params.clone(),
+                &task.profile,
+                task.force_restart,
+            )?;
+            jobs.push((bti, ji));
+        }
+
+        if spec.test_group && !jobs.is_empty() {
+            let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
+            state.last_test_group = Some(TestGroup {
+                group_id,
+                base_tasks: jobs.iter().map(|(bti, _)| *bti).collect(),
+                job_indices: jobs.iter().map(|(_, ji)| *ji).collect(),
+            });
+        }
+
+        Ok(SubmitResult { jobs })
+    }
+
+    pub fn call_function(&self, name: &str) -> Result<Option<FunctionGlobalAction>, String> {
+        use crate::config::FunctionDefAction;
+        use crate::function::FunctionAction;
+
+        let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
+        state.change_number = state.change_number.wrapping_add(1);
+
+        if let Some(FunctionAction::RestartCaptured { task_name, profile }) =
+            state.session_functions.get(name).cloned()
+        {
+            state.lookup_and_spawn_task(
+                self.workspace_id, &self.process_channel, &task_name, ValueMap::new(), &profile, true,
+            )?;
+            return Ok(None);
+        }
+
+        for func_def in state.config.current.functions {
+            if func_def.name == name {
+                match &func_def.action {
+                    FunctionDefAction::Restart { task } => {
+                        state.lookup_and_spawn_task(
+                            self.workspace_id, &self.process_channel, task, ValueMap::new(), "", true,
+                        )?;
+                    }
+                    FunctionDefAction::Kill { task } => {
+                        state.lookup_and_terminate_task(&self.process_channel, task)?;
+                    }
+                    FunctionDefAction::Spawn { tasks } => {
+                        for task_call in *tasks {
+                            state.lookup_and_spawn_task(
+                                self.workspace_id,
+                                &self.process_channel,
+                                &task_call.name,
+                                task_call.vars.clone(),
+                                task_call.profile.unwrap_or(""),
+                                false,
+                            )?;
+                        }
+                    }
+                    FunctionDefAction::RestartSelected => {
+                        return Ok(Some(FunctionGlobalAction::RestartSelected));
+                    }
+                }
+                return Ok(None);
+            }
+        }
+
+        Err(format!("Function '{}' not configured", name))
+    }
+
+    pub fn rerun_test_group(&self, only_failed: bool) -> Result<TestRun, String> {
+        let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
+        state.change_number = state.change_number.wrapping_add(1);
+
+        let test_group = state.last_test_group.as_ref().ok_or("No test group to rerun")?;
+        let tasks_to_run: Vec<(BaseTaskIndex, Option<JobIndex>)> = if only_failed {
+            let mut failed = Vec::new();
+            for (i, &job_index) in test_group.job_indices.iter().enumerate() {
+                let Some(job) = state.jobs.get(job_index.idx()) else { continue };
+                let is_failed = matches!(&job.process_status, JobStatus::Exited { status, .. } if *status != 0)
+                    || matches!(&job.process_status, JobStatus::Cancelled);
+                if is_failed && let Some(&bti) = test_group.base_tasks.get(i) {
+                    failed.push((bti, Some(job_index)));
+                }
+            }
+            if failed.is_empty() {
+                return Err("No failed tests to rerun".to_string());
+            }
+            failed
+        } else {
+            test_group
+                .base_tasks
+                .iter()
+                .zip(test_group.job_indices.iter())
+                .map(|(&bti, &ji)| (bti, Some(ji)))
+                .collect()
+        };
+        if tasks_to_run.is_empty() {
+            return Err("No tests to rerun".to_string());
+        }
+
+        let run_id = state.active_test_run.as_ref().map_or(0, |r| r.run_id + 1);
+        let mut matched_tests = Vec::new();
+        for (base_task_idx, original_job) in tasks_to_run {
+            let Some(base_task) = state.base_tasks.get(base_task_idx.idx()) else { continue };
+            if base_task.removed {
+                continue;
+            }
+            let (spawn_profile, spawn_params) = original_job
+                .and_then(|ji| state.jobs.get(ji.idx()))
+                .map(|job| (job.spawn_profile.clone(), job.spawn_params.clone()))
+                .unwrap_or_else(|| (String::new(), ValueMap::new()));
+            let env = Environment {
+                profile: &spawn_profile,
+                param: spawn_params.clone(),
+                vars: base_task.config.vars,
+            };
+            let Ok(task_config) = base_task.config.eval(&env) else {
+                kvlog::error!("Failed to evaluate test config", name = base_task.name);
+                continue;
+            };
+            drop(env);
+            matched_tests.push(MatchedTest { base_task_idx, task_config, spawn_profile, spawn_params });
+        }
+
+        state.run_test_batch(matched_tests, run_id, &self.process_channel, self.workspace_id)
+    }
 }
 
 impl Workspace {
@@ -1781,57 +2041,6 @@ impl Workspace {
     pub fn state(&self) -> std::sync::RwLockReadGuard<'_, WorkspaceState> {
         self.state.read().unwrap()
     }
-    pub fn restart_task(&self, base_task: BaseTaskIndex, params: ValueMap, profile: &str) -> JobIndex {
-        let state = &mut *self.state.write().unwrap();
-        state.change_number = state.change_number.wrapping_add(1);
-        state.refresh_config();
-        state.spawn_task(
-            self.workspace_id,
-            &self.process_channel,
-            base_task,
-            params,
-            profile,
-            ScheduleReason::Requested,
-            true,
-        )
-    }
-
-    pub fn start_task(&self, base_task: BaseTaskIndex, params: ValueMap, profile: &str) -> JobIndex {
-        let state = &mut *self.state.write().unwrap();
-        state.change_number = state.change_number.wrapping_add(1);
-        state.refresh_config();
-        state.spawn_task(
-            self.workspace_id,
-            &self.process_channel,
-            base_task,
-            params,
-            profile,
-            ScheduleReason::Requested,
-            false,
-        )
-    }
-
-    /// Layer 1: Start task by name.
-    ///
-    /// Acquires state lock, refreshes config, looks up task, and spawns it.
-    pub fn start_task_by_name(&self, name: &str, params: ValueMap, profile: &str) -> Result<(BaseTaskIndex, JobIndex), String> {
-        let state = &mut *self.state.write().unwrap();
-        state.refresh_config();
-        state.change_number = state.change_number.wrapping_add(1);
-        let Some(base_index) = state.base_index_by_name(name) else {
-            return Err(format!("Task '{}' not found", name));
-        };
-        let job_index = state.spawn_task(
-            self.workspace_id,
-            &self.process_channel,
-            base_index,
-            params,
-            profile,
-            ScheduleReason::Requested,
-            false,
-        );
-        Ok((base_index, job_index))
-    }
 
     pub fn terminate_tasks(&self, base_task: BaseTaskIndex) {
         let state = &mut *self.state.write().unwrap();
@@ -1872,17 +2081,6 @@ impl Workspace {
         }
     }
 
-    /// Layer 1: Restart task by name.
-    ///
-    /// Acquires state lock, looks up task, and spawns it.
-    pub fn restart_task_by_name(&self, name: &str, params: ValueMap, profile: &str) -> Result<JobIndex, String> {
-        let state = &mut *self.state.write().unwrap();
-        state.refresh_config();
-        let (_, job_index) =
-            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, true)?;
-        Ok(job_index)
-    }
-
     /// Layer 1: Restart task by name with cache checking.
     ///
     /// If `cached` is true and there's a cache hit (task already running/completed
@@ -1912,15 +2110,27 @@ impl Workspace {
                 let Some(cache_config) = &bt.config.cache else {
                     drop(state);
                     let state = &mut *self.state.write().unwrap();
-                    let (_, _) =
-                        state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
+                    let (_, _) = state.lookup_and_spawn_task(
+                        self.workspace_id,
+                        &self.process_channel,
+                        name,
+                        params,
+                        profile,
+                        false,
+                    )?;
                     return Ok(None);
                 };
                 if cache_config.never {
                     drop(state);
                     let state = &mut *self.state.write().unwrap();
-                    let (_, _) =
-                        state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
+                    let (_, _) = state.lookup_and_spawn_task(
+                        self.workspace_id,
+                        &self.process_channel,
+                        name,
+                        params,
+                        profile,
+                        false,
+                    )?;
                     return Ok(None);
                 };
 
@@ -1968,18 +2178,6 @@ impl Workspace {
         }
     }
 
-    /// Layer 1: Restart task by name and mark as test.
-    ///
-    /// Acquires state lock, looks up task, spawns it, and records it as a test group.
-    pub fn spawn_task_as_test(&self, name: &str, params: ValueMap, profile: &str) -> Result<(), String> {
-        let state = &mut *self.state.write().unwrap();
-        state.refresh_config();
-        let (base_index, job_index) =
-            state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
-        state.record_test_group(base_index, job_index);
-        Ok(())
-    }
-
     /// Layer 1: Terminate task by name.
     ///
     /// Acquires state lock, looks up task, and terminates all running instances.
@@ -1989,73 +2187,6 @@ impl Workspace {
         state.lookup_and_terminate_task(&self.process_channel, name)
     }
 
-    /// Layer 1: Execute a function by name.
-    ///
-    /// Looks up function from session_functions or config.functions, then executes its action.
-    pub fn call_function(&self, name: &str) -> Result<Option<FunctionGlobalAction>, String> {
-        use crate::config::FunctionDefAction;
-        use crate::function::FunctionAction;
-
-        let state = &mut *self.state.write().unwrap();
-        state.refresh_config();
-
-        if let Some(FunctionAction::RestartCaptured { task_name, profile }) = state.session_functions.get(name).cloned()
-        {
-            state.lookup_and_spawn_task(
-                self.workspace_id,
-                &self.process_channel,
-                &task_name,
-                ValueMap::new(),
-                &profile,
-                true,
-            )?;
-            return Ok(None);
-        }
-
-        for func_def in state.config.current.functions {
-            if func_def.name == name {
-                match &func_def.action {
-                    FunctionDefAction::Restart { task } => {
-                        state.lookup_and_spawn_task(
-                            self.workspace_id,
-                            &self.process_channel,
-                            task,
-                            ValueMap::new(),
-                            "",
-                            true,
-                        )?;
-                    }
-                    FunctionDefAction::Kill { task } => {
-                        state.lookup_and_terminate_task(&self.process_channel, task)?;
-                    }
-                    FunctionDefAction::Spawn { tasks } => {
-                        for task_call in *tasks {
-                            state.lookup_and_spawn_task(
-                                self.workspace_id,
-                                &self.process_channel,
-                                &task_call.name,
-                                task_call.vars.clone(),
-                                task_call.profile.unwrap_or(""),
-                                false,
-                            )?;
-                        }
-                    }
-                    FunctionDefAction::RestartSelected => {
-                        return Ok(Some(FunctionGlobalAction::RestartSelected));
-                    }
-                }
-                return Ok(None);
-            }
-        }
-
-        Err(format!("Function '{}' not configured", name))
-    }
-
-    /// Starts a test run with the given filters.
-    /// Returns the test run containing all scheduled test jobs, or an error
-    /// if any test has conflicting service profile requirements.
-    ///
-    /// Uses batch spawning to deduplicate requirements across all tests.
     pub fn start_test_run(&self, filters: &[TestFilter]) -> Result<TestRun, String> {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
@@ -2063,10 +2194,6 @@ impl Workspace {
 
         let run_id = state.active_test_run.as_ref().map_or(0, |r| r.run_id + 1);
 
-        struct MatchedTest {
-            base_task_idx: BaseTaskIndex,
-            task_config: TaskConfigRc,
-        }
         let mut matched_tests = Vec::new();
         for (base_task_idx, base_task) in state.base_tasks.iter().enumerate() {
             if base_task.removed || base_task.config.kind != TaskKind::Test {
@@ -2081,452 +2208,15 @@ impl Workspace {
                 kvlog::error!("Failed to evaluate test config", name = base_task.name);
                 continue;
             };
-            matched_tests.push(MatchedTest { base_task_idx: BaseTaskIndex::new_or_panic(base_task_idx), task_config });
-        }
-
-        struct TestRequirements {
-            base_task_idx: BaseTaskIndex,
-            task_config: TaskConfigRc,
-            requirements: Vec<(RequirementKey, JobPredicate)>,
-        }
-
-        let mut batch: SpawnBatch<TestRequirements> = SpawnBatch::new();
-
-        for matched in &matched_tests {
-            let task_config = &matched.task_config;
-            let mut requirements = Vec::new();
-
-            // Check for service profile conflicts (including transitive through services).
-            // Services need to stay Active, so their transitive service deps must also be active.
-            // Actions complete and terminate, so transitive conflicts through actions are fine.
-            let mut service_profiles: hashbrown::HashMap<BaseTaskIndex, String> = hashbrown::HashMap::new();
-            let mut services_to_check: Vec<(String, String)> = task_config
-                .config()
-                .require
-                .iter()
-                .filter_map(|tc| {
-                    let dep_name = &*tc.name;
-                    let dep_base_task = state.name_map.get(dep_name)?;
-                    let dep_config = &state.base_tasks[dep_base_task.idx()].config;
-                    if dep_config.kind == TaskKind::Service {
-                        Some((dep_name.to_string(), tc.profile.unwrap_or("").to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let mut visited_services: hashbrown::HashSet<BaseTaskIndex> = hashbrown::HashSet::new();
-
-            while let Some((dep_name, dep_profile)) = services_to_check.pop() {
-                let Some(&dep_base_task) = state.name_map.get(&*dep_name) else {
-                    continue;
-                };
-                let dep_config = &state.base_tasks[dep_base_task.idx()].config;
-
-                // Check for conflicts first, before checking visited
-                if let Some(existing_profile) = service_profiles.get(&dep_base_task) {
-                    if *existing_profile != dep_profile {
-                        let test_name = state.base_tasks[matched.base_task_idx.idx()].name;
-                        let service_name = state.base_tasks[dep_base_task.idx()].name;
-                        return Err(format!(
-                            "Test '{}' has conflicting service requirements: '{}:{}' and '{}:{}'",
-                            test_name, service_name, existing_profile, service_name, dep_profile
-                        ));
-                    }
-                    // Same profile already processed, skip recursion
-                    continue;
-                }
-                service_profiles.insert(dep_base_task, dep_profile.clone());
-
-                // Skip if already visited with this profile (avoid infinite loops)
-                if !visited_services.insert(dep_base_task) {
-                    continue;
-                }
-
-                // Recurse into this service's service dependencies
-                let env = Environment { profile: &dep_profile, param: ValueMap::new(), vars: dep_config.vars };
-                if let Ok(srv_config) = dep_config.eval(&env) {
-                    for req in srv_config.config().require.iter() {
-                        let req_name = &*req.name;
-                        let Some(&req_base_task) = state.name_map.get(req_name) else {
-                            continue;
-                        };
-                        let req_config = &state.base_tasks[req_base_task.idx()].config;
-                        if req_config.kind == TaskKind::Service {
-                            services_to_check.push((req_name.to_string(), req.profile.unwrap_or("").to_string()));
-                        }
-                    }
-                }
-            }
-
-            for tc in task_config.config().require.iter() {
-                let dep_name = &*tc.name;
-                let dep_profile = tc.profile.unwrap_or("");
-                let dep_params = tc.vars.clone().to_owned();
-
-                let Some(&dep_base_task) = state.name_map.get(dep_name) else {
-                    continue;
-                };
-                let dep_config = &state.base_tasks[dep_base_task.idx()].config;
-
-                let predicate = match dep_config.kind {
-                    TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
-                    TaskKind::Service => JobPredicate::Active,
-                    TaskKind::Test => continue,
-                };
-
-                let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
-                requirements.push((key, predicate));
-            }
-
-            batch.add_task(TestRequirements {
-                base_task_idx: matched.base_task_idx,
-                task_config: task_config.clone(),
-                requirements,
-            });
-        }
-
-        state.resolve_batch_requirements(self.workspace_id, &self.process_channel, &mut batch);
-
-        let tasks = batch.take_tasks();
-        let mut test_jobs = Vec::new();
-
-        for task in tasks {
-            let task_config = task.task_data.task_config;
-            let mut pred = Vec::new();
-
-            for (key, predicate) in &task.task_data.requirements {
-                match batch.get_resolved(key) {
-                    Some(ResolvedRequirement::Cached) => {}
-                    Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
-                        pred.push(ScheduleRequirement { job: *ji, predicate: predicate.clone() });
-                    }
-                    None => {}
-                }
-            }
-
-            let cache_key =
-                task_config.config().cache.as_ref().map_or(String::new(), |c| state.compute_cache_key(c.key));
-
-            let job_index = JobIndex(state.jobs.len() as u32);
-            let base_task = &mut state.base_tasks[task.task_data.base_task_idx.idx()];
-            let task_name = base_task.name;
-            let pc = base_task.jobs.len();
-            let job_id = LogGroup::new(task.task_data.base_task_idx, pc);
-
-            let spawn = pred.is_empty();
-            if spawn {
-                base_task.jobs.push_active(job_index);
-                state.test_jobs.push_active(job_index);
-            } else {
-                base_task.jobs.push_scheduled(job_index);
-                state.test_jobs.push_scheduled(job_index);
-            }
-
-            for req in &pred {
-                if matches!(req.predicate, JobPredicate::Active) {
-                    state.service_dependents.add_dependent(req.job, job_index);
-                }
-            }
-
-            state.jobs.push(Job {
-                process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
-                log_group: job_id,
-                task: task_config.clone(),
-                started_at: crate::clock::now(),
-                cache_key,
+            matched_tests.push(MatchedTest {
+                base_task_idx: BaseTaskIndex::new_or_panic(base_task_idx),
+                task_config,
                 spawn_profile: String::new(),
                 spawn_params: ValueMap::new(),
             });
-
-            if !spawn {
-                kvlog::info!("Job scheduled", task_name, job_index, reason = ScheduleReason::TestRun.name());
-            }
-
-            test_jobs.push(TestJob {
-                base_task_index: task.task_data.base_task_idx,
-                job_index,
-                status: TestJobStatus::Pending,
-            });
-
-            if spawn {
-                self.process_channel.send(crate::event_loop::ProcessRequest::Spawn {
-                    task: task_config,
-                    job_index,
-                    workspace_id: self.workspace_id,
-                    job_id,
-                });
-            }
         }
 
-        let test_run = TestRun { run_id, started_at: crate::clock::now(), test_jobs };
-        state.active_test_run =
-            Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
-
-        let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
-        let base_tasks_in_group: Vec<BaseTaskIndex> = test_run.test_jobs.iter().map(|tj| tj.base_task_index).collect();
-        let job_indices: Vec<JobIndex> = test_run.test_jobs.iter().map(|tj| tj.job_index).collect();
-
-        state.last_test_group = Some(TestGroup { group_id, base_tasks: base_tasks_in_group, job_indices });
-
-        Ok(test_run)
-    }
-
-    pub fn start_test_run_from_base_tasks(
-        &self,
-        base_task_indices: &[(BaseTaskIndex, Option<JobIndex>)],
-    ) -> Result<TestRun, String> {
-        let state = &mut *self.state.write().unwrap();
-        state.change_number = state.change_number.wrapping_add(1);
-        state.refresh_config();
-
-        let run_id = state.active_test_run.as_ref().map_or(0, |r| r.run_id + 1);
-
-        struct MatchedTest {
-            base_task_idx: BaseTaskIndex,
-            task_config: TaskConfigRc,
-            spawn_profile: String,
-            spawn_params: ValueMap<'static>,
-        }
-        let mut matched_tests = Vec::new();
-        for &(base_task_idx, original_job) in base_task_indices {
-            let Some(base_task) = state.base_tasks.get(base_task_idx.idx()) else {
-                continue;
-            };
-            if base_task.removed {
-                continue;
-            }
-            let (spawn_profile, spawn_params) = original_job
-                .and_then(|ji| state.jobs.get(ji.idx()))
-                .map(|job| (job.spawn_profile.clone(), job.spawn_params.clone()))
-                .unwrap_or_else(|| (String::new(), ValueMap::new()));
-            let env = Environment { profile: &spawn_profile, param: spawn_params.clone(), vars: base_task.config.vars };
-            let Ok(task_config) = base_task.config.eval(&env) else {
-                kvlog::error!("Failed to evaluate test config", name = base_task.name);
-                continue;
-            };
-            drop(env);
-            matched_tests.push(MatchedTest { base_task_idx, task_config, spawn_profile, spawn_params });
-        }
-
-        struct TestRequirements {
-            base_task_idx: BaseTaskIndex,
-            task_config: TaskConfigRc,
-            spawn_profile: String,
-            spawn_params: ValueMap<'static>,
-            requirements: Vec<(RequirementKey, JobPredicate)>,
-        }
-
-        let mut batch: SpawnBatch<TestRequirements> = SpawnBatch::new();
-
-        for matched in matched_tests {
-            let task_config = &matched.task_config;
-            let mut requirements = Vec::new();
-
-            let mut service_profiles: hashbrown::HashMap<BaseTaskIndex, String> = hashbrown::HashMap::new();
-            let mut services_to_check: Vec<(String, String)> = task_config
-                .config()
-                .require
-                .iter()
-                .filter_map(|tc| {
-                    let dep_name = &*tc.name;
-                    let dep_base_task = state.name_map.get(dep_name)?;
-                    let dep_config = &state.base_tasks[dep_base_task.idx()].config;
-                    if dep_config.kind == TaskKind::Service {
-                        Some((dep_name.to_string(), tc.profile.unwrap_or("").to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let mut visited_services: hashbrown::HashSet<BaseTaskIndex> = hashbrown::HashSet::new();
-
-            while let Some((dep_name, dep_profile)) = services_to_check.pop() {
-                let Some(&dep_base_task) = state.name_map.get(&*dep_name) else {
-                    continue;
-                };
-                let dep_config = &state.base_tasks[dep_base_task.idx()].config;
-
-                if let Some(existing_profile) = service_profiles.get(&dep_base_task) {
-                    if *existing_profile != dep_profile {
-                        let test_name = state.base_tasks[matched.base_task_idx.idx()].name;
-                        let service_name = state.base_tasks[dep_base_task.idx()].name;
-                        return Err(format!(
-                            "Test '{}' has conflicting service requirements: '{}:{}' and '{}:{}'",
-                            test_name, service_name, existing_profile, service_name, dep_profile
-                        ));
-                    }
-                    continue;
-                }
-                service_profiles.insert(dep_base_task, dep_profile.clone());
-
-                if !visited_services.insert(dep_base_task) {
-                    continue;
-                }
-
-                let env = Environment { profile: &dep_profile, param: ValueMap::new(), vars: dep_config.vars };
-                if let Ok(srv_config) = dep_config.eval(&env) {
-                    for req in srv_config.config().require.iter() {
-                        let req_name = &*req.name;
-                        let Some(&req_base_task) = state.name_map.get(req_name) else {
-                            continue;
-                        };
-                        let req_config = &state.base_tasks[req_base_task.idx()].config;
-                        if req_config.kind == TaskKind::Service {
-                            services_to_check.push((req_name.to_string(), req.profile.unwrap_or("").to_string()));
-                        }
-                    }
-                }
-            }
-
-            for tc in task_config.config().require.iter() {
-                let dep_name = &*tc.name;
-                let dep_profile = tc.profile.unwrap_or("");
-                let dep_params = tc.vars.clone().to_owned();
-
-                let Some(&dep_base_task) = state.name_map.get(dep_name) else {
-                    continue;
-                };
-                let dep_config = &state.base_tasks[dep_base_task.idx()].config;
-
-                let predicate = match dep_config.kind {
-                    TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
-                    TaskKind::Service => JobPredicate::Active,
-                    TaskKind::Test => continue,
-                };
-
-                let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
-                requirements.push((key, predicate));
-            }
-
-            batch.add_task(TestRequirements {
-                base_task_idx: matched.base_task_idx,
-                task_config: task_config.clone(),
-                spawn_profile: matched.spawn_profile,
-                spawn_params: matched.spawn_params,
-                requirements,
-            });
-        }
-
-        state.resolve_batch_requirements(self.workspace_id, &self.process_channel, &mut batch);
-
-        let tasks = batch.take_tasks();
-        let mut test_jobs = Vec::new();
-
-        for task in tasks {
-            let task_config = task.task_data.task_config;
-            let spawn_profile = task.task_data.spawn_profile;
-            let spawn_params = task.task_data.spawn_params;
-            let mut pred = Vec::new();
-
-            for (key, predicate) in &task.task_data.requirements {
-                match batch.get_resolved(key) {
-                    Some(ResolvedRequirement::Cached) => {}
-                    Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
-                        pred.push(ScheduleRequirement { job: *ji, predicate: predicate.clone() });
-                    }
-                    None => {}
-                }
-            }
-
-            let cache_key =
-                task_config.config().cache.as_ref().map_or(String::new(), |c| state.compute_cache_key(c.key));
-
-            let job_index = JobIndex(state.jobs.len() as u32);
-            let base_task = &mut state.base_tasks[task.task_data.base_task_idx.idx()];
-            let task_name = base_task.name;
-            let pc = base_task.jobs.len();
-            let job_id = LogGroup::new(task.task_data.base_task_idx, pc);
-
-            let spawn = pred.is_empty();
-            if spawn {
-                base_task.jobs.push_active(job_index);
-                state.test_jobs.push_active(job_index);
-            } else {
-                base_task.jobs.push_scheduled(job_index);
-                state.test_jobs.push_scheduled(job_index);
-            }
-
-            for req in &pred {
-                if matches!(req.predicate, JobPredicate::Active) {
-                    state.service_dependents.add_dependent(req.job, job_index);
-                }
-            }
-
-            state.jobs.push(Job {
-                process_status: if !spawn { JobStatus::Scheduled { after: pred } } else { JobStatus::Starting },
-                log_group: job_id,
-                task: task_config.clone(),
-                started_at: crate::clock::now(),
-                cache_key,
-                spawn_profile,
-                spawn_params,
-            });
-
-            if !spawn {
-                kvlog::info!("Job scheduled", task_name, job_index, reason = ScheduleReason::TestRun.name());
-            }
-
-            test_jobs.push(TestJob {
-                base_task_index: task.task_data.base_task_idx,
-                job_index,
-                status: TestJobStatus::Pending,
-            });
-
-            if spawn {
-                self.process_channel.send(crate::event_loop::ProcessRequest::Spawn {
-                    task: task_config,
-                    job_index,
-                    workspace_id: self.workspace_id,
-                    job_id,
-                });
-            }
-        }
-
-        let test_run = TestRun { run_id, started_at: crate::clock::now(), test_jobs };
-        state.active_test_run =
-            Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
-
-        let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
-        let base_tasks_in_group: Vec<BaseTaskIndex> = test_run.test_jobs.iter().map(|tj| tj.base_task_index).collect();
-        let job_indices: Vec<JobIndex> = test_run.test_jobs.iter().map(|tj| tj.job_index).collect();
-
-        state.last_test_group = Some(TestGroup { group_id, base_tasks: base_tasks_in_group, job_indices });
-
-        Ok(test_run)
-    }
-
-    /// Reruns the last test group.
-    /// If only_failed is true, only runs tests that failed in the last run.
-    /// Returns the TestRun or an error if no test group exists.
-    pub fn rerun_test_group(&self, only_failed: bool) -> Result<TestRun, String> {
-        let state = self.state.read().unwrap();
-        let test_group = state.last_test_group.as_ref().ok_or("No test group to rerun")?;
-
-        let tasks_to_run: Vec<(BaseTaskIndex, Option<JobIndex>)> = if only_failed {
-            let mut failed = Vec::new();
-            for (i, &job_index) in test_group.job_indices.iter().enumerate() {
-                let Some(job) = state.jobs.get(job_index.idx()) else { continue };
-                let is_failed = matches!(&job.process_status, JobStatus::Exited { status, .. } if *status != 0)
-                    || matches!(&job.process_status, JobStatus::Cancelled);
-                if is_failed && let Some(&bti) = test_group.base_tasks.get(i) {
-                    failed.push((bti, Some(job_index)));
-                }
-            }
-            if failed.is_empty() {
-                return Err("No failed tests to rerun".to_string());
-            }
-            failed
-        } else {
-            test_group.base_tasks.iter().zip(test_group.job_indices.iter()).map(|(&bti, &ji)| (bti, Some(ji))).collect()
-        };
-
-        if tasks_to_run.is_empty() {
-            return Err("No tests to rerun".to_string());
-        }
-
-        drop(state);
-        self.start_test_run_from_base_tasks(&tasks_to_run)
+        state.run_test_batch(matched_tests, run_id, &self.process_channel, self.workspace_id)
     }
 
     /// Narrows the test group by removing passed tests.

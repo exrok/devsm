@@ -1,7 +1,7 @@
 use super::*;
 use crate::rpc::DecodeResult;
 use crate::rpc::DecodingState;
-use crate::workspace::FunctionGlobalAction;
+use crate::workspace::{FunctionGlobalAction, SpawnSpec};
 use jsony_value::ValueMap;
 
 pub struct ClientMessage<'a> {
@@ -83,26 +83,27 @@ fn restart_selected_from_clients(clients: &Slab<ClientEntry>, ws: &WorkspaceEntr
                 return Err("no jobs in selected meta-group");
             };
             let job = &ws_state[last_ji];
-            let bti = job.log_group.base_task_index();
+            let name = ws_state.base_tasks[job.log_group.base_task_index().idx()].name.to_string();
             let params = job.spawn_params.clone();
             let profile = job.spawn_profile.clone();
             drop(ws_state);
-            ws.handle.restart_task(bti, params, &profile);
+            let _ = ws.handle.submit(SpawnSpec::task(&name, &profile, params, true));
         } else {
             let bti = workspace::BaseTaskIndex(selected as u32);
             let ws_state = ws.handle.state();
             let Some(bt) = ws_state.base_tasks.get(bti.idx()) else {
                 return Err("selected task no longer exists");
             };
+            let name = bt.name.to_string();
             if let Some(&last_ji) = bt.jobs.all().last() {
                 let job = &ws_state[last_ji];
                 let params = job.spawn_params.clone();
                 let profile = job.spawn_profile.clone();
                 drop(ws_state);
-                ws.handle.restart_task(bti, params, &profile);
+                let _ = ws.handle.submit(SpawnSpec::task(&name, &profile, params, true));
             } else {
                 drop(ws_state);
-                ws.handle.restart_task(bti, ValueMap::new(), "");
+                let _ = ws.handle.submit(SpawnSpec::task(&name, "", ValueMap::new(), true));
             }
         }
         return Ok(());
@@ -228,16 +229,17 @@ fn handle_rpc_message(
             let ws_index = resolve_workspace_from_header_result(state, ws_data)?;
             let req = jsony::from_binary::<crate::rpc::RunTaskRequest>(payload)
                 .map_err(|_| rpc::HandlerError::new(2, "Invalid run task request"))?;
-            let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
+            let params = jsony::from_binary::<ValueMap>(req.params).unwrap_or_else(|_| ValueMap::new()).to_owned();
             let ws = &state.workspaces[ws_index as usize];
 
-            match ws.handle.restart_task_by_name(req.task_name, params, req.profile) {
-                Ok(job_index) => {
+            match ws.handle.submit(SpawnSpec::task(req.task_name, req.profile, params, true)) {
+                Ok(result) => {
+                    let job_index = result.jobs.first().map(|(_, ji)| ji.as_u32());
                     return Ok(token.respond(
                         RpcMessageKind::RunTaskAck,
                         &crate::rpc::RunTaskResponse {
                             success: true,
-                            job_index: Some(job_index.as_u32()),
+                            job_index,
                             error: None,
                         },
                     ));
@@ -283,18 +285,26 @@ fn handle_rpc_restart_task(ws: &mut WorkspaceEntry, payload: &[u8]) -> CommandBo
         return CommandBody::Error("Invalid request payload".into());
     };
 
-    let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
+    let params = jsony::from_binary::<ValueMap>(req.params).unwrap_or_else(|_| ValueMap::new()).to_owned();
 
-    let result = if req.as_test {
-        ws.handle.spawn_task_as_test(req.task_name, params, req.profile).map(|()| None)
+    if req.as_test {
+        let mut spec = SpawnSpec::task(req.task_name, req.profile, params, false);
+        spec.test_group = true;
+        match ws.handle.submit(spec) {
+            Ok(_) => CommandBody::Empty,
+            Err(e) => CommandBody::Error(e.into()),
+        }
+    } else if req.cached {
+        match ws.handle.spawn_task_by_name_cached(req.task_name, params, req.profile, true) {
+            Ok(None) => CommandBody::Empty,
+            Ok(Some(msg)) => CommandBody::Message(msg.into()),
+            Err(e) => CommandBody::Error(e.into()),
+        }
     } else {
-        ws.handle.spawn_task_by_name_cached(req.task_name, params, req.profile, req.cached)
-    };
-
-    match result {
-        Ok(None) => CommandBody::Empty,
-        Ok(Some(msg)) => CommandBody::Message(msg.into()),
-        Err(e) => CommandBody::Error(e.into()),
+        match ws.handle.submit(SpawnSpec::task(req.task_name, req.profile, params, false)) {
+            Ok(_) => CommandBody::Empty,
+            Err(e) => CommandBody::Error(e.into()),
+        }
     }
 }
 
