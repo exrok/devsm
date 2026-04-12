@@ -149,13 +149,9 @@ fn handle_run_client_read(rpc_reader: &mut RpcClientStream, log_group: LogGroup,
     }
 
     if kill_task {
-        for (_, process) in &state.processes {
+        for (_, process) in &mut state.processes {
             if process.log_group == log_group {
-                let child_pid = process.child.id();
-                let pgid = -(child_pid as i32);
-                unsafe {
-                    libc::kill(pgid, libc::SIGINT);
-                }
+                process.request_termination(ExitCause::Killed);
                 break;
             }
         }

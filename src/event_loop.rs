@@ -97,6 +97,56 @@ impl ActiveProcess {
             self.style = new_style;
         }
     }
+
+    pub(crate) fn request_termination(&mut self, cause: ExitCause) {
+        if !self.alive {
+            return;
+        }
+        self.pending_exit_cause = Some(cause);
+        let child_pid = self.child.id();
+        let pgid = -(child_pid as i32);
+        kvlog::info!(
+            "Sending SIGINT to process group",
+            job_index = self.job_index,
+            base_task_index = self.log_group.base_task_index().0,
+            reason = cause.name(),
+            pid = child_pid,
+            pgid
+        );
+        unsafe {
+            if libc::kill(pgid, libc::SIGINT) == -1 {
+                let err = std::io::Error::last_os_error();
+                kvlog::error!("Failed to send SIGINT", ?err, pid = child_pid, pgid);
+            }
+        }
+        self.alive = false;
+        self.kill_sent_at = Some(crate::clock::now());
+    }
+
+    pub(crate) fn send_signal(&self, signal: i32) {
+        let child_pid = self.child.id();
+        let pgid = -(child_pid as i32);
+        unsafe {
+            if libc::kill(pgid, signal) == -1 {
+                let err = std::io::Error::last_os_error();
+                kvlog::error!("Failed to send signal", ?err, pid = child_pid, pgid, signal);
+            }
+        }
+    }
+
+    pub(crate) fn escalate_to_sigkill(&mut self) {
+        let elapsed_secs = self.kill_sent_at.map(|t| crate::clock::now().duration_since(t).as_secs());
+        kvlog::warn!(
+            "Process did not terminate after SIGINT, escalating to SIGKILL",
+            job_index = self.job_index,
+            base_task_index = self.log_group.base_task_index().0,
+            pid = self.child.id(),
+            pgid = -(self.child.id() as i32),
+            ?elapsed_secs
+        );
+        self.send_signal(libc::SIGKILL);
+        self.kill_sent_at = None;
+    }
 }
 
 pub(crate) struct Buffer {
@@ -377,7 +427,7 @@ impl EventLoop {
             for (wsi, ws) in &self.state.workspaces {
                 let state = ws.handle.state();
 
-                if let Some(service_to_kill) = state.service_to_terminate_for_queue() {
+                if let Some((service_to_kill, exit_cause)) = state.service_to_terminate_for_queue() {
                     let job = &state.jobs[service_to_kill.idx()];
                     let job_id = job.log_group;
                     let JobStatus::Running { process_index, .. } = job.process_status else {
@@ -388,24 +438,8 @@ impl EventLoop {
 
                     if let Some(process) = self.state.processes.get_mut(process_index)
                         && process.log_group == job_id
-                        && process.alive
                     {
-                        let child_pid = process.child.id();
-                        let pgid_to_kill = -(child_pid as i32);
-                        kvlog::info!(
-                            "Sending SIGINT to process group",
-                            job_index = service_to_kill,
-                            base_task_index = job_id.base_task_index().0,
-                            reason = ExitCause::ProfileConflict.name(),
-                            pid = child_pid,
-                            pgid = pgid_to_kill
-                        );
-                        process.pending_exit_cause = Some(ExitCause::ProfileConflict);
-                        unsafe {
-                            libc::kill(pgid_to_kill, libc::SIGINT);
-                        }
-                        process.alive = false;
-                        process.kill_sent_at = Some(crate::clock::now());
+                        process.request_termination(exit_cause);
                     }
                     break;
                 }
@@ -465,7 +499,7 @@ impl EventLoop {
 
     fn check_timeouts(&mut self) {
         let now = crate::clock::now();
-        let mut to_kill: Vec<(usize, u32)> = Vec::new();
+        let mut to_kill: Vec<usize> = Vec::new();
 
         for (index, process) in &self.state.processes {
             if !process.alive {
@@ -482,34 +516,15 @@ impl EventLoop {
                     .is_some_and(|secs| now.duration_since(tracker.last_output_at).as_secs_f64() > secs);
 
             if should_kill {
-                to_kill.push((index, process.child.id()));
+                to_kill.push(index);
             }
         }
 
-        for (index, child_pid) in to_kill {
+        for index in to_kill {
             let Some(process) = self.state.processes.get_mut(index) else {
                 continue;
             };
-            if !process.alive {
-                continue;
-            }
-
-            let pgid_to_kill = -(child_pid as i32);
-            kvlog::info!(
-                "Sending SIGINT to process group (timeout)",
-                job_index = process.job_index,
-                base_task_index = process.log_group.base_task_index().0,
-                reason = ExitCause::Timeout.name(),
-                pid = child_pid,
-                pgid = pgid_to_kill
-            );
-
-            process.pending_exit_cause = Some(ExitCause::Timeout);
-            unsafe {
-                libc::kill(pgid_to_kill, libc::SIGINT);
-            }
-            process.alive = false;
-            process.kill_sent_at = Some(now);
+            process.request_termination(ExitCause::Timeout);
         }
     }
 
@@ -526,26 +541,7 @@ impl EventLoop {
                 continue;
             }
 
-            let child_pid = process.child.id();
-            let pgid_to_kill = -(child_pid as i32);
-
-            kvlog::warn!(
-                "Process did not terminate after SIGINT, escalating to SIGKILL",
-                job_index = process.job_index,
-                base_task_index = process.log_group.base_task_index().0,
-                pid = child_pid,
-                pgid = pgid_to_kill,
-                elapsed_secs = now.duration_since(kill_sent_at).as_secs()
-            );
-
-            unsafe {
-                if libc::kill(pgid_to_kill, libc::SIGKILL) == -1 {
-                    let err = std::io::Error::last_os_error();
-                    kvlog::error!("Failed to send SIGKILL", ?err, pid = child_pid, pgid = pgid_to_kill);
-                }
-            }
-
-            process.kill_sent_at = None;
+            process.escalate_to_sigkill();
         }
     }
 
@@ -896,27 +892,7 @@ impl EventLoop {
                     );
                     return false;
                 }
-                process.pending_exit_cause = Some(exit_cause);
-                let child_pid = process.child.id();
-                let pgid_to_kill = -(child_pid as i32);
-
-                kvlog::info!(
-                    "Sending SIGINT to process group",
-                    job_index = process.job_index,
-                    base_task_index = job_id.base_task_index().0,
-                    reason = exit_cause.name(),
-                    pid = child_pid,
-                    pgid = pgid_to_kill
-                );
-
-                unsafe {
-                    if libc::kill(pgid_to_kill, libc::SIGINT) == -1 {
-                        let err = std::io::Error::last_os_error();
-                        kvlog::error!("Failed to send SIGINT", ?err, pid = child_pid, pgid = pgid_to_kill);
-                    }
-                }
-                process.alive = false;
-                process.kill_sent_at = Some(crate::clock::now());
+                process.request_termination(exit_cause);
                 false
             }
             ProcessRequest::AttachClient { stdin, stdout, socket, workspace_config, kind } => {
@@ -1004,16 +980,8 @@ impl EventLoop {
                 false
             }
             ProcessRequest::GlobalTermination => {
-                for (_, process) in &mut self.state.processes {
-                    let child_pid = process.child.id();
-                    let pgid_to_kill = -(child_pid as i32);
-
-                    unsafe {
-                        if libc::kill(pgid_to_kill, libc::SIGTERM) == -1 {
-                            let err = std::io::Error::last_os_error();
-                            kvlog::error!("Failed to send SIGTERM", ?err, ?child_pid);
-                        }
-                    }
+                for (_, process) in &self.state.processes {
+                    process.send_signal(libc::SIGTERM);
                 }
                 true
             }

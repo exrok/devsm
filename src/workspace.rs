@@ -1422,16 +1422,22 @@ impl WorkspaceState {
     /// 2. Has a scheduled service waiting for it to terminate
     ///
     /// The caller should terminate this service to allow the queued service to start.
-    pub fn service_to_terminate_for_queue(&self) -> Option<JobIndex> {
-        for &job_index in self.service_jobs.scheduled() {
-            let JobStatus::Scheduled { after } = &self[job_index].process_status else {
+    pub fn service_to_terminate_for_queue(&self) -> Option<(JobIndex, ExitCause)> {
+        for &scheduled_job_index in self.service_jobs.scheduled() {
+            let JobStatus::Scheduled { after } = &self[scheduled_job_index].process_status else {
                 continue;
             };
+            let scheduled_base_task = self[scheduled_job_index].log_group.base_task_index();
             for req in after {
                 if req.predicate == JobPredicate::Terminated {
                     let blocking_job = &self.jobs[req.job.idx()];
                     if blocking_job.process_status.is_running() && self.service_dependents.can_stop(req.job) {
-                        return Some(req.job);
+                        let exit_cause = if blocking_job.log_group.base_task_index() == scheduled_base_task {
+                            ExitCause::Restarted
+                        } else {
+                            ExitCause::ProfileConflict
+                        };
+                        return Some((req.job, exit_cause));
                     }
                 }
             }
