@@ -1528,7 +1528,11 @@ pub fn run(
                         },
                         extui::event::MouseEventKind::Down(button) => {
                             let is_left = matches!(button, extui::event::MouseButton::Left);
-                            if is_left && show_task_tree && y == status_bar_y {
+                            let is_right = matches!(button, extui::event::MouseButton::Right);
+                            if is_right && y == status_bar_y {
+                                tui.drag = None;
+                                tui.logs.jump_to_newest();
+                            } else if is_left && show_task_tree && y == status_bar_y {
                                 tui.drag = Some(DragKind::MenuSeparator);
                             } else if is_left && Some(y) == hybrid_sep_y {
                                 tui.drag = Some(DragKind::HybridSeparator);

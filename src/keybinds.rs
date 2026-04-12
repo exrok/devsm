@@ -465,6 +465,7 @@ impl Keybinds {
         self.bind(Mode::TaskTree, "/", Command::SearchLogs);
         self.bind(Mode::TaskTree, "HOME", Command::JumpToOldestLogs);
         self.bind(Mode::TaskTree, "END", Command::JumpToNewestLogs);
+        self.bind(Mode::TaskTree, "ESC", Command::JumpToNewestLogs);
         self.bind(Mode::TaskTree, "C-k", Command::LogScrollUp);
         self.bind(Mode::TaskTree, "C-j", Command::LogScrollDown);
         self.bind(Mode::TaskTree, "PGUP", Command::HelpScrollUp);
