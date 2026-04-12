@@ -1244,24 +1244,16 @@ impl EventLoop {
         let (name, profile) = task_name.rsplit_once(":").unwrap_or((task_name, ""));
 
         let ws = &self.state.workspaces[ws_index as usize];
-        let job_id = {
-            let mut state = ws.handle.state.write().unwrap();
-            let Some(base_index) = state.base_index_by_name(name) else {
-                drop(state);
-                let _ = std::io::Write::write_all(&mut stdout, b"Task not found\n");
+        let (base_index, job_index) = match ws.handle.start_task_by_name(name, params, profile) {
+            Ok(result) => result,
+            Err(e) => {
+                let _ = std::io::Write::write_all(&mut stdout, format!("{e}\n").as_bytes());
                 return;
-            };
-            drop(state);
-            ws.handle.start_task(base_index, params, profile);
-
-            let state = ws.handle.state.read().unwrap();
-            let bt = &state.base_tasks[base_index.idx()];
-            bt.jobs.all().last().map(|ji| (state[*ji].log_group, *ji, base_index))
+            }
         };
-
-        let Some((job_id, job_index, base_index)) = job_id else {
-            let _ = std::io::Write::write_all(&mut stdout, b"Failed to start task\n");
-            return;
+        let job_id = {
+            let state = ws.handle.state.read().unwrap();
+            state[job_index].log_group
         };
 
         if as_test {

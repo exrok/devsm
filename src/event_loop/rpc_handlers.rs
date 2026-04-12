@@ -230,30 +230,25 @@ fn handle_rpc_message(
                 .map_err(|_| rpc::HandlerError::new(2, "Invalid run task request"))?;
             let params: ValueMap = jsony::from_binary(req.params).unwrap_or_else(|_| ValueMap::new());
             let ws = &state.workspaces[ws_index as usize];
-            let mut ws_state = ws.handle.state.write().unwrap();
-            let Some(base_index) = ws_state.base_index_by_name(req.task_name) else {
-                drop(ws_state);
-                return Ok(token.respond(
-                    RpcMessageKind::RunTaskAck,
-                    &crate::rpc::RunTaskResponse {
-                        success: false,
-                        job_index: None,
-                        error: Some(format!("Task '{}' not found", req.task_name).into()),
-                    },
-                ));
-            };
-            drop(ws_state);
 
-            ws.handle.restart_task(base_index, params, req.profile);
-
-            let ws_state = ws.handle.state.read().unwrap();
-            let bt = &ws_state.base_tasks[base_index.idx()];
-            let job_index = bt.jobs.all().last().map(|ji| ji.as_u32());
-
-            return Ok(token.respond(
-                RpcMessageKind::RunTaskAck,
-                &crate::rpc::RunTaskResponse { success: true, job_index, error: None },
-            ));
+            match ws.handle.restart_task_by_name(req.task_name, params, req.profile) {
+                Ok(job_index) => {
+                    return Ok(token.respond(
+                        RpcMessageKind::RunTaskAck,
+                        &crate::rpc::RunTaskResponse {
+                            success: true,
+                            job_index: Some(job_index.as_u32()),
+                            error: None,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    return Ok(token.respond(
+                        RpcMessageKind::RunTaskAck,
+                        &crate::rpc::RunTaskResponse { success: false, job_index: None, error: Some(e.into()) },
+                    ));
+                }
+            }
         }
         RpcMessageKind::Terminate => {
             return Ok(token.respond_empty(RpcMessageKind::TerminateAck));

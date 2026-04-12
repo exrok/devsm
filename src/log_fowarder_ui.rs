@@ -98,6 +98,7 @@ impl LogForwarderConfig {
             };
         }
 
+        workspace.refresh_config_if_changed();
         let mut state = workspace.state.write().unwrap();
 
         let mut base_tasks = BaseTaskSet::new();

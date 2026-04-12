@@ -1218,8 +1218,10 @@ impl WorkspaceState {
 
     /// Layer 2: Lookup task by name and spawn it in one operation.
     ///
-    /// Refreshes config, increments change_number, and spawns the task.
+    /// Increments change_number and spawns the task.
     /// Returns the base task index and job index on success.
+    ///
+    /// Callers must ensure config is refreshed before calling this method.
     pub fn lookup_and_spawn_task(
         &mut self,
         workspace_id: u32,
@@ -1233,7 +1235,6 @@ impl WorkspaceState {
             return Err(format!("Task '{}' not found", name));
         };
         self.change_number = self.change_number.wrapping_add(1);
-        self.refresh_config();
         let job_index =
             self.spawn_task(workspace_id, channel, base_index, params, profile, ScheduleReason::Requested, force_restart);
         Ok((base_index, job_index))
@@ -1691,6 +1692,11 @@ pub enum FunctionGlobalAction {
 }
 
 impl Workspace {
+    pub fn refresh_config_if_changed(&self) {
+        let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
+    }
+
     pub fn logged_rust_panics(&self) -> Vec<LoggedPanic> {
         struct PanicFromLog {
             age: u32,
@@ -1805,6 +1811,28 @@ impl Workspace {
         )
     }
 
+    /// Layer 1: Start task by name.
+    ///
+    /// Acquires state lock, refreshes config, looks up task, and spawns it.
+    pub fn start_task_by_name(&self, name: &str, params: ValueMap, profile: &str) -> Result<(BaseTaskIndex, JobIndex), String> {
+        let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
+        state.change_number = state.change_number.wrapping_add(1);
+        let Some(base_index) = state.base_index_by_name(name) else {
+            return Err(format!("Task '{}' not found", name));
+        };
+        let job_index = state.spawn_task(
+            self.workspace_id,
+            &self.process_channel,
+            base_index,
+            params,
+            profile,
+            ScheduleReason::Requested,
+            false,
+        );
+        Ok((base_index, job_index))
+    }
+
     pub fn terminate_tasks(&self, base_task: BaseTaskIndex) {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
@@ -1847,9 +1875,9 @@ impl Workspace {
     /// Layer 1: Restart task by name.
     ///
     /// Acquires state lock, looks up task, and spawns it.
-    #[expect(unused, reason = "public API for programmatic restart without cache checking")]
     pub fn restart_task_by_name(&self, name: &str, params: ValueMap, profile: &str) -> Result<JobIndex, String> {
         let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
         let (_, job_index) =
             state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, true)?;
         Ok(job_index)
@@ -1871,6 +1899,7 @@ impl Workspace {
         cached: bool,
     ) -> Result<Option<String>, String> {
         if cached {
+            self.refresh_config_if_changed();
             // Phase 1: Gather info needed for cache key computation (hold lock briefly)
             let (cache_info, profile) = {
                 let state = self.state.read().unwrap();
@@ -1932,6 +1961,7 @@ impl Workspace {
             Ok(None)
         } else {
             let state = &mut *self.state.write().unwrap();
+            state.refresh_config();
             let (_, _job_index) =
                 state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
             Ok(None)
@@ -1943,6 +1973,7 @@ impl Workspace {
     /// Acquires state lock, looks up task, spawns it, and records it as a test group.
     pub fn spawn_task_as_test(&self, name: &str, params: ValueMap, profile: &str) -> Result<(), String> {
         let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
         let (base_index, job_index) =
             state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
         state.record_test_group(base_index, job_index);
@@ -1954,6 +1985,7 @@ impl Workspace {
     /// Acquires state lock, looks up task, and terminates all running instances.
     pub fn terminate_task_by_name(&self, name: &str) -> Result<String, String> {
         let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
         state.lookup_and_terminate_task(&self.process_channel, name)
     }
 
@@ -1965,6 +1997,7 @@ impl Workspace {
         use crate::function::FunctionAction;
 
         let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
 
         if let Some(FunctionAction::RestartCaptured { task_name, profile }) = state.session_functions.get(name).cloned()
         {

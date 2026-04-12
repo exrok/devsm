@@ -617,6 +617,7 @@ fn process_key(
                 }
                 select_search::Action::Enter => {
                     if let Some(group) = selection.selected::<usize>() {
+                        workspace.refresh_config_if_changed();
                         let mut ws1 = workspace.state.write().unwrap();
                         let ws = &mut *ws1;
                         if let Some((_, tasks)) = ws.config.current.groups.get(group) {
@@ -908,6 +909,7 @@ fn process_key(
 }
 
 fn call_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str) {
+    workspace.refresh_config_if_changed();
     let ws = workspace.state();
     if let Some(FunctionAction::RestartCaptured { task_name, profile }) = ws.session_functions.get(fn_name) {
         let task_name = task_name.clone();

@@ -2347,3 +2347,42 @@ cmd = ["true"]
         result.stderr
     );
 }
+
+#[test]
+fn config_hot_reload_new_task() {
+    let mut harness = TestHarness::new("config_hot_reload");
+    harness.write_config(
+        r#"
+[action.existing_task]
+cmd = ["echo", "existing"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "existing_task"]);
+    assert!(result.success(), "existing_task should succeed: {}", result.stderr);
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    fs::write(
+        &config_path,
+        r#"
+[action.existing_task]
+cmd = ["echo", "existing"]
+
+[action.new_task]
+cmd = ["echo", "hot reloaded"]
+"#,
+    )
+    .expect("Failed to write updated config");
+
+    let result = harness.run_client(&["run", "new_task"]);
+    assert!(result.success(), "new_task should be found after config reload: {}", result.stderr);
+    assert!(
+        result.stderr.contains("Task exited (code 0)"),
+        "new_task should exit successfully, got: {}",
+        result.stderr
+    );
+}
