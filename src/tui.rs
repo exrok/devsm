@@ -157,6 +157,12 @@ impl ChainState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DragKind {
+    MenuSeparator,
+    HybridSeparator,
+}
+
 struct TuiState {
     frame: DoubleBuffer,
     frame_width: u16,
@@ -169,6 +175,8 @@ struct TuiState {
     status_message: Option<StatusMessage>,
     task_tree_hidden: bool,
     chain: ChainState,
+    menu_height_override: Option<u16>,
+    drag: Option<DragKind>,
 }
 
 fn compute_menu_height(terminal_height: u16) -> u16 {
@@ -186,6 +194,17 @@ fn compute_menu_height(terminal_height: u16) -> u16 {
     }
 }
 
+const MENU_HEIGHT_MIN: u16 = 5;
+const MENU_HEIGHT_LOG_RESERVE: u16 = 5;
+
+fn effective_menu_height(terminal_height: u16, override_: Option<u16>) -> u16 {
+    let max = terminal_height.saturating_sub(MENU_HEIGHT_LOG_RESERVE).max(MENU_HEIGHT_MIN);
+    match override_ {
+        Some(v) => v.clamp(MENU_HEIGHT_MIN, max),
+        None => compute_menu_height(terminal_height),
+    }
+}
+
 fn render<'a>(
     w: u16,
     h: u16,
@@ -196,7 +215,7 @@ fn render<'a>(
 ) -> &'a [u8] {
     let has_overlay = !matches!(tui.overlay, FocusOverlap::None);
     let show_task_tree_area = has_overlay || !tui.task_tree_hidden;
-    let menu_height = if show_task_tree_area { compute_menu_height(h) } else { 1 };
+    let menu_height = if show_task_tree_area { effective_menu_height(h, tui.menu_height_override) } else { 1 };
 
     let dimensions_changed = tui.frame_width != w || tui.frame_height != menu_height;
     let resized = delta.any(Has::RESIZED) || dimensions_changed;
@@ -1157,8 +1176,15 @@ pub enum ScrollTarget {
     None,
 }
 
-fn scroll_target(w: u16, h: u16, x: u16, y: u16, show_task_tree: bool) -> ScrollTarget {
-    let menu_height = if show_task_tree { compute_menu_height(h) } else { 1 } as i32;
+fn scroll_target(
+    w: u16,
+    h: u16,
+    x: u16,
+    y: u16,
+    show_task_tree: bool,
+    menu_override: Option<u16>,
+) -> ScrollTarget {
+    let menu_height = if show_task_tree { effective_menu_height(h, menu_override) } else { 1 } as i32;
     let mut dest = Rect { x: 0, y: 0, w, h };
     let mut bot = dest.take_bottom(menu_height);
     let (tl, bl) = dest.v_split(0.5);
@@ -1395,6 +1421,8 @@ pub fn run(
         status_message: None,
         task_tree_hidden: false,
         chain: ChainState::default(),
+        menu_height_override: None,
+        drag: None,
     };
 
     let mut delta = Has(0);
@@ -1471,7 +1499,16 @@ pub fn run(
                     let y = mouse.row;
                     let has_overlay = !matches!(tui.overlay, FocusOverlap::None);
                     let show_task_tree = has_overlay || !tui.task_tree_hidden;
-                    let target = scroll_target(w, h, x, y, show_task_tree);
+                    let menu_h = if show_task_tree { effective_menu_height(h, tui.menu_height_override) } else { 1 };
+                    let status_bar_y = h.saturating_sub(menu_h);
+                    let log_area_h = h.saturating_sub(menu_h);
+                    let in_hybrid = matches!(tui.logs.mode(), log_stack::Mode::Hybrid(..));
+                    let hybrid_sep_y = if in_hybrid && log_area_h >= 2 {
+                        Some(tui.logs.effective_hybrid_top_h(log_area_h))
+                    } else {
+                        None
+                    };
+                    let target = scroll_target(w, h, x, y, show_task_tree, tui.menu_height_override);
                     match mouse.kind {
                         extui::event::MouseEventKind::ScrollDown => match target {
                             ScrollTarget::TopLog => tui.logs.pending_top_scroll -= 5,
@@ -1489,21 +1526,55 @@ pub fn run(
                             }
                             ScrollTarget::None => (),
                         },
-                        extui::event::MouseEventKind::Down(button) => match target {
-                            ScrollTarget::TaskList { row } => {
-                                tui.task_tree.select_primary_by_row(row as usize, &workspace.state());
-                                if matches!(button, extui::event::MouseButton::Right) {
-                                    restart_selected_task(&mut tui, workspace);
+                        extui::event::MouseEventKind::Down(button) => {
+                            let is_left = matches!(button, extui::event::MouseButton::Left);
+                            if is_left && show_task_tree && y == status_bar_y {
+                                tui.drag = Some(DragKind::MenuSeparator);
+                            } else if is_left && Some(y) == hybrid_sep_y {
+                                tui.drag = Some(DragKind::HybridSeparator);
+                            } else {
+                                tui.drag = None;
+                                match target {
+                                    ScrollTarget::TaskList { row } => {
+                                        tui.task_tree.select_primary_by_row(row as usize, &workspace.state());
+                                        if matches!(button, extui::event::MouseButton::Right) {
+                                            restart_selected_task(&mut tui, workspace);
+                                        }
+                                    }
+                                    ScrollTarget::JobList { row } => {
+                                        tui.task_tree.select_job_by_row(row as usize, &workspace.state());
+                                        if matches!(button, extui::event::MouseButton::Right) {
+                                            restart_selected_task(&mut tui, workspace);
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
-                            ScrollTarget::JobList { row } => {
-                                tui.task_tree.select_job_by_row(row as usize, &workspace.state());
-                                if matches!(button, extui::event::MouseButton::Right) {
-                                    restart_selected_task(&mut tui, workspace);
+                        }
+                        extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left) => {
+                            match tui.drag {
+                                Some(DragKind::MenuSeparator) => {
+                                    let new_h = h.saturating_sub(y);
+                                    tui.menu_height_override = Some(new_h);
+                                    delta |= Has::RESIZED;
                                 }
+                                Some(DragKind::HybridSeparator)
+                                    if in_hybrid
+                                        && log_area_h >= log_stack::HYBRID_MIN_PANE * 2 + 1 =>
+                                {
+                                    let max_top = log_area_h - log_stack::HYBRID_MIN_PANE - 1;
+                                    let clamped = y.clamp(log_stack::HYBRID_MIN_PANE, max_top);
+                                    if tui.logs.hybrid_top_h_pinned() != Some(clamped) {
+                                        tui.logs.set_hybrid_top_h(clamped);
+                                        delta |= Has::RESIZED;
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
-                        },
+                        }
+                        extui::event::MouseEventKind::Up(_) => {
+                            tui.drag = None;
+                        }
                         _ => {}
                     }
                 }

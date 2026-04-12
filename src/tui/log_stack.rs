@@ -86,7 +86,6 @@ struct SeparatorState {
     y: u16,
 }
 
-#[derive(Default)]
 pub struct LogStack {
     mode: Mode,
     top: LogWidget,
@@ -100,11 +99,61 @@ pub struct LogStack {
     last_separator: Option<SeparatorState>,
     /// Tracks whether the welcome message was rendered (to avoid redundant redraws).
     welcome_shown: bool,
+    /// User-pinned top pane height in Hybrid mode. `None` means default 50/50.
+    /// Anchoring the top pane keeps the separator at a fixed screen y when the
+    /// menu bar is resized, since the log area grows/shrinks from its bottom.
+    hybrid_top_h: Option<u16>,
+}
+
+/// Minimum rows required for each pane in hybrid mode.
+pub const HYBRID_MIN_PANE: u16 = 3;
+
+impl Default for LogStack {
+    fn default() -> Self {
+        Self {
+            mode: Mode::default(),
+            top: LogWidget::default(),
+            bottom: LogWidget::default(),
+            pending_top_scroll: 0,
+            pending_bottom_scroll: 0,
+            base_task_log_style: LogStyle::default(),
+            highlight: None,
+            last_separator: None,
+            welcome_shown: false,
+            hybrid_top_h: None,
+        }
+    }
 }
 impl LogStack {
     /// Returns the current display mode.
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// Computes the top pane height for a given log-area height, applying the
+    /// user-pinned value (if any) and clamping to keep both panes at least
+    /// `HYBRID_MIN_PANE` rows tall. The pinned value is preserved across
+    /// resizes; the clamp is only applied for display so that the separator
+    /// returns to its anchored position when there's room again.
+    pub fn effective_hybrid_top_h(&self, log_area_h: u16) -> u16 {
+        let separator = 1u16;
+        if log_area_h < HYBRID_MIN_PANE * 2 + separator {
+            return log_area_h.saturating_sub(separator) / 2;
+        }
+        let max_top = log_area_h - HYBRID_MIN_PANE - separator;
+        let default = ((log_area_h - separator) as u32 * 3 / 10) as u16;
+        self.hybrid_top_h.unwrap_or(default).clamp(HYBRID_MIN_PANE, max_top)
+    }
+
+    pub fn set_hybrid_top_h(&mut self, top_h: u16) {
+        if self.hybrid_top_h != Some(top_h) {
+            self.hybrid_top_h = Some(top_h);
+            self.last_separator = None;
+        }
+    }
+
+    pub fn hybrid_top_h_pinned(&self) -> Option<u16> {
+        self.hybrid_top_h
     }
 
     /// Returns the scroll state for both top and bottom panes.
@@ -267,7 +316,9 @@ impl LogStack {
         let logs = ws.logs.read().unwrap();
         if let Some(bot_filter) = bot_filter {
             let view = logs.view(bot_filter);
-            let bot_rect = dest.take_bottom(0.5);
+            let top_h = self.effective_hybrid_top_h(dest.h);
+            let bot_h = dest.h.saturating_sub(top_h + 1);
+            let bot_rect = dest.take_bottom(bot_h as i32);
             if resized {
                 self.bottom.check_resize_revert_to_tail(&view, &def, bot_rect);
             }
@@ -278,6 +329,9 @@ impl LogStack {
             let Mode::Hybrid(selection_state) = &self.mode else { unreachable!() };
             let current_sep = SeparatorState { selection: *selection_state, y: br.y };
 
+            if resized {
+                self.last_separator = None;
+            }
             if self.last_separator.as_ref() != Some(&current_sep) {
                 extui::vt::MoveCursor(br.x, br.y).write_to_buffer(buf);
                 AnsiColor::Grey[6].with_fg(AnsiColor::Grey[25]).write_to_buffer(buf);
