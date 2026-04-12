@@ -186,7 +186,7 @@ pub enum Command {
     ToggleHelp,
     HelpScrollUp,
     HelpScrollDown,
-    ToggleViewMode,
+    ToggleGroupExpand,
     ToggleTaskTree,
     ToggleShortcutBar,
     OverlayCancel,
@@ -238,7 +238,7 @@ impl FromStr for Command {
             "ToggleHelp" => Command::ToggleHelp,
             "HelpScrollUp" => Command::HelpScrollUp,
             "HelpScrollDown" => Command::HelpScrollDown,
-            "ToggleViewMode" => Command::ToggleViewMode,
+            "ToggleGroupExpand" => Command::ToggleGroupExpand,
             "ToggleTaskTree" => Command::ToggleTaskTree,
             "ToggleShortcutBar" => Command::ToggleShortcutBar,
             "OverlayCancel" => Command::OverlayCancel,
@@ -456,7 +456,7 @@ impl Keybinds {
         self.bind(Mode::TaskTree, "s", Command::LaunchTask);
         self.bind(Mode::TaskTree, "g", Command::StartGroup);
         self.bind(Mode::TaskTree, "ENTER", Command::StartSelection);
-        self.bind(Mode::TaskTree, "v", Command::ToggleViewMode);
+        self.bind(Mode::TaskTree, "TAB", Command::ToggleGroupExpand);
         self.bind(Mode::TaskTree, "\\", Command::ToggleTaskTree);
         self.bind(Mode::TaskTree, "R", Command::RefreshConfig);
         self.bind(Mode::TaskTree, "t", Command::LaunchTestFilter);
@@ -671,7 +671,7 @@ impl Command {
             Command::ToggleHelp => "Help",
             Command::HelpScrollUp => "Help Up",
             Command::HelpScrollDown => "Help Down",
-            Command::ToggleViewMode => "Toggle View",
+            Command::ToggleGroupExpand => "Expand/Collapse",
             Command::ToggleTaskTree => "Toggle Tasks",
             Command::ToggleShortcutBar => "Toggle Shortcuts",
             Command::OverlayCancel => "Cancel",
@@ -716,7 +716,7 @@ impl Command {
             Command::ToggleHelp => "ToggleHelp",
             Command::HelpScrollUp => "HelpScrollUp",
             Command::HelpScrollDown => "HelpScrollDown",
-            Command::ToggleViewMode => "ToggleViewMode",
+            Command::ToggleGroupExpand => "ToggleGroupExpand",
             Command::ToggleTaskTree => "ToggleTaskTree",
             Command::ToggleShortcutBar => "ToggleShortcutBar",
             Command::OverlayCancel => "OverlayCancel",

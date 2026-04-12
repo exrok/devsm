@@ -111,7 +111,7 @@ pub const HYBRID_MIN_PANE: u16 = 3;
 impl Default for LogStack {
     fn default() -> Self {
         Self {
-            mode: Mode::default(),
+            mode: Mode::Hybrid(SelectionState::default()),
             top: LogWidget::default(),
             bottom: LogWidget::default(),
             pending_top_scroll: 0,
@@ -315,6 +315,19 @@ impl LogStack {
 
         let logs = ws.logs.read().unwrap();
         if let Some(bot_filter) = bot_filter {
+            let top_view = logs.view(top_filter.clone());
+            if top_view.is_empty() {
+                let view = logs.view(bot_filter);
+                let pending = self.pending_bottom_scroll + self.pending_top_scroll;
+                if resized {
+                    self.bottom.check_resize_revert_to_tail(&view, &def, dest);
+                }
+                self.bottom.scrollable_render(pending, buf, dest, &view, &def);
+                self.pending_bottom_scroll = 0;
+                self.pending_top_scroll = 0;
+                self.last_separator = None;
+                return;
+            }
             let view = logs.view(bot_filter);
             let top_h = self.effective_hybrid_top_h(dest.h);
             let bot_h = dest.h.saturating_sub(top_h + 1);
@@ -344,8 +357,9 @@ impl LogStack {
                     } else if let Some(kind) = selection_state.meta_group {
                         buf.extend_from_slice(b" NOT ");
                         let label = match kind {
-                            MetaGroupKind::Tests => "@tests",
+                            MetaGroupKind::Services => "@services",
                             MetaGroupKind::Actions => "@actions",
+                            MetaGroupKind::Tests => "@tests",
                         };
                         buf.extend_from_slice(label.as_bytes());
                     }

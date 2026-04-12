@@ -4,34 +4,80 @@ use crate::{
     config::{Command, ServiceHidden, TaskKind},
     function::FunctionAction,
     tui::constrain_scroll_offset,
-    workspace::{BaseTaskIndex, JobIndex, JobStatus, WorkspaceState},
+    workspace::{BaseTask, BaseTaskIndex, JobIndex, JobStatus, WorkspaceState},
 };
 
-/// Represents a collapsible category for non-service tasks.
+fn task_is_visible(bt: &BaseTask) -> bool {
+    if bt.removed || bt.config.managed == Some(false) {
+        return false;
+    }
+    match bt.config.kind {
+        TaskKind::Service => match bt.config.hidden {
+            ServiceHidden::Never => true,
+            ServiceHidden::UntilRan => bt.has_run_this_session,
+        },
+        TaskKind::Action | TaskKind::Test => true,
+    }
+}
+
+fn group_has_visible_tasks(ws: &WorkspaceState, kind: MetaGroupKind) -> bool {
+    let task_kind = kind.task_kind();
+    ws.base_tasks.iter().any(|bt| bt.config.kind == task_kind && task_is_visible(bt))
+}
+
+fn first_visible_task_of_kind(ws: &WorkspaceState, kind: MetaGroupKind) -> Option<BaseTaskIndex> {
+    let task_kind = kind.task_kind();
+    ws.base_tasks
+        .iter()
+        .position(|bt| bt.config.kind == task_kind && task_is_visible(bt))
+        .map(|i| BaseTaskIndex(i as u32))
+}
+
+/// Top-level collapsible category in the task list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MetaGroupKind {
-    Tests,
+    Services,
     Actions,
+    Tests,
 }
 
 impl MetaGroupKind {
     pub fn task_kind(self) -> TaskKind {
         match self {
-            MetaGroupKind::Tests => TaskKind::Test,
+            MetaGroupKind::Services => TaskKind::Service,
             MetaGroupKind::Actions => TaskKind::Action,
+            MetaGroupKind::Tests => TaskKind::Test,
+        }
+    }
+
+    pub fn from_task_kind(kind: TaskKind) -> MetaGroupKind {
+        match kind {
+            TaskKind::Service => MetaGroupKind::Services,
+            TaskKind::Action => MetaGroupKind::Actions,
+            TaskKind::Test => MetaGroupKind::Tests,
         }
     }
 
     fn display_name(self) -> &'static str {
         match self {
-            MetaGroupKind::Tests => "@tests",
+            MetaGroupKind::Services => "@services",
             MetaGroupKind::Actions => "@actions",
+            MetaGroupKind::Tests => "@tests",
+        }
+    }
+
+    fn letter(self) -> &'static str {
+        match self {
+            MetaGroupKind::Services => " S ",
+            MetaGroupKind::Actions => " A ",
+            MetaGroupKind::Tests => " T ",
         }
     }
 }
 
-/// An entry in the primary task list. In collapsed mode, tests and actions are
-/// aggregated under meta-groups; in expanded mode, all base tasks are shown individually.
+/// An entry in the primary task list. A `MetaGroup` header is rendered only
+/// when its group is collapsed (or has no visible tasks); when expanded, the
+/// group's child `Task` entries appear directly without a header row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PrimaryEntry {
     Task(BaseTaskIndex),
@@ -113,14 +159,13 @@ impl StatusKind {
     }
 }
 pub struct TaskTreeState {
-    /// Whether to show collapsed view (meta-groups) or expanded view (all tasks).
-    collapsed: bool,
-    /// The primary list entries (tasks or meta-groups).
+    services_expanded: bool,
+    actions_expanded: bool,
+    tests_expanded: bool,
     primary_list: Vec<PrimaryEntry>,
     change_number: u32,
     primary_index: usize,
     primary_scroll_offset: usize,
-    /// The currently selected primary entry.
     selected_entry: Option<PrimaryEntry>,
     job_list_index: usize,
     job_list_scroll_offset: usize,
@@ -130,7 +175,9 @@ pub struct TaskTreeState {
 impl Default for TaskTreeState {
     fn default() -> Self {
         Self {
-            collapsed: true,
+            services_expanded: true,
+            actions_expanded: true,
+            tests_expanded: true,
             primary_list: Default::default(),
             change_number: u32::MAX,
             primary_index: Default::default(),
@@ -148,7 +195,7 @@ impl Default for TaskTreeState {
 /// When a specific task or job is selected, `base_task` contains the task index.
 /// When a meta-group is selected without a specific job, `base_task` is `None`
 /// and `meta_group` contains the group kind.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SelectionState {
     /// The selected base task. `None` when a meta-group is selected without a specific job.
     pub base_task: Option<BaseTaskIndex>,
@@ -159,15 +206,54 @@ pub struct SelectionState {
 }
 
 impl TaskTreeState {
-    /// Toggles between collapsed and expanded view modes.
-    pub fn toggle_collapsed(&mut self) {
-        self.collapsed = !self.collapsed;
-        self.change_number = u32::MAX; // Force rebuild of primary list
+    fn group_flag_mut(&mut self, kind: MetaGroupKind) -> &mut bool {
+        match kind {
+            MetaGroupKind::Services => &mut self.services_expanded,
+            MetaGroupKind::Actions => &mut self.actions_expanded,
+            MetaGroupKind::Tests => &mut self.tests_expanded,
+        }
     }
 
-    /// Returns whether the task tree is in collapsed mode.
-    pub fn is_collapsed(&self) -> bool {
-        self.collapsed
+    pub fn is_group_expanded(&self, kind: MetaGroupKind) -> bool {
+        match kind {
+            MetaGroupKind::Services => self.services_expanded,
+            MetaGroupKind::Actions => self.actions_expanded,
+            MetaGroupKind::Tests => self.tests_expanded,
+        }
+    }
+
+    /// Toggles expansion of the given meta-group. Returns `false` if the group
+    /// has no visible tasks (in which case nothing changes — empty groups can
+    /// only render as a header, so toggling has no effect).
+    ///
+    /// Anchors the selection so that the cursor lands somewhere meaningful
+    /// after the rebuild: on the new header when collapsing, on the first task
+    /// when expanding (since the header row disappears).
+    pub fn toggle_group_expand(&mut self, kind: MetaGroupKind, ws: &WorkspaceState) -> bool {
+        if !group_has_visible_tasks(ws, kind) {
+            return false;
+        }
+        let flag = self.group_flag_mut(kind);
+        *flag = !*flag;
+        self.selected_entry = if *flag {
+            first_visible_task_of_kind(ws, kind).map(PrimaryEntry::Task)
+        } else {
+            Some(PrimaryEntry::MetaGroup(kind))
+        };
+        self.change_number = u32::MAX;
+        true
+    }
+
+    /// Returns the meta-group the current selection belongs to — either the
+    /// selected group header itself, or the parent group of a selected child task.
+    pub fn group_for_selection(&self, ws: &WorkspaceState) -> Option<MetaGroupKind> {
+        match self.selected_entry? {
+            PrimaryEntry::MetaGroup(kind) => Some(kind),
+            PrimaryEntry::Task(bti) => {
+                let bt = ws.base_tasks.get(bti.idx())?;
+                Some(MetaGroupKind::from_task_kind(bt.config.kind))
+            }
+        }
     }
 
     /// Returns the current selection without normalization. Used for read-only display.
@@ -252,52 +338,18 @@ impl TaskTreeState {
     fn rebuild_primary_list(&mut self, ws: &WorkspaceState) {
         self.primary_list.clear();
 
-        if self.collapsed {
+        for group in [MetaGroupKind::Services, MetaGroupKind::Actions, MetaGroupKind::Tests] {
+            let task_kind = group.task_kind();
+            let has_any = group_has_visible_tasks(ws, group);
+            if !has_any || !self.is_group_expanded(group) {
+                self.primary_list.push(PrimaryEntry::MetaGroup(group));
+                continue;
+            }
             for (i, bt) in ws.base_tasks.iter().enumerate() {
-                if bt.removed || bt.config.managed == Some(false) {
+                if bt.config.kind != task_kind || !task_is_visible(bt) {
                     continue;
                 }
-                if bt.config.kind == TaskKind::Service {
-                    let should_display = match bt.config.hidden {
-                        ServiceHidden::Never => true,
-                        ServiceHidden::UntilRan => bt.has_run_this_session,
-                    };
-                    if should_display {
-                        self.primary_list.push(PrimaryEntry::Task(BaseTaskIndex(i as u32)));
-                    }
-                }
-            }
-
-            let has_tests = ws
-                .base_tasks
-                .iter()
-                .any(|bt| !bt.removed && bt.config.managed != Some(false) && bt.config.kind == TaskKind::Test);
-            let has_actions = ws
-                .base_tasks
-                .iter()
-                .any(|bt| !bt.removed && bt.config.managed != Some(false) && bt.config.kind == TaskKind::Action);
-
-            if has_actions {
-                self.primary_list.push(PrimaryEntry::MetaGroup(MetaGroupKind::Actions));
-            }
-            if has_tests {
-                self.primary_list.push(PrimaryEntry::MetaGroup(MetaGroupKind::Tests));
-            }
-        } else {
-            for (i, bt) in ws.base_tasks.iter().enumerate() {
-                if bt.removed || bt.config.managed == Some(false) {
-                    continue;
-                }
-                let should_display = match bt.config.kind {
-                    TaskKind::Service => match bt.config.hidden {
-                        ServiceHidden::Never => true,
-                        ServiceHidden::UntilRan => bt.has_run_this_session,
-                    },
-                    TaskKind::Action | TaskKind::Test => true,
-                };
-                if should_display {
-                    self.primary_list.push(PrimaryEntry::Task(BaseTaskIndex(i as u32)));
-                }
+                self.primary_list.push(PrimaryEntry::Task(BaseTaskIndex(i as u32)));
             }
         }
 
@@ -412,6 +464,21 @@ impl TaskTreeState {
         let _ = self.selection_state(ws);
     }
 
+    /// Returns the meta-group kind at `row` if and only if that row is also the
+    /// currently-selected entry. Used by the mouse handler to toggle expansion
+    /// when a user clicks the already-selected group header.
+    pub fn selected_meta_group_at_row(&self, row: usize) -> Option<MetaGroupKind> {
+        let list_index = self.primary_scroll_offset + row;
+        let entry = self.primary_list.get(list_index).copied()?;
+        if Some(entry) != self.selected_entry {
+            return None;
+        }
+        match entry {
+            PrimaryEntry::MetaGroup(kind) => Some(kind),
+            PrimaryEntry::Task(_) => None,
+        }
+    }
+
     pub fn select_job_by_row(&mut self, row: usize, ws: &WorkspaceState) {
         let entry = match self.normalize_primary() {
             Some(entry) => entry,
@@ -487,6 +554,9 @@ impl TaskTreeState {
             Some(sel) => sel,
             None => return,
         };
+        let current_kind = sel
+            .meta_group
+            .or_else(|| sel.base_task.map(|bti| MetaGroupKind::from_task_kind(ws.base_tasks[bti.idx()].config.kind)));
         self.primary_scroll_offset = constrain_scroll_offset(
             rect.h as usize,
             self.primary_index,
@@ -511,6 +581,10 @@ impl TaskTreeState {
                         .map(|job| StatusKind::of(&ws[*job].process_status, task.config.kind))
                         .unwrap_or(StatusKind::Null);
 
+                    let kind = MetaGroupKind::from_task_kind(task.config.kind);
+                    let letter_fg = if Some(kind) == current_kind { AnsiColor::Grey[18] } else { AnsiColor::Grey[10] };
+                    line.take_left(3).with(letter_fg.with_bg(AnsiColor::Grey[0])).text(out, kind.letter());
+
                     line.take_left(6)
                         .with(if is_selected {
                             status.dark_bg().with_fg(AnsiColor::Black)
@@ -521,13 +595,14 @@ impl TaskTreeState {
 
                     let fn_indicator = get_bound_function(ws, task_id);
 
-                    let style = if is_selected { status.light_bg().with_fg(AnsiColor(236)) } else { AnsiColor(248).as_fg() };
-                    let substyle =
-                        if is_selected { status.light_bg().with_fg(AnsiColor::Grey[7]) } else { AnsiColor::Grey[16].as_fg() };
+                    let style =
+                        if is_selected { status.light_bg().with_fg(AnsiColor(236)) } else { AnsiColor(248).as_fg() };
+                    let substyle = if is_selected {
+                        status.light_bg().with_fg(AnsiColor::Grey[7])
+                    } else {
+                        AnsiColor::Grey[16].as_fg()
+                    };
                     let mut rem = line.with(style).fill(out).skip(1);
-                    if task.config.kind == TaskKind::Test {
-                        rem = rem.with(substyle).text(out, "test/").with(style);
-                    }
                     rem = rem.text(out, task.name).with(HAlign::Right);
 
                     if let Some(fn_name) = fn_indicator {
@@ -567,21 +642,17 @@ impl TaskTreeState {
                         })
                         .text(out, status.padded_text());
 
-                    let style = if is_selected { status.light_bg().with_fg(AnsiColor(236)) } else { AnsiColor(248).as_fg() };
-                    let substyle =
-                        if is_selected { status.light_bg().with_fg(AnsiColor::Grey[7]) } else { AnsiColor::Grey[16].as_fg() };
-
-                    let mut rem = line
-                        .with(if is_selected { status.light_bg().with_fg(AnsiColor(236)) } else { AnsiColor(248).as_fg() })
-                        .fill(out)
-                        .skip(1)
-                        .fmt(out, kind.display_name())
-                        .with(HAlign::Right);
-
-                    let jobs = match kind {
-                        MetaGroupKind::Tests => &ws.test_jobs,
-                        MetaGroupKind::Actions => &ws.action_jobs,
+                    let style =
+                        if is_selected { status.light_bg().with_fg(AnsiColor(236)) } else { AnsiColor(248).as_fg() };
+                    let substyle = if is_selected {
+                        status.light_bg().with_fg(AnsiColor::Grey[7])
+                    } else {
+                        AnsiColor::Grey[16].as_fg()
                     };
+
+                    let mut rem = line.with(style).fill(out).skip(1).text(out, kind.display_name()).with(HAlign::Right);
+
+                    let jobs = ws.jobs_list_by_kind(kind.task_kind());
                     let active = jobs.running().len();
                     let sched = jobs.scheduled().len();
                     let all = jobs.all().len();

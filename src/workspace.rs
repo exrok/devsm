@@ -1092,12 +1092,32 @@ impl std::ops::Index<JobIndex> for WorkspaceState {
 }
 
 impl WorkspaceState {
+    /// Returns the name used to look up a base task in `name_map` / to pass to
+    /// `SpawnSpec::task`. Tests are registered under a `~test/` prefix, so their
+    /// display name (`BaseTask::name`) is not a valid spawn key on its own.
+    pub fn spawn_name_for(&self, bti: BaseTaskIndex) -> String {
+        let bt = &self.base_tasks[bti.idx()];
+        match bt.config.kind {
+            TaskKind::Test => format!("~test/{}", bt.name),
+            _ => bt.name.to_string(),
+        }
+    }
+
     /// Returns all job indices for tasks of the given kind.
     pub fn jobs_by_kind(&self, kind: TaskKind) -> &[JobIndex] {
         match kind {
             TaskKind::Action => self.action_jobs.all(),
             TaskKind::Test => self.test_jobs.all(),
-            TaskKind::Service => &[],
+            TaskKind::Service => self.service_jobs.all(),
+        }
+    }
+
+    /// Returns the full job list for the given task kind.
+    pub fn jobs_list_by_kind(&self, kind: TaskKind) -> &JobIndexList {
+        match kind {
+            TaskKind::Action => &self.action_jobs,
+            TaskKind::Test => &self.test_jobs,
+            TaskKind::Service => &self.service_jobs,
         }
     }
 

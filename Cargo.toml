@@ -33,8 +33,7 @@ annotate-snippets = "0.12.10"
 blake3 = { version = "1.8.3" }
 fast-glob = "1.0.0"
 # Use git dependency until version 0.2 is released.
-#extui = { git = "https://github.com/exrok/extui", rev = "504f4bbb419bb154a083a5f174908dadba8ad9b8" }
-extui.path = "/home/user/Projects/git/extui"
+extui = { git = "https://github.com/exrok/extui", rev = "8b6fc2196537401d4432699c4b08190e6bcd1e50" }
 mimalloc = { version = "0.1.48", optional = true }
 
 [dev-dependencies]

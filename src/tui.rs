@@ -9,7 +9,9 @@ use extui::{AnsiColor, DoubleBuffer, HAlign, Rect, Style, TerminalFlags, vt};
 use jsony_value::ValueMap;
 
 use crate::config::TaskKind;
-use crate::event_loop::{Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_TESTS};
+use crate::event_loop::{
+    Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_SERVICES, SELECTED_META_GROUP_TESTS,
+};
 use crate::function::{FunctionAction, SetFunctionAction};
 use crate::keybinds::{BindingEntry, Command, InputEvent, Keybinds, Mode};
 use crate::log_storage::{BaseTaskSet, LogFilter};
@@ -365,7 +367,6 @@ struct StatusBarData {
     search_info: Option<(usize, usize)>,
     running: usize,
     scheduled: usize,
-    is_collapsed: bool,
     log_mode: &'static str,
     is_scrolled: bool,
     status_message: Option<(String, bool)>,
@@ -398,10 +399,9 @@ fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData)
 
     r = r.with(HAlign::Right);
 
-    let view_mode = if data.is_collapsed { "C" } else { "E" };
     r = r
         .with(AnsiColor::Grey[8].with_fg(AnsiColor::Grey[25]))
-        .fmt(frame, format_args!(" {} {} ", data.log_mode, view_mode));
+        .fmt(frame, format_args!(" {} ", data.log_mode));
 
     let block_style = if data.running > 0 {
         AnsiColor::DarkOliveGreen.with_fg(AnsiColor::Black)
@@ -459,8 +459,9 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
             format!(" {} ", ws.base_tasks[bti.idx()].name)
         } else if let Some(kind) = sel.meta_group {
             match kind {
-                MetaGroupKind::Tests => " @tests ".to_string(),
+                MetaGroupKind::Services => " @services ".to_string(),
                 MetaGroupKind::Actions => " @actions ".to_string(),
+                MetaGroupKind::Tests => " @tests ".to_string(),
             }
         } else {
             String::new()
@@ -520,7 +521,6 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
         search_info,
         running,
         scheduled,
-        is_collapsed: tui.task_tree.is_collapsed(),
         log_mode,
         is_scrolled,
         status_message,
@@ -661,8 +661,16 @@ fn process_key(
                                 test_group: false,
                             };
                             drop(ws1);
-                            let _ = workspace.submit(spec);
-                            tui.status_message = Some(StatusMessage::info("Group Started"));
+                            match workspace.submit(spec) {
+                                Ok(_) => {
+                                    tui.status_message = Some(StatusMessage::info("Group Started"));
+                                }
+                                Err(err) => {
+                                    kvlog::warn!("Group submit failed", group, err);
+                                    tui.status_message =
+                                        Some(StatusMessage::error(format!("Group failed: {}", err)));
+                                }
+                            }
                         }
                     }
 
@@ -701,11 +709,19 @@ fn process_key(
                     tui.overlay = FocusOverlap::None;
                 }
                 LauncherAction::Start { base_task, profile, params } => {
-                    let name = ws.base_tasks[base_task.idx()].name.to_string();
+                    let name = ws.spawn_name_for(base_task);
+                    let task_kind = ws.base_tasks[base_task.idx()].config.kind;
                     drop(ws);
-                    let _ = workspace.submit(SpawnSpec::task(&name, &profile, params, false));
+                    match workspace.submit(SpawnSpec::task(&name, &profile, params, false)) {
+                        Ok(_) => {
+                            tui.status_message = Some(StatusMessage::info("Task Spawned"));
+                        }
+                        Err(err) => {
+                            kvlog::warn!("Task launcher submit failed", name, ?task_kind, profile, err);
+                            tui.status_message = Some(StatusMessage::error(format!("Spawn failed: {}", err)));
+                        }
+                    }
                     tui.overlay = FocusOverlap::None;
-                    tui.status_message = Some(StatusMessage::info("Task Spawned"));
                 }
                 LauncherAction::None => {}
             }
@@ -831,8 +847,14 @@ fn process_key(
             let state = TestFilterLauncherState::new(&ws);
             tui.overlay = FocusOverlap::TestFilterLauncher { state };
         }
-        Command::ToggleViewMode => {
-            tui.task_tree.toggle_collapsed();
+        Command::ToggleGroupExpand => {
+            let ws = workspace.state();
+            if let Some(kind) = tui.task_tree.group_for_selection(&ws) {
+                if !tui.task_tree.toggle_group_expand(kind, &ws) {
+                    drop(ws);
+                    tui.status_message = Some(StatusMessage::error("Group is empty"));
+                }
+            }
         }
         Command::ToggleTaskTree => {
             tui.task_tree_hidden = !tui.task_tree_hidden;
@@ -867,9 +889,16 @@ fn process_key(
                 let mut state = TaskLauncherState::with_task(&ws, bti);
                 match state.try_auto_start(&ws) {
                     LauncherAction::Start { base_task, profile, params } => {
-                        let name = ws.base_tasks[base_task.idx()].name.to_string();
+                        let name = ws.spawn_name_for(base_task);
+                        let task_kind = ws.base_tasks[base_task.idx()].config.kind;
                         drop(ws);
-                        let _ = workspace.submit(SpawnSpec::task(&name, &profile, params, false));
+                        if let Err(err) =
+                            workspace.submit(SpawnSpec::task(&name, &profile, params, false))
+                        {
+                            kvlog::warn!("StartSelection submit failed", name, ?task_kind, profile, err);
+                            tui.status_message =
+                                Some(StatusMessage::error(format!("Start failed: {}", err)));
+                        }
                     }
                     _ => tui.overlay = FocusOverlap::TaskLauncher { state },
                 }
@@ -1074,6 +1103,8 @@ fn jump_to_fail_in_test_group(tui: &mut TuiState, workspace: &Workspace, forward
 fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {
     let ws = workspace.state();
     let Some(sel) = tui.task_tree.selection_state(&ws) else {
+        kvlog::warn!("Restart requested with no selection");
+        tui.status_message = Some(StatusMessage::error("Nothing selected to restart"));
         return;
     };
     let had_job_selected = sel.job.is_some();
@@ -1094,28 +1125,39 @@ fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {
             Some((job.log_group.base_task_index(), job.spawn_params.clone(), job.spawn_profile.clone()))
         } else {
             let msg = match kind {
-                MetaGroupKind::Tests => "No Test to Restart",
+                MetaGroupKind::Services => "No Service to Restart",
                 MetaGroupKind::Actions => "No Action to Restart",
+                MetaGroupKind::Tests => "No Test to Restart",
             };
+            kvlog::warn!("Restart requested on empty meta-group", ?kind);
             tui.status_message = Some(StatusMessage::error(msg));
             return;
         }
     } else {
         None
     }) else {
+        kvlog::warn!("Restart requested but selection resolved to nothing", ?sel);
+        tui.status_message = Some(StatusMessage::error("Nothing to restart"));
         return;
     };
-    let name = ws.base_tasks[base_task.idx()].name.to_string();
+    let name = ws.spawn_name_for(base_task);
+    let task_kind = ws.base_tasks[base_task.idx()].config.kind;
     drop(ws);
-    if let Ok(result) = workspace.submit(SpawnSpec::task(&name, &profile, params, true)) {
-        if had_job_selected {
-            if let Some(&(_, ji)) = result.jobs.first() {
-                let ws = workspace.state();
-                tui.task_tree.select_job(ji, &ws);
+    match workspace.submit(SpawnSpec::task(&name, &profile, params, true)) {
+        Ok(result) => {
+            if had_job_selected {
+                if let Some(&(_, ji)) = result.jobs.first() {
+                    let ws = workspace.state();
+                    tui.task_tree.select_job(ji, &ws);
+                }
             }
+            tui.status_message = Some(StatusMessage::info("Task Restarted"));
+        }
+        Err(err) => {
+            kvlog::warn!("Task restart submit failed", name, ?task_kind, profile, err);
+            tui.status_message = Some(StatusMessage::error(format!("Restart failed: {}", err)));
         }
     }
-    tui.status_message = Some(StatusMessage::info("Task Restarted"));
 }
 
 fn spawn_shell_command(script: &str, tui: &mut TuiState, workspace: &Workspace) {
@@ -1227,8 +1269,9 @@ fn job_status_str(status: &crate::workspace::JobStatus) -> &'static str {
 
 fn meta_group_kind_str(kind: MetaGroupKind) -> &'static str {
     match kind {
-        MetaGroupKind::Tests => "tests",
+        MetaGroupKind::Services => "services",
         MetaGroupKind::Actions => "actions",
+        MetaGroupKind::Tests => "tests",
     }
 }
 
@@ -1239,7 +1282,11 @@ fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_
     let scroll_state = tui.logs.scroll_state(&ws, workspace);
     let mut message = jsony::object! {
         tty_render_byte_count,
-        collapsed: tui.task_tree.is_collapsed(),
+        groups_expanded: {
+            services: tui.task_tree.is_group_expanded(MetaGroupKind::Services),
+            actions: tui.task_tree.is_group_expanded(MetaGroupKind::Actions),
+            tests: tui.task_tree.is_group_expanded(MetaGroupKind::Tests)
+        },
         scroll: {
             top: {
                 is_scrolled: scroll_state.top.is_scrolled,
@@ -1451,8 +1498,9 @@ pub fn run(
                     bti.idx() as u64
                 } else if let Some(kind) = sel.meta_group {
                     match kind {
-                        MetaGroupKind::Tests => SELECTED_META_GROUP_TESTS,
+                        MetaGroupKind::Services => SELECTED_META_GROUP_SERVICES,
                         MetaGroupKind::Actions => SELECTED_META_GROUP_ACTIONS,
+                        MetaGroupKind::Tests => SELECTED_META_GROUP_TESTS,
                     }
                 } else {
                     0
@@ -1555,7 +1603,17 @@ pub fn run(
                                 tui.drag = None;
                                 match target {
                                     ScrollTarget::TaskList { row } => {
+                                        let toggle_group = is_left
+                                            .then(|| tui.task_tree.selected_meta_group_at_row(row as usize))
+                                            .flatten();
                                         tui.task_tree.select_primary_by_row(row as usize, &workspace.state());
+                                        if let Some(kind) = toggle_group {
+                                            let ws = workspace.state();
+                                            if !tui.task_tree.toggle_group_expand(kind, &ws) {
+                                                drop(ws);
+                                                tui.status_message = Some(StatusMessage::error("Group is empty"));
+                                            }
+                                        }
                                         if matches!(button, extui::event::MouseButton::Right) {
                                             restart_selected_task(&mut tui, workspace);
                                         }

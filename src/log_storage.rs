@@ -65,6 +65,15 @@ impl LogFilter {
 }
 
 impl<'a> LogView<'a> {
+    pub fn is_empty(&self) -> bool {
+        let mut empty = true;
+        self.for_each_forward(self.logs.head(), &mut |_, _| {
+            empty = false;
+            std::ops::ControlFlow::Break(())
+        });
+        empty
+    }
+
     pub fn contains(&self, line: &LogEntry) -> bool {
         match &self.filter {
             LogFilter::All => true,

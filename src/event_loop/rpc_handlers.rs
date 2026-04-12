@@ -73,6 +73,7 @@ fn restart_selected_from_clients(clients: &Slab<ClientEntry>, ws: &WorkspaceEntr
         let selected = client.channel.selected.load(std::sync::atomic::Ordering::Relaxed);
         if selected & SELECTED_META_GROUP_FLAG != 0 {
             let kind = match selected {
+                SELECTED_META_GROUP_SERVICES => TaskKind::Service,
                 SELECTED_META_GROUP_TESTS => TaskKind::Test,
                 SELECTED_META_GROUP_ACTIONS => TaskKind::Action,
                 _ => return Err("invalid meta-group selection"),
@@ -83,27 +84,34 @@ fn restart_selected_from_clients(clients: &Slab<ClientEntry>, ws: &WorkspaceEntr
                 return Err("no jobs in selected meta-group");
             };
             let job = &ws_state[last_ji];
-            let name = ws_state.base_tasks[job.log_group.base_task_index().idx()].name.to_string();
+            let bti = job.log_group.base_task_index();
+            let name = ws_state.spawn_name_for(bti);
             let params = job.spawn_params.clone();
             let profile = job.spawn_profile.clone();
             drop(ws_state);
-            let _ = ws.handle.submit(SpawnSpec::task(&name, &profile, params, true));
+            if let Err(err) = ws.handle.submit(SpawnSpec::task(&name, &profile, params, true)) {
+                kvlog::warn!("RPC meta-group restart failed", name, profile, err);
+            }
         } else {
             let bti = workspace::BaseTaskIndex(selected as u32);
             let ws_state = ws.handle.state();
-            let Some(bt) = ws_state.base_tasks.get(bti.idx()) else {
+            if ws_state.base_tasks.get(bti.idx()).is_none() {
                 return Err("selected task no longer exists");
-            };
-            let name = bt.name.to_string();
-            if let Some(&last_ji) = bt.jobs.all().last() {
+            }
+            let name = ws_state.spawn_name_for(bti);
+            if let Some(&last_ji) = ws_state.base_tasks[bti.idx()].jobs.all().last() {
                 let job = &ws_state[last_ji];
                 let params = job.spawn_params.clone();
                 let profile = job.spawn_profile.clone();
                 drop(ws_state);
-                let _ = ws.handle.submit(SpawnSpec::task(&name, &profile, params, true));
+                if let Err(err) = ws.handle.submit(SpawnSpec::task(&name, &profile, params, true)) {
+                    kvlog::warn!("RPC task restart failed", name, profile, err);
+                }
             } else {
                 drop(ws_state);
-                let _ = ws.handle.submit(SpawnSpec::task(&name, "", ValueMap::new(), true));
+                if let Err(err) = ws.handle.submit(SpawnSpec::task(&name, "", ValueMap::new(), true)) {
+                    kvlog::warn!("RPC task fresh-start failed", name, err);
+                }
             }
         }
         return Ok(());

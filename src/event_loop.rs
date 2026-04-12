@@ -750,6 +750,8 @@ pub const SELECTED_META_GROUP_FLAG: u64 = 1 << 63;
 pub const SELECTED_META_GROUP_TESTS: u64 = SELECTED_META_GROUP_FLAG;
 /// Meta-group selection for actions (`@actions`).
 pub const SELECTED_META_GROUP_ACTIONS: u64 = SELECTED_META_GROUP_FLAG | 1;
+/// Meta-group selection for services (`@services`).
+pub const SELECTED_META_GROUP_SERVICES: u64 = SELECTED_META_GROUP_FLAG | 2;
 
 /// Channel for communicating with a client thread (TUI or forwarder).
 ///
@@ -761,8 +763,9 @@ pub struct ClientChannel {
     pub state: AtomicU64,
     /// Tracks selected item. Only used by TUI clients.
     /// - Values without `SELECTED_META_GROUP_FLAG` set: base task index
-    /// - `SELECTED_META_GROUP_TESTS`: the @tests meta-group is selected
+    /// - `SELECTED_META_GROUP_SERVICES`: the @services meta-group is selected
     /// - `SELECTED_META_GROUP_ACTIONS`: the @actions meta-group is selected
+    /// - `SELECTED_META_GROUP_TESTS`: the @tests meta-group is selected
     pub selected: AtomicU64,
     /// Event queue. Only used by TUI clients.
     pub events: Mutex<Vec<()>>,

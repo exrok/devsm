@@ -17,7 +17,7 @@ impl ShortcutEntry {
 pub fn render_shortcut_bar(frame: &mut DoubleBuffer, rect: Rect, entries: &[ShortcutEntry]) {
     let bar_bg = AnsiColor::Grey[3].with_fg(AnsiColor::Grey[3]);
     let key_style = AnsiColor::Grey[3].with_fg(AnsiColor::Grey[15]);
-    let label_style = AnsiColor::Grey[3].with_fg(AnsiColor::Grey[9]);
+    let label_style = AnsiColor::Grey[3].with_fg(AnsiColor::Grey[11]);
 
     rect.with(bar_bg).fill(frame);
 
@@ -76,94 +76,129 @@ pub fn build_shortcut_entries(
     match mode {
         Mode::TaskTree | Mode::Global => {
             if task_tree_hidden {
-                push_entries(&mut entries, keybinds, m, &[
-                    (&Command::ToggleTaskTree, "Tasks"),
-                    (&Command::SearchLogs, "Search"),
-                    (&Command::LogModeAll, "All"),
-                    (&Command::LogModeSelected, "Sel"),
-                    (&Command::LogModeHybrid, "Hyb"),
-                    (&Command::Quit, "Quit"),
-                    (&Command::ToggleHelp, "Help"),
-                ]);
+                push_entries(
+                    &mut entries,
+                    keybinds,
+                    m,
+                    &[
+                        (&Command::ToggleTaskTree, "Tasks"),
+                        (&Command::SearchLogs, "Search"),
+                        (&Command::LogModeAll, "All"),
+                        (&Command::LogModeSelected, "Sel"),
+                        (&Command::LogModeHybrid, "Hyb"),
+                        (&Command::Quit, "Quit"),
+                        (&Command::ToggleHelp, "Help"),
+                    ],
+                );
             } else if is_scrolled {
-                push_entries(&mut entries, keybinds, m, &[
-                    (&Command::JumpToNewestLogs, "Newest"),
-                    (&Command::JumpToOldestLogs, "Oldest"),
-                    (&Command::LogScrollUp, "Up"),
-                    (&Command::LogScrollDown, "Down"),
-                    (&Command::SearchLogs, "Search"),
-                ]);
+                push_entries(
+                    &mut entries,
+                    keybinds,
+                    m,
+                    &[
+                        (&Command::JumpToNewestLogs, "Newest"),
+                        (&Command::JumpToOldestLogs, "Oldest"),
+                        (&Command::LogScrollUp, "Up"),
+                        (&Command::LogScrollDown, "Down"),
+                        (&Command::SearchLogs, "Search"),
+                    ],
+                );
                 if selection.is_some_and(|s| s.base_task.is_some()) {
-                    push_entries(&mut entries, keybinds, m, &[
-                        (&Command::RestartTask, "Restart Selected"),
-                    ]);
+                    push_entries(&mut entries, keybinds, m, &[(&Command::RestartTask, "Restart Selected")]);
                 }
-                push_entries(&mut entries, keybinds, m, &[
-                    (&Command::Quit, "Quit"),
-                    (&Command::ToggleHelp, "Help"),
-                ]);
+                push_entries(&mut entries, keybinds, m, &[(&Command::Quit, "Quit"), (&Command::ToggleHelp, "Help")]);
             } else {
                 let is_test_meta = selection.is_some_and(|s| s.meta_group == Some(MetaGroupKind::Tests));
                 let is_action_meta = selection.is_some_and(|s| s.meta_group == Some(MetaGroupKind::Actions));
                 let in_secondary = selection.is_some_and(|s| s.job.is_some());
 
                 if is_test_meta {
-                    push_entries(&mut entries, keybinds, m, &[
-                        (&Command::LaunchTestFilter, "Filter"),
-                        (&Command::RerunTestGroup, "Rerun"),
-                        (&Command::NarrowTestGroup, "Narrow"),
-                        (&Command::NextFailInTestGroup, "Next Fail"),
-                    ]);
+                    push_entries(
+                        &mut entries,
+                        keybinds,
+                        m,
+                        &[
+                            (&Command::LaunchTestFilter, "Filter"),
+                            (&Command::RerunTestGroup, "Rerun"),
+                            (&Command::NarrowTestGroup, "Narrow"),
+                            (&Command::NextFailInTestGroup, "Next Fail"),
+                        ],
+                    );
                 } else if is_action_meta {
-                    push_entries(&mut entries, keybinds, m, &[
-                        (&Command::StartSelection, "Start Selected"),
-                        (&Command::LaunchTask, "Task Launcher"),
-                        (&Command::StartGroup, "Group Launcher"),
-                    ]);
+                    push_entries(
+                        &mut entries,
+                        keybinds,
+                        m,
+                        &[
+                            (&Command::StartSelection, "Start Selected"),
+                            (&Command::LaunchTask, "Task Launcher"),
+                            (&Command::StartGroup, "Group Launcher"),
+                        ],
+                    );
                 } else if in_secondary {
-                    push_entries(&mut entries, keybinds, m, &[
-                        (&Command::RestartTask, "Restart Selected"),
-                        (&Command::TerminateTask, "Kill Selected"),
-                        (&Command::FocusPrimary, "Tasks"),
-                    ]);
+                    push_entries(
+                        &mut entries,
+                        keybinds,
+                        m,
+                        &[
+                            (&Command::RestartTask, "Restart Selected"),
+                            (&Command::TerminateTask, "Kill Selected"),
+                            (&Command::FocusPrimary, "Tasks"),
+                        ],
+                    );
                 } else {
-                    push_entries(&mut entries, keybinds, m, &[
-                        (&Command::RestartTask, "Restart Selected"),
-                        (&Command::TerminateTask, "Kill Selected"),
-                        (&Command::LaunchTask, "Task Launcher"),
-                        (&Command::StartSelection, "Start Selected"),
-                        (&Command::StartGroup, "Group Launcher"),
-                        (&Command::LogModeAll, "All"),
-                        (&Command::LogModeSelected, "Sel"),
-                        (&Command::LogModeHybrid, "Hyb"),
-                    ]);
+                    push_entries(
+                        &mut entries,
+                        keybinds,
+                        m,
+                        &[
+                            (&Command::RestartTask, "Restart Selected"),
+                            (&Command::TerminateTask, "Kill Selected"),
+                            (&Command::LaunchTask, "Task Launcher"),
+                            (&Command::StartSelection, "Start Selected"),
+                            (&Command::StartGroup, "Group Launcher"),
+                            (&Command::LogModeAll, "All"),
+                            (&Command::LogModeSelected, "Sel"),
+                            (&Command::LogModeHybrid, "Hyb"),
+                        ],
+                    );
                 }
-                push_entries(&mut entries, keybinds, m, &[
-                    (&Command::SearchLogs, "Search"),
-                    (&Command::Quit, "Quit"),
-                    (&Command::ToggleHelp, "Help"),
-                ]);
+                push_entries(
+                    &mut entries,
+                    keybinds,
+                    m,
+                    &[(&Command::SearchLogs, "Search"), (&Command::Quit, "Quit"), (&Command::ToggleHelp, "Help")],
+                );
             }
         }
-        Mode::LogSearch | Mode::SelectSearch | Mode::TaskLauncher
-        | Mode::TestFilterLauncher | Mode::Input => {
-            push_entries(&mut entries, keybinds, m, &[
-                (&Command::OverlayCancel, "Cancel"),
-                (&Command::OverlayConfirm, "Confirm"),
-                (&Command::SelectPrev, "Prev"),
-                (&Command::SelectNext, "Next"),
-                (&Command::Quit, "Quit"),
-            ]);
+        Mode::LogSearch | Mode::SelectSearch | Mode::TaskLauncher | Mode::TestFilterLauncher | Mode::Input => {
+            push_entries(
+                &mut entries,
+                keybinds,
+                m,
+                &[
+                    (&Command::OverlayCancel, "Cancel"),
+                    (&Command::OverlayConfirm, "Confirm"),
+                    (&Command::SelectPrev, "Prev"),
+                    (&Command::SelectNext, "Next"),
+                    (&Command::Quit, "Quit"),
+                ],
+            );
         }
         Mode::Pager => {
-            push_entries(&mut entries, keybinds, m, &[
-                (&Command::SelectPrev, "Up"),
-                (&Command::SelectNext, "Down"),
-                (&Command::JumpToOldestLogs, "Top"),
-                (&Command::JumpToNewestLogs, "Bottom"),
-                (&Command::Quit, "Quit"),
-                (&Command::ToggleHelp, "Help"),
-            ]);
+            push_entries(
+                &mut entries,
+                keybinds,
+                m,
+                &[
+                    (&Command::SelectPrev, "Up"),
+                    (&Command::SelectNext, "Down"),
+                    (&Command::JumpToOldestLogs, "Top"),
+                    (&Command::JumpToNewestLogs, "Bottom"),
+                    (&Command::Quit, "Quit"),
+                    (&Command::ToggleHelp, "Help"),
+                ],
+            );
         }
     }
 

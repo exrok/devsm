@@ -16,7 +16,7 @@ use jsony::Jsony;
 pub struct TuiState {
     pub tty_render_byte_count: usize,
     #[allow(dead_code)]
-    collapsed: bool,
+    groups_expanded: Option<TuiGroupsExpanded>,
     #[allow(dead_code)]
     pub scroll: Option<TuiScrollState>,
     #[allow(dead_code)]
@@ -26,6 +26,14 @@ pub struct TuiState {
     pub base_tasks: Vec<TuiBaseTask>,
     #[allow(dead_code)]
     meta_groups: Option<TuiMetaGroups>,
+}
+
+#[derive(Debug, Clone, Jsony, Default)]
+#[allow(dead_code)]
+struct TuiGroupsExpanded {
+    services: bool,
+    actions: bool,
+    tests: bool,
 }
 
 #[derive(Debug, Clone, Jsony, Default)]
