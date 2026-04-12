@@ -101,6 +101,7 @@ mod log_stack;
 mod select_search;
 mod task_launcher;
 mod task_tree;
+mod shortcut_bar;
 mod test_filter_launcher;
 
 use config_error::{ConfigErrorAction, ConfigErrorState, ConfigSource};
@@ -174,6 +175,7 @@ struct TuiState {
     help: HelpMenu,
     status_message: Option<StatusMessage>,
     task_tree_hidden: bool,
+    shortcut_bar_visible: bool,
     chain: ChainState,
     menu_height_override: Option<u16>,
     drag: Option<DragKind>,
@@ -215,14 +217,16 @@ fn render<'a>(
 ) -> &'a [u8] {
     let has_overlay = !matches!(tui.overlay, FocusOverlap::None);
     let show_task_tree_area = has_overlay || !tui.task_tree_hidden;
+    let shortcut_h: u16 = if tui.shortcut_bar_visible && h > 3 { 1 } else { 0 };
     let menu_height = if show_task_tree_area { effective_menu_height(h, tui.menu_height_override) } else { 1 };
+    let frame_height = menu_height + shortcut_h;
 
-    let dimensions_changed = tui.frame_width != w || tui.frame_height != menu_height;
+    let dimensions_changed = tui.frame_width != w || tui.frame_height != frame_height;
     let resized = delta.any(Has::RESIZED) || dimensions_changed;
     if dimensions_changed {
-        tui.frame.resize(w, menu_height);
+        tui.frame.resize(w, frame_height);
         tui.frame_width = w;
-        tui.frame_height = menu_height;
+        tui.frame_height = frame_height;
     }
     if resized {
         tui.frame.reset();
@@ -237,7 +241,7 @@ fn render<'a>(
         tui.logs.update_selection(sel);
     }
 
-    tui.frame.y_offset = h - menu_height;
+    tui.frame.y_offset = h - frame_height;
     tui.frame.buf.clear();
 
     Style::DEFAULT.delta().write_to_buffer(&mut tui.frame.buf);
@@ -250,15 +254,17 @@ fn render<'a>(
         _ => None,
     };
 
-    let dest = Rect { x: 0, y: 0, w, h: h - menu_height };
+    let dest = Rect { x: 0, y: 0, w, h: h - frame_height };
     tui.logs.render(&mut tui.frame.buf, dest, workspace, keybinds, resized);
 
-    let mut bot = Rect { x: 0, y: 0, w, h: menu_height };
+    let mut bot = Rect { x: 0, y: 0, w, h: frame_height };
 
     {
         let status_data = build_status_bar_data(tui, workspace, keybinds);
         render_status_bar(&mut tui.frame, bot.take_top(1), &status_data);
     }
+
+    let shortcut_rect = if shortcut_h > 0 { Some(bot.take_bottom(1)) } else { None };
 
     if show_task_tree_area {
         let mut task_tree_rect = bot.take_top(19);
@@ -322,6 +328,29 @@ fn render<'a>(
             let chain_idx = if matches!(tui.overlay, FocusOverlap::None) { tui.chain.current } else { None };
             render_help_menu(&mut tui.frame, help_rect, keybinds, &mut tui.help, current_mode, chain_idx);
         }
+    }
+
+    if let Some(rect) = shortcut_rect {
+        let current_mode = match &tui.overlay {
+            FocusOverlap::Group { .. } => Mode::SelectSearch,
+            FocusOverlap::LogSearch { .. } => Mode::LogSearch,
+            FocusOverlap::TaskLauncher { .. } => Mode::TaskLauncher,
+            FocusOverlap::TestFilterLauncher { .. } => Mode::TestFilterLauncher,
+            FocusOverlap::ConfigError { .. } => Mode::Pager,
+            FocusOverlap::None => Mode::TaskTree,
+        };
+        let chain_idx = if matches!(tui.overlay, FocusOverlap::None) { tui.chain.current } else { None };
+        let scroll_state = tui.logs.scroll_state(&workspace.state(), workspace);
+        let is_scrolled = scroll_state.top.is_scrolled || scroll_state.bottom.is_some_and(|b| b.is_scrolled);
+        let entries = shortcut_bar::build_shortcut_entries(
+            keybinds,
+            current_mode,
+            chain_idx,
+            sel.as_ref(),
+            is_scrolled,
+            tui.task_tree_hidden,
+        );
+        shortcut_bar::render_shortcut_bar(&mut tui.frame, rect, &entries);
     }
 
     tui.frame.render_internal();
@@ -808,6 +837,9 @@ fn process_key(
         Command::ToggleTaskTree => {
             tui.task_tree_hidden = !tui.task_tree_hidden;
         }
+        Command::ToggleShortcutBar => {
+            tui.shortcut_bar_visible = !tui.shortcut_bar_visible;
+        }
         Command::LogModeAll => {
             tui.logs.set_mode(log_stack::Mode::All);
         }
@@ -1134,6 +1166,7 @@ pub enum ScrollTarget {
     BottomLog,
     TaskList { row: u16 },
     JobList { row: u16 },
+    HelpMenu,
     None,
 }
 
@@ -1144,6 +1177,7 @@ fn scroll_target(
     y: u16,
     show_task_tree: bool,
     menu_override: Option<u16>,
+    help_width: i32,
 ) -> ScrollTarget {
     let menu_height = if show_task_tree { effective_menu_height(h, menu_override) } else { 1 } as i32;
     let mut dest = Rect { x: 0, y: 0, w, h };
@@ -1159,7 +1193,13 @@ fn scroll_target(
             ScrollTarget::None
         };
     }
-    let task_tree_rect = bot.take_top(19);
+    let mut task_tree_rect = bot.take_top(19);
+    if help_width > 0 {
+        let help_rect = task_tree_rect.take_right(help_width);
+        if help_rect.contains(x, y) {
+            return ScrollTarget::HelpMenu;
+        }
+    }
     let (p, mut s) = task_tree_rect.h_split(0.5);
     s.take_left(1);
     if p.contains(x, y) {
@@ -1369,18 +1409,20 @@ pub fn run(
     }
     let (mut w, mut h) = if let Some(terminal) = &terminal { terminal.size()? } else { (160, 90) };
     let initial_menu_height = compute_menu_height(h);
+    let initial_frame_height = initial_menu_height + 1;
 
     let mut previous = 0;
     let mut tui = TuiState {
-        frame: DoubleBuffer::new(w, initial_menu_height),
+        frame: DoubleBuffer::new(w, initial_frame_height),
         frame_width: w,
-        frame_height: initial_menu_height,
+        frame_height: initial_frame_height,
         logs: LogStack::default(),
         task_tree: TaskTreeState::default(),
         overlay: FocusOverlap::None,
         help: HelpMenu { visible: false, scroll: 0 },
         status_message: None,
         task_tree_hidden: false,
+        shortcut_bar_visible: true,
         chain: ChainState::default(),
         menu_height_override: None,
         drag: None,
@@ -1460,22 +1502,31 @@ pub fn run(
                     let y = mouse.row;
                     let has_overlay = !matches!(tui.overlay, FocusOverlap::None);
                     let show_task_tree = has_overlay || !tui.task_tree_hidden;
+                    let shortcut_h: u16 = if tui.shortcut_bar_visible && h > 3 { 1 } else { 0 };
                     let menu_h = if show_task_tree { effective_menu_height(h, tui.menu_height_override) } else { 1 };
-                    let status_bar_y = h.saturating_sub(menu_h);
-                    let log_area_h = h.saturating_sub(menu_h);
+                    let frame_h = menu_h + shortcut_h;
+                    let status_bar_y = h.saturating_sub(frame_h);
+                    let log_area_h = status_bar_y;
                     let in_hybrid = matches!(tui.logs.mode(), log_stack::Mode::Hybrid(..));
                     let hybrid_sep_y = if in_hybrid && log_area_h >= 2 {
                         Some(tui.logs.effective_hybrid_top_h(log_area_h))
                     } else {
                         None
                     };
-                    let target = scroll_target(w, h, x, y, show_task_tree, tui.menu_height_override);
+                    if shortcut_h > 0 && y == h.saturating_sub(1) {
+                        continue;
+                    }
+                    let help_width = if tui.help.visible { 32.min(w as i32) } else { 0 };
+                    let target = scroll_target(w, h.saturating_sub(shortcut_h), x, y, show_task_tree, tui.menu_height_override, help_width);
                     match mouse.kind {
                         extui::event::MouseEventKind::ScrollDown => match target {
                             ScrollTarget::TopLog => tui.logs.pending_top_scroll -= 5,
                             ScrollTarget::BottomLog => tui.logs.pending_bottom_scroll -= 5,
                             ScrollTarget::TaskList { .. } | ScrollTarget::JobList { .. } => {
                                 let _ = tui.task_tree.move_cursor_down(&workspace.state());
+                            }
+                            ScrollTarget::HelpMenu => {
+                                tui.help.scroll = tui.help.scroll.saturating_add(5);
                             }
                             ScrollTarget::None => (),
                         },
@@ -1484,6 +1535,9 @@ pub fn run(
                             ScrollTarget::BottomLog => tui.logs.pending_bottom_scroll += 5,
                             ScrollTarget::TaskList { .. } | ScrollTarget::JobList { .. } => {
                                 let _ = tui.task_tree.move_cursor_up(&workspace.state());
+                            }
+                            ScrollTarget::HelpMenu => {
+                                tui.help.scroll = tui.help.scroll.saturating_sub(5);
                             }
                             ScrollTarget::None => (),
                         },
@@ -1519,7 +1573,7 @@ pub fn run(
                         extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left) => {
                             match tui.drag {
                                 Some(DragKind::MenuSeparator) => {
-                                    let new_h = h.saturating_sub(y);
+                                    let new_h = h.saturating_sub(shortcut_h).saturating_sub(y);
                                     tui.menu_height_override = Some(new_h);
                                     delta |= Has::RESIZED;
                                 }

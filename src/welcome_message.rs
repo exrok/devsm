@@ -78,19 +78,19 @@ pub fn render_welcome_message(buf: &mut Vec<u8>, rect: Rect, keybinds: &Keybinds
 
     let mut quick_start: Vec<WelcomeLine> = vec![Section("Quick start:")];
     if let Some(key) = key_str(&Command::LaunchTask) {
-        quick_start.push(Binding { key, desc: "Spawn task" });
+        quick_start.push(Binding { key, desc: "Task launcher" });
     }
     if let Some(key) = key_str(&Command::StartGroup) {
-        quick_start.push(Binding { key, desc: "Group Spawn" });
+        quick_start.push(Binding { key, desc: "Group launcher" });
     }
     if let Some(key) = key_str(&Command::StartSelection) {
-        quick_start.push(Binding { key, desc: "Start selection" });
+        quick_start.push(Binding { key, desc: "Start selected" });
     }
     if let Some(key) = key_str(&Command::RestartTask) {
-        quick_start.push(Binding { key, desc: "Restart selection" });
+        quick_start.push(Binding { key, desc: "Restart selected" });
     }
     if let Some(key) = key_str(&Command::TerminateTask) {
-        quick_start.push(Binding { key, desc: "Kill selection" });
+        quick_start.push(Binding { key, desc: "Kill selected" });
     }
 
     let mut log_view: Vec<WelcomeLine> = vec![Section("Log view:")];

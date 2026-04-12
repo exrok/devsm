@@ -188,6 +188,7 @@ pub enum Command {
     HelpScrollDown,
     ToggleViewMode,
     ToggleTaskTree,
+    ToggleShortcutBar,
     OverlayCancel,
     OverlayConfirm,
     RefreshConfig,
@@ -239,6 +240,7 @@ impl FromStr for Command {
             "HelpScrollDown" => Command::HelpScrollDown,
             "ToggleViewMode" => Command::ToggleViewMode,
             "ToggleTaskTree" => Command::ToggleTaskTree,
+            "ToggleShortcutBar" => Command::ToggleShortcutBar,
             "OverlayCancel" => Command::OverlayCancel,
             "OverlayConfirm" => Command::OverlayConfirm,
             "RefreshConfig" => Command::RefreshConfig,
@@ -629,6 +631,18 @@ impl Keybinds {
             })
             .min()
     }
+
+    /// Finds the first key bound to a command in a specific mode, falling back to global.
+    pub fn key_for_command_in_mode(&self, mode: Mode, command: &Command) -> Option<InputEvent> {
+        self.table_for_mode(mode)
+            .iter()
+            .chain(self.global.iter())
+            .filter_map(|(key, entry)| match entry {
+                BindingEntry::Command(cmd) if cmd == command => Some(*key),
+                _ => None,
+            })
+            .min()
+    }
 }
 
 impl Command {
@@ -640,12 +654,12 @@ impl Command {
             Command::SelectPrev => "Prev",
             Command::FocusPrimary => "Focus Left",
             Command::FocusSecondary => "Focus Right",
-            Command::RestartTask => "Restart",
-            Command::TerminateTask => "Terminate",
-            Command::LaunchTask => "Launch",
+            Command::RestartTask => "Restart Selected",
+            Command::TerminateTask => "Kill Selected",
+            Command::LaunchTask => "Task Launcher",
             Command::LaunchTestFilter => "Test Filter",
-            Command::StartGroup => "Start Group",
-            Command::StartSelection => "Profile",
+            Command::StartGroup => "Group Launcher",
+            Command::StartSelection => "Start Selected",
             Command::SearchLogs => "Search",
             Command::LogModeAll => "Log: All",
             Command::LogModeSelected => "Log: Selected",
@@ -659,6 +673,7 @@ impl Command {
             Command::HelpScrollDown => "Help Down",
             Command::ToggleViewMode => "Toggle View",
             Command::ToggleTaskTree => "Toggle Tasks",
+            Command::ToggleShortcutBar => "Toggle Shortcuts",
             Command::OverlayCancel => "Cancel",
             Command::OverlayConfirm => "Confirm",
             Command::RefreshConfig => "Refresh Config",
@@ -703,6 +718,7 @@ impl Command {
             Command::HelpScrollDown => "HelpScrollDown",
             Command::ToggleViewMode => "ToggleViewMode",
             Command::ToggleTaskTree => "ToggleTaskTree",
+            Command::ToggleShortcutBar => "ToggleShortcutBar",
             Command::OverlayCancel => "OverlayCancel",
             Command::OverlayConfirm => "OverlayConfirm",
             Command::RefreshConfig => "RefreshConfig",
