@@ -358,8 +358,11 @@ impl TestFilterLauncherState {
             match self.mode {
                 FilterMode::Name => {
                     if let Some(test) = self.tests.get(entry.index()) {
-                        let substyle =
-                            if is_selected { AnsiColor::Grey[5].with_bg(AnsiColor(153)) } else { AnsiColor::Grey[14].as_fg() };
+                        let substyle = if is_selected {
+                            AnsiColor::Grey[5].with_bg(AnsiColor(153))
+                        } else {
+                            AnsiColor::Grey[14].as_fg()
+                        };
                         let r = entry_rect.with(style).text(out, test.name.as_ref());
                         if !test.tags.is_empty() {
                             let tags_str = test.tags.join(", ");

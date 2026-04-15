@@ -1,16 +1,42 @@
 use std::fmt::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, render_diagnostic, toml_error_to_diagnostic};
 use crate::function::SetFunctionAction;
 use crate::keybinds::{BindingEntry, ChainGroup, Command, InputEvent, Keybinds, Mode};
+use crate::workspace::{DEFAULT_JOB_HISTORY, MAX_JOB_HISTORY, MIN_JOB_HISTORY};
 
 /// User configuration loaded from ~/.config/devsm.user.toml
-#[derive(Default)]
 pub struct UserConfig {
     pub keybinds: Keybinds,
     /// Whether the config was loaded from a user config file.
     pub loaded_from_file: bool,
+    /// Daemon-wide cap on retained job metadata, after clamping. Lives here
+    /// rather than in per-workspace `devsm.toml` because the daemon process
+    /// is shared across workspaces and one workspace should not dictate
+    /// eviction behaviour for others.
+    pub max_job_history: u32,
+}
+
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self { keybinds: Keybinds::default(), loaded_from_file: false, max_job_history: DEFAULT_JOB_HISTORY }
+    }
+}
+
+/// Daemon-wide view of [`UserConfig::max_job_history`]. Updated whenever the
+/// user config is loaded or reloaded; read by `WorkspaceState::new` and
+/// `refresh_config` so new or reloaded workspaces pick up the latest value
+/// without needing an explicit propagation path.
+static GLOBAL_MAX_JOB_HISTORY: AtomicU32 = AtomicU32::new(DEFAULT_JOB_HISTORY);
+
+pub fn global_max_job_history() -> u32 {
+    GLOBAL_MAX_JOB_HISTORY.load(Ordering::Relaxed)
+}
+
+pub fn set_global_max_job_history(value: u32) {
+    GLOBAL_MAX_JOB_HISTORY.store(value, Ordering::Relaxed);
 }
 
 /// Returns the path to the user config file.
@@ -39,6 +65,11 @@ pub fn default_user_config_toml() -> String {
 #   - Press 'R' (Shift+r) to reload all configs including this user config (default binding)
 #   - Set a key to `nan` to unbind it (e.g., g = nan)
 #   - Chain bindings: "SPACE l" = "LaunchTask" (press SPACE then l)
+
+# [daemon]
+# # Cap on retained job metadata before history pruning fires. Range 128..=1000000,
+# # default 10000. When exceeded, the oldest 25% of terminal jobs are evicted.
+# max_job_history = 10000
 
 "#,
     );
@@ -278,17 +309,59 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
     })?;
 
     let mut keybinds = Keybinds::default();
+    let mut max_job_history = DEFAULT_JOB_HISTORY;
 
     let root_table = toml.table();
 
     for (key, _value) in root_table {
-        if key.name != "bind" {
+        if key.name != "bind" && key.name != "daemon" {
             let span: std::ops::Range<usize> = key.span.into();
             let diagnostic = Diagnostic::error()
                 .with_message(format!("unknown key '{}'", key.name))
                 .with_label(DiagnosticLabel::primary(span))
-                .with_note("only 'bind' is supported at the root level");
+                .with_note("supported root keys are 'bind' and 'daemon'");
             return Err(render_diagnostic(file_name, content, &diagnostic));
+        }
+    }
+
+    if let Some(daemon_value) = root_table.get("daemon") {
+        let daemon_table = daemon_value.as_table().ok_or_else(|| {
+            let span: std::ops::Range<usize> = daemon_value.span().into();
+            let diagnostic =
+                Diagnostic::error().with_message("'daemon' must be a table").with_label(DiagnosticLabel::primary(span));
+            render_diagnostic(file_name, content, &diagnostic)
+        })?;
+
+        for (key, value) in daemon_table {
+            match key.name.as_ref() {
+                "max_job_history" => {
+                    let toml_spanner::Value::Integer(i) = value.value() else {
+                        let span: std::ops::Range<usize> = value.span().into();
+                        let diagnostic = Diagnostic::error()
+                            .with_message("'daemon.max_job_history' must be a non-negative integer")
+                            .with_label(DiagnosticLabel::primary(span));
+                        return Err(render_diagnostic(file_name, content, &diagnostic));
+                    };
+                    let raw = i.as_i128();
+                    if raw < 0 {
+                        let span: std::ops::Range<usize> = value.span().into();
+                        let diagnostic = Diagnostic::error()
+                            .with_message("'daemon.max_job_history' must be a non-negative integer")
+                            .with_label(DiagnosticLabel::primary(span));
+                        return Err(render_diagnostic(file_name, content, &diagnostic));
+                    }
+                    let raw = raw as u64;
+                    max_job_history = raw.clamp(MIN_JOB_HISTORY as u64, MAX_JOB_HISTORY as u64) as u32;
+                }
+                _ => {
+                    let span: std::ops::Range<usize> = key.span.into();
+                    let diagnostic = Diagnostic::error()
+                        .with_message(format!("unknown daemon key '{}'", key.name))
+                        .with_label(DiagnosticLabel::primary(span))
+                        .with_note("supported daemon keys: max_job_history");
+                    return Err(render_diagnostic(file_name, content, &diagnostic));
+                }
+            }
         }
     }
 
@@ -419,7 +492,7 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
         }
     }
 
-    Ok(UserConfig { keybinds, loaded_from_file: false })
+    Ok(UserConfig { keybinds, loaded_from_file: false, max_job_history })
 }
 
 #[cfg(test)]
@@ -464,7 +537,7 @@ fn parse_user_config(content: &str) -> Result<UserConfig, String> {
         }
     }
 
-    Ok(UserConfig { keybinds, loaded_from_file: false })
+    Ok(UserConfig { keybinds, loaded_from_file: false, max_job_history: DEFAULT_JOB_HISTORY })
 }
 
 #[cfg(test)]
@@ -529,6 +602,51 @@ mod tests {
         .unwrap();
         let four: InputEvent = "4".parse().unwrap();
         assert_eq!(config.keybinds.lookup(Mode::Pager, four), Some(Command::LogModeAll), "numeric key 4 unquoted");
+    }
+
+    #[test]
+    fn daemon_max_job_history_defaults() {
+        let config = parse_user_config_for_daemon("", "test.toml").unwrap();
+        assert_eq!(config.max_job_history, DEFAULT_JOB_HISTORY);
+
+        let config = parse_user_config_for_daemon("[daemon]\nmax_job_history = 5000\n", "test.toml").unwrap();
+        assert_eq!(config.max_job_history, 5000);
+    }
+
+    #[test]
+    fn daemon_max_job_history_clamps_low() {
+        let config = parse_user_config_for_daemon("[daemon]\nmax_job_history = 10\n", "test.toml").unwrap();
+        assert_eq!(config.max_job_history, MIN_JOB_HISTORY);
+    }
+
+    #[test]
+    fn daemon_max_job_history_clamps_high() {
+        let config = parse_user_config_for_daemon("[daemon]\nmax_job_history = 999999999\n", "test.toml").unwrap();
+        assert_eq!(config.max_job_history, MAX_JOB_HISTORY);
+    }
+
+    #[test]
+    fn daemon_max_job_history_rejects_negative() {
+        match parse_user_config_for_daemon("[daemon]\nmax_job_history = -1\n", "test.toml") {
+            Err(err) => assert!(err.contains("non-negative"), "unexpected error: {err}"),
+            Ok(_) => panic!("expected error for negative value"),
+        }
+    }
+
+    #[test]
+    fn daemon_max_job_history_rejects_non_integer() {
+        match parse_user_config_for_daemon("[daemon]\nmax_job_history = \"big\"\n", "test.toml") {
+            Err(err) => assert!(err.contains("non-negative"), "unexpected error: {err}"),
+            Ok(_) => panic!("expected error for non-integer value"),
+        }
+    }
+
+    #[test]
+    fn daemon_rejects_unknown_key() {
+        match parse_user_config_for_daemon("[daemon]\nwibble = 42\n", "test.toml") {
+            Err(err) => assert!(err.contains("unknown daemon key"), "unexpected error: {err}"),
+            Ok(_) => panic!("expected error for unknown daemon key"),
+        }
     }
 
     #[test]

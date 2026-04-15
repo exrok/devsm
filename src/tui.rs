@@ -101,9 +101,9 @@ mod config_error;
 mod log_search;
 mod log_stack;
 mod select_search;
+mod shortcut_bar;
 mod task_launcher;
 mod task_tree;
-mod shortcut_bar;
 mod test_filter_launcher;
 
 use config_error::{ConfigErrorAction, ConfigErrorState, ConfigSource};
@@ -399,9 +399,7 @@ fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData)
 
     r = r.with(HAlign::Right);
 
-    r = r
-        .with(AnsiColor::Grey[8].with_fg(AnsiColor::Grey[25]))
-        .fmt(frame, format_args!(" {} ", data.log_mode));
+    r = r.with(AnsiColor::Grey[8].with_fg(AnsiColor::Grey[25])).fmt(frame, format_args!(" {} ", data.log_mode));
 
     let block_style = if data.running > 0 {
         AnsiColor::DarkOliveGreen.with_fg(AnsiColor::Black)
@@ -670,8 +668,7 @@ fn process_key(
                                 }
                                 Err(err) => {
                                     kvlog::warn!("Group submit failed", group, err);
-                                    tui.status_message =
-                                        Some(StatusMessage::error(format!("Group failed: {}", err)));
+                                    tui.status_message = Some(StatusMessage::error(format!("Group failed: {}", err)));
                                 }
                             }
                         }
@@ -896,12 +893,9 @@ fn process_key(
                         let name = ws.spawn_name_for(base_task);
                         let task_kind = ws.base_tasks[base_task.idx()].config.kind;
                         drop(ws);
-                        if let Err(err) =
-                            workspace.submit(SpawnSpec::task(&name, &profile, params, false))
-                        {
+                        if let Err(err) = workspace.submit(SpawnSpec::task(&name, &profile, params, false)) {
                             kvlog::warn!("StartSelection submit failed", name, ?task_kind, profile, err);
-                            tui.status_message =
-                                Some(StatusMessage::error(format!("Start failed: {}", err)));
+                            tui.status_message = Some(StatusMessage::error(format!("Start failed: {}", err)));
                         }
                     }
                     _ => tui.overlay = FocusOverlap::TaskLauncher { state },
@@ -1065,7 +1059,7 @@ fn jump_to_fail_in_test_group(tui: &mut TuiState, workspace: &Workspace, forward
         .iter()
         .enumerate()
         .filter(|&(_, ji)| {
-            let Some(job) = ws.jobs.get(ji.idx()) else { return false };
+            let Some(job) = ws.jobs.get(*ji) else { return false };
             matches!(&job.process_status, crate::workspace::JobStatus::Exited { status, .. } if *status != 0)
                 || matches!(&job.process_status, crate::workspace::JobStatus::Cancelled)
         })
@@ -1407,6 +1401,7 @@ fn attempt_config_reload(tui: &mut TuiState, workspace: &Workspace, keybinds: &m
 
     match crate::user_config::reload_user_config() {
         Ok(config) => {
+            crate::user_config::set_global_max_job_history(config.max_job_history);
             crate::event_loop::update_global_keybinds(config.keybinds);
             *keybinds = crate::event_loop::global_keybinds();
         }
@@ -1569,7 +1564,15 @@ pub fn run(
                         continue;
                     }
                     let help_width = if tui.help.visible { 32.min(w as i32) } else { 0 };
-                    let target = scroll_target(w, h.saturating_sub(shortcut_h), x, y, show_task_tree, tui.menu_height_override, help_width);
+                    let target = scroll_target(
+                        w,
+                        h.saturating_sub(shortcut_h),
+                        x,
+                        y,
+                        show_task_tree,
+                        tui.menu_height_override,
+                        help_width,
+                    );
                     match mouse.kind {
                         extui::event::MouseEventKind::ScrollDown => match target {
                             ScrollTarget::TopLog => tui.logs.pending_top_scroll -= 5,
@@ -1632,27 +1635,24 @@ pub fn run(
                                 }
                             }
                         }
-                        extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left) => {
-                            match tui.drag {
-                                Some(DragKind::MenuSeparator) => {
-                                    let new_h = h.saturating_sub(shortcut_h).saturating_sub(y);
-                                    tui.menu_height_override = Some(new_h);
+                        extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left) => match tui.drag {
+                            Some(DragKind::MenuSeparator) => {
+                                let new_h = h.saturating_sub(shortcut_h).saturating_sub(y);
+                                tui.menu_height_override = Some(new_h);
+                                delta |= Has::RESIZED;
+                            }
+                            Some(DragKind::HybridSeparator)
+                                if in_hybrid && log_area_h >= log_stack::HYBRID_MIN_PANE * 2 + 1 =>
+                            {
+                                let max_top = log_area_h - log_stack::HYBRID_MIN_PANE - 1;
+                                let clamped = y.clamp(log_stack::HYBRID_MIN_PANE, max_top);
+                                if tui.logs.hybrid_top_h_pinned() != Some(clamped) {
+                                    tui.logs.set_hybrid_top_h(clamped);
                                     delta |= Has::RESIZED;
                                 }
-                                Some(DragKind::HybridSeparator)
-                                    if in_hybrid
-                                        && log_area_h >= log_stack::HYBRID_MIN_PANE * 2 + 1 =>
-                                {
-                                    let max_top = log_area_h - log_stack::HYBRID_MIN_PANE - 1;
-                                    let clamped = y.clamp(log_stack::HYBRID_MIN_PANE, max_top);
-                                    if tui.logs.hybrid_top_h_pinned() != Some(clamped) {
-                                        tui.logs.set_hybrid_top_h(clamped);
-                                        delta |= Has::RESIZED;
-                                    }
-                                }
-                                _ => {}
                             }
-                        }
+                            _ => {}
+                        },
                         extui::event::MouseEventKind::Up(_) => {
                             tui.drag = None;
                         }

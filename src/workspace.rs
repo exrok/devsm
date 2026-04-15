@@ -10,6 +10,7 @@ use crate::{
     log_storage::{LogGroup, Logs},
 };
 pub use job_index_list::JobIndexList;
+pub use job_store::{JobIndex, JobStore};
 use jsony_value::{Value, ValueMap, ValueNumber, ValueRef};
 use std::{
     path::PathBuf,
@@ -17,6 +18,18 @@ use std::{
     time::{Instant, SystemTime},
 };
 mod job_index_list;
+mod job_store;
+
+/// Lower bound on `[daemon] max_job_history`. Values below this are clamped
+/// up so eviction still has room to work — the 25% churn per batch would
+/// otherwise fire on almost every insert.
+pub const MIN_JOB_HISTORY: u32 = 128;
+/// Upper bound on `[daemon] max_job_history`. Guards against absurd user
+/// input. 1M live jobs at ~128 bytes each is already ~128 MB of metadata —
+/// well past any reasonable dev workflow.
+pub const MAX_JOB_HISTORY: u32 = 1_000_000;
+/// Default when `[daemon] max_job_history` is absent.
+pub const DEFAULT_JOB_HISTORY: u32 = 10_000;
 
 /// Info needed to compute a cache key outside the workspace lock.
 enum CacheKeyInfoItem {
@@ -180,30 +193,6 @@ impl BaseTaskIndex {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
-#[repr(transparent)]
-pub struct JobIndex(u32);
-
-impl kvlog::Encode for JobIndex {
-    fn encode_log_value_into(&self, output: kvlog::ValueEncoder<'_>) {
-        self.0.encode_log_value_into(output);
-    }
-}
-
-impl JobIndex {
-    pub fn idx(self) -> usize {
-        self.0 as usize
-    }
-
-    pub fn as_u32(self) -> u32 {
-        self.0
-    }
-
-    pub fn from_usize(idx: usize) -> Self {
-        Self(idx as u32)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExitCause {
     Unknown,
@@ -279,7 +268,9 @@ enum RequirementStatus {
 
 impl ScheduleRequirement {
     fn status(&self, ws: &WorkspaceState) -> RequirementStatus {
-        let job = &ws[self.job];
+        let Some(job) = ws.jobs.get(self.job) else {
+            return RequirementStatus::Met;
+        };
         match self.predicate {
             JobPredicate::Terminated => match &job.process_status {
                 JobStatus::Scheduled { .. } => RequirementStatus::Pending,
@@ -472,6 +463,7 @@ impl LatestConfig {
                 removed: false,
                 jobs: JobIndexList::default(),
                 profile_change_counter: 0,
+                spawn_counter: 0,
                 last_profile: None,
                 has_run_this_session: false,
             });
@@ -492,6 +484,7 @@ impl LatestConfig {
                 removed: false,
                 jobs: JobIndexList::default(),
                 profile_change_counter: 0,
+                spawn_counter: 0,
                 last_profile: None,
                 has_run_this_session: false,
             });
@@ -522,6 +515,11 @@ pub struct BaseTask {
     /// Counter incremented when the task's profile changes (not on first run).
     /// Used as cache key input for `profile_changed` invalidation.
     pub profile_change_counter: u32,
+    /// Monotonic count of jobs ever spawned for this base task. Feeds the
+    /// LogGroup counter so a log group id stays unique across the daemon
+    /// lifetime even after old jobs are pruned from `jobs` by history
+    /// eviction. Never decremented.
+    pub spawn_counter: u32,
     /// The profile used for the last spawn (for tracking profile changes).
     pub last_profile: Option<String>,
     /// Test-specific metadata. Present only for tests (kind == Test).
@@ -619,6 +617,13 @@ impl ServiceDependents {
         for deps in self.dependents.values_mut() {
             deps.remove(&dependent);
         }
+    }
+
+    /// Drop the entry for an evicted service (if any). Callers should only
+    /// invoke this after the service has moved to a terminal state and its
+    /// dependents have all been released via [`remove_from_all`].
+    pub fn remove_service(&mut self, service: JobIndex) {
+        self.dependents.remove(&service);
     }
 
     pub fn can_stop(&self, service: JobIndex) -> bool {
@@ -788,7 +793,9 @@ pub struct WorkspaceState {
     pub base_tasks: Vec<BaseTask>,
     pub change_number: u32,
     pub name_map: hashbrown::HashMap<Box<str>, BaseTaskIndex>,
-    pub jobs: Vec<Job>,
+    pub jobs: JobStore,
+    /// Maximum live jobs retained in `jobs` before history pruning kicks in.
+    pub max_job_history: u32,
     pub active_test_run: Option<TestRun>,
     pub action_jobs: JobIndexList,
     pub test_jobs: JobIndexList,
@@ -913,6 +920,7 @@ impl WorkspaceState {
                 removed: false,
                 jobs: JobIndexList::default(),
                 profile_change_counter: 0,
+                spawn_counter: 0,
                 last_profile: None,
                 has_run_this_session: false,
             });
@@ -934,6 +942,10 @@ impl WorkspaceState {
             self.config.update_base_tasks(&mut self.base_tasks, &mut self.name_map);
             self.spawn_specs.clear();
         }
+        // Pick up any daemon-side knob the user has adjusted via
+        // ~/.config/devsm.user.toml reload, independent of whether the
+        // workspace toml itself changed.
+        self.max_job_history = crate::user_config::global_max_job_history();
     }
 
     fn get_or_create_spawn_spec(
@@ -1028,7 +1040,7 @@ impl WorkspaceState {
         match allow_multiple {
             AllowMultiple::False => {
                 for &job_index in bt.jobs.terminate_scheduled() {
-                    self.jobs[job_index.idx()].process_status = JobStatus::Cancelled;
+                    self.jobs[job_index].process_status = JobStatus::Cancelled;
                     match task_kind {
                         TaskKind::Action => self.action_jobs.set_terminal(job_index),
                         TaskKind::Test => self.test_jobs.set_terminal(job_index),
@@ -1038,7 +1050,7 @@ impl WorkspaceState {
                 }
 
                 for &job_index in bt.jobs.running() {
-                    let job = &mut self.jobs[job_index.idx()];
+                    let job = &mut self.jobs[job_index];
                     let JobStatus::Running { process_index, .. } = &job.process_status else {
                         continue;
                     };
@@ -1059,11 +1071,11 @@ impl WorkspaceState {
                     .jobs
                     .scheduled()
                     .iter()
-                    .filter(|ji| (self.jobs[ji.idx()].spawn_profile() == profile) == match_same)
+                    .filter(|ji| (self.jobs[**ji].spawn_profile() == profile) == match_same)
                     .copied()
                     .collect();
                 for job_index in &to_cancel {
-                    self.jobs[job_index.idx()].process_status = JobStatus::Cancelled;
+                    self.jobs[*job_index].process_status = JobStatus::Cancelled;
                     let bt = &mut self.base_tasks[base_task.idx()];
                     bt.jobs.set_terminal(*job_index);
                     match task_kind {
@@ -1078,11 +1090,11 @@ impl WorkspaceState {
                     .jobs
                     .running()
                     .iter()
-                    .filter(|ji| (self.jobs[ji.idx()].spawn_profile() == profile) == match_same)
+                    .filter(|ji| (self.jobs[**ji].spawn_profile() == profile) == match_same)
                     .copied()
                     .collect();
                 for job_index in to_terminate {
-                    let job = &self.jobs[job_index.idx()];
+                    let job = &self.jobs[job_index];
                     let JobStatus::Running { process_index, .. } = &job.process_status else {
                         continue;
                     };
@@ -1223,23 +1235,38 @@ impl WorkspaceState {
         reason: ScheduleReason,
     ) -> JobIndex {
         let spec = self.cache_spawn_spec(base_task, profile, params, task.clone());
-        let job_index = JobIndex(self.jobs.len() as u32);
-        let bt = &mut self.base_tasks[base_task.idx()];
-        let task_name = bt.name.clone();
-        let pc = bt.jobs.len();
-        let job_id = LogGroup::new(base_task, pc);
+        let (task_name, task_kind, job_id) = {
+            let bt = &mut self.base_tasks[base_task.idx()];
+            let task_name = bt.name.clone();
+            let task_kind = bt.config.kind;
+            if task_kind == TaskKind::Service {
+                bt.has_run_this_session = true;
+            }
+            let pc = bt.spawn_counter as usize;
+            bt.spawn_counter = bt.spawn_counter.wrapping_add(1);
+            (task_name, task_kind, LogGroup::new(base_task, pc))
+        };
 
         let spawn = requirements.is_empty();
-        let task_kind = bt.config.kind;
-        if task_kind == TaskKind::Service {
-            bt.has_run_this_session = true;
-        }
+        let active_deps: Vec<JobIndex> = requirements
+            .iter()
+            .filter(|req| matches!(req.predicate, JobPredicate::Active))
+            .map(|req| req.job)
+            .collect();
+        let job_index = self.jobs.insert(Job {
+            process_status: if spawn { JobStatus::Starting } else { JobStatus::Scheduled { after: requirements } },
+            log_group: job_id,
+            started_at: crate::clock::now(),
+            cache_key,
+            spawn: spec.clone(),
+        });
+
+        let bt = &mut self.base_tasks[base_task.idx()];
         if spawn {
             bt.jobs.push_active(job_index);
         } else {
             bt.jobs.push_scheduled(job_index);
         }
-
         let global_list = match task_kind {
             TaskKind::Action => &mut self.action_jobs,
             TaskKind::Test => &mut self.test_jobs,
@@ -1250,27 +1277,15 @@ impl WorkspaceState {
         } else {
             global_list.push_scheduled(job_index);
         }
-
-        for req in &requirements {
-            if matches!(req.predicate, JobPredicate::Active) {
-                self.service_dependents.add_dependent(req.job, job_index);
-            }
+        for dep in active_deps {
+            self.service_dependents.add_dependent(dep, job_index);
         }
-
-        self.jobs.push(Job {
-            process_status: if spawn { JobStatus::Starting } else { JobStatus::Scheduled { after: requirements } },
-            log_group: job_id,
-            started_at: crate::clock::now(),
-            cache_key,
-            spawn: spec.clone(),
-        });
 
         if spawn {
             channel.send(crate::event_loop::ProcessRequest::Spawn { task, job_index, workspace_id, job_id });
         } else {
             kvlog::info!("Job scheduled", task_name = task_name.as_ref(), job_index, reason = reason.name());
         }
-
         job_index
     }
 }
@@ -1278,7 +1293,7 @@ impl WorkspaceState {
 impl std::ops::Index<JobIndex> for WorkspaceState {
     type Output = Job;
     fn index(&self, index: JobIndex) -> &Self::Output {
-        &self.jobs[index.idx()]
+        &self.jobs[index]
     }
 }
 
@@ -1319,7 +1334,7 @@ impl WorkspaceState {
         let mut summary = TestGroupSummary { total: test_group.job_indices.len() as u32, ..Default::default() };
 
         for &job_index in &test_group.job_indices {
-            let Some(job) = self.jobs.get(job_index.idx()) else { continue };
+            let Some(job) = self.jobs.get(job_index) else { continue };
             match &job.process_status {
                 JobStatus::Scheduled { .. } | JobStatus::Starting => summary.pending += 1,
                 JobStatus::Running { .. } => summary.running += 1,
@@ -1449,8 +1464,8 @@ impl WorkspaceState {
         let mut killed_count = 0u32;
         let mut cancelled_count = 0u32;
 
-        for job_index in bt.jobs.non_terminal() {
-            let job = &self.jobs[job_index.idx()];
+        for &job_index in bt.jobs.non_terminal() {
+            let job = &self.jobs[job_index];
             match &job.process_status {
                 JobStatus::Running { process_index, .. } => {
                     kvlog::info!("Terminating running job", task_name, job_index, process_index);
@@ -1466,7 +1481,7 @@ impl WorkspaceState {
                 }
                 JobStatus::Scheduled { .. } => {
                     kvlog::info!("Cancelling scheduled job", task_name, job_index);
-                    jobs_to_cancel.push(*job_index);
+                    jobs_to_cancel.push(job_index);
                     cancelled_count += 1;
                 }
                 JobStatus::Exited { .. } | JobStatus::Cancelled => {}
@@ -1486,11 +1501,10 @@ impl WorkspaceState {
 
         Ok(msg)
     }
-
 }
 impl std::ops::IndexMut<JobIndex> for WorkspaceState {
     fn index_mut(&mut self, index: JobIndex) -> &mut Self::Output {
-        &mut self.jobs[index.idx()]
+        &mut self.jobs[index]
     }
 }
 
@@ -1503,7 +1517,7 @@ pub enum Scheduled {
 impl WorkspaceState {
     #[track_caller]
     pub fn update_job_status(&mut self, job_index: JobIndex, status: JobStatus) {
-        let job = &mut self.jobs[job_index.idx()];
+        let job = &mut self.jobs[job_index];
         let job_id = job.log_group;
         let base_task = &mut self.base_tasks[job_id.base_task_index().idx()];
         let task_name = base_task.name.as_ref();
@@ -1575,7 +1589,97 @@ impl WorkspaceState {
             _ => {}
         }
 
+        let is_now_terminal = matches!(status, S::Exited { .. } | S::Cancelled);
         job.process_status = status;
+
+        if is_now_terminal && self.jobs.len() as u32 > self.max_job_history {
+            self.prune_history();
+        }
+    }
+
+    /// Resolve a [`JobIndex`] without panicking — returns `None` for stale
+    /// handles that have been evicted.
+    #[allow(dead_code)]
+    pub fn get_job(&self, ji: JobIndex) -> Option<&Job> {
+        self.jobs.get(ji)
+    }
+
+    /// Build the set of job indices that must not be evicted this pass.
+    /// Terminal jobs referenced by a still-`Scheduled` job's `after` list
+    /// need to survive so `ScheduleRequirement::status` can read their exit
+    /// state when the waiter finally runs.
+    fn collect_protected_deps(&self) -> hashbrown::HashSet<JobIndex> {
+        let mut protected: hashbrown::HashSet<JobIndex> = hashbrown::HashSet::new();
+        for (_, job) in self.jobs.iter() {
+            if let JobStatus::Scheduled { after } = &job.process_status {
+                for req in after {
+                    protected.insert(req.job);
+                }
+            }
+        }
+        protected
+    }
+
+    /// Drop the oldest terminal jobs to bring `jobs.len()` down to
+    /// `max * 3 / 4`. Called from [`update_job_status`] when a terminal
+    /// transition takes us over the cap. Non-terminal jobs and jobs
+    /// referenced by live `Scheduled` waiters are preserved.
+    fn prune_history(&mut self) {
+        let max = self.max_job_history;
+        let current = self.jobs.len() as u32;
+        if current <= max {
+            return;
+        }
+        let target = max - max / 4;
+        let to_drop = (current - target) as usize;
+
+        let protected = self.collect_protected_deps();
+
+        let mut victims: Vec<(Instant, JobIndex)> = Vec::with_capacity(current as usize);
+        for (ji, job) in self.jobs.iter() {
+            if !matches!(job.process_status, JobStatus::Exited { .. } | JobStatus::Cancelled) {
+                continue;
+            }
+            if protected.contains(&ji) {
+                continue;
+            }
+            victims.push((job.started_at, ji));
+        }
+
+        if victims.is_empty() {
+            return;
+        }
+        if victims.len() > to_drop {
+            victims.select_nth_unstable_by_key(to_drop, |(t, _)| *t);
+            victims.truncate(to_drop);
+        }
+
+        let evicted: hashbrown::HashSet<JobIndex> = victims.into_iter().map(|(_, ji)| ji).collect();
+        if evicted.is_empty() {
+            return;
+        }
+
+        for &ji in &evicted {
+            self.jobs.remove(ji);
+            self.service_dependents.remove_service(ji);
+        }
+
+        let still_live = |ji: JobIndex| !evicted.contains(&ji);
+        for bt in &mut self.base_tasks {
+            bt.jobs.retain_live(still_live);
+        }
+        self.action_jobs.retain_live(still_live);
+        self.test_jobs.retain_live(still_live);
+        self.service_jobs.retain_live(still_live);
+
+        if let Some(tg) = &mut self.last_test_group {
+            tg.job_indices.retain(|ji| still_live(*ji));
+            if tg.job_indices.is_empty() {
+                self.last_test_group = None;
+            }
+        }
+
+        kvlog::info!("Job history pruned", evicted = evicted.len(), live = self.jobs.len());
     }
 
     pub fn new(config_path: PathBuf) -> Result<WorkspaceState, crate::config::ConfigError> {
@@ -1583,13 +1687,15 @@ impl WorkspaceState {
         let mut base_tasks = Vec::new();
         let mut name_map = hashbrown::HashMap::new();
         config.update_base_tasks(&mut base_tasks, &mut name_map);
+        let max_job_history = crate::user_config::global_max_job_history();
 
         Ok(WorkspaceState {
             change_number: 0,
             config,
             name_map,
             base_tasks,
-            jobs: Vec::new(),
+            jobs: JobStore::new(),
+            max_job_history,
             active_test_run: None,
             action_jobs: JobIndexList::default(),
             test_jobs: JobIndexList::default(),
@@ -1642,7 +1748,7 @@ impl WorkspaceState {
             let scheduled_base_task = self[scheduled_job_index].log_group.base_task_index();
             for req in after {
                 if req.predicate == JobPredicate::Terminated {
-                    let blocking_job = &self.jobs[req.job.idx()];
+                    let blocking_job = &self.jobs[req.job];
                     if blocking_job.process_status.is_running() && self.service_dependents.can_stop(req.job) {
                         let exit_cause = if blocking_job.log_group.base_task_index() == scheduled_base_task {
                             ExitCause::Restarted
@@ -1672,14 +1778,14 @@ impl WorkspaceState {
         let spawner = &self.base_tasks[base_task.idx()];
 
         for &ji in spawner.jobs.running() {
-            let job = &self.jobs[ji.idx()];
+            let job = &self.jobs[ji];
             if service_matches_require(job, requested_profile, requested_params) {
                 return ServiceCompatibility::Compatible(ji);
             }
         }
 
         if let Some(&ji) = spawner.jobs.running().iter().next() {
-            let job = &self.jobs[ji.idx()];
+            let job = &self.jobs[ji];
             match spawner.config.allow_multiple {
                 AllowMultiple::True | AllowMultiple::DistinctProfiles => {
                     return ServiceCompatibility::Available;
@@ -1731,8 +1837,8 @@ impl WorkspaceState {
                             self.compute_cache_key_with_require(cache_config.key, &profile, &params);
                         let spawner = &self.base_tasks[base_task.idx()];
 
-                        for ji in spawner.jobs.all().iter().rev() {
-                            let job = &self.jobs[ji.idx()];
+                        for &ji in spawner.jobs.all().iter().rev() {
+                            let job = &self.jobs[ji];
                             if matches!(job.process_status, JobStatus::Cancelled) {
                                 continue;
                             }
@@ -1746,7 +1852,7 @@ impl WorkspaceState {
                             if job.process_status.is_pending_completion()
                                 && (expected_cache_key.is_empty() || job.cache_key == expected_cache_key)
                             {
-                                resolved = Some(ResolvedRequirement::Pending(*ji));
+                                resolved = Some(ResolvedRequirement::Pending(ji));
                                 break;
                             }
                         }
@@ -2066,11 +2172,15 @@ impl Workspace {
         state.refresh_config();
         state.change_number = state.change_number.wrapping_add(1);
 
-        if let Some(FunctionAction::RestartCaptured { task_name, profile }) =
-            state.session_functions.get(name).cloned()
+        if let Some(FunctionAction::RestartCaptured { task_name, profile }) = state.session_functions.get(name).cloned()
         {
             state.lookup_and_spawn_task(
-                self.workspace_id, &self.process_channel, &task_name, ValueMap::new(), &profile, true,
+                self.workspace_id,
+                &self.process_channel,
+                &task_name,
+                ValueMap::new(),
+                &profile,
+                true,
             )?;
             return Ok(None);
         }
@@ -2082,7 +2192,14 @@ impl Workspace {
 
         match &func_def.action {
             FunctionDefAction::Restart { task } => {
-                state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, task, ValueMap::new(), "", true)?;
+                state.lookup_and_spawn_task(
+                    self.workspace_id,
+                    &self.process_channel,
+                    task,
+                    ValueMap::new(),
+                    "",
+                    true,
+                )?;
             }
             FunctionDefAction::Kill { task } => {
                 state.lookup_and_terminate_task(&self.process_channel, task)?;
@@ -2115,7 +2232,7 @@ impl Workspace {
         let tasks_to_run: Vec<(BaseTaskIndex, Option<JobIndex>)> = if only_failed {
             let mut failed = Vec::new();
             for (i, &job_index) in test_group.job_indices.iter().enumerate() {
-                let Some(job) = state.jobs.get(job_index.idx()) else { continue };
+                let Some(job) = state.jobs.get(job_index) else { continue };
                 let is_failed = matches!(&job.process_status, JobStatus::Exited { status, .. } if *status != 0)
                     || matches!(&job.process_status, JobStatus::Cancelled);
                 if is_failed && let Some(&bti) = test_group.base_tasks.get(i) {
@@ -2127,12 +2244,7 @@ impl Workspace {
             }
             failed
         } else {
-            test_group
-                .base_tasks
-                .iter()
-                .zip(test_group.job_indices.iter())
-                .map(|(&bti, &ji)| (bti, Some(ji)))
-                .collect()
+            test_group.base_tasks.iter().zip(test_group.job_indices.iter()).map(|(&bti, &ji)| (bti, Some(ji))).collect()
         };
         if tasks_to_run.is_empty() {
             return Err("No tests to rerun".to_string());
@@ -2146,14 +2258,10 @@ impl Workspace {
                 continue;
             }
             let (spawn_profile, spawn_params) = original_job
-                .and_then(|ji| state.jobs.get(ji.idx()))
+                .and_then(|ji| state.jobs.get(ji))
                 .map(|job| (job.spawn_profile().to_string(), job.spawn_params().clone()))
                 .unwrap_or_else(|| (String::new(), ValueMap::new()));
-            let env = Environment {
-                profile: &spawn_profile,
-                param: spawn_params.clone(),
-                vars: base_task.config.vars,
-            };
+            let env = Environment { profile: &spawn_profile, param: spawn_params.clone(), vars: base_task.config.vars };
             let Ok(task_config) = base_task.config.eval(&env) else {
                 kvlog::error!("Failed to evaluate test config", name = base_task.name.as_ref());
                 continue;
@@ -2226,7 +2334,7 @@ impl Workspace {
                 let base_task_idx = p.log_group.base_task_index();
                 let task_name =
                     state.base_tasks.get(base_task_idx.idx()).map(|bt| bt.name.as_ref()).unwrap_or("<unknown>");
-                let job = state.jobs.iter().find(|job| job.log_group == p.log_group);
+                let job = state.jobs.iter().find(|(_, job)| job.log_group == p.log_group).map(|(_, job)| job);
                 let (pwd, cmd) = match job {
                     Some(job) => {
                         let config = job.task().config();
@@ -2257,36 +2365,6 @@ impl Workspace {
     pub fn state(&self) -> std::sync::RwLockReadGuard<'_, WorkspaceState> {
         self.state.read().unwrap()
     }
-    pub fn restart_task(&self, base_task: BaseTaskIndex, params: ValueMap, profile: &str) -> JobIndex {
-        let mut state_guard = self.state.write().unwrap();
-        let state = &mut *state_guard;
-        state.change_number = state.change_number.wrapping_add(1);
-        state.refresh_config();
-        state.spawn_task(
-            self.workspace_id,
-            &self.process_channel,
-            base_task,
-            params,
-            profile,
-            ScheduleReason::Requested,
-            true,
-        )
-    }
-
-    pub fn start_task(&self, base_task: BaseTaskIndex, params: ValueMap, profile: &str) -> JobIndex {
-        let state = &mut *self.state.write().unwrap();
-        state.change_number = state.change_number.wrapping_add(1);
-        state.refresh_config();
-        state.spawn_task(
-            self.workspace_id,
-            &self.process_channel,
-            base_task,
-            params,
-            profile,
-            ScheduleReason::Requested,
-            false,
-        )
-    }
 
     pub fn terminate_tasks(&self, base_task: BaseTaskIndex) {
         let state = &mut *self.state.write().unwrap();
@@ -2297,7 +2375,7 @@ impl Workspace {
 
         let mut jobs_to_cancel = Vec::new();
         for job_index in job_indices {
-            let job = &state.jobs[job_index.idx()];
+            let job = &state.jobs[job_index];
             match &job.process_status {
                 JobStatus::Running { process_index, .. } => {
                     kvlog::info!("Terminating running job", task_name = task_name.as_ref(), job_index, process_index);
@@ -2476,7 +2554,7 @@ impl Workspace {
 
         let mut failed_indices = Vec::new();
         for (i, &job_index) in job_indices.iter().enumerate() {
-            let Some(job) = state.jobs.get(job_index.idx()) else { continue };
+            let Some(job) = state.jobs.get(job_index) else { continue };
             let failed = matches!(&job.process_status, JobStatus::Exited { status, .. } if *status != 0)
                 || matches!(&job.process_status, JobStatus::Cancelled);
             if failed {
@@ -2972,6 +3050,214 @@ mod scheduling_tests {
                 }
                 _ => panic!("Expected Conflict"),
             }
+        }
+    }
+
+    mod job_history_tests {
+        use super::*;
+
+        fn manifest_path(relative: &str) -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+        }
+
+        /// Build a workspace state loaded from the big example config,
+        /// drop the configured history cap to `max`, and return a spawn spec
+        /// bound to the first non-synthetic base task so tests can mint jobs
+        /// without a MioChannel.
+        fn fixture(max: u32) -> (WorkspaceState, BaseTaskIndex, Arc<ResolvedSpawnSpec>) {
+            let mut state =
+                WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).expect("load test config");
+            state.max_job_history = max;
+            let base_task = state.name_map["simple_cmd"];
+            let config = state.base_tasks[base_task.idx()].config.clone();
+            let task = config
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .expect("eval task");
+            let spec = state.cache_spawn_spec(base_task, "", ValueMap::new(), task);
+            (state, base_task, spec)
+        }
+
+        fn insert_job(state: &mut WorkspaceState, base_task: BaseTaskIndex, spec: Arc<ResolvedSpawnSpec>) -> JobIndex {
+            let bt = &mut state.base_tasks[base_task.idx()];
+            let pc = bt.spawn_counter as usize;
+            bt.spawn_counter = bt.spawn_counter.wrapping_add(1);
+            let log_group = LogGroup::new(base_task, pc);
+            let ji = state.jobs.insert(Job {
+                process_status: JobStatus::Starting,
+                log_group,
+                started_at: crate::clock::now(),
+                cache_key: String::new(),
+                spawn: spec,
+            });
+            state.base_tasks[base_task.idx()].jobs.push_active(ji);
+            state.action_jobs.push_active(ji);
+            ji
+        }
+
+        fn exit(state: &mut WorkspaceState, ji: JobIndex, status: u32) {
+            // Match the real spawn_task flow: Starting → Running → Exited.
+            // The (Starting, Exited) direct transition is not modelled by
+            // the global kind-list and would leak stale entries there.
+            state.update_job_status(ji, JobStatus::Running { process_index: 0, ready_state: None });
+            state.update_job_status(
+                ji,
+                JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status },
+            );
+        }
+
+        #[test]
+        fn eviction_caps_terminal_history_at_three_quarters() {
+            let max = 128;
+            let (mut state, base_task, spec) = fixture(max);
+
+            // Insert max + 40 jobs, drive each to Exited. Prune fires on the
+            // terminal transition that takes live count over max; from there
+            // on the count stays bounded.
+            let mut jis = Vec::new();
+            for _ in 0..(max as usize + 40) {
+                let ji = insert_job(&mut state, base_task, spec.clone());
+                jis.push(ji);
+                exit(&mut state, ji, 0);
+            }
+
+            let live = state.jobs.len() as u32;
+            assert!(live <= max, "live count {live} should stay at or below max {max}");
+            assert!(
+                live >= max - max / 4,
+                "live count {live} should hover near the post-prune target {}",
+                max - max / 4
+            );
+            // The oldest JobIndices must be evicted; newest are retained.
+            let oldest = jis[0];
+            let newest = *jis.last().unwrap();
+            assert!(state.jobs.get(oldest).is_none(), "oldest should be evicted");
+            assert!(state.jobs.get(newest).is_some(), "newest should survive");
+        }
+
+        #[test]
+        fn eviction_preserves_running_jobs() {
+            let max = 128;
+            let (mut state, base_task, spec) = fixture(max);
+
+            // Pin a running job at the very front, then saturate with terminal
+            // actions behind it. The running job has no Exited transition,
+            // so prune must leave it alone.
+            let running = insert_job(&mut state, base_task, spec.clone());
+            for _ in 0..(max as usize * 2) {
+                let ji = insert_job(&mut state, base_task, spec.clone());
+                exit(&mut state, ji, 0);
+            }
+
+            assert!(state.jobs.get(running).is_some(), "running job must not be evicted");
+            assert!(matches!(state.jobs[running].process_status, JobStatus::Starting | JobStatus::Running { .. }));
+        }
+
+        #[test]
+        fn eviction_preserves_scheduled_dep_targets() {
+            let max = 128;
+            let (mut state, base_task, spec) = fixture(max);
+
+            // A is terminal, B is still Scheduled with `after: [A]`. Even
+            // though A is the oldest terminal job, prune must protect it
+            // because B's dependency predicate still needs its exit state.
+            let a = insert_job(&mut state, base_task, spec.clone());
+            exit(&mut state, a, 0);
+
+            let b = state.jobs.insert(Job {
+                process_status: JobStatus::Scheduled {
+                    after: vec![ScheduleRequirement {
+                        job: a,
+                        predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
+                    }],
+                },
+                log_group: LogGroup::new(base_task, 999),
+                started_at: crate::clock::now(),
+                cache_key: String::new(),
+                spawn: spec.clone(),
+            });
+            state.base_tasks[base_task.idx()].jobs.push_scheduled(b);
+
+            // Now hammer with enough terminal jobs that A would otherwise be
+            // evicted many times over.
+            for _ in 0..(max as usize * 3) {
+                let ji = insert_job(&mut state, base_task, spec.clone());
+                exit(&mut state, ji, 0);
+            }
+
+            assert!(state.jobs.get(a).is_some(), "terminal dep target must be protected");
+            assert!(state.jobs.get(b).is_some(), "scheduled waiter must survive");
+        }
+
+        #[test]
+        fn eviction_cleans_base_task_list() {
+            let max = 128;
+            let (mut state, base_task, spec) = fixture(max);
+
+            for _ in 0..(max as usize + 40) {
+                let ji = insert_job(&mut state, base_task, spec.clone());
+                exit(&mut state, ji, 0);
+            }
+
+            // Every index still in the per-base-task list must resolve.
+            let bt = &state.base_tasks[base_task.idx()];
+            for &ji in bt.jobs.all() {
+                assert!(state.jobs.get(ji).is_some(), "base_task.jobs referenced an evicted index {:?}", ji);
+            }
+            // Same for the global kind list.
+            for &ji in state.action_jobs.all() {
+                assert!(state.jobs.get(ji).is_some(), "action_jobs referenced an evicted index {:?}", ji);
+            }
+        }
+
+        #[test]
+        fn log_group_counter_stays_monotonic_across_eviction() {
+            let max = 128;
+            let (mut state, base_task, spec) = fixture(max);
+
+            let first = insert_job(&mut state, base_task, spec.clone());
+            let first_lg = state.jobs[first].log_group;
+
+            for _ in 0..(max as usize + 80) {
+                let ji = insert_job(&mut state, base_task, spec.clone());
+                exit(&mut state, ji, 0);
+            }
+            // At this point many per-base-task entries have been pruned and
+            // `bt.jobs.len()` is smaller than it was at peak, but
+            // `spawn_counter` must still be monotonic so new LogGroups do
+            // not collide with any that already went to the log buffer.
+            let latest = insert_job(&mut state, base_task, spec.clone());
+            let latest_lg = state.jobs[latest].log_group;
+            assert_ne!(first_lg, latest_lg);
+            // spawn_counter is the monotonic source of truth; LogGroups
+            // derived from it must stay distinct across eviction because the
+            // counter is never decremented even after per-base-task list
+            // entries are pruned.
+            assert!(state.base_tasks[base_task.idx()].spawn_counter > 1, "spawn_counter should have advanced");
+        }
+
+        #[test]
+        fn generation_invalidates_stale_handle_after_slot_reuse() {
+            let (mut state, base_task, spec) = fixture(128);
+
+            let first = insert_job(&mut state, base_task, spec.clone());
+            exit(&mut state, first, 0);
+            // Force prune to evict `first` by dropping the cap under the
+            // current live count.
+            state.max_job_history = 1;
+            // Need another terminal transition to re-enter prune_history.
+            let filler = insert_job(&mut state, base_task, spec.clone());
+            exit(&mut state, filler, 0);
+
+            assert!(state.jobs.get(first).is_none(), "old handle should be evicted");
+
+            // Insert a fresh job; the slab may reuse `first`'s slot, but the
+            // generation check on the stale handle must still reject it.
+            let reused = insert_job(&mut state, base_task, spec.clone());
+            if reused.slot() == first.slot() {
+                assert_ne!(reused.generation(), first.generation());
+            }
+            assert!(state.jobs.get(first).is_none());
+            assert!(state.jobs.get(reused).is_some());
         }
     }
 }

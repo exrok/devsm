@@ -51,9 +51,17 @@ pub struct TestHarness {
 
 impl TestHarness {
     /// Creates a new test harness with a unique temp directory.
+    ///
+    /// The path includes the host pid so that two concurrent `cargo test`
+    /// runs (e.g. a dev loop and a CI shell invoking the same suite) do not
+    /// collide on `/tmp/devsm_e2e_<name>_<counter>` and corrupt each other's
+    /// sockets — previously the local `TEST_COUNTER` restarted at zero in
+    /// every process, so parallel runs wiped each other's directories and
+    /// fought over the same `devsm.socket`, which would stall the daemon.
     pub fn new(test_name: &str) -> Self {
         let counter = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let temp_dir = std::env::temp_dir().join(format!("devsm_e2e_{}_{}", test_name, counter));
+        let pid = std::process::id();
+        let temp_dir = std::env::temp_dir().join(format!("devsm_e2e_{}_p{}_{}", test_name, pid, counter));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
 

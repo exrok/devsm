@@ -11,5 +11,5 @@ mod e2e_test_app;
 mod e2e_tui;
 #[path = "e2e/harness.rs"]
 mod harness;
-#[path = "../../devsm/src/rpc.rs"]
+#[path = "../src/rpc.rs"]
 mod rpc;

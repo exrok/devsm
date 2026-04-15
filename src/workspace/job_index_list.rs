@@ -88,7 +88,7 @@ impl JobIndexList {
             self.active += 1;
             return;
         }
-        debug_assert!(false, "JobIndexList::run called on non-scheduled job: {:?}", job.0);
+        debug_assert!(false, "JobIndexList::run called on non-scheduled job: {:?}", job.slot());
     }
     pub fn set_terminal(&mut self, job: JobIndex) {
         for (i, j) in self.non_terminal().iter().enumerate() {
@@ -107,8 +107,30 @@ impl JobIndexList {
             self.terminal += 1;
             return;
         }
-        debug_assert!(false, "JobIndexList::terminate called on non-running job: {:?}", job.0);
+        debug_assert!(false, "JobIndexList::terminate called on non-running job: {:?}", job.slot());
     }
+    /// Drop entries from the *terminal* prefix that no longer satisfy
+    /// `alive`. Used by history eviction — we never evict non-terminal jobs,
+    /// so only the terminal section can shrink. The active and scheduled
+    /// sections stay untouched and keep their positions.
+    ///
+    /// O(terminal_count).
+    pub fn retain_live(&mut self, alive: impl Fn(JobIndex) -> bool) {
+        let old_terminal = self.terminal as usize;
+        let mut write = 0;
+        for read in 0..old_terminal {
+            if alive(self.jobs[read]) {
+                self.jobs[write] = self.jobs[read];
+                write += 1;
+            }
+        }
+        let removed = old_terminal - write;
+        if removed != 0 {
+            self.jobs.drain(write..old_terminal);
+            self.terminal -= removed as u32;
+        }
+    }
+
     pub fn terminal(&self) -> &[JobIndex] {
         &self.jobs[..self.terminal as usize]
     }
@@ -128,40 +150,76 @@ mod test {
     use super::*;
     #[test]
     fn simple() {
-        use JobIndex as J;
+        let j = |n: usize| JobIndex::from_usize(n);
         let mut list = JobIndexList::default();
         macro_rules! assert_state {
             ([$($term: literal),*] [$($run: literal),*] [$($sched: literal),*]) => {
-                assert_eq!(list.terminal(), &[$(J($term)),*]);
-                assert_eq!(list.running(), &[$(J($run)),*]);
-                assert_eq!(list.scheduled(), &[$(J($sched)),*]);
+                assert_eq!(list.terminal(), &[$(j($term)),*]);
+                assert_eq!(list.running(), &[$(j($run)),*]);
+                assert_eq!(list.scheduled(), &[$(j($sched)),*]);
             };
         }
         assert_state!([][][]);
         assert!(list.non_terminal().is_empty());
 
-        list.push_scheduled(J(1));
+        list.push_scheduled(j(1));
         assert_state!([][][1]);
-        assert_eq!(list.non_terminal(), &[J(1)]);
+        assert_eq!(list.non_terminal(), &[j(1)]);
 
-        list.push_active(J(2));
+        list.push_active(j(2));
         assert_state!([][2][1]);
-        assert_eq!(list.non_terminal(), &[J(2), J(1)]);
+        assert_eq!(list.non_terminal(), &[j(2), j(1)]);
 
-        list.push_active(J(3));
+        list.push_active(j(3));
         assert_state!([][2,3][1]);
 
-        list.push_scheduled(J(4));
+        list.push_scheduled(j(4));
         assert_state!([][2,3][1,4]);
 
-        list.set_terminal(J(3));
+        list.set_terminal(j(3));
         assert_state!([3][2][1,4]);
 
-        list.set_terminal(J(1));
+        list.set_terminal(j(1));
         assert_state!([3, 1][2][4]);
 
-        assert_eq!(list.non_terminal(), &[J(2), J(4)]);
-        assert_eq!(list.terminate_all(), &[J(2), J(4)]);
+        assert_eq!(list.non_terminal(), &[j(2), j(4)]);
+        assert_eq!(list.terminate_all(), &[j(2), j(4)]);
         assert_state!([3, 1, 2, 4][][]);
+    }
+
+    #[test]
+    fn retain_live_drops_from_terminal_prefix_only() {
+        let j = |n: usize| JobIndex::from_usize(n);
+        let mut list = JobIndexList::default();
+
+        list.push_scheduled(j(10));
+        list.push_active(j(11));
+        list.push_scheduled(j(12));
+        list.set_terminal(j(11));
+        list.set_terminal(j(10));
+        list.push_active(j(13));
+
+        assert_eq!(list.terminal(), &[j(11), j(10)]);
+        assert_eq!(list.running(), &[j(13)]);
+        assert_eq!(list.scheduled(), &[j(12)]);
+
+        // Evict j(11) — j(10) and non-terminal entries survive.
+        list.retain_live(|ji| ji != j(11));
+        assert_eq!(list.terminal(), &[j(10)]);
+        assert_eq!(list.running(), &[j(13)]);
+        assert_eq!(list.scheduled(), &[j(12)]);
+
+        // Evicting a non-terminal index does nothing (only terminal prefix
+        // is scanned).
+        list.retain_live(|ji| ji != j(13));
+        assert_eq!(list.terminal(), &[j(10)]);
+        assert_eq!(list.running(), &[j(13)]);
+        assert_eq!(list.scheduled(), &[j(12)]);
+
+        // Drain the whole terminal prefix.
+        list.retain_live(|_| false);
+        assert_eq!(list.terminal(), &[] as &[JobIndex]);
+        assert_eq!(list.running(), &[j(13)]);
+        assert_eq!(list.scheduled(), &[j(12)]);
     }
 }

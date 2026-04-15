@@ -338,7 +338,8 @@ impl LogSearchState {
             let entry = indexer[log_match.log_id];
             let text = unsafe { entry.text(logs) };
 
-            let base_style = if is_selected { AnsiColor::LightSkyBlue1.with_fg(AnsiColor::Black) } else { Style::DEFAULT };
+            let base_style =
+                if is_selected { AnsiColor::LightSkyBlue1.with_fg(AnsiColor::Black) } else { Style::DEFAULT };
             let highlight_style = AnsiColor::Grey[25].with_fg(AnsiColor::Black);
 
             if is_selected {

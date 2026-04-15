@@ -503,8 +503,11 @@ impl TaskLauncherState {
 
             match self.mode {
                 LauncherMode::TaskName => {
-                    let substyle =
-                        if is_selected { AnsiColor::Grey[5].with_bg(AnsiColor(153)) } else { AnsiColor::Grey[14].as_fg() };
+                    let substyle = if is_selected {
+                        AnsiColor::Grey[5].with_bg(AnsiColor(153))
+                    } else {
+                        AnsiColor::Grey[14].as_fg()
+                    };
 
                     let Some(task) = self.task_at_entry(entry) else { continue };
                     let kind_str = match task.kind {
@@ -531,8 +534,11 @@ impl TaskLauncherState {
                     entry_rect.with(style).text(out, task_name).text(out, ":").text(out, profile);
                 }
                 LauncherMode::Variable => {
-                    let substyle =
-                        if is_selected { AnsiColor::Grey[5].with_bg(AnsiColor(153)) } else { AnsiColor::Grey[14].as_fg() };
+                    let substyle = if is_selected {
+                        AnsiColor::Grey[5].with_bg(AnsiColor(153))
+                    } else {
+                        AnsiColor::Grey[14].as_fg()
+                    };
                     let Some(&var) = self
                         .available_variables
                         .iter()

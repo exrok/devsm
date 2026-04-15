@@ -2,7 +2,11 @@ use super::*;
 use std::fs;
 
 fn create_test_tree(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("cache_key_test_{}", name));
+    // Guard the path with the host pid so parallel `cargo test` invocations
+    // (e.g. a dev loop plus an outer wrapper suite) don't race to wipe each
+    // other's directories mid-test.
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("cache_key_test_p{}_{}", pid, name));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir

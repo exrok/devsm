@@ -62,8 +62,24 @@ impl LogForwarderConfig {
 
         if let Some(job_idx) = query.job_index {
             let state = workspace.state.read().unwrap();
-            let job_index = JobIndex::from_usize(job_idx as usize);
-            let Some(job) = state.jobs.get(job_index.idx()) else {
+            let job_index = match state.jobs.by_public_id(job_idx) {
+                Some(ji) => ji,
+                None => {
+                    return Self {
+                        filter: LogForwarderFilter::All,
+                        pattern: pattern_lower,
+                        case_sensitive,
+                        max_age_secs: query.max_age_secs,
+                        strip_ansi,
+                        with_taskname: false,
+                        task_names,
+                        follow: query.follow,
+                        oldest: query.oldest,
+                        newest: query.newest,
+                    };
+                }
+            };
+            let Some(job) = state.jobs.get(job_index) else {
                 return Self {
                     filter: LogForwarderFilter::All,
                     pattern: pattern_lower,
@@ -409,9 +425,9 @@ enum Phase {
     Running,
 }
 
-fn send_status(encoder: &mut Encoder, socket: &mut Option<UnixStream>, status: JobStatusKind, job_index: JobIndex) {
+fn send_status(encoder: &mut Encoder, socket: &mut Option<UnixStream>, status: JobStatusKind, public_id: u32) {
     let Some(socket) = socket.as_mut() else { return };
-    encoder.encode_push(RpcMessageKind::JobStatus, &JobStatusEvent { job_index: job_index.as_u32(), status });
+    encoder.encode_push(RpcMessageKind::JobStatus, &JobStatusEvent { job_index: public_id, status });
     let _ = socket.write_all(encoder.output());
     encoder.clear();
 }
@@ -420,11 +436,11 @@ fn send_exit_status(
     encoder: &mut Encoder,
     socket: &mut Option<UnixStream>,
     exit_code: i32,
-    job_index: JobIndex,
+    public_id: u32,
     cause: RpcExitCause,
 ) {
     let Some(socket) = socket.as_mut() else { return };
-    encoder.encode_push(RpcMessageKind::JobExited, &JobExitedEvent { job_index: job_index.as_u32(), exit_code, cause });
+    encoder.encode_push(RpcMessageKind::JobExited, &JobExitedEvent { job_index: public_id, exit_code, cause });
     let _ = socket.write_all(encoder.output());
     encoder.clear();
 }
@@ -488,7 +504,8 @@ pub fn run(
 
         if job_exited {
             if let (Some(code), Some(job_index)) = (exit_code, current_job) {
-                send_exit_status(&mut encoder, &mut socket, code, job_index, cause.unwrap_or(RpcExitCause::Unknown));
+                let public_id = workspace.state.read().unwrap().jobs.public_id_of(job_index).unwrap_or(0);
+                send_exit_status(&mut encoder, &mut socket, code, public_id, cause.unwrap_or(RpcExitCause::Unknown));
             }
             send_termination(&mut encoder, &mut socket);
             break;
@@ -543,28 +560,28 @@ fn forward_new_logs(
 
     if *last_log_id >= current_tail {
         let state = workspace.state.read().unwrap();
-        for (idx, job) in state.jobs.iter().enumerate() {
+        for (job_index, job) in state.jobs.iter() {
             if job.log_group != log_group {
                 continue;
             }
-            let job_index = JobIndex::from_usize(idx);
             *current_job = Some(job_index);
+            let public_id = state.jobs.public_id_of(job_index).unwrap_or(0);
             match &job.process_status {
                 JobStatus::Scheduled { after } if !after.is_empty() => {
                     let has_terminating =
                         after.iter().any(|req| matches!(req.predicate, crate::workspace::JobPredicate::Terminated));
                     if has_terminating && *phase != Phase::Restarting {
                         *phase = Phase::Restarting;
-                        send_status(encoder, socket, JobStatusKind::Restarting, job_index);
+                        send_status(encoder, socket, JobStatusKind::Restarting, public_id);
                     } else if !has_terminating && *phase != Phase::Waiting {
                         *phase = Phase::Waiting;
-                        send_status(encoder, socket, JobStatusKind::Waiting, job_index);
+                        send_status(encoder, socket, JobStatusKind::Waiting, public_id);
                     }
                 }
                 JobStatus::Starting | JobStatus::Running { .. } => {
                     if *phase != Phase::Running {
                         *phase = Phase::Running;
-                        send_status(encoder, socket, JobStatusKind::Running, job_index);
+                        send_status(encoder, socket, JobStatusKind::Running, public_id);
                     }
                 }
                 JobStatus::Exited { status, cause, .. } => {
@@ -606,17 +623,17 @@ fn forward_new_logs(
     *last_log_id = current_tail;
 
     let state = workspace.state.read().unwrap();
-    for (idx, job) in state.jobs.iter().enumerate() {
+    for (job_index, job) in state.jobs.iter() {
         if job.log_group != log_group {
             continue;
         }
-        let job_index = JobIndex::from_usize(idx);
         *current_job = Some(job_index);
+        let public_id = state.jobs.public_id_of(job_index).unwrap_or(0);
         match &job.process_status {
             JobStatus::Starting | JobStatus::Running { .. } => {
                 if *phase != Phase::Running {
                     *phase = Phase::Running;
-                    send_status(encoder, socket, JobStatusKind::Running, job_index);
+                    send_status(encoder, socket, JobStatusKind::Running, public_id);
                 }
             }
             JobStatus::Exited { status, cause, .. } => {

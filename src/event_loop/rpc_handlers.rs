@@ -238,14 +238,11 @@ fn handle_rpc_message(
 
             match ws.handle.submit(SpawnSpec::task(req.task_name, req.profile, params, true)) {
                 Ok(result) => {
-                    let job_index = result.jobs.first().map(|(_, ji)| ji.as_u32());
+                    let ws_state = ws.handle.state();
+                    let job_index = result.jobs.first().and_then(|(_, ji)| ws_state.jobs.public_id_of(*ji));
                     return Ok(token.respond(
                         RpcMessageKind::RunTaskAck,
-                        &crate::rpc::RunTaskResponse {
-                            success: true,
-                            job_index,
-                            error: None,
-                        },
+                        &crate::rpc::RunTaskResponse { success: true, job_index, error: None },
                     ));
                 }
                 Err(e) => {

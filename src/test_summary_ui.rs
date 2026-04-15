@@ -240,7 +240,7 @@ fn init_tui_state(test_run: &TestRun, workspace: &Workspace, width: u16, height:
         .test_jobs
         .iter()
         .map(|tj| {
-            let job = &state.jobs[tj.job_index.idx()];
+            let job = &state.jobs[tj.job_index];
             let command = format_command(&job.task().config().command);
             TestDisplay {
                 base_task_index: tj.base_task_index,
@@ -273,7 +273,7 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
             continue;
         }
 
-        let job = &ws_state.jobs[test_job.job_index.idx()];
+        let job = &ws_state.jobs[test_job.job_index];
         let (new_status, timeout_info) = match &job.process_status {
             JobStatus::Scheduled { .. } | JobStatus::Starting => {
                 all_done = false;
@@ -559,7 +559,7 @@ fn update_test_statuses(
             continue;
         }
 
-        let job = &state.jobs[test_job.job_index.idx()];
+        let job = &state.jobs[test_job.job_index];
         let (new_status, timeout_info) = match &job.process_status {
             JobStatus::Scheduled { .. } | JobStatus::Starting => {
                 all_done = false;
@@ -634,7 +634,8 @@ fn update_test_statuses(
                         }
                         writeln!(buf, "</logs>").ok();
 
-                        writeln!(buf, "hint: `devsm logs --job={}` for full logs", test_job.job_index.idx()).ok();
+                        let public_id = state.jobs.public_id_of(test_job.job_index).unwrap_or(0);
+                        writeln!(buf, "hint: `devsm logs --job={}` for full logs", public_id).ok();
                     }
                     writeln!(buf).ok();
                 }

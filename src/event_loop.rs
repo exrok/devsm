@@ -428,7 +428,7 @@ impl EventLoop {
                 let state = ws.handle.state();
 
                 if let Some((service_to_kill, exit_cause)) = state.service_to_terminate_for_queue() {
-                    let job = &state.jobs[service_to_kill.idx()];
+                    let job = &state.jobs[service_to_kill];
                     let job_id = job.log_group;
                     let JobStatus::Running { process_index, .. } = job.process_status else {
                         drop(state);
@@ -446,7 +446,7 @@ impl EventLoop {
 
                 match state.next_scheduled() {
                     workspace::Scheduled::Ready(job_index) => {
-                        let job = &state.jobs[job_index.idx()];
+                        let job = &state.jobs[job_index];
                         let job_correlation = job.log_group;
                         let job_task = job.task().clone();
                         drop(state);
@@ -1409,7 +1409,9 @@ impl EventLoop {
         job_index: JobIndex,
         status: crate::rpc::JobStatusKind,
     ) {
-        let event = crate::rpc::JobStatusEvent { job_index: job_index.as_u32(), status };
+        let Some(ws) = self.state.workspaces.get(ws_index as usize) else { return };
+        let public_id = ws.handle.state.read().unwrap().jobs.public_id_of(job_index).unwrap_or(0);
+        let event = crate::rpc::JobStatusEvent { job_index: public_id, status };
         let mut encoder = crate::rpc::Encoder::new();
         encoder.encode_push(RpcMessageKind::JobStatus, &event);
         let output = encoder.output();
@@ -1433,7 +1435,9 @@ impl EventLoop {
         exit_code: i32,
         cause: crate::rpc::ExitCause,
     ) {
-        let event = crate::rpc::JobExitedEvent { job_index: job_index.as_u32(), exit_code, cause };
+        let Some(ws) = self.state.workspaces.get(ws_index as usize) else { return };
+        let public_id = ws.handle.state.read().unwrap().jobs.public_id_of(job_index).unwrap_or(0);
+        let event = crate::rpc::JobExitedEvent { job_index: public_id, exit_code, cause };
         let mut encoder = crate::rpc::Encoder::new();
         encoder.encode_push(RpcMessageKind::JobExited, &event);
         let output = encoder.output();
@@ -1454,7 +1458,9 @@ impl EventLoop {
         if !crate::clock::is_fuzz() {
             return;
         }
-        let event = crate::rpc::DebugTraceEvent { tag, job_index: job_index.as_u32() };
+        let Some(ws) = self.state.workspaces.get(ws_index as usize) else { return };
+        let public_id = ws.handle.state.read().unwrap().jobs.public_id_of(job_index).unwrap_or(0);
+        let event = crate::rpc::DebugTraceEvent { tag, job_index: public_id };
         let mut encoder = crate::rpc::Encoder::new();
         encoder.encode_push(RpcMessageKind::DebugTrace, &event);
         let output = encoder.output();
@@ -1649,6 +1655,7 @@ pub(crate) fn global_keybinds() -> Arc<crate::keybinds::Keybinds> {
         .get_or_init(|| {
             let config = crate::user_config::UserConfig::load();
             GLOBAL_USER_CONFIG_LOADED.get_or_init(|| config.loaded_from_file);
+            crate::user_config::set_global_max_job_history(config.max_job_history);
             Mutex::new(Arc::new(config.keybinds))
         })
         .lock()

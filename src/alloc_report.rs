@@ -34,11 +34,8 @@ fn load_workspace_config_for_report(relative: &str) -> WorkspaceConfig<'static> 
 fn base_restart_params(expr: &'static TaskConfigExpr<'static>) -> Option<ValueMap<'static>> {
     let mut params = ValueMap::new();
     for var_name in expr.collect_variables() {
-        let default = expr
-            .vars
-            .iter()
-            .find_map(|(candidate, meta)| (*candidate == var_name).then_some(meta.default))
-            .flatten();
+        let default =
+            expr.vars.iter().find_map(|(candidate, meta)| (*candidate == var_name).then_some(meta.default)).flatten();
         let Some(value) = default else {
             return None;
         };
