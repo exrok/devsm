@@ -3,6 +3,7 @@ use crate::line_width::MatchHighlight;
 use crate::log_storage::LogEntry;
 use crate::log_storage::LogId;
 use crate::log_storage::LogView;
+use crate::scroll_view::render_single_entry_bounded;
 use extui::Rect;
 
 #[derive(Debug)]
@@ -22,6 +23,9 @@ pub struct LogScrollWidget {
     pub(crate) tail: LogId,
     /// The last highlight state that was rendered
     pub(crate) last_highlight: Option<LogHighlight>,
+    /// The last skip_rect (log-overlay cutout) that was rendered against.
+    /// A change in this value forces a full re-render just like a rect change.
+    pub(crate) last_skip_rect: Option<Rect>,
 }
 
 impl LogScrollWidget {
@@ -33,6 +37,10 @@ impl LogScrollWidget {
         lines_to_render: u16,
         style: &LogStyle,
     ) -> u16 {
+        if style.skip_rect.is_some() {
+            return self.render_content_skip(buf, rect, view, lines_to_render, style);
+        }
+
         let logs = view.logs.indexer();
         let mut entries = self.ids[self.top_index..].iter().map(|&id| (id, logs[id]));
         let mut remaining_height = lines_to_render;
@@ -75,14 +83,57 @@ impl LogScrollWidget {
         remaining_height
     }
 
+    fn render_content_skip(
+        &self,
+        buf: &mut Vec<u8>,
+        rect: Rect,
+        view: &LogView,
+        lines_to_render: u16,
+        style: &LogStyle,
+    ) -> u16 {
+        let logs = view.logs.indexer();
+        let mut entries = self.ids[self.top_index..].iter().map(|&id| (id, logs[id]));
+        let mut current_row = rect.y;
+        let end_row = rect.y + lines_to_render;
+        let mut first_entry_skip = self.scroll_shift_up;
+
+        while current_row < end_row {
+            let Some((log_id, entry)) = entries.next() else { break };
+            let remaining = end_row - current_row;
+            let skip_in_entry = first_entry_skip;
+            first_entry_skip = 0;
+
+            let rendered = render_single_entry_bounded(
+                buf,
+                view.logs,
+                rect,
+                &entry,
+                log_id,
+                skip_in_entry,
+                remaining,
+                style,
+                current_row,
+            );
+            if rendered == 0 {
+                break;
+            }
+            current_row += rendered;
+        }
+
+        end_row - current_row
+    }
+
     /// Renders with delta optimization when possible.
     /// Handles highlight-only changes efficiently by only re-rendering affected entries.
     pub fn render_reset_if_needed(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
-        if rect == self.previous && style.highlight == self.last_highlight {
+        if rect == self.previous
+            && style.highlight == self.last_highlight
+            && style.skip_rect == self.last_skip_rect
+        {
             return;
         }
 
-        if rect == self.previous {
+        if rect == self.previous && self.last_skip_rect == style.skip_rect && style.skip_rect.is_none() {
             self.delta_highlight_only(buf, rect, view, style);
         } else {
             self.render_reset(buf, rect, view, style);
@@ -92,6 +143,7 @@ impl LogScrollWidget {
     pub fn render_reset(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
         self.previous = rect;
         self.last_highlight = style.highlight;
+        self.last_skip_rect = style.skip_rect;
         self.tail = view.tail;
 
         while let Some(id) = self.ids.get(self.top_index) {
@@ -104,7 +156,8 @@ impl LogScrollWidget {
             }
         }
 
-        let use_batch_clear = rect.y == 0 && !style.assume_blank;
+        let has_skip = style.skip_rect.is_some();
+        let use_batch_clear = rect.y == 0 && !style.assume_blank && !has_skip;
 
         if use_batch_clear {
             vt::MoveCursor(rect.x + rect.w, rect.y + rect.h - 1).write_to_buffer(buf);
@@ -115,9 +168,15 @@ impl LogScrollWidget {
         let remaining_height = self.render_content(buf, rect, view, rect.h, style);
 
         if !use_batch_clear && !style.assume_blank {
-            for _ in 0..remaining_height {
-                buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
-                buf.extend_from_slice(b"\r\n");
+            if has_skip {
+                let pad_start = rect.y + rect.h - remaining_height;
+                vt::MoveCursor(rect.x, pad_start).write_to_buffer(buf);
+                super::pad_with_skip(buf, rect, pad_start, remaining_height, style.skip_rect);
+            } else {
+                for _ in 0..remaining_height {
+                    buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+                    buf.extend_from_slice(b"\r\n");
+                }
             }
         }
     }
@@ -222,6 +281,10 @@ impl LogScrollWidget {
         lines: u16,
         style: &LogStyle,
     ) {
+        if style.skip_rect.is_some() {
+            self.render_reset(buf, rect, view, style);
+            return;
+        }
         vt::ScrollRegion(rect.y + 1, rect.y + rect.h).write_to_buffer(buf);
         extui::splat!(buf, vt::ScrollBufferDown(lines), vt::ScrollRegion::RESET);
         self.render_top_lines(buf, rect, view, lines, style);
@@ -236,6 +299,10 @@ impl LogScrollWidget {
         lines: u16,
         style: &LogStyle,
     ) {
+        if style.skip_rect.is_some() {
+            self.render_reset(buf, rect, view, style);
+            return;
+        }
         vt::ScrollRegion(rect.y + 1, rect.y + rect.h).write_to_buffer(buf);
         extui::splat!(buf, vt::ScrollBufferUp(lines), vt::ScrollRegion::RESET);
         self.render_bottom_lines(buf, rect, view, lines, style);
@@ -361,6 +428,10 @@ impl LogScrollWidget {
     }
 
     pub(crate) fn delta_highlight_only(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
+        if style.skip_rect.is_some() {
+            self.render_reset(buf, rect, view, style);
+            return;
+        }
         let old_highlight = self.last_highlight;
         let new_highlight = style.highlight;
 
@@ -411,6 +482,10 @@ impl LogScrollWidget {
         direction: ScrollDirection,
         style: &LogStyle,
     ) {
+        if style.skip_rect.is_some() {
+            self.render_reset(buf, rect, view, style);
+            return;
+        }
         let old_highlight = self.last_highlight;
         let new_highlight = style.highlight;
 

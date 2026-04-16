@@ -191,6 +191,8 @@ pub enum Command {
     ToggleShortcutBar,
     OverlayCancel,
     OverlayConfirm,
+    /// Open the command palette overlay on top of the log view.
+    OpenCommandPalette,
     RefreshConfig,
     /// Rerun the last test group.
     RerunTestGroup,
@@ -243,6 +245,7 @@ impl FromStr for Command {
             "ToggleShortcutBar" => Command::ToggleShortcutBar,
             "OverlayCancel" => Command::OverlayCancel,
             "OverlayConfirm" => Command::OverlayConfirm,
+            "OpenCommandPalette" => Command::OpenCommandPalette,
             "RefreshConfig" => Command::RefreshConfig,
             "RerunTestGroup" => Command::RerunTestGroup,
             "NarrowTestGroup" => Command::NarrowTestGroup,
@@ -306,10 +309,12 @@ pub enum Mode {
     TaskLauncher,
     /// Active when the test filter selection overlay is open.
     TestFilterLauncher,
+    /// Active when the command palette is open over the log view.
+    CommandPalette,
 }
 
 impl Mode {
-    pub const ALL: [Mode; 8] = [
+    pub const ALL: [Mode; 9] = [
         Mode::Global,
         Mode::Input,
         Mode::Pager,
@@ -318,6 +323,7 @@ impl Mode {
         Mode::LogSearch,
         Mode::TaskLauncher,
         Mode::TestFilterLauncher,
+        Mode::CommandPalette,
     ];
 
     pub fn config_name(self) -> &'static str {
@@ -330,6 +336,7 @@ impl Mode {
             Mode::LogSearch => "log_search",
             Mode::TaskLauncher => "task_launcher",
             Mode::TestFilterLauncher => "test_filter_launcher",
+            Mode::CommandPalette => "command_palette",
         }
     }
 }
@@ -347,6 +354,7 @@ impl FromStr for Mode {
             "log_search" | "logsearch" => Mode::LogSearch,
             "task_launcher" | "tasklauncher" => Mode::TaskLauncher,
             "test_filter_launcher" | "testfilterlauncher" => Mode::TestFilterLauncher,
+            "command_palette" | "commandpalette" => Mode::CommandPalette,
             _ => return Err(format!("Unknown mode: `{s}`")),
         })
     }
@@ -365,6 +373,7 @@ pub struct Keybinds {
     log_search: BindingTable,
     task_launcher: BindingTable,
     test_filter_launcher: BindingTable,
+    command_palette: BindingTable,
     chains: Vec<ChainGroup>,
 }
 
@@ -396,6 +405,7 @@ impl Keybinds {
             log_search: HashTable::new(),
             task_launcher: HashTable::new(),
             test_filter_launcher: HashTable::new(),
+            command_palette: HashTable::new(),
             chains: Vec::new(),
         }
     }
@@ -427,12 +437,15 @@ impl Keybinds {
             Mode::LogSearch => &self.log_search,
             Mode::TaskLauncher => &self.task_launcher,
             Mode::TestFilterLauncher => &self.test_filter_launcher,
+            Mode::CommandPalette => &self.command_palette,
         }
     }
 
     fn load_defaults(&mut self) {
         self.bind(Mode::Global, "C-c", Command::Quit);
         self.bind(Mode::Global, "?", Command::ToggleHelp);
+        self.bind(Mode::Global, "M-x", Command::OpenCommandPalette);
+        self.bind(Mode::Global, "C-P", Command::OpenCommandPalette);
 
         self.bind(Mode::Input, "C-k", Command::SelectPrev);
         self.bind(Mode::Input, "UP", Command::SelectPrev);
@@ -500,6 +513,7 @@ impl Keybinds {
             Mode::LogSearch => &mut self.log_search,
             Mode::TaskLauncher => &mut self.task_launcher,
             Mode::TestFilterLauncher => &mut self.test_filter_launcher,
+            Mode::CommandPalette => &mut self.command_palette,
         };
         let entry = BindingEntry::Command(command);
         match table.find_mut(hash, |(k, _)| *k == input) {
@@ -550,6 +564,7 @@ impl Keybinds {
             Mode::LogSearch => &mut self.log_search,
             Mode::TaskLauncher => &mut self.task_launcher,
             Mode::TestFilterLauncher => &mut self.test_filter_launcher,
+            Mode::CommandPalette => &mut self.command_palette,
         }
     }
 
@@ -676,6 +691,7 @@ impl Command {
             Command::ToggleShortcutBar => "Toggle Shortcuts",
             Command::OverlayCancel => "Cancel",
             Command::OverlayConfirm => "Confirm",
+            Command::OpenCommandPalette => "Command Palette",
             Command::RefreshConfig => "Refresh Config",
             Command::RerunTestGroup => "Rerun Tests",
             Command::NarrowTestGroup => "Narrow Tests",
@@ -721,6 +737,7 @@ impl Command {
             Command::ToggleShortcutBar => "ToggleShortcutBar",
             Command::OverlayCancel => "OverlayCancel",
             Command::OverlayConfirm => "OverlayConfirm",
+            Command::OpenCommandPalette => "OpenCommandPalette",
             Command::RefreshConfig => "RefreshConfig",
             Command::RerunTestGroup => "RerunTestGroup",
             Command::NarrowTestGroup => "NarrowTestGroup",
@@ -811,6 +828,27 @@ mod tests {
 
         let slash: InputEvent = "/".parse().unwrap();
         assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Global], slash), Some(Command::SearchLogs));
+    }
+
+    #[test]
+    fn command_palette_defaults_bound() {
+        let keybinds = Keybinds::default();
+
+        let alt_x: InputEvent = "M-x".parse().unwrap();
+        assert_eq!(
+            keybinds.lookup_chain(&[Mode::TaskTree, Mode::Global], alt_x),
+            Some(Command::OpenCommandPalette),
+            "M-x (0x{:x}) should be bound to OpenCommandPalette in Global",
+            alt_x.0
+        );
+
+        let ctrl_shift_p: InputEvent = "C-P".parse().unwrap();
+        assert_eq!(
+            keybinds.lookup_chain(&[Mode::TaskTree, Mode::Global], ctrl_shift_p),
+            Some(Command::OpenCommandPalette),
+            "C-P (0x{:x}) should be bound to OpenCommandPalette in Global",
+            ctrl_shift_p.0
+        );
     }
 
     #[test]

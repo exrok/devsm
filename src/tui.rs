@@ -97,6 +97,7 @@ fn selection_to_filter(sel: &SelectionState, ws: &WorkspaceState) -> LogFilter {
     }
 }
 
+mod command_palette;
 mod config_error;
 mod log_search;
 mod log_stack;
@@ -106,6 +107,7 @@ mod task_launcher;
 mod task_tree;
 mod test_filter_launcher;
 
+use command_palette::{CommandPaletteState, PaletteAction};
 use config_error::{ConfigErrorAction, ConfigErrorState, ConfigSource};
 
 struct StatusMessage {
@@ -135,7 +137,16 @@ enum FocusOverlap {
     TaskLauncher { state: TaskLauncherState },
     TestFilterLauncher { state: TestFilterLauncherState },
     ConfigError { state: ConfigErrorState },
+    CommandPalette { state: CommandPaletteState },
     None,
+}
+
+impl FocusOverlap {
+    /// Returns true for overlays that render centered on top of the log view
+    /// (as opposed to replacing the bottom task-tree pane).
+    fn is_log_overlay(&self) -> bool {
+        matches!(self, FocusOverlap::CommandPalette { .. })
+    }
 }
 
 struct HelpMenu {
@@ -181,6 +192,15 @@ struct TuiState {
     chain: ChainState,
     menu_height_override: Option<u16>,
     drag: Option<DragKind>,
+
+    /// Dedicated secondary DoubleBuffer for log overlays like the command
+    /// palette. Sized to just the overlay rect so its cell diff is cheap.
+    /// Lives in `TuiState` (not per-overlay) so its back buffer survives
+    /// across re-renders, giving efficient keystroke updates.
+    log_overlay: Option<DoubleBuffer>,
+    /// Rect that the cached `log_overlay` was last sized to. Comparing against
+    /// the new rect tells us when to reset the buffer instead of diffing.
+    log_overlay_last_rect: Option<Rect>,
 }
 
 fn compute_menu_height(terminal_height: u16) -> u16 {
@@ -209,6 +229,27 @@ fn effective_menu_height(terminal_height: u16, override_: Option<u16>) -> u16 {
     }
 }
 
+/// Rect for the command palette box — a centered cutout inside the log area
+/// that the scroll_view treats as a `skip_rect`. The log widget clears the
+/// cells outside this box on each full reset (so stale cells don't leak
+/// through) and leaves the box itself untouched for the overlay to paint.
+///
+/// Returns `None` if the log area is too small to hold any useful palette.
+fn compute_palette_rect(w: u16, log_area_h: u16) -> Option<Rect> {
+    const MIN_W: u16 = 20;
+    const MIN_H: u16 = 6;
+    const MAX_W: u16 = 80;
+    if w < MIN_W + 2 || log_area_h < MIN_H + 2 {
+        return None;
+    }
+    let box_h = log_area_h.saturating_sub(4).min(16).max(MIN_H);
+    let box_w = w.saturating_sub(4).min(MAX_W).max(MIN_W);
+    let x = (w - box_w) / 2;
+    let y = (log_area_h - box_h) / 2;
+    Some(Rect { x, y, w: box_w, h: box_h })
+}
+
+
 fn render<'a>(
     w: u16,
     h: u16,
@@ -218,7 +259,8 @@ fn render<'a>(
     delta: Has,
 ) -> &'a [u8] {
     let has_overlay = !matches!(tui.overlay, FocusOverlap::None);
-    let show_task_tree_area = has_overlay || !tui.task_tree_hidden;
+    let is_log_overlay = tui.overlay.is_log_overlay();
+    let show_task_tree_area = (has_overlay && !is_log_overlay) || !tui.task_tree_hidden;
     let shortcut_h: u16 = if tui.shortcut_bar_visible && h > 3 { 1 } else { 0 };
     let menu_height = if show_task_tree_area { effective_menu_height(h, tui.menu_height_override) } else { 1 };
     let frame_height = menu_height + shortcut_h;
@@ -256,8 +298,11 @@ fn render<'a>(
         _ => None,
     };
 
-    let dest = Rect { x: 0, y: 0, w, h: h - frame_height };
-    tui.logs.render(&mut tui.frame.buf, dest, workspace, keybinds, resized);
+    let log_area_h = h - frame_height;
+    let log_overlay_rect: Option<Rect> = if is_log_overlay { compute_palette_rect(w, log_area_h) } else { None };
+
+    let dest = Rect { x: 0, y: 0, w, h: log_area_h };
+    tui.logs.render(&mut tui.frame.buf, dest, workspace, keybinds, resized, log_overlay_rect);
 
     let mut bot = Rect { x: 0, y: 0, w, h: frame_height };
 
@@ -309,7 +354,7 @@ fn render<'a>(
             FocusOverlap::ConfigError { state } => {
                 state.render(&mut tui.frame, task_tree_rect);
             }
-            FocusOverlap::None => {
+            FocusOverlap::CommandPalette { .. } | FocusOverlap::None => {
                 let (p, mut s) = task_tree_rect.h_split(0.5);
                 s.take_left(1);
                 let ws = workspace.state();
@@ -319,28 +364,14 @@ fn render<'a>(
         }
 
         if let Some(help_rect) = help_rect {
-            let current_mode = match &tui.overlay {
-                FocusOverlap::Group { .. } => Mode::SelectSearch,
-                FocusOverlap::LogSearch { .. } => Mode::LogSearch,
-                FocusOverlap::TaskLauncher { .. } => Mode::TaskLauncher,
-                FocusOverlap::TestFilterLauncher { .. } => Mode::TestFilterLauncher,
-                FocusOverlap::ConfigError { .. } => Mode::Pager,
-                FocusOverlap::None => Mode::TaskTree,
-            };
+            let current_mode = current_mode_for_overlay(&tui.overlay);
             let chain_idx = if matches!(tui.overlay, FocusOverlap::None) { tui.chain.current } else { None };
             render_help_menu(&mut tui.frame, help_rect, keybinds, &mut tui.help, current_mode, chain_idx);
         }
     }
 
     if let Some(rect) = shortcut_rect {
-        let current_mode = match &tui.overlay {
-            FocusOverlap::Group { .. } => Mode::SelectSearch,
-            FocusOverlap::LogSearch { .. } => Mode::LogSearch,
-            FocusOverlap::TaskLauncher { .. } => Mode::TaskLauncher,
-            FocusOverlap::TestFilterLauncher { .. } => Mode::TestFilterLauncher,
-            FocusOverlap::ConfigError { .. } => Mode::Pager,
-            FocusOverlap::None => Mode::TaskTree,
-        };
+        let current_mode = current_mode_for_overlay(&tui.overlay);
         let chain_idx = if matches!(tui.overlay, FocusOverlap::None) { tui.chain.current } else { None };
         let scroll_state = tui.logs.scroll_state(&workspace.state(), workspace);
         let is_scrolled = scroll_state.top.is_scrolled || scroll_state.bottom.is_some_and(|b| b.is_scrolled);
@@ -357,7 +388,49 @@ fn render<'a>(
 
     tui.frame.render_internal();
 
+    if let Some(band_rect) = log_overlay_rect {
+        let geometry_changed = tui.log_overlay_last_rect != Some(band_rect);
+        if geometry_changed || tui.log_overlay.is_none() {
+            let mut buffer = DoubleBuffer::new(band_rect.w, band_rect.h);
+            buffer.x_offset = band_rect.x;
+            buffer.y_offset = band_rect.y;
+            buffer.bounded = true;
+            tui.log_overlay = Some(buffer);
+            tui.log_overlay_last_rect = Some(band_rect);
+        }
+
+        let overlay_buf = tui.log_overlay.as_mut().expect("log_overlay just initialized");
+        overlay_buf.x_offset = band_rect.x;
+        overlay_buf.y_offset = band_rect.y;
+        overlay_buf.bounded = true;
+        overlay_buf.buf.clear();
+
+        let local_band = Rect { x: 0, y: 0, w: band_rect.w, h: band_rect.h };
+        if let FocusOverlap::CommandPalette { state } = &mut tui.overlay {
+            state.render(overlay_buf, local_band);
+        }
+        overlay_buf.render_internal();
+        tui.frame.buf.extend_from_slice(&overlay_buf.buf);
+        overlay_buf.buf.clear();
+    } else if tui.log_overlay.is_some() {
+        if let Some(buf) = tui.log_overlay.as_mut() {
+            buf.reset();
+        }
+    }
+
     pre_truncate(&mut tui.frame.buf)
+}
+
+fn current_mode_for_overlay(overlay: &FocusOverlap) -> Mode {
+    match overlay {
+        FocusOverlap::Group { .. } => Mode::SelectSearch,
+        FocusOverlap::LogSearch { .. } => Mode::LogSearch,
+        FocusOverlap::TaskLauncher { .. } => Mode::TaskLauncher,
+        FocusOverlap::TestFilterLauncher { .. } => Mode::TestFilterLauncher,
+        FocusOverlap::ConfigError { .. } => Mode::Pager,
+        FocusOverlap::CommandPalette { .. } => Mode::CommandPalette,
+        FocusOverlap::None => Mode::TaskTree,
+    }
 }
 
 struct StatusBarData {
@@ -441,6 +514,7 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
         FocusOverlap::TaskLauncher { .. } => ("LAUNCH", AnsiColor::LightGoldenrod2),
         FocusOverlap::TestFilterLauncher { .. } => ("TEST", AnsiColor::Cyan1),
         FocusOverlap::ConfigError { .. } => ("ERROR", AnsiColor::Red1),
+        FocusOverlap::CommandPalette { .. } => ("PALETTE", AnsiColor::LightGoldenrod1),
         FocusOverlap::None => ("NORMAL", AnsiColor::DarkOliveGreen),
     };
 
@@ -762,6 +836,19 @@ fn process_key(
             }
             return ProcessKeyResult::Continue;
         }
+        FocusOverlap::CommandPalette { state } => {
+            match state.process_input(key_event, keybinds) {
+                PaletteAction::Cancel => {
+                    tui.overlay = FocusOverlap::None;
+                }
+                PaletteAction::Execute(cmd) => {
+                    tui.overlay = FocusOverlap::None;
+                    return dispatch_command(tui, workspace, keybinds, cmd);
+                }
+                PaletteAction::None => {}
+            }
+            return ProcessKeyResult::Continue;
+        }
         FocusOverlap::None => {}
     }
 
@@ -802,8 +889,20 @@ fn process_key(
     };
     kvlog::info!("Processed Input Event", %input, ?command);
 
+    dispatch_command(tui, workspace, keybinds, command)
+}
+
+fn dispatch_command(
+    tui: &mut TuiState,
+    workspace: &Workspace,
+    keybinds: &Keybinds,
+    command: Command,
+) -> ProcessKeyResult {
     match command {
         Command::Quit => return ProcessKeyResult::Quit,
+        Command::OpenCommandPalette => {
+            tui.overlay = FocusOverlap::CommandPalette { state: CommandPaletteState::new(keybinds) };
+        }
         Command::SearchLogs => {
             let ws_state = workspace.state();
             let filter = match tui.logs.mode() {
@@ -1340,6 +1439,11 @@ fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_
             FocusOverlap::ConfigError { .. } => {
                 kind: "ConfigError"
             },
+            FocusOverlap::CommandPalette { state } => {
+                kind: "CommandPalette",
+                input: state.input(),
+                selected: state.selected_display()
+            },
             FocusOverlap::None => None,
         },
         @[if let Some(sel) = &selection]
@@ -1472,6 +1576,8 @@ pub fn run(
         chain: ChainState::default(),
         menu_height_override: None,
         drag: None,
+        log_overlay: None,
+        log_overlay_last_rect: None,
     };
 
     let mut delta = Has(0);
@@ -1547,6 +1653,13 @@ pub fn run(
                 Event::Mouse(mouse) => {
                     let x = mouse.column;
                     let y = mouse.row;
+                    if tui.overlay.is_log_overlay() {
+                        if let Some(overlay_rect) = tui.log_overlay_last_rect
+                            && overlay_rect.contains(x, y)
+                        {
+                            continue;
+                        }
+                    }
                     let has_overlay = !matches!(tui.overlay, FocusOverlap::None);
                     let show_task_tree = has_overlay || !tui.task_tree_hidden;
                     let shortcut_h: u16 = if tui.shortcut_bar_visible && h > 3 { 1 } else { 0 };

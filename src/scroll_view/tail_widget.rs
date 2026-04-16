@@ -14,23 +14,38 @@ pub struct LogTailWidget {
     /// The last rectangle that has been rendered, zero height rects will not rendering anything,
     /// to force a full rerender set the previous to an Empty rectangle
     pub(crate) previous: Rect,
+    /// Last skip_rect (log-overlay cutout) honored by this widget. A change
+    /// forces a full reset and hardware-scroll deltas are disabled while
+    /// skip_rect is active so the overlay cells aren't shifted.
+    pub(crate) last_skip_rect: Option<Rect>,
 }
 
 impl Default for LogTailWidget {
     fn default() -> Self {
-        Self { tail: Default::default(), next_screen_offset: Default::default(), previous: Rect::EMPTY }
+        Self {
+            tail: Default::default(),
+            next_screen_offset: Default::default(),
+            previous: Rect::EMPTY,
+            last_skip_rect: None,
+        }
     }
 }
 
 impl LogTailWidget {
     pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
-        if rect != self.previous {
+        if rect != self.previous || self.last_skip_rect != style.skip_rect {
             self.previous = rect;
+            self.last_skip_rect = style.skip_rect;
             self.next_screen_offset = render_buffer_tail_reset(buf, rect, view, style);
             self.tail = view.tail;
             return;
         }
         if rect.h == 0 || self.tail >= view.tail {
+            self.tail = view.tail;
+            return;
+        }
+        if style.skip_rect.is_some() {
+            self.next_screen_offset = render_buffer_tail_reset(buf, rect, view, style);
             self.tail = view.tail;
             return;
         }

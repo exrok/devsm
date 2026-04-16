@@ -212,7 +212,12 @@ fn prefix_wrapping() {
 
     // Setup style with a prefix for Job 0
     let prefix = Prefix { bytes: "P: ".into(), width: 3 };
-    let style = LogStyle { prefixes: vec![prefix.clone(), prefix], assume_blank: false, highlight: None };
+    let style = LogStyle {
+        prefixes: vec![prefix.clone(), prefix],
+        assume_blank: false,
+        highlight: None,
+        skip_rect: None,
+    };
 
     writer.push("Short");
     view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
@@ -1023,5 +1028,358 @@ fn highlight_shrink_unhighlights_suffix() {
         cell_at_3.bgcolor() == vt100::Color::Default,
         "Cell at position 3 ('e') should be un-highlighted after shrink, got {:?}",
         cell_at_3.bgcolor()
+    );
+}
+
+/// Setting `skip_rect` on a tail-mode render should leave the band untouched —
+/// rows inside the rect must keep whatever was on screen before the render.
+#[test]
+fn skip_rect_tail_reset_preserves_band() {
+    let mut parser = vt100::Parser::new(12, 10, 0);
+    let mut buf = Vec::new();
+
+    let mut seed = Vec::new();
+    vt::MoveCursor(0, 2).write_to_buffer(&mut seed);
+    seed.extend_from_slice(b"OVERLAY_A");
+    vt::MoveCursor(0, 3).write_to_buffer(&mut seed);
+    seed.extend_from_slice(b"OVERLAY_B");
+    vt::MoveCursor(0, 4).write_to_buffer(&mut seed);
+    seed.extend_from_slice(b"OVERLAY_C");
+    parser.process(&seed);
+
+    let mut writer = LogWriter::new();
+    let logs = writer.reader();
+    let mut view = LogWidget::default();
+
+    for i in 0..6 {
+        writer.push(&format!("L{}", i));
+    }
+
+    let rect = Rect { x: 0, y: 0, w: 10, h: 6 };
+    let style = LogStyle { skip_rect: Some(Rect { x: 0, y: 2, w: 10, h: 3 }), ..Default::default() };
+
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    parser.process(&buf);
+    buf.clear();
+
+    let rows: Vec<String> = parser.screen().rows(0, 10).take(7).collect();
+    assert!(rows[2].starts_with("OVERLAY_A"), "row 2 overlay preserved, got {:?}", rows[2]);
+    assert!(rows[3].starts_with("OVERLAY_B"), "row 3 overlay preserved, got {:?}", rows[3]);
+    assert!(rows[4].starts_with("OVERLAY_C"), "row 4 overlay preserved, got {:?}", rows[4]);
+
+    assert!(
+        rows[0].starts_with("L0") || rows[0].starts_with('L'),
+        "rows above skip band should show log content, got {:?}",
+        rows[0]
+    );
+    assert!(rows[1].starts_with("L1") || rows[1].starts_with('L'), "row 1 should show log, got {:?}", rows[1]);
+    assert!(rows[5].starts_with('L'), "rows below skip band should show log content, got {:?}", rows[5]);
+}
+
+/// After the overlay closes (skip_rect transitions from Some to None), the
+/// next render must fully repaint the area the overlay was covering.
+#[test]
+fn skip_rect_close_repaints_band() {
+    let mut parser = vt100::Parser::new(6, 10, 0);
+    let mut buf = Vec::new();
+
+    let mut writer = LogWriter::new();
+    let logs = writer.reader();
+    let mut view = LogWidget::default();
+
+    for i in 0..8 {
+        writer.push(&format!("line{}", i));
+    }
+
+    let rect = Rect { x: 0, y: 0, w: 10, h: 8 };
+
+    let style_with_skip = LogStyle {
+        skip_rect: Some(Rect { x: 0, y: 2, w: 10, h: 3 }),
+        ..Default::default()
+    };
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style_with_skip);
+    parser.process(&buf);
+    buf.clear();
+
+    let mut seed = Vec::new();
+    vt::MoveCursor(0, 2).write_to_buffer(&mut seed);
+    seed.extend_from_slice(b"PALETTE");
+    vt::MoveCursor(0, 3).write_to_buffer(&mut seed);
+    seed.extend_from_slice(b"STATE");
+    parser.process(&seed);
+
+    let style_without_skip = LogStyle::default();
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style_without_skip);
+    parser.process(&buf);
+    buf.clear();
+
+    let rows: Vec<String> = parser.screen().rows(0, 10).take(8).collect();
+    for (i, row) in rows.iter().enumerate() {
+        assert!(
+            !row.contains("PALETTE") && !row.contains("STATE"),
+            "row {} should not contain overlay leftovers, got {:?}",
+            i,
+            row
+        );
+    }
+    let has_log_content = rows.iter().any(|r| r.contains("line"));
+    assert!(has_log_content, "after skip_rect cleared, log content should repaint: {:?}", rows);
+}
+
+/// A narrow `skip_rect` (cutout smaller than the log rect) must leave the
+/// cells inside the skip untouched while still rendering log content in
+/// the left and right side columns of the rows it covers — the command
+/// palette depends on both halves being honored.
+#[test]
+fn skip_rect_narrow_renders_side_columns() {
+    let mut parser = vt100::Parser::new(12, 20, 0);
+    let mut buf = Vec::new();
+
+    let mut seed = Vec::new();
+    for row in 2..5 {
+        vt::MoveCursor(5, row).write_to_buffer(&mut seed);
+        seed.extend_from_slice(b"[PAL]");
+    }
+    parser.process(&seed);
+
+    let mut writer = LogWriter::new();
+    let logs = writer.reader();
+    let mut view = LogWidget::default();
+
+    for i in 0..8 {
+        writer.push(&format!("LL{:02}_mmmm_RRRRRRR_", i));
+    }
+
+    let rect = Rect { x: 0, y: 0, w: 20, h: 8 };
+    let style = LogStyle {
+        skip_rect: Some(Rect { x: 5, y: 2, w: 5, h: 3 }),
+        ..Default::default()
+    };
+
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    parser.process(&buf);
+    buf.clear();
+
+    let rows: Vec<String> = parser.screen().rows(0, 20).take(8).collect();
+
+    for (i, row) in rows.iter().enumerate() {
+        assert!(row.contains("LL"), "row {} should contain log content, got {:?}", i, row);
+    }
+
+    for row in 2u16..5 {
+        let cell_inside = parser.screen().cell(row, 5).unwrap();
+        assert_eq!(
+            cell_inside.contents(),
+            "[",
+            "row {} col 5 (inside skip) should still be '[' from seed, got {:?}",
+            row,
+            cell_inside.contents()
+        );
+        let cell_inside_end = parser.screen().cell(row, 9).unwrap();
+        assert_eq!(
+            cell_inside_end.contents(),
+            "]",
+            "row {} col 9 (inside skip) should still be ']' from seed, got {:?}",
+            row,
+            cell_inside_end.contents()
+        );
+
+        let row_text = &rows[row as usize];
+        let prefix: String = row_text.chars().take(5).collect();
+        assert!(
+            prefix.contains("LL"),
+            "row {} left side (cols 0..5) should contain log content, got {:?}",
+            row,
+            prefix
+        );
+        let suffix: String = row_text.chars().skip(10).collect();
+        assert!(
+            suffix.contains("RRR"),
+            "row {} right side (cols 10+) should contain log content, got {:?}",
+            row,
+            suffix
+        );
+    }
+}
+
+/// Log lines that carry SGR escapes must still render with the right
+/// colors when they share a row with the command palette. Both the left
+/// half (style from the line start) and the right half (style active at
+/// the rejoin column) need to pick up foreground color changes, and
+/// subsequent escapes after the skip cutout must keep working. Regression
+/// for styles being dropped after [`Style::write_to_buffer`] was used as
+/// an absolute setter when it is really additive.
+#[test]
+fn skip_rect_narrow_preserves_styles_across_cut() {
+    let mut parser = vt100::Parser::new(12, 20, 0);
+    let mut buf = Vec::new();
+
+    let mut writer = LogWriter::new();
+    let logs = writer.reader();
+    let mut view = LogWidget::default();
+
+    writer.push("AA\x1b[31mRR\x1b[0mBB\x1b[32mGGGGGGGG\x1b[0mCC\x1b[34mBB");
+
+    let rect = Rect { x: 0, y: 0, w: 20, h: 4 };
+    let style = LogStyle {
+        skip_rect: Some(Rect { x: 6, y: 0, w: 8, h: 1 }),
+        ..Default::default()
+    };
+
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    parser.process(&buf);
+    buf.clear();
+
+    let screen = parser.screen();
+
+    let red_cell = screen.cell(0, 2).unwrap();
+    assert_eq!(
+        red_cell.contents(),
+        "R",
+        "left side col 2 should render 'R' from the red run"
+    );
+    assert_eq!(
+        red_cell.fgcolor(),
+        vt100::Color::Idx(1),
+        "left side col 2 should be red, got {:?}",
+        red_cell.fgcolor()
+    );
+
+    let black_cell = screen.cell(0, 4).unwrap();
+    assert_eq!(black_cell.contents(), "B", "left side col 4 should render 'B' from the reset run");
+    assert_eq!(
+        black_cell.fgcolor(),
+        vt100::Color::Default,
+        "left side col 4 should be default after the reset, got {:?}",
+        black_cell.fgcolor()
+    );
+
+    let right_green = screen.cell(0, 14).unwrap();
+    assert_eq!(right_green.contents(), "C", "right side col 14 should render 'C' from after the green run");
+    assert_eq!(
+        right_green.fgcolor(),
+        vt100::Color::Default,
+        "right side col 14 should be default (the green run was reset mid-line), got {:?}",
+        right_green.fgcolor()
+    );
+
+    let right_blue = screen.cell(0, 16).unwrap();
+    assert_eq!(right_blue.contents(), "B", "right side col 16 should render 'B' after the blue escape");
+    assert_eq!(
+        right_blue.fgcolor(),
+        vt100::Color::Idx(4),
+        "right side col 16 should be blue (escape after the cut is honoured), got {:?}",
+        right_blue.fgcolor()
+    );
+}
+
+/// With a narrow `skip_rect` in place, pushing new log lines after the
+/// overlay is already open must propagate to the side columns of the skip
+/// band on the next render — the user needs to see fresh log activity
+/// beside the palette box as tasks keep running.
+#[test]
+fn skip_rect_narrow_new_logs_update_sides() {
+    let mut parser = vt100::Parser::new(12, 30, 0);
+    let mut buf = Vec::new();
+
+    let mut seed = Vec::new();
+    for row in 2..5 {
+        vt::MoveCursor(10, row).write_to_buffer(&mut seed);
+        seed.extend_from_slice(b"<PAL>");
+    }
+    parser.process(&seed);
+
+    let mut writer = LogWriter::new();
+    let logs = writer.reader();
+    let mut view = LogWidget::default();
+
+    for i in 0..4 {
+        writer.push(&format!("before-{}", i));
+    }
+
+    let rect = Rect { x: 0, y: 0, w: 30, h: 8 };
+    let style = LogStyle {
+        skip_rect: Some(Rect { x: 10, y: 2, w: 5, h: 3 }),
+        ..Default::default()
+    };
+
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    parser.process(&buf);
+    buf.clear();
+
+    for i in 0..4 {
+        writer.push(&format!("after-{}", i));
+    }
+
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    parser.process(&buf);
+    buf.clear();
+
+    let rows: Vec<String> = parser.screen().rows(0, 30).take(8).collect();
+    let all_text = rows.join("\n");
+
+    assert!(all_text.contains("after-0"), "fresh logs should appear after re-render: {:?}", rows);
+    assert!(all_text.contains("after-3"), "fresh logs should appear after re-render: {:?}", rows);
+
+    for row in 2u16..5 {
+        let cell_inside = parser.screen().cell(row, 10).unwrap();
+        assert_eq!(
+            cell_inside.contents(),
+            "<",
+            "row {} col 10 (inside skip) should still be '<' from seed after log update, got {:?}",
+            row,
+            cell_inside.contents()
+        );
+    }
+
+    let side_has_fresh_content = (2..5).any(|row| {
+        let row_text = &rows[row as usize];
+        let left: String = row_text.chars().take(10).collect();
+        let right: String = row_text.chars().skip(15).collect();
+        left.contains("after") || right.contains("after")
+    });
+    assert!(
+        side_has_fresh_content,
+        "fresh logs should be visible in the side columns of skip rows: {:?}",
+        rows
+    );
+}
+
+/// When skip_rect is set, scroll_widget must not use hardware scroll deltas
+/// (ScrollRegion + ScrollBufferUp/Down). Those would shift the overlay band.
+#[test]
+fn skip_rect_disables_hardware_scroll() {
+    let mut buf = Vec::new();
+
+    let mut writer = LogWriter::new();
+    let logs = writer.reader();
+    let mut view = LogWidget::default();
+
+    for i in 0..10 {
+        writer.push(&format!("line{}", i));
+    }
+
+    let rect = Rect { x: 0, y: 0, w: 20, h: 8 };
+    let style = LogStyle { skip_rect: Some(Rect { x: 0, y: 2, w: 20, h: 3 }), ..Default::default() };
+
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    buf.clear();
+
+    view.scroll_up(2, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
+
+    let out = std::str::from_utf8(&buf).unwrap();
+    assert!(
+        !out.contains("\x1b[1;8r") && !out.contains("\x1b[1;9r"),
+        "scroll_up with skip_rect must not emit ScrollRegion/ScrollBuffer: {:?}",
+        out
+    );
+
+    buf.clear();
+    view.scroll_down(2, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    let out = std::str::from_utf8(&buf).unwrap();
+    assert!(
+        !out.contains("\x1b[1;8r") && !out.contains("\x1b[1;9r"),
+        "scroll_down with skip_rect must not emit ScrollRegion/ScrollBuffer: {:?}",
+        out
     );
 }

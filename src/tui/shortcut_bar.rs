@@ -171,7 +171,12 @@ pub fn build_shortcut_entries(
                 );
             }
         }
-        Mode::LogSearch | Mode::SelectSearch | Mode::TaskLauncher | Mode::TestFilterLauncher | Mode::Input => {
+        Mode::LogSearch
+        | Mode::SelectSearch
+        | Mode::TaskLauncher
+        | Mode::TestFilterLauncher
+        | Mode::Input
+        | Mode::CommandPalette => {
             push_entries(
                 &mut entries,
                 keybinds,

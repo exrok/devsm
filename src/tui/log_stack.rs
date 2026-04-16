@@ -271,14 +271,22 @@ impl LogStack {
             }
         }
     }
-    pub fn render(&mut self, buf: &mut Vec<u8>, mut dest: Rect, ws: &Workspace, keybinds: &Keybinds, resized: bool) {
+    pub fn render(
+        &mut self,
+        buf: &mut Vec<u8>,
+        mut dest: Rect,
+        ws: &Workspace,
+        keybinds: &Keybinds,
+        resized: bool,
+        skip_rect: Option<Rect>,
+    ) {
         let (top_filter, bot_filter) = {
             let ws = ws.state();
 
             let no_jobs_spawned = ws.jobs.is_empty();
 
             if no_jobs_spawned {
-                if !self.welcome_shown || resized {
+                if skip_rect.is_none() && (!self.welcome_shown || resized) {
                     render_welcome_message(buf, dest, keybinds, user_config_loaded());
                     self.welcome_shown = true;
                 }
@@ -311,7 +319,8 @@ impl LogStack {
         };
 
         self.base_task_log_style.highlight = self.highlight;
-        let def = LogStyle { highlight: self.highlight, ..LogStyle::default() };
+        self.base_task_log_style.skip_rect = skip_rect;
+        let def = LogStyle { highlight: self.highlight, skip_rect, ..LogStyle::default() };
 
         let logs = ws.logs.read().unwrap();
         if let Some(bot_filter) = bot_filter {
@@ -345,7 +354,10 @@ impl LogStack {
             if resized {
                 self.last_separator = None;
             }
-            if self.last_separator.as_ref() != Some(&current_sep) {
+            let sep_in_skip = skip_rect.is_some_and(|s| br.y >= s.y && br.y < s.y + s.h);
+            if sep_in_skip {
+                self.last_separator = None;
+            } else if self.last_separator.as_ref() != Some(&current_sep) {
                 extui::vt::MoveCursor(br.x, br.y).write_to_buffer(buf);
                 AnsiColor::Grey[6].with_fg(AnsiColor::Grey[25]).write_to_buffer(buf);
                 if selection_state.job.is_none() {

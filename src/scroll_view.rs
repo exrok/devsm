@@ -481,6 +481,10 @@ pub struct LogStyle {
     pub prefixes: Vec<Prefix>,
     pub assume_blank: bool,
     pub highlight: Option<LogHighlight>,
+    /// When set, rows inside this rectangle are not written by the log view —
+    /// a log overlay (like the command palette) owns those cells. Enabling this
+    /// disables hardware-scroll deltas so the overlay cells survive scrolling.
+    pub skip_rect: Option<Rect>,
 }
 
 impl LogStyle {
@@ -579,6 +583,7 @@ impl LogWidget {
                 tail: view.tail,
                 previous: Rect { x: tail.previous.x, y: tail.previous.y, w: tail.previous.w, h: tail.previous.h },
                 last_highlight: None,
+                last_skip_rect: None,
             };
 
             *self = LogWidget::Scroll(scroll_view)
@@ -943,7 +948,7 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
         if remaining_v_space <= 0 { std::ops::ControlFlow::Break(()) } else { std::ops::ControlFlow::Continue(()) }
     });
 
-    let use_batch_clear = rect.y == 0 && !style.assume_blank;
+    let use_batch_clear = rect.y == 0 && !style.assume_blank && style.skip_rect.is_none();
 
     if use_batch_clear {
         vt::MoveCursor(rect.x + rect.w, rect.y + rect.h - 1).write_to_buffer(buf);
@@ -952,42 +957,433 @@ fn render_buffer_tail_reset(buf: &mut Vec<u8>, rect: Rect, view: &LogView, style
 
     vt::MoveCursor(rect.x, rect.y).write_to_buffer(buf);
 
-    let mut screen_lines_left = rect.h;
+    let mut current_row = rect.y;
+    let end_row = rect.y + rect.h;
     let mut entries_to_render = displayed.iter().rev();
+    let has_skip = style.skip_rect.is_some();
 
     if remaining_v_space < 0
         && let Some((log_id, entry)) = entries_to_render.next()
     {
         let skip = (-remaining_v_space) as u16;
-        let rendered = render_single_entry(
-            buf,
-            view.logs,
-            rect.w,
-            entry,
-            *log_id,
-            skip,
-            screen_lines_left,
-            style,
-            style.highlight,
-        );
-        screen_lines_left = screen_lines_left.saturating_sub(rendered);
+        let remaining = end_row - current_row;
+        let rendered = if has_skip {
+            render_single_entry_bounded(buf, view.logs, rect, entry, *log_id, skip, remaining, style, current_row)
+        } else {
+            render_single_entry(buf, view.logs, rect.w, entry, *log_id, skip, remaining, style, style.highlight)
+        };
+        current_row += rendered;
     }
 
     for (log_id, entry) in entries_to_render {
-        if screen_lines_left == 0 {
+        if current_row >= end_row {
             break;
         }
-        let rendered =
-            render_single_entry(buf, view.logs, rect.w, entry, *log_id, 0, screen_lines_left, style, style.highlight);
-        screen_lines_left = screen_lines_left.saturating_sub(rendered);
+        let remaining = end_row - current_row;
+        let rendered = if has_skip {
+            render_single_entry_bounded(buf, view.logs, rect, entry, *log_id, 0, remaining, style, current_row)
+        } else {
+            render_single_entry(buf, view.logs, rect.w, entry, *log_id, 0, remaining, style, style.highlight)
+        };
+        current_row += rendered;
     }
 
+    let screen_lines_left = end_row - current_row;
     if !use_batch_clear && !style.assume_blank {
-        for _ in 0..screen_lines_left {
-            buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
-            buf.extend_from_slice(b"\r\n");
+        if has_skip {
+            pad_with_skip(buf, rect, current_row, screen_lines_left, style.skip_rect);
+        } else {
+            for _ in 0..screen_lines_left {
+                buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+                buf.extend_from_slice(b"\r\n");
+            }
         }
     }
 
     rect.h.saturating_sub(screen_lines_left)
+}
+
+/// Emits one entry into the rect, splitting the call around any overlap
+/// with `style.skip_rect`. Always emits a `MoveCursor` to `(rect.x, start_row)`
+/// at the top, so the caller doesn't need to track cursor position across
+/// skipped bands. Returns the number of screen rows consumed (including rows
+/// that span the overlay band — those rows render log content in the side
+/// columns outside the skip, leaving the cells inside the skip alone).
+pub(crate) fn render_single_entry_bounded(
+    buf: &mut Vec<u8>,
+    logs: &Logs,
+    rect: Rect,
+    entry: &LogEntry,
+    log_id: LogId,
+    skip_lines: u16,
+    max_lines: u16,
+    style: &LogStyle,
+    start_row: u16,
+) -> u16 {
+    if max_lines == 0 {
+        return 0;
+    }
+
+    let Some(skip) = style.skip_rect else {
+        vt::MoveCursor(rect.x, start_row).write_to_buffer(buf);
+        return render_single_entry(buf, logs, rect.w, entry, log_id, skip_lines, max_lines, style, style.highlight);
+    };
+
+    let total_h = get_entry_height(entry, style, rect.w as u32) as u16;
+    let entry_remaining = total_h.saturating_sub(skip_lines);
+    let entry_max = entry_remaining.min(max_lines);
+    if entry_max == 0 {
+        return 0;
+    }
+
+    let first_row = start_row;
+    let last_row_excl = start_row + entry_max;
+    let skip_top = skip.y;
+    let skip_bot = skip.y + skip.h;
+
+    if last_row_excl <= skip_top || first_row >= skip_bot {
+        vt::MoveCursor(rect.x, start_row).write_to_buffer(buf);
+        return render_single_entry(buf, logs, rect.w, entry, log_id, skip_lines, entry_max, style, style.highlight);
+    }
+
+    let mut consumed = 0u16;
+
+    if first_row < skip_top {
+        let part_a_max = (skip_top - first_row).min(entry_max);
+        vt::MoveCursor(rect.x, first_row).write_to_buffer(buf);
+        let rendered = render_single_entry(
+            buf,
+            logs,
+            rect.w,
+            entry,
+            log_id,
+            skip_lines,
+            part_a_max,
+            style,
+            style.highlight,
+        );
+        consumed += rendered;
+        if rendered < part_a_max || consumed >= entry_max {
+            return consumed;
+        }
+    }
+
+    let middle_end_row = skip_bot.min(last_row_excl);
+    let middle_start_row = first_row + consumed;
+    let middle_count = middle_end_row.saturating_sub(middle_start_row);
+
+    if middle_count > 0 {
+        let line_offset_start = skip_lines + consumed;
+        let line_offset_end = line_offset_start + middle_count;
+        render_entry_middle_rows_clipped(
+            buf,
+            logs,
+            rect,
+            entry,
+            style,
+            line_offset_start,
+            line_offset_end,
+            middle_start_row,
+            skip,
+        );
+        consumed += middle_count;
+        if consumed >= entry_max {
+            return consumed;
+        }
+    }
+
+    vt::MoveCursor(rect.x, first_row + consumed).write_to_buffer(buf);
+    let part_c_max = entry_max - consumed;
+    let part_c_skip = skip_lines + consumed;
+    let rendered = render_single_entry(
+        buf,
+        logs,
+        rect.w,
+        entry,
+        log_id,
+        part_c_skip,
+        part_c_max,
+        style,
+        style.highlight,
+    );
+    consumed += rendered;
+
+    consumed
+}
+
+/// Renders the wrapped lines of `entry` at indices `[line_start, line_end)`
+/// onto screen rows starting at `first_row_y`, with each row split around
+/// `skip`. Cells inside the skip box are left untouched so the overlay
+/// widget that owns them stays intact.
+fn render_entry_middle_rows_clipped(
+    buf: &mut Vec<u8>,
+    logs: &Logs,
+    rect: Rect,
+    entry: &LogEntry,
+    style: &LogStyle,
+    line_start: u16,
+    line_end: u16,
+    first_row_y: u16,
+    skip: Rect,
+) {
+    if line_start >= line_end {
+        return;
+    }
+
+    let prefix = style.prefix(entry.log_group);
+    let prefix_width = prefix.map(|p| p.width as u16).unwrap_or(0);
+    let prefix_bytes = prefix.map(|p| p.bytes.as_bytes()).unwrap_or(b"");
+
+    let text = unsafe { entry.text(logs) };
+
+    if entry.width == 0 {
+        if line_start == 0 && line_end > 0 {
+            render_line_with_skip(buf, rect, first_row_y, prefix_bytes, prefix_width, "", entry.style, skip);
+        }
+        return;
+    }
+
+    let first_line_capacity = rect.w.saturating_sub(prefix_width) as usize;
+    let mut first_splitter = line_width::naive_line_splitting(text, entry.style, first_line_capacity);
+    let first_line = first_splitter.next();
+    let first_line_len = first_line.as_ref().map(|(t, _)| t.len()).unwrap_or(0);
+
+    let mut current_line_idx: u16 = 0;
+    let mut current_row = first_row_y;
+
+    if let Some((line_text, line_style)) = first_line {
+        if current_line_idx >= line_start && current_line_idx < line_end {
+            render_line_with_skip(buf, rect, current_row, prefix_bytes, prefix_width, line_text, line_style, skip);
+            current_row += 1;
+        }
+        current_line_idx += 1;
+    }
+
+    if current_line_idx >= line_end {
+        return;
+    }
+
+    if first_line_len < text.len() {
+        let rest = &text[first_line_len..];
+        let sub_iter = line_width::naive_line_splitting(rest, entry.style, rect.w as usize);
+        for (line_text, line_style) in sub_iter {
+            if current_line_idx >= line_end {
+                break;
+            }
+            if current_line_idx >= line_start {
+                render_line_with_skip(buf, rect, current_row, b"", 0, line_text, line_style, skip);
+                current_row += 1;
+            }
+            current_line_idx += 1;
+        }
+    }
+}
+
+/// Fills `row_count` rows starting at `start_row` with blank-line clears.
+/// Rows that fall inside `skip_rect`'s y range get their side columns
+/// (outside the skip x range) cleared while the cells inside the skip are
+/// left untouched. Rows outside the skip y range get a normal
+/// `CLEAR_LINE_TO_RIGHT`. Assumes the cursor is already at
+/// `(rect.x, start_row)`.
+pub(crate) fn pad_with_skip(
+    buf: &mut Vec<u8>,
+    rect: Rect,
+    start_row: u16,
+    row_count: u16,
+    skip_rect: Option<Rect>,
+) {
+    let mut row = start_row;
+    for _ in 0..row_count {
+        let in_skip = skip_rect.is_some_and(|s| row >= s.y && row < s.y + s.h);
+        if in_skip {
+            clear_side_columns(buf, rect, row, skip_rect.unwrap());
+            buf.extend_from_slice(b"\r\n");
+        } else {
+            buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+            buf.extend_from_slice(b"\r\n");
+        }
+        row += 1;
+    }
+}
+
+/// Clears the side columns (outside `skip.x..skip.x + skip.w`) of a single
+/// row `row`, leaving the cells inside `skip` alone. Used by
+/// [`pad_with_skip`] and the entry renderer when a row falls inside the
+/// skip y range but no log content fills its side columns.
+fn clear_side_columns(buf: &mut Vec<u8>, rect: Rect, row: u16, skip: Rect) {
+    let rect_end_col = rect.x + rect.w;
+    let skip_left = skip.x.max(rect.x);
+    let skip_right = (skip.x + skip.w).min(rect_end_col);
+
+    vt::CLEAR_STYLE.write_to_buffer(buf);
+    if skip_left > rect.x {
+        vt::MoveCursor(rect.x, row).write_to_buffer(buf);
+        buf.extend(std::iter::repeat_n(b' ', (skip_left - rect.x) as usize));
+    }
+    if skip_right < rect_end_col {
+        vt::MoveCursor(skip_right, row).write_to_buffer(buf);
+        buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+    }
+}
+
+/// Emits the visible bytes of a single wrapped line at display-column range
+/// `[col_start, col_end)`, passing SGR escapes through as raw bytes so the
+/// emitted text keeps its original style semantics (including attributes
+/// being cleared by `0` / `22` / etc., which [`Style::write_to_buffer`]
+/// cannot represent because it writes additive SGRs from a default baseline).
+///
+/// The terminal is assumed to be in the default style on entry. On the first
+/// visible byte this function resets the style (`\x1b[0m`) and then sets the
+/// absolute style active at that column; after that, raw SGR escapes from
+/// the underlying text are emitted as-is.
+///
+/// Wide graphemes that would straddle `col_end` or `col_start` are dropped
+/// and the affected cells are padded with spaces so the visible slice is
+/// column-exact.
+fn render_line_at_cols(
+    buf: &mut Vec<u8>,
+    line_text: &str,
+    base_style: extui::Style,
+    col_start: u16,
+    col_end: u16,
+) {
+    if col_start >= col_end {
+        return;
+    }
+
+    let mut col: u16 = 0;
+    let mut current_style = base_style;
+    let mut visible_started = false;
+
+    fn begin_visible(buf: &mut Vec<u8>, style: extui::Style, started: &mut bool) {
+        if !*started {
+            buf.extend_from_slice(vt::CLEAR_STYLE);
+            if style != extui::Style::DEFAULT {
+                style.write_to_buffer(buf);
+            }
+            *started = true;
+        }
+    }
+
+    for segment in line_width::Segment::iterator(line_text) {
+        if col >= col_end {
+            break;
+        }
+        match segment {
+            line_width::Segment::Ascii(s) => {
+                let bytes = s.as_bytes();
+                let mut i = 0usize;
+                while i < bytes.len() && col < col_end {
+                    if col >= col_start {
+                        begin_visible(buf, current_style, &mut visible_started);
+                        let start = i;
+                        while i < bytes.len() && col < col_end {
+                            i += 1;
+                            col += 1;
+                        }
+                        buf.extend_from_slice(&bytes[start..i]);
+                    } else {
+                        i += 1;
+                        col += 1;
+                    }
+                }
+            }
+            line_width::Segment::Utf8(s) => {
+                for cluster in unicode_segmentation::UnicodeSegmentation::graphemes(s, true) {
+                    let w = UnicodeWidthStr::width(cluster) as u16;
+                    if w == 0 {
+                        continue;
+                    }
+                    let col_after = col + w;
+                    if col_after > col_end {
+                        if col >= col_start {
+                            begin_visible(buf, current_style, &mut visible_started);
+                            for _ in col..col_end {
+                                buf.push(b' ');
+                            }
+                        }
+                        col = col_end;
+                        break;
+                    }
+                    if col >= col_start {
+                        begin_visible(buf, current_style, &mut visible_started);
+                        buf.extend_from_slice(cluster.as_bytes());
+                    } else if col_after > col_start {
+                        begin_visible(buf, current_style, &mut visible_started);
+                        for _ in col_start..col_after {
+                            buf.push(b' ');
+                        }
+                    }
+                    col = col_after;
+                }
+            }
+            line_width::Segment::AnsiEscapes(escape) => {
+                line_width::apply_raw_display_mode_vt_to_style(&mut current_style, escape);
+                if visible_started {
+                    buf.extend_from_slice(b"\x1b[");
+                    buf.extend_from_slice(escape.as_bytes());
+                    buf.push(b'm');
+                }
+            }
+        }
+    }
+}
+
+/// Emits one wrapped line at absolute row `row` inside `rect`, cut out
+/// around `skip`. The row layout is `prefix_bytes` (taking `prefix_width`
+/// display columns starting at `rect.x`) followed by `line_text` at
+/// `line_style`. The left half `[rect.x, skip.x)` is rendered in place, the
+/// cells inside the skip box are left untouched, and the right half
+/// `[skip.x + skip.w, rect.x + rect.w)` is rendered after a cursor jump.
+///
+/// When the prefix would land inside the skip cutout it's dropped and the
+/// affected cells are blanked — slicing pre-baked prefix bytes by column is
+/// expensive for a degenerate visual arrangement nobody uses.
+fn render_line_with_skip(
+    buf: &mut Vec<u8>,
+    rect: Rect,
+    row: u16,
+    prefix_bytes: &[u8],
+    prefix_width: u16,
+    line_text: &str,
+    line_style: extui::Style,
+    skip: Rect,
+) {
+    let rect_end_col = rect.x + rect.w;
+    let skip_left_col = skip.x.clamp(rect.x, rect_end_col);
+    let skip_right_col = (skip.x + skip.w).clamp(rect.x, rect_end_col);
+
+    let left_end_local = skip_left_col - rect.x;
+    let right_start_local = skip_right_col - rect.x;
+    let total_local = rect.w;
+
+    if left_end_local > 0 {
+        vt::MoveCursor(rect.x, row).write_to_buffer(buf);
+        if prefix_width == 0 {
+            render_line_at_cols(buf, line_text, line_style, 0, left_end_local);
+        } else if prefix_width <= left_end_local {
+            buf.extend_from_slice(prefix_bytes);
+            let text_end = left_end_local - prefix_width;
+            if text_end > 0 {
+                render_line_at_cols(buf, line_text, line_style, 0, text_end);
+            }
+        } else {
+            vt::CLEAR_STYLE.write_to_buffer(buf);
+            for _ in 0..left_end_local {
+                buf.push(b' ');
+            }
+        }
+        vt::CLEAR_STYLE.write_to_buffer(buf);
+    }
+
+    if right_start_local < total_local {
+        vt::MoveCursor(skip_right_col, row).write_to_buffer(buf);
+        if prefix_width <= right_start_local {
+            let line_col_start = right_start_local - prefix_width;
+            let line_col_end = total_local - prefix_width;
+            render_line_at_cols(buf, line_text, line_style, line_col_start, line_col_end);
+        }
+        vt::CLEAR_STYLE.write_to_buffer(buf);
+        buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+    }
 }

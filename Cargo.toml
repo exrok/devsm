@@ -36,6 +36,9 @@ fast-glob = "1.0.0"
 extui = { git = "https://github.com/exrok/extui", rev = "8b6fc2196537401d4432699c4b08190e6bcd1e50" }
 mimalloc = { version = "0.1.48", optional = true }
 
+[patch."https://github.com/exrok/extui"]
+extui = { path = "/home/user/Projects/git/extui" }
+
 [dev-dependencies]
 vt100 = "*"
 
