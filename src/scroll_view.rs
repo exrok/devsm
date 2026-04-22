@@ -1327,6 +1327,14 @@ fn render_line_at_cols(
             }
         }
     }
+
+    let pad_from = if visible_started { col } else { col_start };
+    if pad_from < col_end {
+        buf.extend_from_slice(vt::CLEAR_STYLE);
+        for _ in pad_from..col_end {
+            buf.push(b' ');
+        }
+    }
 }
 
 /// Emits one wrapped line at absolute row `row` inside `rect`, cut out

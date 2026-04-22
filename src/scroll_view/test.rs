@@ -1202,6 +1202,69 @@ fn skip_rect_narrow_renders_side_columns() {
     }
 }
 
+/// When a log line is shorter than the clipping range, the cells that
+/// fall inside the side columns but beyond the line's text must be
+/// cleared on each full reset — otherwise stale content from before a
+/// resize (or from the previous overlay layout) hangs around next to the
+/// palette edges.
+#[test]
+fn skip_rect_narrow_short_line_clears_side_padding() {
+    let mut parser = vt100::Parser::new(12, 30, 0);
+    let mut buf = Vec::new();
+
+    let mut seed = Vec::new();
+    for row in 0..6 {
+        vt::MoveCursor(0, row).write_to_buffer(&mut seed);
+        seed.extend_from_slice(b"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+    }
+    parser.process(&seed);
+
+    let mut writer = LogWriter::new();
+    let logs = writer.reader();
+    let mut view = LogWidget::default();
+
+    for _ in 0..6 {
+        writer.push("ab");
+    }
+
+    let rect = Rect { x: 0, y: 0, w: 30, h: 6 };
+    let style = LogStyle {
+        skip_rect: Some(Rect { x: 10, y: 2, w: 10, h: 2 }),
+        ..Default::default()
+    };
+
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    parser.process(&buf);
+    buf.clear();
+
+    let screen = parser.screen();
+
+    for row in 2u16..4 {
+        for col in 2u16..10 {
+            let cell = screen.cell(row, col).unwrap();
+            assert_ne!(
+                cell.contents(),
+                "X",
+                "row {} col {} should no longer contain the stale 'X' from seed, got {:?}",
+                row,
+                col,
+                cell.contents()
+            );
+        }
+        for col in 20u16..30 {
+            let cell = screen.cell(row, col).unwrap();
+            assert_ne!(
+                cell.contents(),
+                "X",
+                "row {} col {} (right side of skip) should no longer contain the stale 'X', got {:?}",
+                row,
+                col,
+                cell.contents()
+            );
+        }
+    }
+}
+
 /// Log lines that carry SGR escapes must still render with the right
 /// colors when they share a row with the command palette. Both the left
 /// half (style from the line start) and the right half (style active at

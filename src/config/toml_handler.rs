@@ -59,7 +59,7 @@ fn parse_string_expr<'a>(
                 let then_expr = parse_string_expr(alloc, then_val, re)?;
 
                 let mut or_else = None;
-                if let Some(else_val) = table.get("or_else") {
+                if let Some(else_val) = table.get("or_else").or_else(|| table.get("else")) {
                     or_else = Some(parse_string_expr(alloc, else_val, re)?);
                 }
 
@@ -261,7 +261,7 @@ fn parse_string_list_expr<'a>(
                 let then_expr = parse_string_list_expr(alloc, then_val, re)?;
 
                 let mut or_else = None;
-                if let Some(else_val) = table.get("or_else") {
+                if let Some(else_val) = table.get("or_else").or_else(|| table.get("else")) {
                     or_else = Some(parse_string_list_expr(alloc, else_val, re)?);
                 }
 
