@@ -126,10 +126,7 @@ impl LogScrollWidget {
     /// Renders with delta optimization when possible.
     /// Handles highlight-only changes efficiently by only re-rendering affected entries.
     pub fn render_reset_if_needed(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
-        if rect == self.previous
-            && style.highlight == self.last_highlight
-            && style.skip_rect == self.last_skip_rect
-        {
+        if rect == self.previous && style.highlight == self.last_highlight && style.skip_rect == self.last_skip_rect {
             return;
         }
 

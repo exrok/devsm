@@ -1051,17 +1051,8 @@ pub(crate) fn render_single_entry_bounded(
     if first_row < skip_top {
         let part_a_max = (skip_top - first_row).min(entry_max);
         vt::MoveCursor(rect.x, first_row).write_to_buffer(buf);
-        let rendered = render_single_entry(
-            buf,
-            logs,
-            rect.w,
-            entry,
-            log_id,
-            skip_lines,
-            part_a_max,
-            style,
-            style.highlight,
-        );
+        let rendered =
+            render_single_entry(buf, logs, rect.w, entry, log_id, skip_lines, part_a_max, style, style.highlight);
         consumed += rendered;
         if rendered < part_a_max || consumed >= entry_max {
             return consumed;
@@ -1095,17 +1086,8 @@ pub(crate) fn render_single_entry_bounded(
     vt::MoveCursor(rect.x, first_row + consumed).write_to_buffer(buf);
     let part_c_max = entry_max - consumed;
     let part_c_skip = skip_lines + consumed;
-    let rendered = render_single_entry(
-        buf,
-        logs,
-        rect.w,
-        entry,
-        log_id,
-        part_c_skip,
-        part_c_max,
-        style,
-        style.highlight,
-    );
+    let rendered =
+        render_single_entry(buf, logs, rect.w, entry, log_id, part_c_skip, part_c_max, style, style.highlight);
     consumed += rendered;
 
     consumed
@@ -1185,13 +1167,7 @@ fn render_entry_middle_rows_clipped(
 /// left untouched. Rows outside the skip y range get a normal
 /// `CLEAR_LINE_TO_RIGHT`. Assumes the cursor is already at
 /// `(rect.x, start_row)`.
-pub(crate) fn pad_with_skip(
-    buf: &mut Vec<u8>,
-    rect: Rect,
-    start_row: u16,
-    row_count: u16,
-    skip_rect: Option<Rect>,
-) {
+pub(crate) fn pad_with_skip(buf: &mut Vec<u8>, rect: Rect, start_row: u16, row_count: u16, skip_rect: Option<Rect>) {
     let mut row = start_row;
     for _ in 0..row_count {
         let in_skip = skip_rect.is_some_and(|s| row >= s.y && row < s.y + s.h);
@@ -1240,13 +1216,7 @@ fn clear_side_columns(buf: &mut Vec<u8>, rect: Rect, row: u16, skip: Rect) {
 /// Wide graphemes that would straddle `col_end` or `col_start` are dropped
 /// and the affected cells are padded with spaces so the visible slice is
 /// column-exact.
-fn render_line_at_cols(
-    buf: &mut Vec<u8>,
-    line_text: &str,
-    base_style: extui::Style,
-    col_start: u16,
-    col_end: u16,
-) {
+fn render_line_at_cols(buf: &mut Vec<u8>, line_text: &str, base_style: extui::Style, col_start: u16, col_end: u16) {
     if col_start >= col_end {
         return;
     }

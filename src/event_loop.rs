@@ -450,7 +450,9 @@ impl EventLoop {
                         let job_correlation = job.log_group;
                         let job_task = job.task().clone();
                         drop(state);
-                        let _ = self.spawn(wsi as WorkspaceIndex, job_correlation, job_index, job_task);
+                        if let Err(err) = self.spawn(wsi as WorkspaceIndex, job_correlation, job_index, job_task) {
+                            self.handle_spawn_failure(wsi as WorkspaceIndex, job_correlation, job_index, err);
+                        }
                         continue 'outer;
                     }
                     workspace::Scheduled::Never(job_index) => {
@@ -684,6 +686,26 @@ impl EventLoop {
         }
         self.broadcast_job_status(workspace_index, job_index, crate::rpc::JobStatusKind::Running);
         Ok(())
+    }
+
+    fn handle_spawn_failure(
+        &mut self,
+        workspace_id: WorkspaceIndex,
+        job_id: LogGroup,
+        job_index: JobIndex,
+        err: anyhow::Error,
+    ) {
+        kvlog::error!("Failed to spawn process", ?err, ?job_id);
+        let Some(workspace) = self.state.workspaces.get(workspace_id as usize) else {
+            return;
+        };
+        let mut ws = workspace.handle.state.write().unwrap();
+        ws.update_job_status(
+            job_index,
+            JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::SpawnFailed, status: 127 },
+        );
+        drop(ws);
+        self.broadcast_job_exited(workspace_id, job_index, 127, crate::rpc::ExitCause::SpawnFailed);
     }
 }
 
@@ -990,20 +1012,7 @@ impl EventLoop {
             }
             ProcessRequest::Spawn { task, job_id, workspace_id, job_index } => {
                 if let Err(err) = self.spawn(workspace_id, job_id, job_index, task) {
-                    kvlog::error!("Failed to spawn process", ?err, ?job_id);
-                    if let Some(workspace) = self.state.workspaces.get(workspace_id as usize) {
-                        let mut ws = workspace.handle.state.write().unwrap();
-                        ws.update_job_status(
-                            job_index,
-                            JobStatus::Exited {
-                                finished_at: crate::clock::now(),
-                                cause: ExitCause::SpawnFailed,
-                                status: 127,
-                            },
-                        );
-                        drop(ws);
-                        self.broadcast_job_exited(workspace_id, job_index, 127, crate::rpc::ExitCause::SpawnFailed);
-                    }
+                    self.handle_spawn_failure(workspace_id, job_id, job_index, err);
                 }
                 false
             }

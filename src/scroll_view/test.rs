@@ -212,12 +212,8 @@ fn prefix_wrapping() {
 
     // Setup style with a prefix for Job 0
     let prefix = Prefix { bytes: "P: ".into(), width: 3 };
-    let style = LogStyle {
-        prefixes: vec![prefix.clone(), prefix],
-        assume_blank: false,
-        highlight: None,
-        skip_rect: None,
-    };
+    let style =
+        LogStyle { prefixes: vec![prefix.clone(), prefix], assume_blank: false, highlight: None, skip_rect: None };
 
     writer.push("Short");
     view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
@@ -1093,10 +1089,7 @@ fn skip_rect_close_repaints_band() {
 
     let rect = Rect { x: 0, y: 0, w: 10, h: 8 };
 
-    let style_with_skip = LogStyle {
-        skip_rect: Some(Rect { x: 0, y: 2, w: 10, h: 3 }),
-        ..Default::default()
-    };
+    let style_with_skip = LogStyle { skip_rect: Some(Rect { x: 0, y: 2, w: 10, h: 3 }), ..Default::default() };
     view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style_with_skip);
     parser.process(&buf);
     buf.clear();
@@ -1151,10 +1144,7 @@ fn skip_rect_narrow_renders_side_columns() {
     }
 
     let rect = Rect { x: 0, y: 0, w: 20, h: 8 };
-    let style = LogStyle {
-        skip_rect: Some(Rect { x: 5, y: 2, w: 5, h: 3 }),
-        ..Default::default()
-    };
+    let style = LogStyle { skip_rect: Some(Rect { x: 5, y: 2, w: 5, h: 3 }), ..Default::default() };
 
     view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
     parser.process(&buf);
@@ -1228,10 +1218,7 @@ fn skip_rect_narrow_short_line_clears_side_padding() {
     }
 
     let rect = Rect { x: 0, y: 0, w: 30, h: 6 };
-    let style = LogStyle {
-        skip_rect: Some(Rect { x: 10, y: 2, w: 10, h: 2 }),
-        ..Default::default()
-    };
+    let style = LogStyle { skip_rect: Some(Rect { x: 10, y: 2, w: 10, h: 2 }), ..Default::default() };
 
     view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
     parser.process(&buf);
@@ -1284,10 +1271,7 @@ fn skip_rect_narrow_preserves_styles_across_cut() {
     writer.push("AA\x1b[31mRR\x1b[0mBB\x1b[32mGGGGGGGG\x1b[0mCC\x1b[34mBB");
 
     let rect = Rect { x: 0, y: 0, w: 20, h: 4 };
-    let style = LogStyle {
-        skip_rect: Some(Rect { x: 6, y: 0, w: 8, h: 1 }),
-        ..Default::default()
-    };
+    let style = LogStyle { skip_rect: Some(Rect { x: 6, y: 0, w: 8, h: 1 }), ..Default::default() };
 
     view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
     parser.process(&buf);
@@ -1296,17 +1280,8 @@ fn skip_rect_narrow_preserves_styles_across_cut() {
     let screen = parser.screen();
 
     let red_cell = screen.cell(0, 2).unwrap();
-    assert_eq!(
-        red_cell.contents(),
-        "R",
-        "left side col 2 should render 'R' from the red run"
-    );
-    assert_eq!(
-        red_cell.fgcolor(),
-        vt100::Color::Idx(1),
-        "left side col 2 should be red, got {:?}",
-        red_cell.fgcolor()
-    );
+    assert_eq!(red_cell.contents(), "R", "left side col 2 should render 'R' from the red run");
+    assert_eq!(red_cell.fgcolor(), vt100::Color::Idx(1), "left side col 2 should be red, got {:?}", red_cell.fgcolor());
 
     let black_cell = screen.cell(0, 4).unwrap();
     assert_eq!(black_cell.contents(), "B", "left side col 4 should render 'B' from the reset run");
@@ -1361,10 +1336,7 @@ fn skip_rect_narrow_new_logs_update_sides() {
     }
 
     let rect = Rect { x: 0, y: 0, w: 30, h: 8 };
-    let style = LogStyle {
-        skip_rect: Some(Rect { x: 10, y: 2, w: 5, h: 3 }),
-        ..Default::default()
-    };
+    let style = LogStyle { skip_rect: Some(Rect { x: 10, y: 2, w: 5, h: 3 }), ..Default::default() };
 
     view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
     parser.process(&buf);
@@ -1401,11 +1373,7 @@ fn skip_rect_narrow_new_logs_update_sides() {
         let right: String = row_text.chars().skip(15).collect();
         left.contains("after") || right.contains("after")
     });
-    assert!(
-        side_has_fresh_content,
-        "fresh logs should be visible in the side columns of skip rows: {:?}",
-        rows
-    );
+    assert!(side_has_fresh_content, "fresh logs should be visible in the side columns of skip rows: {:?}", rows);
 }
 
 /// When skip_rect is set, scroll_widget must not use hardware scroll deltas

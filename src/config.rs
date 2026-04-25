@@ -205,7 +205,7 @@ unsafe impl Sync for TaskConfigRc {}
 
 impl TaskConfigRc {
     pub fn config<'a>(&'a self) -> &'a TaskConfig<'a> {
-        unsafe { std::mem::transmute::<&'a TaskConfig<'static>, &'a TaskConfig<'a>>(&self.0.config) }
+        &self.0.config
     }
 
     fn new(config: TaskConfig<'static>, bump: Bump, generation: Option<Arc<ConfigGeneration>>) -> Self {
@@ -530,7 +530,7 @@ impl ConfigGeneration {
     }
 
     pub fn workspace<'a>(&'a self) -> &'a WorkspaceConfig<'a> {
-        unsafe { std::mem::transmute::<&'a WorkspaceConfig<'static>, &'a WorkspaceConfig<'a>>(&self.workspace) }
+        &self.workspace
     }
 
     pub fn base_path(&self) -> &Path {

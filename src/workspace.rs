@@ -1569,6 +1569,7 @@ impl WorkspaceState {
                 (S::Scheduled { .. }, S::Cancelled)
                 | (S::Starting, S::Cancelled)
                 | (S::Running { .. }, S::Cancelled)
+                | (S::Starting, S::Exited { .. })
                 | (S::Running { .. }, S::Exited { .. }) => {
                     list.set_terminal(job_index);
                 }
@@ -1583,6 +1584,7 @@ impl WorkspaceState {
             (S::Scheduled { .. }, S::Cancelled)
             | (S::Starting, S::Cancelled)
             | (S::Running { .. }, S::Cancelled)
+            | (S::Starting, S::Exited { .. })
             | (S::Running { .. }, S::Exited { .. }) => {
                 self.service_dependents.remove_from_all(job_index);
             }

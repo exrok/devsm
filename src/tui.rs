@@ -249,7 +249,6 @@ fn compute_palette_rect(w: u16, log_area_h: u16) -> Option<Rect> {
     Some(Rect { x, y, w: box_w, h: box_h })
 }
 
-
 fn render<'a>(
     w: u16,
     h: u16,

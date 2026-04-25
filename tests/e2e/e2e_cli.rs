@@ -170,6 +170,82 @@ env.PROFILE_VAL = {{ if.profile = "verbose", then = "verbose", or_else = "defaul
 }
 
 #[test]
+fn failed_spawn_does_not_leak_stale_service_dependent() {
+    // Reproduces the "stuck in waiting" behavior the user observed when transitioning a
+    // service from a working profile to one whose conditional cmd evaluates to an empty
+    // list. The Starting → Exited(SpawnFailed) transition (for the failing profile) must
+    // clean up the global job lists and ServiceDependents — otherwise dep:a retains a
+    // stale dependent and can_stop returns false, so a subsequent action that needs
+    // dep:b can never get dep:a auto-terminated and stays in Wait forever.
+    let mut harness = TestHarness::new("failed_spawn_no_leak_dep");
+    let consumer_marker = harness.temp_dir.join("consumer.marker");
+
+    harness.write_config(&format!(
+        r#"
+[service.dep]
+sh = "while true; do sleep 1; done"
+profiles = ["a", "b"]
+
+[service.broken]
+cmd = {{ if.profile = "good", then = ["sh", "-c", "while true; do sleep 1; done"] }}
+require = ["dep"]
+profiles = ["good", "bad"]
+
+[action.consumer]
+sh = "echo done > {marker}"
+require = ["dep:b"]
+"#,
+        marker = consumer_marker.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+
+    // Bring up broken:good; this transitively spawns dep:a.
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "broken",
+        profile: "good",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "broken:good spawn rejected: {:?}", resp.body);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Switch to broken:bad. broken:good is killed, broken:bad is queued, eventually it
+    // transitions Starting → Exited(SpawnFailed) when spawn() finds an empty cmd.
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "broken",
+        profile: "bad",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "broken:bad spawn rejected: {:?}", resp.body);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Now ask for an action that needs dep:b. dep is currently running with profile a,
+    // so dep:b must be queued and dep:a auto-terminated to make room. With the bug this
+    // hangs.
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "consumer",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "consumer spawn rejected: {:?}", resp.body);
+
+    assert!(
+        harness.wait_for_file(&consumer_marker, Duration::from_secs(5)),
+        "consumer should run after the failed broken:bad spawn cleared its stale dependent;\nserver log:\n{}",
+        harness.server_log(),
+    );
+}
+
+#[test]
 fn require_runs_dependency_first() {
     let mut harness = TestHarness::new("require_order");
     let order_file = harness.temp_dir.join("order.txt");

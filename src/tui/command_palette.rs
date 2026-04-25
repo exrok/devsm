@@ -55,15 +55,7 @@ impl CommandPaletteState {
         let mut results = Vec::new();
         searcher.query("", &mut results);
 
-        Self {
-            input: String::new(),
-            cursor: 0,
-            searcher,
-            commands,
-            results,
-            selected: 0,
-            scroll_offset: 0,
-        }
+        Self { input: String::new(), cursor: 0, searcher, commands, results, selected: 0, scroll_offset: 0 }
     }
 
     pub fn input(&self) -> &str {
