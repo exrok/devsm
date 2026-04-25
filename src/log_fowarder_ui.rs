@@ -568,8 +568,10 @@ fn forward_new_logs(
             let public_id = state.jobs.public_id_of(job_index).unwrap_or(0);
             match &job.process_status {
                 JobStatus::Scheduled { after } if !after.is_empty() => {
-                    let has_terminating =
-                        after.iter().any(|req| matches!(req.predicate, crate::workspace::JobPredicate::Terminated));
+                    use crate::workspace::ScheduleRequirement as SR;
+                    let has_terminating = after.iter().any(|req| {
+                        matches!(req, SR::Task { predicate: crate::workspace::JobPredicate::Terminated, .. })
+                    });
                     if has_terminating && *phase != Phase::Restarting {
                         *phase = Phase::Restarting;
                         send_status(encoder, socket, JobStatusKind::Restarting, public_id);

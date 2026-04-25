@@ -2462,3 +2462,256 @@ cmd = ["echo", "hot reloaded"]
         result.stderr
     );
 }
+
+// ============================================================================
+// Resource lock tests
+// ============================================================================
+
+/// Two tasks declaring the same resource must run sequentially even if both are
+/// scheduled in the same batch.
+#[test]
+fn resource_two_tasks_serialize() {
+    let mut harness = TestHarness::new("resource_serialize");
+    let sequence = harness.temp_dir.join("seq.log");
+
+    harness.write_config(&format!(
+        r#"
+[test.first]
+sh = "echo first_start >> {seq}; sleep 0.3; echo first_end >> {seq}"
+require = [{{ resource = "R" }}]
+
+[test.second]
+sh = "echo second_start >> {seq}; echo second_end >> {seq}"
+require = [{{ resource = "R" }}]
+"#,
+        seq = sequence.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "test command failed: {}", result.stderr);
+
+    let log = fs::read_to_string(&sequence).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    let pos_first_end = lines.iter().position(|l| l.contains("first_end")).expect("first_end missing");
+    let pos_second_start = lines.iter().position(|l| l.contains("second_start")).expect("second_start missing");
+    assert!(pos_first_end < pos_second_start, "second must start AFTER first ends; got: {:?}", lines);
+}
+
+/// A task without the resource overlaps freely with the holder.
+#[test]
+fn resource_third_runs_concurrent() {
+    let mut harness = TestHarness::new("resource_concurrent");
+    let sequence = harness.temp_dir.join("seq.log");
+
+    harness.write_config(&format!(
+        r#"
+[test.holder]
+sh = "echo holder_start >> {seq}; sleep 0.4; echo holder_end >> {seq}"
+require = [{{ resource = "R" }}]
+
+[test.unrelated]
+sh = "sleep 0.1; echo unrelated_mid >> {seq}"
+"#,
+        seq = sequence.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "test command failed: {}", result.stderr);
+
+    let log = fs::read_to_string(&sequence).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    let pos_holder_end = lines.iter().position(|l| l.contains("holder_end")).expect("holder_end missing");
+    let pos_unrelated = lines.iter().position(|l| l.contains("unrelated_mid")).expect("unrelated_mid missing");
+    assert!(
+        pos_unrelated < pos_holder_end,
+        "unrelated must finish BEFORE holder ends (running concurrently); got: {:?}",
+        lines
+    );
+}
+
+/// Three contenders with priorities 2, 1, 0 must execute in priority order.
+#[test]
+fn resource_priority_order() {
+    let mut harness = TestHarness::new("resource_priority");
+    let sequence = harness.temp_dir.join("seq.log");
+
+    harness.write_config(&format!(
+        r#"
+[test.low]
+sh = "echo low >> {seq}; sleep 0.05"
+require = [{{ resource = "R", priority = 0 }}]
+
+[test.mid]
+sh = "echo mid >> {seq}; sleep 0.05"
+require = [{{ resource = "R", priority = 1 }}]
+
+[test.high]
+sh = "echo high >> {seq}; sleep 0.05"
+require = [{{ resource = "R", priority = 2 }}]
+"#,
+        seq = sequence.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "test command failed: {}", result.stderr);
+
+    let log = fs::read_to_string(&sequence).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    let pos_high = lines.iter().position(|l| l.contains("high")).expect("high missing");
+    let pos_mid = lines.iter().position(|l| l.contains("mid")).expect("mid missing");
+    let pos_low = lines.iter().position(|l| l.contains("low")).expect("low missing");
+    assert!(pos_high < pos_mid && pos_mid < pos_low, "expected high < mid < low, got: {:?}", lines);
+}
+
+/// A task with two resources only starts when both are free.
+#[test]
+fn resource_multi_atomic() {
+    let mut harness = TestHarness::new("resource_multi");
+    let sequence = harness.temp_dir.join("seq.log");
+
+    harness.write_config(&format!(
+        r#"
+[test.holder_a]
+sh = "echo holder_a_start >> {seq}; sleep 0.4; echo holder_a_end >> {seq}"
+require = [{{ resource = "A" }}]
+
+[test.needs_a_and_b]
+sh = "echo combo_start >> {seq}; echo combo_end >> {seq}"
+require = [{{ resource = "A" }}, {{ resource = "B" }}]
+"#,
+        seq = sequence.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test"]);
+    assert!(result.success(), "test command failed: {}", result.stderr);
+
+    let log = fs::read_to_string(&sequence).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    let pos_holder_end = lines.iter().position(|l| l.contains("holder_a_end")).expect("holder_a_end missing");
+    let pos_combo_start = lines.iter().position(|l| l.contains("combo_start")).expect("combo_start missing");
+    assert!(pos_holder_end < pos_combo_start, "combo must start AFTER A is released; got: {:?}", lines);
+}
+
+/// A failed spawn (bogus executable) releases the resource so the next waiter unblocks.
+#[test]
+fn resource_release_on_spawn_fail() {
+    let mut harness = TestHarness::new("resource_spawn_fail");
+    let success_marker = harness.temp_dir.join("ok.txt");
+
+    harness.write_config(&format!(
+        r#"
+[test.broken]
+cmd = ["/nonexistent/bin/devsm-test-binary"]
+require = [{{ resource = "R", priority = 1 }}]
+
+[test.ok]
+sh = "echo ok > {marker}"
+require = [{{ resource = "R", priority = 0 }}]
+"#,
+        marker = success_marker.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let _ = harness.run_client(&["test"]);
+
+    assert!(
+        harness.wait_for_file(&success_marker, Duration::from_secs(5)),
+        "ok task must run after broken's spawn failure released the resource"
+    );
+}
+
+/// A plain require cycle (A → B → A) errors at spawn time with the cycle path.
+#[test]
+fn plain_require_cycle_error() {
+    let mut harness = TestHarness::new("require_cycle");
+
+    harness.write_config(
+        r#"
+[action.a]
+cmd = ["true"]
+require = ["b"]
+
+[action.b]
+cmd = ["true"]
+require = ["a"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "a"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("require cycle"),
+        "expected `require cycle` error, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+}
+
+/// A task declaring resource R that transitively requires (Active) a service
+/// also declaring R is a deadlock.
+#[test]
+fn resource_service_deadlock_error() {
+    let mut harness = TestHarness::new("resource_deadlock");
+
+    harness.write_config(
+        r#"
+[service.svc]
+cmd = ["sleep", "infinity"]
+require = [{ resource = "R" }]
+
+[action.user]
+cmd = ["true"]
+require = ["svc", { resource = "R" }]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "user"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("resource deadlock"),
+        "expected `resource deadlock` error, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+}
+
+/// Sharing a resource via an Action chain (predicate
+/// TerminatedNaturallyAndSuccessfully) is *not* a deadlock — the action
+/// releases its hold before the requirer runs.
+#[test]
+fn resource_action_chain_not_flagged() {
+    let mut harness = TestHarness::new("resource_action_chain");
+    let marker = harness.temp_dir.join("done.txt");
+
+    harness.write_config(&format!(
+        r#"
+[action.dep]
+cmd = ["true"]
+require = [{{ resource = "R" }}]
+
+[action.user]
+sh = "echo done > {marker}"
+require = ["dep", {{ resource = "R" }}]
+"#,
+        marker = marker.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "user"]);
+    assert!(result.success(), "action chain should not be flagged as deadlock: {}", result.stderr);
+    assert!(harness.wait_for_file(&marker, Duration::from_secs(5)), "user task should complete");
+}

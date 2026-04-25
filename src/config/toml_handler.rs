@@ -3,8 +3,8 @@ use toml_spanner::{Context, Document, Failed, Item, Table, Value};
 
 use crate::config::{
     Alias, AllowMultiple, CacheConfig, CacheKeyInput, CommandExpr, FunctionDef, FunctionDefAction, If, Predicate,
-    ReadyConfig, ReadyPredicate, ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind,
-    TestConfigExpr, TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
+    ReadyConfig, ReadyPredicate, Requirement, ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr,
+    TaskKind, TestConfigExpr, TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
 };
 
 fn parse_predicate<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Predicate<'a>, Failed> {
@@ -282,7 +282,7 @@ fn parse_task<'a>(
     let mut pwd = StringExpr::Literal("./");
     let mut profiles_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
-    let mut require: &[TaskCall<'a>] = &[];
+    let mut require: &[Requirement<'a>] = &[];
     let mut cache: Option<CacheConfig<'a>> = None;
     let mut ready: Option<ReadyConfig<'a>> = None;
     let mut timeout: Option<TimeoutConfig<'a>> = None;
@@ -317,8 +317,9 @@ fn parse_task<'a>(
                 let arr = value.require_array(ctx)?;
                 let mut calls = bumpalo::collections::Vec::new_in(alloc);
                 for item in arr {
-                    calls.push(parse_task_call(item, ctx)?);
+                    calls.push(parse_requirement(item, ctx)?);
                 }
+                check_no_duplicate_resources(&calls, value, ctx)?;
                 require = calls.into_bump_slice();
             }
             "cache" => {
@@ -489,7 +490,7 @@ fn parse_test<'a>(
 ) -> Result<TestConfigExpr<'a>, Failed> {
     let mut pwd = StringExpr::Literal("./");
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
-    let mut require: &[TaskCall<'a>] = &[];
+    let mut require: &[Requirement<'a>] = &[];
     let mut tags_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut cache: Option<CacheConfig<'a>> = None;
     let mut timeout: Option<TimeoutConfig<'a>> = None;
@@ -515,8 +516,9 @@ fn parse_test<'a>(
                 let arr = value.require_array(ctx)?;
                 let mut calls = bumpalo::collections::Vec::new_in(alloc);
                 for item in arr {
-                    calls.push(parse_task_call(item, ctx)?);
+                    calls.push(parse_requirement(item, ctx)?);
                 }
+                check_no_duplicate_resources(&calls, value, ctx)?;
                 require = calls.into_bump_slice();
             }
             "tag" => match value.value() {
@@ -569,6 +571,80 @@ fn parse_test<'a>(
         timeout,
         vars: vars_vec.into_bump_slice(),
     })
+}
+
+fn parse_requirement<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Requirement<'a>, Failed> {
+    match value.value() {
+        Value::String(_) | Value::Array(_) => Ok(Requirement::Task(parse_task_call(value, ctx)?)),
+        Value::Table(table) => parse_resource_entry(table, value, ctx),
+        _ => Err(ctx.report_expected_but_found(&"a string, array, or `{ resource = \"...\" }` table", value)),
+    }
+}
+
+fn parse_resource_entry<'a>(
+    table: &Table<'a>,
+    value: &Item<'a>,
+    ctx: &mut Context<'a>,
+) -> Result<Requirement<'a>, Failed> {
+    let mut name: Option<&'a str> = None;
+    let mut priority: i32 = 0;
+
+    for (key, val) in table {
+        match key.name {
+            "resource" => {
+                name = Some(val.require_string(ctx)?);
+            }
+            "priority" => match val.value() {
+                Value::Integer(&i) => {
+                    let raw = i.as_i128();
+                    let Ok(p) = i32::try_from(raw) else {
+                        return Err(ctx.report_custom_error("priority must fit in an i32", val));
+                    };
+                    priority = p;
+                }
+                _ => return Err(ctx.report_expected_but_found(&"an integer", val)),
+            },
+            "name" | "profile" | "vars" => {
+                return Err(ctx.report_custom_error(
+                    "resource requirement cannot also specify `name`, `profile`, or `vars` — \
+                     use a string or array entry for task-call requirements",
+                    val,
+                ));
+            }
+            _ => {
+                return Err(ctx.report_custom_error(
+                    "unknown key on resource requirement (expected `resource` and optional `priority`)",
+                    val,
+                ));
+            }
+        }
+    }
+
+    let Some(name) = name else {
+        return Err(ctx.report_custom_error("resource requirement is missing the `resource` field", value));
+    };
+
+    Ok(Requirement::Resource { name, priority })
+}
+
+fn check_no_duplicate_resources<'a>(
+    items: &[Requirement<'a>],
+    value: &Item<'a>,
+    ctx: &mut Context<'a>,
+) -> Result<(), Failed> {
+    for (i, r) in items.iter().enumerate() {
+        let Requirement::Resource { name, .. } = r else { continue };
+        for prior in &items[..i] {
+            if let Requirement::Resource { name: prior_name, .. } = prior
+                && *prior_name == *name
+            {
+                return Err(
+                    ctx.report_custom_error(&format!("duplicate resource `{}` within a single `require`", name), value)
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_task_call<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<TaskCall<'a>, Failed> {
@@ -994,5 +1070,84 @@ mod test {
             CacheKeyInput::ProfileChanged(task_name) => assert_eq!(*task_name, "backend"),
             _ => panic!("Expected ProfileChanged cache key input"),
         }
+    }
+
+    #[test]
+    fn parse_resource_requirement_basic() {
+        let text = "[action.t]\ncmd = [\"echo\"]\nrequire = [{ resource = \"cargo-bin\", priority = 2 }]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "Expected success: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let (_, task) = &config.tasks[0];
+        assert_eq!(task.require.len(), 1);
+        match &task.require[0] {
+            Requirement::Resource { name, priority } => {
+                assert_eq!(*name, "cargo-bin");
+                assert_eq!(*priority, 2);
+            }
+            other => panic!("expected resource requirement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_resource_default_priority() {
+        let text = "[action.t]\ncmd = [\"echo\"]\nrequire = [{ resource = \"R\" }]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "Expected success: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let (_, task) = &config.tasks[0];
+        match &task.require[0] {
+            Requirement::Resource { priority, .. } => assert_eq!(*priority, 0),
+            other => panic!("expected resource requirement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_priority_on_non_resource_table() {
+        let text = "[action.t]\ncmd = [\"echo\"]\nrequire = [{ name = \"build\", priority = 1 }]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("resource") || m.contains("priority")),
+            "expected error to mention `resource`/`priority`, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn reject_resource_mixed_with_name() {
+        let text = "[action.t]\ncmd = [\"echo\"]\nrequire = [{ resource = \"R\", name = \"build\" }]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("resource")),
+            "expected message about mixed keys, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_resource_in_one_require() {
+        let text = "[action.t]\ncmd = [\"echo\"]\nrequire = [{ resource = \"R\" }, { resource = \"R\" }]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("duplicate") && m.contains("R")),
+            "expected duplicate-resource message, got: {:?}",
+            messages
+        );
     }
 }

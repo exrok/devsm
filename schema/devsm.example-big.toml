@@ -403,6 +403,16 @@ require = [
   ],
 ]
 
+# Resource lock with priority (serialized against other resource users)
+[test.test_with_resource_priority]
+cmd = ["cargo", "build"]
+require = [{ resource = "cargo-bin", priority = 1 }]
+
+# Resource lock with default priority + a task-call requirement in the same require
+[test.test_with_resource_and_task]
+cmd = ["cargo", "test"]
+require = [{ resource = "cargo-bin" }, "simple_cmd"]
+
 # Test with cache
 [test.test_with_cache]
 cmd = ["cargo", "test", "--lib"]

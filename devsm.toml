@@ -52,6 +52,7 @@ cmd = [
   "--skip-path-checks",
   "schema/devsm.example-big.toml",
 ]
+require = [{resource = "cargo-bin"}]
 tag = ["schema"]
 
 [test.typos]
@@ -62,3 +63,4 @@ cmd = ["cargo", "check"]
 
 [test.cargo-test]
 cmd = ["cargo", "test", "--features=fuzz"]
+require = [{resource = "cargo-bin"}]

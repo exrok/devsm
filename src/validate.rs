@@ -5,8 +5,9 @@ use std::path::Path;
 use toml_spanner::{Item, Table, Value};
 
 use crate::config::toml_handler;
-use crate::config::{StringExpr, WorkspaceConfig};
+use crate::config::{StringExpr, TaskKind, WorkspaceConfig};
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, DiagnosticLevel, emit_diagnostic, toml_error_to_diagnostic};
+use crate::workspace::require_graph::{NameLookup, RequireAnalysis, TaskInput};
 
 pub struct ValidateOptions {
     pub skip_path_checks: bool,
@@ -156,6 +157,7 @@ fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptio
     };
 
     validate_cross_references(&workspace_config, doc.table(), &mut emit);
+    validate_require_graph(&workspace_config, doc.table(), &mut emit);
 
     if !options.skip_path_checks {
         validate_pwd_paths(&workspace_config, base_path, doc.table(), &mut emit);
@@ -222,7 +224,8 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
     }
 
     for (task_name, task_expr) in config.tasks.iter() {
-        for call in task_expr.require.iter() {
+        for req in task_expr.require.iter() {
+            let crate::config::Requirement::Task(call) = req else { continue };
             let required_name: &str = &call.name;
 
             if !task_names.contains(required_name) {
@@ -270,7 +273,8 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
 
     for (test_name, test_variants) in config.tests.iter() {
         for test_expr in test_variants.iter() {
-            for call in test_expr.require.iter() {
+            for req in test_expr.require.iter() {
+                let crate::config::Requirement::Task(call) = req else { continue };
                 let required_name: &str = &call.name;
 
                 if !task_names.contains(required_name) {
@@ -300,6 +304,77 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                 }
             }
         }
+    }
+}
+
+fn validate_require_graph(config: &WorkspaceConfig, root: &Table, emit: &mut dyn FnMut(Diagnostic)) {
+    let mut tasks: Vec<TaskInput> = Vec::with_capacity(config.tasks.len() + config.tests.len());
+    let mut name_map: hashbrown::HashMap<&str, usize> = hashbrown::HashMap::new();
+    let mut name_kind: Vec<&str> = Vec::new();
+
+    for (name, expr) in config.tasks.iter() {
+        if name_map.contains_key(*name) {
+            continue;
+        }
+        name_map.insert(*name, tasks.len());
+        tasks.push(TaskInput { name, kind: expr.kind, require: expr.require });
+        name_kind.push(*name);
+    }
+
+    for (name, variants) in config.tests.iter() {
+        if name_map.contains_key(*name) {
+            continue;
+        }
+        let Some(first) = variants.first() else { continue };
+        name_map.insert(*name, tasks.len());
+        tasks.push(TaskInput { name, kind: TaskKind::Test, require: first.require });
+        name_kind.push(*name);
+    }
+
+    if tasks.is_empty() {
+        return;
+    }
+
+    struct StrLookup<'a>(&'a hashbrown::HashMap<&'a str, usize>);
+    impl<'a> NameLookup for StrLookup<'a> {
+        fn lookup(&self, name: &str) -> Option<usize> {
+            self.0.get(name).copied()
+        }
+    }
+    let analysis = RequireAnalysis::build(&tasks, &StrLookup(&name_map));
+
+    for (name, message) in analysis.iter_problems(&tasks) {
+        let label = find_require_array_span(root, name)
+            .map(|span| vec![DiagnosticLabel::primary(span).with_message("declared here")])
+            .unwrap_or_default();
+        emit(Diagnostic::error().with_message(message.to_string()).with_labels(label));
+    }
+}
+
+fn find_require_array_span(root: &Table, task_name: &str) -> Option<Range<usize>> {
+    for section in ["action", "service"] {
+        if let Some(task_table) = root.get(section).and_then(|v| v.as_table())
+            && let Some(task) = task_table.get(task_name).and_then(|v| v.as_table())
+            && let Some(req) = task.get("require")
+        {
+            return Some(req.span().range());
+        }
+    }
+    let test_table = root.get("test")?.as_table()?;
+    let test_value = test_table.get(task_name)?;
+    match test_value.value() {
+        Value::Table(table) => Some(table.get("require")?.span().range()),
+        Value::Array(arr) => {
+            for item in arr {
+                if let Value::Table(t) = item.value()
+                    && let Some(req) = t.get("require")
+                {
+                    return Some(req.span().range());
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 

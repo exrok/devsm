@@ -35,12 +35,14 @@ fast-glob = "1.0.0"
 # Use git dependency until version 0.2 is released.
 extui = { git = "https://github.com/exrok/extui", rev = "b3aa3cba62c0287254a247e2072d2a8df1cd7dd2" }
 mimalloc = { version = "0.1.48", optional = true }
+smallvec = "1.15.1"
 
 # [patch."https://github.com/exrok/extui"]
 # extui = { path = "/home/user/Projects/git/extui" }
 
 [dev-dependencies]
 vt100 = "*"
+
 
 [features]
 fuzz = []

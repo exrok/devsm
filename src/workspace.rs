@@ -11,7 +11,24 @@ use crate::{
 };
 pub use job_index_list::JobIndexList;
 pub use job_store::{JobIndex, JobStore};
+pub use require_graph::{RequireAnalysis, TaskInput};
+pub use resource::{ResourceIndex, ResourceSlab};
+
+fn task_inputs<'a>(base_tasks: &'a [BaseTask]) -> Vec<TaskInput<'a>> {
+    base_tasks
+        .iter()
+        .map(|bt| TaskInput { name: bt.name.as_ref(), kind: bt.config.kind, require: bt.config.require })
+        .collect()
+}
+
+fn build_require_analysis(
+    base_tasks: &[BaseTask],
+    name_map: &hashbrown::HashMap<Box<str>, BaseTaskIndex>,
+) -> RequireAnalysis {
+    RequireAnalysis::build(&task_inputs(base_tasks), name_map)
+}
 use jsony_value::{Value, ValueMap, ValueNumber, ValueRef};
+use smallvec::SmallVec;
 use std::{
     path::PathBuf,
     sync::{Arc, RwLock, Weak},
@@ -19,6 +36,8 @@ use std::{
 };
 mod job_index_list;
 mod job_store;
+pub mod require_graph;
+mod resource;
 
 /// Lower bound on `[daemon] max_job_history`. Values below this are clamped
 /// up so eviction still has room to work — the 25% churn per batch would
@@ -223,6 +242,9 @@ pub struct Job {
     /// Computed cache key for cache invalidation. Empty string means no key-based caching.
     pub cache_key: String,
     pub spawn: Arc<ResolvedSpawnSpec>,
+    /// Resources currently held by this job. Populated on `Scheduled → Starting`,
+    /// drained on any terminal transition.
+    pub held_resources: SmallVec<[ResourceIndex; 2]>,
 }
 
 pub struct ResolvedSpawnSpec {
@@ -255,9 +277,9 @@ pub enum JobPredicate {
 }
 
 #[derive(Debug)]
-pub struct ScheduleRequirement {
-    pub job: JobIndex,
-    pub predicate: JobPredicate,
+pub enum ScheduleRequirement {
+    Task { job: JobIndex, predicate: JobPredicate },
+    Resource { id: ResourceIndex, priority: i32 },
 }
 
 enum RequirementStatus {
@@ -268,42 +290,53 @@ enum RequirementStatus {
 
 impl ScheduleRequirement {
     fn status(&self, ws: &WorkspaceState) -> RequirementStatus {
-        let Some(job) = ws.jobs.get(self.job) else {
-            return RequirementStatus::Met;
-        };
-        match self.predicate {
-            JobPredicate::Terminated => match &job.process_status {
-                JobStatus::Scheduled { .. } => RequirementStatus::Pending,
-                JobStatus::Starting => RequirementStatus::Pending,
-                JobStatus::Running { .. } => RequirementStatus::Pending,
-                JobStatus::Exited { .. } => RequirementStatus::Met,
-                JobStatus::Cancelled => RequirementStatus::Met,
-            },
-            JobPredicate::TerminatedNaturallyAndSuccessfully => match &job.process_status {
-                JobStatus::Scheduled { .. } => RequirementStatus::Pending,
-                JobStatus::Starting => RequirementStatus::Pending,
-                JobStatus::Running { .. } => RequirementStatus::Pending,
-                JobStatus::Cancelled => RequirementStatus::Never,
-                JobStatus::Exited { cause: ExitCause::Killed, .. } => RequirementStatus::Never,
-                JobStatus::Exited { status, .. } => {
-                    if *status == 0 {
-                        RequirementStatus::Met
-                    } else {
-                        RequirementStatus::Never
-                    }
+        match self {
+            ScheduleRequirement::Resource { id, .. } => {
+                if ws.resources.is_free(*id) {
+                    RequirementStatus::Met
+                } else {
+                    RequirementStatus::Pending
                 }
-            },
-            JobPredicate::Active => match &job.process_status {
-                JobStatus::Scheduled { .. } => RequirementStatus::Pending,
-                JobStatus::Starting => RequirementStatus::Pending,
-                JobStatus::Cancelled => RequirementStatus::Never,
-                JobStatus::Running { ready_state, .. } => match ready_state {
-                    None => RequirementStatus::Met,
-                    Some(true) => RequirementStatus::Met,
-                    Some(false) => RequirementStatus::Pending,
-                },
-                JobStatus::Exited { .. } => RequirementStatus::Never,
-            },
+            }
+            ScheduleRequirement::Task { job: job_index, predicate } => {
+                let Some(job) = ws.jobs.get(*job_index) else {
+                    return RequirementStatus::Met;
+                };
+                match predicate {
+                    JobPredicate::Terminated => match &job.process_status {
+                        JobStatus::Scheduled { .. } => RequirementStatus::Pending,
+                        JobStatus::Starting => RequirementStatus::Pending,
+                        JobStatus::Running { .. } => RequirementStatus::Pending,
+                        JobStatus::Exited { .. } => RequirementStatus::Met,
+                        JobStatus::Cancelled => RequirementStatus::Met,
+                    },
+                    JobPredicate::TerminatedNaturallyAndSuccessfully => match &job.process_status {
+                        JobStatus::Scheduled { .. } => RequirementStatus::Pending,
+                        JobStatus::Starting => RequirementStatus::Pending,
+                        JobStatus::Running { .. } => RequirementStatus::Pending,
+                        JobStatus::Cancelled => RequirementStatus::Never,
+                        JobStatus::Exited { cause: ExitCause::Killed, .. } => RequirementStatus::Never,
+                        JobStatus::Exited { status, .. } => {
+                            if *status == 0 {
+                                RequirementStatus::Met
+                            } else {
+                                RequirementStatus::Never
+                            }
+                        }
+                    },
+                    JobPredicate::Active => match &job.process_status {
+                        JobStatus::Scheduled { .. } => RequirementStatus::Pending,
+                        JobStatus::Starting => RequirementStatus::Pending,
+                        JobStatus::Cancelled => RequirementStatus::Never,
+                        JobStatus::Running { ready_state, .. } => match ready_state {
+                            None => RequirementStatus::Met,
+                            Some(true) => RequirementStatus::Met,
+                            Some(false) => RequirementStatus::Pending,
+                        },
+                        JobStatus::Exited { .. } => RequirementStatus::Never,
+                    },
+                }
+            }
         }
     }
 }
@@ -806,6 +839,13 @@ pub struct WorkspaceState {
     pub session_functions: hashbrown::HashMap<String, FunctionAction>,
     /// The most recent test group (persists across runs for rerun functionality).
     pub last_test_group: Option<TestGroup>,
+    /// Daemon-lifetime intern table for `{ resource = "..." }` requirements,
+    /// plus the current holder of each resource.
+    pub resources: ResourceSlab,
+    /// Pre-computed cycle and resource-deadlock errors for the current config
+    /// generation. Rebuilt on every `refresh_config`; per-spawn callers do an
+    /// O(1) lookup via [`detect_require_problems`].
+    pub require_analysis: RequireAnalysis,
     cache_key_hasher: CacheKeyHasher,
     spawn_specs: hashbrown::HashMap<u64, Vec<Weak<ResolvedSpawnSpec>>>,
 }
@@ -941,6 +981,11 @@ impl WorkspaceState {
         if changed {
             self.config.update_base_tasks(&mut self.base_tasks, &mut self.name_map);
             self.spawn_specs.clear();
+            self.require_analysis = build_require_analysis(&self.base_tasks, &self.name_map);
+            let inputs = task_inputs(&self.base_tasks);
+            for (name, err) in self.require_analysis.iter_problems(&inputs) {
+                kvlog::warn!("require graph problem", task = name, error = err);
+            }
         }
         // Pick up any daemon-side knob the user has adjusted via
         // ~/.config/devsm.user.toml reload, independent of whether the
@@ -1054,7 +1099,7 @@ impl WorkspaceState {
                     let JobStatus::Running { process_index, .. } = &job.process_status else {
                         continue;
                     };
-                    pred.push(ScheduleRequirement { job: job_index, predicate: JobPredicate::Terminated });
+                    pred.push(ScheduleRequirement::Task { job: job_index, predicate: JobPredicate::Terminated });
                     channel.send(crate::event_loop::ProcessRequest::TerminateJob {
                         job_id: job.log_group,
                         process_index: *process_index,
@@ -1098,7 +1143,7 @@ impl WorkspaceState {
                     let JobStatus::Running { process_index, .. } = &job.process_status else {
                         continue;
                     };
-                    pred.push(ScheduleRequirement { job: job_index, predicate: JobPredicate::Terminated });
+                    pred.push(ScheduleRequirement::Task { job: job_index, predicate: JobPredicate::Terminated });
                     channel.send(crate::event_loop::ProcessRequest::TerminateJob {
                         job_id: job.log_group,
                         process_index: *process_index,
@@ -1111,6 +1156,13 @@ impl WorkspaceState {
         pred
     }
 
+    /// O(1) lookup of the precomputed cycle/deadlock result for `root`.
+    /// Runs before any job is created so a problematic spawn fails up-front
+    /// instead of leaving jobs stuck in `Scheduled` forever.
+    pub fn detect_require_problems(&self, root: BaseTaskIndex) -> Result<(), String> {
+        self.require_analysis.problem(root)
+    }
+
     fn spawn_task(
         &mut self,
         workspace_id: u32,
@@ -1120,7 +1172,9 @@ impl WorkspaceState {
         profile: &str,
         reason: ScheduleReason,
         force_restart: bool,
-    ) -> JobIndex {
+    ) -> Result<JobIndex, String> {
+        self.detect_require_problems(base_task)?;
+
         let profile = {
             let bt = &self.base_tasks[base_task.idx()];
             if profile.is_empty() { bt.config.profiles.first().copied().unwrap_or("") } else { profile }
@@ -1137,34 +1191,42 @@ impl WorkspaceState {
         let mut batch: SpawnBatch<()> = SpawnBatch::new();
         let mut req_keys = Vec::new();
 
-        for dep_call in task.config().require {
-            let dep_name = &*dep_call.name;
-            let dep_profile = dep_call.profile.unwrap_or("");
-            let dep_params = dep_call.vars.clone().to_owned();
+        for req in task.config().require {
+            match req {
+                crate::config::Requirement::Resource { name, priority } => {
+                    let id = self.resources.intern(name);
+                    pred.push(ScheduleRequirement::Resource { id, priority: *priority });
+                }
+                crate::config::Requirement::Task(dep_call) => {
+                    let dep_name = &*dep_call.name;
+                    let dep_profile = dep_call.profile.unwrap_or("");
+                    let dep_params = dep_call.vars.clone().to_owned();
 
-            let Some(&dep_base_task) = self.name_map.get(dep_name) else {
-                kvlog::error!("unknown alias", dep_name);
-                continue;
-            };
-            let dep_config = &self.base_tasks[dep_base_task.idx()].config;
+                    let Some(&dep_base_task) = self.name_map.get(dep_name) else {
+                        kvlog::error!("unknown alias", dep_name);
+                        continue;
+                    };
+                    let dep_config = &self.base_tasks[dep_base_task.idx()].config;
 
-            let predicate = match dep_config.kind {
-                TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
-                TaskKind::Service => JobPredicate::Active,
-                TaskKind::Test => continue,
-            };
+                    let predicate = match dep_config.kind {
+                        TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
+                        TaskKind::Service => JobPredicate::Active,
+                        TaskKind::Test => continue,
+                    };
 
-            let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
-            req_keys.push((key, predicate));
+                    let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
+                    req_keys.push((key, predicate));
+                }
+            }
         }
 
-        self.resolve_batch_requirements(workspace_id, channel, &mut batch);
+        self.resolve_batch_requirements(workspace_id, channel, &mut batch)?;
 
         for (key, predicate) in &req_keys {
             match batch.get_resolved(key) {
                 Some(ResolvedRequirement::Cached) => {}
                 Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
-                    pred.push(ScheduleRequirement { job: *ji, predicate: predicate.clone() });
+                    pred.push(ScheduleRequirement::Task { job: *ji, predicate: predicate.clone() });
                 }
                 None => {}
             }
@@ -1176,7 +1238,7 @@ impl WorkspaceState {
             .as_ref()
             .map_or(String::new(), |c| self.compute_cache_key_with_require(c.key, &profile, spec.params.as_ref()));
 
-        self.create_job(base_task, task, &profile, params, pred, cache_key, channel, workspace_id, reason)
+        Ok(self.create_job(base_task, task, &profile, params, pred, cache_key, channel, workspace_id, reason))
     }
 
     /// Schedule a queued service that waits for a blocking service to terminate.
@@ -1207,7 +1269,7 @@ impl WorkspaceState {
         };
         let params = params.to_owned();
         let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
-        let requirements = vec![ScheduleRequirement { job: blocked_by, predicate: JobPredicate::Terminated }];
+        let requirements = vec![ScheduleRequirement::Task { job: blocked_by, predicate: JobPredicate::Terminated }];
 
         self.create_job(
             base_task,
@@ -1231,7 +1293,7 @@ impl WorkspaceState {
         requirements: Vec<ScheduleRequirement>,
         cache_key: String,
         channel: &MioChannel,
-        workspace_id: u32,
+        _workspace_id: u32,
         reason: ScheduleReason,
     ) -> JobIndex {
         let spec = self.cache_spawn_spec(base_task, profile, params, task.clone());
@@ -1247,45 +1309,36 @@ impl WorkspaceState {
             (task_name, task_kind, LogGroup::new(base_task, pc))
         };
 
-        let spawn = requirements.is_empty();
         let active_deps: Vec<JobIndex> = requirements
             .iter()
-            .filter(|req| matches!(req.predicate, JobPredicate::Active))
-            .map(|req| req.job)
+            .filter_map(|req| match req {
+                ScheduleRequirement::Task { job, predicate: JobPredicate::Active } => Some(*job),
+                _ => None,
+            })
             .collect();
         let job_index = self.jobs.insert(Job {
-            process_status: if spawn { JobStatus::Starting } else { JobStatus::Scheduled { after: requirements } },
+            process_status: JobStatus::Scheduled { after: requirements },
             log_group: job_id,
             started_at: crate::clock::now(),
             cache_key,
             spawn: spec.clone(),
+            held_resources: SmallVec::new(),
         });
 
-        let bt = &mut self.base_tasks[base_task.idx()];
-        if spawn {
-            bt.jobs.push_active(job_index);
-        } else {
-            bt.jobs.push_scheduled(job_index);
-        }
+        self.base_tasks[base_task.idx()].jobs.push_scheduled(job_index);
         let global_list = match task_kind {
             TaskKind::Action => &mut self.action_jobs,
             TaskKind::Test => &mut self.test_jobs,
             TaskKind::Service => &mut self.service_jobs,
         };
-        if spawn {
-            global_list.push_active(job_index);
-        } else {
-            global_list.push_scheduled(job_index);
-        }
+        global_list.push_scheduled(job_index);
         for dep in active_deps {
             self.service_dependents.add_dependent(dep, job_index);
         }
 
-        if spawn {
-            channel.send(crate::event_loop::ProcessRequest::Spawn { task, job_index, workspace_id, job_id });
-        } else {
-            kvlog::info!("Job scheduled", task_name = task_name.as_ref(), job_index, reason = reason.name());
-        }
+        kvlog::info!("Job scheduled", task_name = task_name.as_ref(), job_index, reason = reason.name());
+        channel.wake();
+        let _ = (task, job_id);
         job_index
     }
 }
@@ -1379,7 +1432,7 @@ impl WorkspaceState {
             profile,
             ScheduleReason::Requested,
             force_restart,
-        );
+        )?;
         Ok((base_index, job_index))
     }
 
@@ -1508,6 +1561,7 @@ impl std::ops::IndexMut<JobIndex> for WorkspaceState {
     }
 }
 
+#[derive(Debug)]
 pub enum Scheduled {
     Ready(JobIndex),
     Never(JobIndex),
@@ -1515,8 +1569,36 @@ pub enum Scheduled {
 }
 
 impl WorkspaceState {
+    /// Update a job's `JobStatus`, maintaining the side-tables that depend on it.
+    ///
+    /// On `Scheduled → Starting` this acquires every `Resource` requirement in
+    /// the old `after` list. On any terminal transition (`→ Exited` or
+    /// `→ Cancelled`) it releases all resources the job currently holds.
+    /// Callers must drive [`Self::next_scheduled`] after a terminal transition
+    /// so any waiters can pick up the freed resources.
     #[track_caller]
     pub fn update_job_status(&mut self, job_index: JobIndex, status: JobStatus) {
+        use JobStatus as S;
+
+        let resources_to_acquire: SmallVec<[ResourceIndex; 2]> = match (&self.jobs[job_index].process_status, &status) {
+            (S::Scheduled { after }, S::Starting) => after
+                .iter()
+                .filter_map(|r| match r {
+                    ScheduleRequirement::Resource { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .collect(),
+            _ => SmallVec::new(),
+        };
+
+        let release_held = matches!(
+            (&self.jobs[job_index].process_status, &status),
+            (S::Starting, S::Cancelled)
+                | (S::Running { .. }, S::Cancelled)
+                | (S::Starting, S::Exited { .. })
+                | (S::Running { .. }, S::Exited { .. })
+        );
+
         let job = &mut self.jobs[job_index];
         let job_id = job.log_group;
         let base_task = &mut self.base_tasks[job_id.base_task_index().idx()];
@@ -1526,7 +1608,6 @@ impl WorkspaceState {
 
         kvlog::info!("Job status changed", job_index, task_name, status = status.name());
 
-        use JobStatus as S;
         match (&job.process_status, &status) {
             (S::Scheduled { .. }, S::Cancelled) => {
                 jobs_list.set_terminal(job_index);
@@ -1592,7 +1673,21 @@ impl WorkspaceState {
         }
 
         let is_now_terminal = matches!(status, S::Exited { .. } | S::Cancelled);
-        job.process_status = status;
+        self.jobs[job_index].process_status = status;
+
+        for id in &resources_to_acquire {
+            self.resources.acquire(*id, job_index);
+        }
+        if !resources_to_acquire.is_empty() {
+            self.jobs[job_index].held_resources.extend(resources_to_acquire);
+        }
+
+        if release_held {
+            let to_release = std::mem::take(&mut self.jobs[job_index].held_resources);
+            for id in to_release {
+                self.resources.release(id);
+            }
+        }
 
         if is_now_terminal && self.jobs.len() as u32 > self.max_job_history {
             self.prune_history();
@@ -1615,7 +1710,9 @@ impl WorkspaceState {
         for (_, job) in self.jobs.iter() {
             if let JobStatus::Scheduled { after } = &job.process_status {
                 for req in after {
-                    protected.insert(req.job);
+                    if let ScheduleRequirement::Task { job: ji, .. } = req {
+                        protected.insert(*ji);
+                    }
                 }
             }
         }
@@ -1690,6 +1787,7 @@ impl WorkspaceState {
         let mut name_map = hashbrown::HashMap::new();
         config.update_base_tasks(&mut base_tasks, &mut name_map);
         let max_job_history = crate::user_config::global_max_job_history();
+        let require_analysis = build_require_analysis(&base_tasks, &name_map);
 
         Ok(WorkspaceState {
             change_number: 0,
@@ -1705,33 +1803,87 @@ impl WorkspaceState {
             service_dependents: ServiceDependents::default(),
             session_functions: hashbrown::HashMap::new(),
             last_test_group: None,
+            resources: ResourceSlab::default(),
+            require_analysis,
             cache_key_hasher: CacheKeyHasher::new(),
             spawn_specs: hashbrown::HashMap::new(),
         })
     }
 
-    /// Brute force scheduling useful testing will provided an optimized alternative later
+    /// Pick one job to start next.
+    ///
+    /// Returns the first scheduled job whose non-resource requirements are met
+    /// AND which wins every resource it needs against any other candidate
+    /// contending for the same resource. Resource arbitration: highest
+    /// `priority` wins; FIFO tiebreak by candidate enumeration order
+    /// (`action_jobs` → `service_jobs` → `test_jobs`, scheduled order within
+    /// each pool). Cross-pool contention is intentionally arbitrated by
+    /// priority — a high-priority test wins resource over a low-priority
+    /// action.
     pub fn next_scheduled(&self) -> Scheduled {
         if !self.has_scheduled_task() {
             return Scheduled::None;
         }
+
+        struct Candidate {
+            job: JobIndex,
+            resources: SmallVec<[(ResourceIndex, i32); 2]>,
+        }
+
+        let mut candidates: Vec<Candidate> = Vec::new();
+
         for job_set in [&self.action_jobs, &self.service_jobs, &self.test_jobs] {
             'pending: for &job_index in job_set.scheduled() {
                 let JobStatus::Scheduled { after } = &self[job_index].process_status else {
-                    kvlog::error!("Inconsistent JobStatus in WorkspaceState::next_ready_task",
+                    kvlog::error!("Inconsistent JobStatus in WorkspaceState::next_scheduled",
                      status = ?&self[job_index].process_status, ?job_index);
                     continue;
                 };
+                let mut resources: SmallVec<[(ResourceIndex, i32); 2]> = SmallVec::new();
                 for req in after {
-                    match req.status(self) {
-                        RequirementStatus::Pending => continue 'pending,
-                        RequirementStatus::Never => return Scheduled::Never(job_index),
-                        RequirementStatus::Met => (),
+                    match req {
+                        ScheduleRequirement::Resource { id, priority } => {
+                            if !self.resources.is_free(*id) {
+                                continue 'pending;
+                            }
+                            resources.push((*id, *priority));
+                        }
+                        ScheduleRequirement::Task { .. } => match req.status(self) {
+                            RequirementStatus::Pending => continue 'pending,
+                            RequirementStatus::Never => return Scheduled::Never(job_index),
+                            RequirementStatus::Met => (),
+                        },
                     }
                 }
-                return Scheduled::Ready(job_index);
+                candidates.push(Candidate { job: job_index, resources });
             }
         }
+
+        if candidates.is_empty() {
+            return Scheduled::None;
+        }
+
+        let mut winner_per_resource: hashbrown::HashMap<ResourceIndex, (JobIndex, i32, usize)> =
+            hashbrown::HashMap::new();
+        for (rank, c) in candidates.iter().enumerate() {
+            for &(id, priority) in &c.resources {
+                let take = match winner_per_resource.get(&id) {
+                    None => true,
+                    Some(&(_, cur_prio, cur_rank)) => priority > cur_prio || (priority == cur_prio && rank < cur_rank),
+                };
+                if take {
+                    winner_per_resource.insert(id, (c.job, priority, rank));
+                }
+            }
+        }
+
+        for c in &candidates {
+            let wins_all = c.resources.iter().all(|&(id, _)| winner_per_resource.get(&id).map(|w| w.0) == Some(c.job));
+            if wins_all {
+                return Scheduled::Ready(c.job);
+            }
+        }
+
         Scheduled::None
     }
 
@@ -1749,16 +1901,17 @@ impl WorkspaceState {
             };
             let scheduled_base_task = self[scheduled_job_index].log_group.base_task_index();
             for req in after {
-                if req.predicate == JobPredicate::Terminated {
-                    let blocking_job = &self.jobs[req.job];
-                    if blocking_job.process_status.is_running() && self.service_dependents.can_stop(req.job) {
-                        let exit_cause = if blocking_job.log_group.base_task_index() == scheduled_base_task {
-                            ExitCause::Restarted
-                        } else {
-                            ExitCause::ProfileConflict
-                        };
-                        return Some((req.job, exit_cause));
-                    }
+                let ScheduleRequirement::Task { job: req_job, predicate: JobPredicate::Terminated } = req else {
+                    continue;
+                };
+                let blocking_job = &self.jobs[*req_job];
+                if blocking_job.process_status.is_running() && self.service_dependents.can_stop(*req_job) {
+                    let exit_cause = if blocking_job.log_group.base_task_index() == scheduled_base_task {
+                        ExitCause::Restarted
+                    } else {
+                        ExitCause::ProfileConflict
+                    };
+                    return Some((*req_job, exit_cause));
                 }
             }
         }
@@ -1779,14 +1932,14 @@ impl WorkspaceState {
     ) -> ServiceCompatibility {
         let spawner = &self.base_tasks[base_task.idx()];
 
-        for &ji in spawner.jobs.running() {
+        for &ji in spawner.jobs.non_terminal() {
             let job = &self.jobs[ji];
             if service_matches_require(job, requested_profile, requested_params) {
                 return ServiceCompatibility::Compatible(ji);
             }
         }
 
-        if let Some(&ji) = spawner.jobs.running().iter().next() {
+        if let Some(&ji) = spawner.jobs.non_terminal().iter().next() {
             let job = &self.jobs[ji];
             match spawner.config.allow_multiple {
                 AllowMultiple::True | AllowMultiple::DistinctProfiles => {
@@ -1814,7 +1967,7 @@ impl WorkspaceState {
         workspace_id: u32,
         channel: &MioChannel,
         batch: &mut SpawnBatch<T>,
-    ) {
+    ) -> Result<(), String> {
         let reqs: Vec<_> = batch
             .pending_requirements
             .iter()
@@ -1873,7 +2026,7 @@ impl WorkspaceState {
                         &profile,
                         ScheduleReason::Dependency,
                         false,
-                    );
+                    )?;
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Service => {
@@ -1915,7 +2068,7 @@ impl WorkspaceState {
                         &profile,
                         ScheduleReason::Dependency,
                         false,
-                    );
+                    )?;
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Test => {
@@ -1923,6 +2076,7 @@ impl WorkspaceState {
                 }
             }
         }
+        Ok(())
     }
 
     fn run_test_batch(
@@ -1938,11 +2092,14 @@ impl WorkspaceState {
             spawn_profile: String,
             spawn_params: ValueMap<'static>,
             requirements: Vec<(RequirementKey, JobPredicate)>,
+            resources: Vec<(ResourceIndex, i32)>,
         }
 
         let mut batch: SpawnBatch<TestRequirements> = SpawnBatch::new();
 
         for matched in matched_tests {
+            self.detect_require_problems(matched.base_task_idx)?;
+
             let task_config = &matched.task_config;
             let mut requirements = Vec::new();
 
@@ -1951,7 +2108,8 @@ impl WorkspaceState {
                 .config()
                 .require
                 .iter()
-                .filter_map(|tc| {
+                .filter_map(|req| {
+                    let crate::config::Requirement::Task(tc) = req else { return None };
                     let dep_name = &*tc.name;
                     let dep_base_task = self.name_map.get(dep_name)?;
                     let dep_config = &self.base_tasks[dep_base_task.idx()].config;
@@ -1990,36 +2148,46 @@ impl WorkspaceState {
                 let env = Environment { profile: &dep_profile, param: ValueMap::new(), vars: dep_config.vars };
                 if let Ok(srv_config) = dep_config.eval(&env) {
                     for req in srv_config.config().require.iter() {
-                        let req_name = &*req.name;
+                        let crate::config::Requirement::Task(tc) = req else { continue };
+                        let req_name = &*tc.name;
                         let Some(&req_base_task) = self.name_map.get(req_name) else {
                             continue;
                         };
                         let req_config = &self.base_tasks[req_base_task.idx()].config;
                         if req_config.kind == TaskKind::Service {
-                            services_to_check.push((req_name.to_string(), req.profile.unwrap_or("").to_string()));
+                            services_to_check.push((req_name.to_string(), tc.profile.unwrap_or("").to_string()));
                         }
                     }
                 }
             }
 
-            for tc in task_config.config().require.iter() {
-                let dep_name = &*tc.name;
-                let dep_profile = tc.profile.unwrap_or("");
-                let dep_params = tc.vars.clone().to_owned();
+            let mut resources: Vec<(ResourceIndex, i32)> = Vec::new();
+            for req in task_config.config().require.iter() {
+                match req {
+                    crate::config::Requirement::Resource { name, priority } => {
+                        let id = self.resources.intern(name);
+                        resources.push((id, *priority));
+                    }
+                    crate::config::Requirement::Task(tc) => {
+                        let dep_name = &*tc.name;
+                        let dep_profile = tc.profile.unwrap_or("");
+                        let dep_params = tc.vars.clone().to_owned();
 
-                let Some(&dep_base_task) = self.name_map.get(dep_name) else {
-                    continue;
-                };
-                let dep_config = &self.base_tasks[dep_base_task.idx()].config;
+                        let Some(&dep_base_task) = self.name_map.get(dep_name) else {
+                            continue;
+                        };
+                        let dep_config = &self.base_tasks[dep_base_task.idx()].config;
 
-                let predicate = match dep_config.kind {
-                    TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
-                    TaskKind::Service => JobPredicate::Active,
-                    TaskKind::Test => continue,
-                };
+                        let predicate = match dep_config.kind {
+                            TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
+                            TaskKind::Service => JobPredicate::Active,
+                            TaskKind::Test => continue,
+                        };
 
-                let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
-                requirements.push((key, predicate));
+                        let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
+                        requirements.push((key, predicate));
+                    }
+                }
             }
 
             batch.add_task(TestRequirements {
@@ -2028,10 +2196,11 @@ impl WorkspaceState {
                 spawn_profile: matched.spawn_profile,
                 spawn_params: matched.spawn_params,
                 requirements,
+                resources,
             });
         }
 
-        self.resolve_batch_requirements(workspace_id, channel, &mut batch);
+        self.resolve_batch_requirements(workspace_id, channel, &mut batch)?;
 
         let tasks = batch.take_tasks();
         let mut test_jobs = Vec::new();
@@ -2044,10 +2213,14 @@ impl WorkspaceState {
                 match batch.get_resolved(key) {
                     Some(ResolvedRequirement::Cached) => {}
                     Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
-                        pred.push(ScheduleRequirement { job: *ji, predicate: predicate.clone() });
+                        pred.push(ScheduleRequirement::Task { job: *ji, predicate: predicate.clone() });
                     }
                     None => {}
                 }
+            }
+
+            for (id, priority) in task.task_data.resources {
+                pred.push(ScheduleRequirement::Resource { id, priority });
             }
 
             let cache_key =
@@ -3090,6 +3263,7 @@ mod scheduling_tests {
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
                 spawn: spec,
+                held_resources: SmallVec::new(),
             });
             state.base_tasks[base_task.idx()].jobs.push_active(ji);
             state.action_jobs.push_active(ji);
@@ -3167,7 +3341,7 @@ mod scheduling_tests {
 
             let b = state.jobs.insert(Job {
                 process_status: JobStatus::Scheduled {
-                    after: vec![ScheduleRequirement {
+                    after: vec![ScheduleRequirement::Task {
                         job: a,
                         predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
                     }],
@@ -3176,6 +3350,7 @@ mod scheduling_tests {
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
                 spawn: spec.clone(),
+                held_resources: SmallVec::new(),
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(b);
 
@@ -3260,6 +3435,204 @@ mod scheduling_tests {
             }
             assert!(state.jobs.get(first).is_none());
             assert!(state.jobs.get(reused).is_some());
+        }
+    }
+
+    mod resource_lock_tests {
+        use super::*;
+
+        fn manifest_path(relative: &str) -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+        }
+
+        fn fresh_state() -> (WorkspaceState, BaseTaskIndex, Arc<ResolvedSpawnSpec>) {
+            let mut state =
+                WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).expect("load test config");
+            state.max_job_history = 1024;
+            let base_task = state.name_map["simple_cmd"];
+            let config = state.base_tasks[base_task.idx()].config.clone();
+            let task = config
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .expect("eval task");
+            let spec = state.cache_spawn_spec(base_task, "", ValueMap::new(), task);
+            (state, base_task, spec)
+        }
+
+        fn insert_scheduled_with_resources(
+            state: &mut WorkspaceState,
+            base_task: BaseTaskIndex,
+            spec: Arc<ResolvedSpawnSpec>,
+            resources: Vec<(ResourceIndex, i32)>,
+        ) -> JobIndex {
+            let bt = &mut state.base_tasks[base_task.idx()];
+            let pc = bt.spawn_counter as usize;
+            bt.spawn_counter = bt.spawn_counter.wrapping_add(1);
+            let log_group = LogGroup::new(base_task, pc);
+            let after =
+                resources.into_iter().map(|(id, priority)| ScheduleRequirement::Resource { id, priority }).collect();
+            let ji = state.jobs.insert(Job {
+                process_status: JobStatus::Scheduled { after },
+                log_group,
+                started_at: crate::clock::now(),
+                cache_key: String::new(),
+                spawn: spec,
+                held_resources: SmallVec::new(),
+            });
+            state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
+            state.action_jobs.push_scheduled(ji);
+            ji
+        }
+
+        #[test]
+        fn intern_returns_same_id_for_same_name() {
+            let mut slab = ResourceSlab::default();
+            let a = slab.intern("foo");
+            let b = slab.intern("foo");
+            assert_eq!(a, b);
+            let c = slab.intern("bar");
+            assert_ne!(a, c);
+        }
+
+        #[test]
+        fn fresh_resource_is_free() {
+            let mut slab = ResourceSlab::default();
+            let id = slab.intern("foo");
+            assert!(slab.is_free(id));
+        }
+
+        #[test]
+        fn acquire_marks_resource_held() {
+            let (mut state, base_task, spec) = fresh_state();
+            let id = state.resources.intern("R");
+            let ji = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(id, 0)]);
+
+            assert!(state.resources.is_free(id));
+            state.update_job_status(ji, JobStatus::Starting);
+            assert!(!state.resources.is_free(id));
+            assert_eq!(state.jobs[ji].held_resources.as_slice(), &[id]);
+        }
+
+        #[test]
+        fn exit_releases_held_resources() {
+            let (mut state, base_task, spec) = fresh_state();
+            let id = state.resources.intern("R");
+            let ji = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(id, 0)]);
+
+            state.update_job_status(ji, JobStatus::Starting);
+            state.update_job_status(ji, JobStatus::Running { process_index: 0, ready_state: None });
+            state.update_job_status(
+                ji,
+                JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },
+            );
+
+            assert!(state.resources.is_free(id));
+            assert!(state.jobs[ji].held_resources.is_empty());
+        }
+
+        #[test]
+        fn cancel_after_starting_releases_resources() {
+            let (mut state, base_task, spec) = fresh_state();
+            let id = state.resources.intern("R");
+            let ji = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(id, 0)]);
+
+            state.update_job_status(ji, JobStatus::Starting);
+            assert!(!state.resources.is_free(id));
+            state.update_job_status(ji, JobStatus::Cancelled);
+            assert!(state.resources.is_free(id));
+        }
+
+        #[test]
+        fn cancel_before_starting_does_not_touch_resource() {
+            let (mut state, base_task, spec) = fresh_state();
+            let id = state.resources.intern("R");
+            let ji = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(id, 0)]);
+
+            assert!(state.resources.is_free(id));
+            state.update_job_status(ji, JobStatus::Cancelled);
+            assert!(state.resources.is_free(id));
+            assert!(state.jobs[ji].held_resources.is_empty());
+        }
+
+        #[test]
+        fn next_scheduled_blocks_on_held_resource() {
+            let (mut state, base_task, spec) = fresh_state();
+            let id = state.resources.intern("R");
+            let first = insert_scheduled_with_resources(&mut state, base_task, spec.clone(), vec![(id, 0)]);
+            let second = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(id, 0)]);
+
+            match state.next_scheduled() {
+                Scheduled::Ready(ji) => assert_eq!(ji, first),
+                other => panic!("expected first job ready, got {other:?}"),
+            }
+            state.update_job_status(first, JobStatus::Starting);
+
+            match state.next_scheduled() {
+                Scheduled::None => {}
+                other => panic!("expected None while resource is held, got {other:?}"),
+            }
+
+            state.update_job_status(first, JobStatus::Running { process_index: 0, ready_state: None });
+            state.update_job_status(
+                first,
+                JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },
+            );
+
+            match state.next_scheduled() {
+                Scheduled::Ready(ji) => assert_eq!(ji, second),
+                other => panic!("expected second job ready after release, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn higher_priority_wins_resource_contention() {
+            let (mut state, base_task, spec) = fresh_state();
+            let id = state.resources.intern("R");
+            let low = insert_scheduled_with_resources(&mut state, base_task, spec.clone(), vec![(id, 0)]);
+            let high = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(id, 5)]);
+
+            match state.next_scheduled() {
+                Scheduled::Ready(ji) => assert_eq!(ji, high, "higher priority must win even though enqueued later"),
+                other => panic!("expected high priority job ready, got {other:?}"),
+            }
+            let _ = low;
+        }
+
+        #[test]
+        fn equal_priority_resolves_fifo() {
+            let (mut state, base_task, spec) = fresh_state();
+            let id = state.resources.intern("R");
+            let first = insert_scheduled_with_resources(&mut state, base_task, spec.clone(), vec![(id, 1)]);
+            let _second = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(id, 1)]);
+
+            match state.next_scheduled() {
+                Scheduled::Ready(ji) => assert_eq!(ji, first, "FIFO breaks ties on equal priority"),
+                other => panic!("expected first job ready, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn multi_resource_atomic_acquire() {
+            let (mut state, base_task, spec) = fresh_state();
+            let r_a = state.resources.intern("A");
+            let r_b = state.resources.intern("B");
+
+            let multi = insert_scheduled_with_resources(&mut state, base_task, spec.clone(), vec![(r_a, 0), (r_b, 0)]);
+            let only_b = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(r_b, 0)]);
+
+            match state.next_scheduled() {
+                Scheduled::Ready(ji) => assert_eq!(ji, multi),
+                other => panic!("expected multi job ready, got {other:?}"),
+            }
+            state.update_job_status(multi, JobStatus::Starting);
+            assert!(!state.resources.is_free(r_a));
+            assert!(!state.resources.is_free(r_b));
+            assert_eq!(state.jobs[multi].held_resources.len(), 2);
+
+            match state.next_scheduled() {
+                Scheduled::None => {}
+                other => panic!("expected None while B is held, got {other:?}"),
+            }
+            let _ = only_b;
         }
     }
 }

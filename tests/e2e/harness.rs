@@ -385,14 +385,13 @@ impl RpcSubscriber {
 }
 
 /// Returns the path to the compiled binary.
+///
+/// Uses `CARGO_BIN_EXE_devsm` so the path matches the binary cargo built for
+/// this test invocation's feature set. Resolving via `current_exe()` instead
+/// returns `target/debug/devsm`, which a concurrent `cargo run` (e.g. another
+/// devsm test action) can overwrite with a non-fuzz build.
 pub fn cargo_bin_path() -> PathBuf {
-    let mut path = std::env::current_exe().expect("Failed to get current exe");
-    path.pop();
-    if path.ends_with("deps") {
-        path.pop();
-    }
-    path.push("devsm");
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_devsm"))
 }
 
 // ── test-app protocol ──────────────────────────────────────────────────────

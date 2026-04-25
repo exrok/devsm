@@ -734,12 +734,6 @@ pub(crate) enum ProcessRequest {
         payload: Vec<u8>,
         remaining: Vec<u8>,
     },
-    Spawn {
-        task: TaskConfigRc,
-        workspace_id: WorkspaceIndex,
-        job_id: LogGroup,
-        job_index: JobIndex,
-    },
     AttachClient {
         stdin: Option<File>,
         stdout: Option<File>,
@@ -868,6 +862,13 @@ impl MioChannel {
     pub(crate) fn send(&self, req: ProcessRequest) {
         if let Err(err) = self.try_send(req) {
             kvlog::error!("Failed to send request", ?err);
+        }
+    }
+    /// Wake the event loop without queuing a request. Used by paths that mutate
+    /// workspace state and need the next `scheduled()` poll to run.
+    pub(crate) fn wake(&self) {
+        if let Err(err) = self.waker.wake() {
+            kvlog::error!("Failed to wake event loop", ?err);
         }
     }
 }
@@ -1009,12 +1010,6 @@ impl EventLoop {
                     process.send_signal(libc::SIGTERM);
                 }
                 true
-            }
-            ProcessRequest::Spawn { task, job_id, workspace_id, job_index } => {
-                if let Err(err) = self.spawn(workspace_id, job_id, job_index, task) {
-                    self.handle_spawn_failure(workspace_id, job_id, job_index, err);
-                }
-                false
             }
             ProcessRequest::RpcMessage { socket, fds, kind, correlation, one_shot, ws_data, payload, remaining } => {
                 use rpc_handlers::{RpcError, RpcOutcome};

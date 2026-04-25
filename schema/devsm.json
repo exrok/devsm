@@ -174,6 +174,29 @@
         }
       ]
     },
+    "requirement": {
+      "description": "Either a task call or a named external resource that the scheduler serializes",
+      "oneOf": [
+        { "$ref": "#/definitions/taskCall" },
+        {
+          "type": "object",
+          "description": "Exclusive resource lock. While one task holds the resource, others declaring the same name wait. Priority resolves contention; ties break FIFO.",
+          "required": ["resource"],
+          "additionalProperties": false,
+          "properties": {
+            "resource": {
+              "type": "string",
+              "description": "Resource identifier (freeform string)"
+            },
+            "priority": {
+              "type": "integer",
+              "default": 0,
+              "description": "Higher priority wins resource contention; default 0"
+            }
+          }
+        }
+      ]
+    },
     "envTable": {
       "type": "object",
       "description": "Environment variables",
@@ -393,7 +416,7 @@
           "type": "array",
           "description": "Task dependencies that must complete before this task runs",
           "items": {
-            "$ref": "#/definitions/taskCall"
+            "$ref": "#/definitions/requirement"
           }
         },
         "cache": {
@@ -467,7 +490,7 @@
           "type": "array",
           "description": "Task dependencies that must be active/running",
           "items": {
-            "$ref": "#/definitions/taskCall"
+            "$ref": "#/definitions/requirement"
           }
         },
         "ready": {
@@ -543,7 +566,7 @@
           "type": "array",
           "description": "Task dependencies that must complete before this test runs",
           "items": {
-            "$ref": "#/definitions/taskCall"
+            "$ref": "#/definitions/requirement"
           }
         },
         "tag": {

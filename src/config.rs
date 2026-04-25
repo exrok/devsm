@@ -27,6 +27,12 @@ pub fn format_config_error(file_name: &str, content: &str, diagnostic: &Diagnost
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub struct Alias<'a>(&'a str);
+impl<'a> Alias<'a> {
+    #[cfg(test)]
+    pub fn new(s: &'a str) -> Self {
+        Alias(s)
+    }
+}
 impl<'a> std::ops::Deref for Alias<'a> {
     type Target = str;
     fn deref(&self) -> &Self::Target {
@@ -42,8 +48,21 @@ pub struct TaskCall<'a> {
     pub vars: ValueMap<'a>,
 }
 
-/// Empty slice of task calls, used as default for require field.
-pub static EMPTY_TASK_CALLS: &[TaskCall<'static>] = &[];
+/// A single entry in a `require` slice. Tasks declare dependencies on either
+/// other tasks (existing form) or on named external resources.
+///
+/// Resources serialize concurrent tasks that touch the same external state
+/// (e.g. a build directory). While one task holds a resource, other tasks
+/// declaring the same `name` wait. `priority` resolves contention; ties break
+/// FIFO by enqueue time.
+#[derive(Debug)]
+pub enum Requirement<'a> {
+    Task(TaskCall<'a>),
+    Resource { name: &'a str, priority: i32 },
+}
+
+/// Empty slice of requirements, used as default for the `require` field.
+pub static EMPTY_REQUIREMENTS: &[Requirement<'static>] = &[];
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VarMeta<'a> {
@@ -229,7 +248,7 @@ pub struct TaskConfig<'a> {
     pub pwd: &'a str,
     pub command: Command<'a>,
     pub envvar: &'a [(&'a str, &'a str)],
-    pub require: &'a [TaskCall<'a>],
+    pub require: &'a [Requirement<'a>],
     pub cache: Option<CacheConfig<'a>>,
     pub ready: Option<ReadyConfig<'a>>,
     pub timeout: Option<TimeoutConfig<'a>>,
@@ -379,7 +398,7 @@ pub struct TaskConfigExpr<'a> {
     command: CommandExpr<'a>,
     pub profiles: &'a [&'a str],
     envvar: &'a [(&'a str, StringExpr<'a>)],
-    pub require: &'a [TaskCall<'a>],
+    pub require: &'a [Requirement<'a>],
     pub cache: Option<CacheConfig<'a>>,
     pub ready: Option<ReadyConfig<'a>>,
     /// Timeout configuration for the task.
@@ -407,7 +426,7 @@ pub struct TestConfigExpr<'a> {
     pub pwd: StringExpr<'a>,
     command: CommandExpr<'a>,
     envvar: &'a [(&'a str, StringExpr<'a>)],
-    pub require: &'a [TaskCall<'a>],
+    pub require: &'a [Requirement<'a>],
     pub tags: &'a [&'a str],
     pub cache: Option<CacheConfig<'a>>,
     /// Timeout configuration for the test.
@@ -452,7 +471,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         ])),
         profiles: &[],
         envvar: &[],
-        require: EMPTY_TASK_CALLS,
+        require: EMPTY_REQUIREMENTS,
         cache: None,
         ready: None,
         timeout: None,
@@ -1017,7 +1036,7 @@ mod tests {
             ])),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_TASK_CALLS,
+            require: EMPTY_REQUIREMENTS,
             cache: None,
             ready: None,
             timeout: None,
@@ -1046,7 +1065,7 @@ mod tests {
             command: CommandExpr::Cmd(StringListExpr::If(&IF_BRANCH)),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_TASK_CALLS,
+            require: EMPTY_REQUIREMENTS,
             cache: None,
             ready: None,
             timeout: None,
@@ -1092,7 +1111,7 @@ mod tests {
             ])),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_TASK_CALLS,
+            require: EMPTY_REQUIREMENTS,
             cache: None,
             ready: None,
             timeout: None,
