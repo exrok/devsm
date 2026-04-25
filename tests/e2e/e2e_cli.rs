@@ -2923,3 +2923,132 @@ require = ["dep", {{ resource = "R" }}]
     assert!(result.success(), "action chain should not be flagged as deadlock: {}", result.stderr);
     assert!(harness.wait_for_file(&marker, Duration::from_secs(5)), "user task should complete");
 }
+
+/// `devsm validate` must accept the `action.`, `service.`, and `test.`
+/// kind-qualified require prefixes that the daemon's lookup already supports.
+#[test]
+fn validate_accepts_kind_qualified_require_names() {
+    let harness = TestHarness::new("validate_kind_qualified");
+    harness.write_config(
+        r#"
+[action.dep]
+cmd = ["echo", "dep"]
+
+[service.svc]
+cmd = ["./svc"]
+
+[test.t]
+cmd = ["echo", "t"]
+
+[action.user]
+cmd = ["echo", "user"]
+require = ["action.dep", "service.svc"]
+"#,
+    );
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let result = Command::new(cargo_bin_path())
+        .arg("validate")
+        .arg(&config_path)
+        .arg("--skip-path-checks")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("validate should run");
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        result.status.success(),
+        "validate must accept kind-qualified require names; status: {:?}\nstdout: {}\nstderr: {}",
+        result.status,
+        stdout,
+        stderr,
+    );
+}
+
+/// A task whose `require` list pins the same `allow_multiple = false` service
+/// to two different variants (different params or different profiles) cannot
+/// be satisfied. The daemon must reject the spawn up front rather than
+/// scheduling jobs that deadlock or silently get cancelled.
+#[test]
+fn task_with_incompatible_service_requirements_errors_up_front() {
+    let mut harness = TestHarness::new("incompat_svc_reqs");
+    harness.write_config(
+        r#"
+[service.svc]
+sh = "while true; do sleep 1; done"
+var.port = { default = "8080" }
+
+[action.user]
+cmd = ["true"]
+require = [
+  ["svc", { port = "a" }],
+  ["svc", { port = "b" }],
+]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "user"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("conflicting") || combined.contains("incompatible"),
+        "spawn must reject incompatible service requirements up front, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+}
+
+/// A `function call` sends the spawn request straight to the daemon without
+/// the CLI's client-side `resolve_name_in_config` check. After a reload that
+/// removes the target task, the daemon must report it gone instead of silently
+/// reusing the stale v1 expression.
+#[test]
+fn function_call_to_removed_task_errors_after_reload() {
+    let mut harness = TestHarness::new("fn_removed_task");
+    let marker = harness.temp_dir.join("target_ran.txt");
+
+    harness.write_config(&format!(
+        r#"
+[action.target]
+sh = "echo ran > {marker}"
+
+[function]
+fn1 = {{ restart = "target" }}
+"#,
+        marker = marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["function", "call", "fn1"]);
+    assert!(result.success(), "fn1 must run target before reload: {}", result.stderr);
+    assert!(harness.wait_for_file(&marker, Duration::from_secs(5)), "target should have produced marker");
+    std::fs::remove_file(&marker).expect("clear marker before reload");
+
+    std::thread::sleep(Duration::from_millis(100));
+    harness.write_config(
+        r#"
+[action.placeholder]
+cmd = ["true"]
+
+[function]
+fn1 = { restart = "target" }
+"#,
+    );
+
+    let result = harness.run_client(&["function", "call", "fn1"]);
+    std::thread::sleep(Duration::from_millis(200));
+    let combined = format!("{}{}", result.stdout, result.stderr);
+
+    assert!(!marker.exists(), "stale target config must not run after reload removes it (combined output: {})", combined);
+    assert!(
+        combined.contains("not found"),
+        "daemon should reject the removed task, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+}
+

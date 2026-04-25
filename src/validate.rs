@@ -179,12 +179,42 @@ fn validity_summary(path: &Path, warnings: usize) -> String {
     }
 }
 
+/// Resolves a `kind.name` or bare task reference to its short name, mirroring
+/// the daemon's [`crate::workspace::WorkspaceState::lookup_name`] semantics.
+/// Returns `Some(short_name)` if the reference resolves, `None` otherwise.
+fn resolve_qualified_reference<'a>(
+    name: &'a str,
+    name_kinds: &hashbrown::HashMap<&str, TaskKind>,
+    test_names: &HashSet<&str>,
+) -> Option<&'a str> {
+    let (kind_filter, short) = match name.split_once('.') {
+        Some(("service", rest)) => (Some(TaskKind::Service), rest),
+        Some(("action", rest)) => (Some(TaskKind::Action), rest),
+        Some(("test", rest)) => (Some(TaskKind::Test), rest),
+        _ => (None, name),
+    };
+    match kind_filter {
+        Some(TaskKind::Service) | Some(TaskKind::Action) => {
+            if name_kinds.get(short) == Some(&kind_filter.unwrap()) { Some(short) } else { None }
+        }
+        Some(TaskKind::Test) => {
+            if test_names.contains(short) { Some(short) } else { None }
+        }
+        None => {
+            if name_kinds.contains_key(name) || test_names.contains(name) { Some(name) } else { None }
+        }
+    }
+}
+
 fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut dyn FnMut(Diagnostic)) {
     let mut task_profiles: HashSet<(&str, &str)> = HashSet::new();
     let mut task_names: HashSet<&str> = HashSet::new();
+    let mut name_kinds: hashbrown::HashMap<&str, TaskKind> = hashbrown::HashMap::new();
+    let mut test_names: HashSet<&str> = HashSet::new();
 
     for (name, task_expr) in config.tasks.iter() {
         task_names.insert(name);
+        name_kinds.insert(name, task_expr.kind);
         for profile in task_expr.profiles.iter() {
             task_profiles.insert((name, profile));
         }
@@ -192,6 +222,7 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
 
     for (name, _) in config.tests.iter() {
         task_names.insert(name);
+        test_names.insert(name);
     }
 
     for (group_name, calls) in config.groups.iter() {
@@ -227,8 +258,9 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
         for req in task_expr.require.iter() {
             let crate::config::Requirement::Task(call) = req else { continue };
             let required_name: &str = &call.name;
+            let resolved = resolve_qualified_reference(required_name, &name_kinds, &test_names);
 
-            if !task_names.contains(required_name) {
+            let Some(short) = resolved else {
                 if let Some(span) = find_require_span(root, task_name, required_name) {
                     emit(
                         Diagnostic::error()
@@ -237,12 +269,13 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                             .with_notes(vec![format!("in task '{}'", task_name)]),
                     );
                 }
-            } else if let Some(profile) = call.profile
-                && !task_profiles.contains(&(required_name, profile))
+                continue;
+            };
+            if let Some(profile) = call.profile
+                && !task_profiles.contains(&(short, profile))
                 && let Some(span) = find_require_span(root, task_name, required_name)
             {
-                let available: Vec<_> =
-                    task_profiles.iter().filter(|(n, _)| *n == required_name).map(|(_, p)| *p).collect();
+                let available: Vec<_> = task_profiles.iter().filter(|(n, _)| *n == short).map(|(_, p)| *p).collect();
                 emit(
                     Diagnostic::error()
                         .with_message(format!("required task '{}' does not have profile '{}'", required_name, profile))
@@ -275,8 +308,9 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
         for req in test_expr.require.iter() {
             let crate::config::Requirement::Task(call) = req else { continue };
             let required_name: &str = &call.name;
+            let resolved = resolve_qualified_reference(required_name, &name_kinds, &test_names);
 
-            if !task_names.contains(required_name) {
+            let Some(short) = resolved else {
                 if let Some(span) = find_test_require_span(root, test_name, required_name) {
                     emit(
                         Diagnostic::error()
@@ -285,12 +319,13 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                             .with_notes(vec![format!("in test '{}'", test_name)]),
                     );
                 }
-            } else if let Some(profile) = call.profile
-                && !task_profiles.contains(&(required_name, profile))
+                continue;
+            };
+            if let Some(profile) = call.profile
+                && !task_profiles.contains(&(short, profile))
                 && let Some(span) = find_test_require_span(root, test_name, required_name)
             {
-                let available: Vec<_> =
-                    task_profiles.iter().filter(|(n, _)| *n == required_name).map(|(_, p)| *p).collect();
+                let available: Vec<_> = task_profiles.iter().filter(|(n, _)| *n == short).map(|(_, p)| *p).collect();
                 emit(
                     Diagnostic::error()
                         .with_message(format!(
@@ -332,13 +367,27 @@ fn validate_require_graph(config: &WorkspaceConfig, root: &Table, emit: &mut dyn
         return;
     }
 
-    struct StrLookup<'a>(&'a hashbrown::HashMap<&'a str, usize>);
+    struct StrLookup<'a> {
+        map: &'a hashbrown::HashMap<&'a str, usize>,
+        tasks: &'a [TaskInput<'a>],
+    }
     impl<'a> NameLookup for StrLookup<'a> {
         fn lookup(&self, name: &str) -> Option<usize> {
-            self.0.get(name).copied()
+            let (kind_filter, short) = match name.split_once('.') {
+                Some(("service", rest)) => (Some(TaskKind::Service), rest),
+                Some(("action", rest)) => (Some(TaskKind::Action), rest),
+                Some(("test", rest)) => (Some(TaskKind::Test), rest),
+                _ => (None, name),
+            };
+            let idx = self.map.get(short).copied()?;
+            match kind_filter {
+                Some(k) if self.tasks[idx].kind == k => Some(idx),
+                Some(_) => None,
+                None => Some(idx),
+            }
         }
     }
-    let analysis = RequireAnalysis::build(&tasks, &StrLookup(&name_map));
+    let analysis = RequireAnalysis::build(&tasks, &StrLookup { map: &name_map, tasks: &tasks });
 
     for (name, message) in analysis.iter_problems(&tasks) {
         let label = find_require_array_span(root, name)

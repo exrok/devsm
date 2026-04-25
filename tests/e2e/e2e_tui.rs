@@ -497,3 +497,75 @@ sh = "for i in $(seq 1 200); do echo \"log line $i\"; done"
         tui.wait_until(|s| s.scroll.as_ref().map(|sc| sc.top.is_scrolled).unwrap_or(false), Duration::from_secs(2));
     assert!(state.is_some(), "Should enter scroll mode when there are enough logs");
 }
+
+/// The TUI's reload key (`R`) consumes the config-file mtime change before any
+/// daemon-side spawn does. The reload path therefore has to rebuild the static
+/// require analysis itself; otherwise a cycle that was present in v1 stays
+/// flagged for the rest of the session even after v2 removes it.
+#[test]
+fn tui_refresh_rebuilds_require_analysis() {
+    let mut harness = TestHarness::new("tui_refresh_require_analysis");
+
+    harness.write_config(
+        r#"
+[action.alpha]
+cmd = ["true"]
+require = ["beta"]
+
+[action.beta]
+cmd = ["true"]
+require = ["alpha"]
+"#,
+    );
+
+    let log_file = fs::File::create(&harness.server_log_path).expect("Failed to create server log");
+    let log_file_err = log_file.try_clone().expect("Failed to clone log file");
+
+    let server = Command::new(cargo_bin_path())
+        .arg("server")
+        .current_dir(&harness.temp_dir)
+        .env("DEVSM_SOCKET", &harness.socket_path)
+        .env("DEVSM_DB", "/dev/null")
+        .env("DEVSM_LOG_STDOUT", "1")
+        .env("DEVSM_JSON_STATE_STREAM", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_file_err))
+        .spawn()
+        .expect("Failed to spawn server");
+    harness.server = Some(server);
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut tui = TuiTestClient::spawn(&harness);
+    let timeout = Duration::from_secs(5);
+    let state = tui.wait_until(|s| s.find_task_by_name("alpha").is_some(), timeout);
+    assert!(state.is_some(), "alpha task should appear, server_log: {}", harness.server_log());
+
+    let result = harness.run_client(&["run", "alpha"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(combined.contains("require cycle"), "v1 must surface the cycle, got: {}", combined);
+
+    std::thread::sleep(Duration::from_millis(100));
+    harness.write_config(
+        r#"
+[action.alpha]
+cmd = ["true"]
+
+[action.beta]
+cmd = ["true"]
+"#,
+    );
+
+    tui.send_key(b"R");
+    std::thread::sleep(Duration::from_millis(300));
+
+    let result = harness.run_client(&["run", "alpha"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        result.success(),
+        "alpha must run cleanly after TUI reload drops the cycle, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+    assert!(!combined.contains("require cycle"), "stale cycle error must not survive reload: {}", combined);
+}

@@ -1491,8 +1491,7 @@ fn attempt_config_reload(tui: &mut TuiState, workspace: &Workspace, keybinds: &m
         match ws.config.refresh_capturing() {
             Ok(changed) => {
                 if changed {
-                    let ws = &mut *ws;
-                    ws.config.update_base_tasks(&mut ws.base_tasks, &mut ws.name_map);
+                    ws.apply_config_changes();
                 }
             }
             Err(e) => {

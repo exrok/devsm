@@ -717,12 +717,14 @@ impl EventLoop {
             return;
         };
         let mut ws = workspace.handle.state.write().unwrap();
-        ws.update_job_status(
-            job_index,
-            JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::SpawnFailed, status: 127 },
-        );
+        let public_id = ws
+            .update_job_status(
+                job_index,
+                JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::SpawnFailed, status: 127 },
+            )
+            .unwrap_or(0);
         drop(ws);
-        self.broadcast_job_exited(workspace_id, job_index, 127, crate::rpc::ExitCause::SpawnFailed);
+        self.broadcast_job_exited(workspace_id, public_id, 127, crate::rpc::ExitCause::SpawnFailed);
     }
 }
 
@@ -1159,13 +1161,16 @@ impl EventLoop {
                 ExitCause::ProfileConflict => crate::rpc::ExitCause::ProfileConflict,
                 ExitCause::Timeout => crate::rpc::ExitCause::Timeout,
             };
-            if let Some(workspace) = self.state.workspaces.get(ws_idx as usize) {
+            let public_id = if let Some(workspace) = self.state.workspaces.get(ws_idx as usize) {
                 let mut ws = workspace.handle.state.write().unwrap();
                 ws.update_job_status(
                     job_idx,
                     JobStatus::Exited { finished_at: crate::clock::now(), cause, status: exit_code },
-                );
-            }
+                )
+                .unwrap_or(0)
+            } else {
+                0
+            };
             if process.ready_checker.as_ref().is_some_and(|rc| rc.timeout_at.is_some()) {
                 self.state.timed_ready_count -= 1;
             }
@@ -1173,7 +1178,7 @@ impl EventLoop {
                 self.state.timed_timeout_count -= 1;
             }
             self.state.processes.remove(index);
-            self.broadcast_job_exited(ws_idx, job_idx, exit_code as i32, rpc_cause);
+            self.broadcast_job_exited(ws_idx, public_id, exit_code as i32, rpc_cause);
             return;
         }
         kvlog::info!("Didn't Find ProcessExited", pid);
@@ -1452,12 +1457,10 @@ impl EventLoop {
     fn broadcast_job_exited(
         &mut self,
         ws_index: WorkspaceIndex,
-        job_index: JobIndex,
+        public_id: u32,
         exit_code: i32,
         cause: crate::rpc::ExitCause,
     ) {
-        let Some(ws) = self.state.workspaces.get(ws_index as usize) else { return };
-        let public_id = ws.handle.state.read().unwrap().jobs.public_id_of(job_index).unwrap_or(0);
         let event = crate::rpc::JobExitedEvent { job_index: public_id, exit_code, cause };
         let mut encoder = crate::rpc::Encoder::new();
         encoder.encode_push(RpcMessageKind::JobExited, &event);

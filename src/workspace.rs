@@ -499,6 +499,12 @@ impl LatestConfig {
         name_map: &mut hashbrown::HashMap<Box<str>, NameEntry>,
     ) {
         for base_task in base_tasks.iter_mut() {
+            // Synthetic Static tasks like `~cargo` are not generation-bound
+            // and persist across reloads. Marking them removed would orphan
+            // them from `name_map` after the prune step below.
+            if matches!(&base_task.config, TaskConfigSource::Static(_)) {
+                continue;
+            }
             base_task.removed = true;
         }
         let generation = self.current.clone();
@@ -561,6 +567,25 @@ impl LatestConfig {
                 has_run_this_session: false,
             });
         }
+
+        // Drop name_map entries pointing at base tasks that the new generation
+        // did not revive. Without this, `lookup_name` and the `NameLookup`
+        // impl used by `RequireAnalysis` keep resolving removed task names to
+        // their stale slots.
+        name_map.retain(|_, entry| {
+            let task_alive = match entry.task {
+                TaskEntry::None => false,
+                TaskEntry::Service(i) | TaskEntry::Action(i) => !base_tasks[i.idx()].removed,
+            };
+            let test_alive = entry.test.is_some_and(|i| !base_tasks[i.idx()].removed);
+            if !task_alive {
+                entry.task = TaskEntry::None;
+            }
+            if !test_alive {
+                entry.test = None;
+            }
+            task_alive || test_alive
+        });
     }
 }
 
@@ -1043,18 +1068,30 @@ impl WorkspaceState {
             return;
         };
         if changed {
-            self.config.update_base_tasks(&mut self.base_tasks, &mut self.name_map);
-            self.spawn_specs.clear();
-            self.require_analysis = build_require_analysis(&self.base_tasks, &self.name_map);
-            let inputs = task_inputs(&self.base_tasks);
-            for (name, err) in self.require_analysis.iter_problems(&inputs) {
-                kvlog::warn!("require graph problem", task = name, error = err);
-            }
+            self.apply_config_changes();
         }
         // Pick up any daemon-side knob the user has adjusted via
         // ~/.config/devsm.user.toml reload, independent of whether the
         // workspace toml itself changed.
         self.max_job_history = crate::user_config::global_max_job_history();
+    }
+
+    /// Canonical reload step. Updates `base_tasks` and `name_map` from the
+    /// current `LatestConfig`, drops the per-spawn cache so eval'd configs
+    /// from the previous generation are not reused, and rebuilds the static
+    /// require analysis.
+    ///
+    /// Both `refresh_config` and the TUI reload path go through this. Skipping
+    /// the require analysis rebuild lets stale cycles or deadlocks linger
+    /// across reloads.
+    pub fn apply_config_changes(&mut self) {
+        self.config.update_base_tasks(&mut self.base_tasks, &mut self.name_map);
+        self.spawn_specs.clear();
+        self.require_analysis = build_require_analysis(&self.base_tasks, &self.name_map);
+        let inputs = task_inputs(&self.base_tasks);
+        for (name, err) in self.require_analysis.iter_problems(&inputs) {
+            kvlog::warn!("require graph problem", task = name, error = err);
+        }
     }
 
     fn get_or_create_spawn_spec(
@@ -1134,6 +1171,16 @@ impl WorkspaceState {
         spec
     }
 
+    /// Cancels every scheduled job for `base_task` through the canonical
+    /// transition path so terminal-side effects (history pruning,
+    /// service-dependents removal, list bookkeeping) all run.
+    pub fn cancel_scheduled_jobs(&mut self, base_task: BaseTaskIndex) {
+        let to_cancel: Vec<JobIndex> = self.base_tasks[base_task.idx()].jobs.scheduled().to_vec();
+        for ji in to_cancel {
+            self.update_job_status(ji, JobStatus::Cancelled);
+        }
+    }
+
     fn plan_conflicts(
         &mut self,
         base_task: BaseTaskIndex,
@@ -1141,25 +1188,17 @@ impl WorkspaceState {
         force_restart: bool,
         channel: &MioChannel,
     ) -> Vec<ScheduleRequirement> {
-        let bt = &mut self.base_tasks[base_task.idx()];
-        let task_kind = bt.config.kind;
+        let bt = &self.base_tasks[base_task.idx()];
         let allow_multiple = if force_restart { AllowMultiple::False } else { bt.config.allow_multiple };
         let mut pred = Vec::new();
 
         match allow_multiple {
             AllowMultiple::False => {
-                for &job_index in bt.jobs.terminate_scheduled() {
-                    self.jobs[job_index].process_status = JobStatus::Cancelled;
-                    match task_kind {
-                        TaskKind::Action => self.action_jobs.set_terminal(job_index),
-                        TaskKind::Test => self.test_jobs.set_terminal(job_index),
-                        TaskKind::Service => self.service_jobs.set_terminal(job_index),
-                    }
-                    self.service_dependents.remove_from_all(job_index);
-                }
+                self.cancel_scheduled_jobs(base_task);
 
-                for &job_index in bt.jobs.running() {
-                    let job = &mut self.jobs[job_index];
+                let running: Vec<JobIndex> = self.base_tasks[base_task.idx()].jobs.running().to_vec();
+                for job_index in running {
+                    let job = &self.jobs[job_index];
                     let JobStatus::Running { process_index, .. } = &job.process_status else {
                         continue;
                     };
@@ -1183,16 +1222,8 @@ impl WorkspaceState {
                     .filter(|ji| (self.jobs[**ji].spawn_profile() == profile) == match_same)
                     .copied()
                     .collect();
-                for job_index in &to_cancel {
-                    self.jobs[*job_index].process_status = JobStatus::Cancelled;
-                    let bt = &mut self.base_tasks[base_task.idx()];
-                    bt.jobs.set_terminal(*job_index);
-                    match task_kind {
-                        TaskKind::Action => self.action_jobs.set_terminal(*job_index),
-                        TaskKind::Test => self.test_jobs.set_terminal(*job_index),
-                        TaskKind::Service => self.service_jobs.set_terminal(*job_index),
-                    }
-                    self.service_dependents.remove_from_all(*job_index);
+                for job_index in to_cancel {
+                    self.update_job_status(job_index, JobStatus::Cancelled);
                 }
 
                 let to_terminate: Vec<_> = self.base_tasks[base_task.idx()]
@@ -1248,12 +1279,56 @@ impl WorkspaceState {
         let bt = &mut self.base_tasks[base_task.idx()];
         bt.update_profile_tracking(&profile);
 
-        let mut pred = self.plan_conflicts(base_task, &profile, force_restart, channel);
         let spec = self.get_or_create_spawn_spec(base_task, &profile, params.clone());
         let task = spec.task.clone();
 
         let mut batch: SpawnBatch<()> = SpawnBatch::new();
         let mut req_keys = Vec::new();
+        let mut service_variants: hashbrown::HashMap<BaseTaskIndex, (String, ValueMap<'static>)> =
+            hashbrown::HashMap::new();
+
+        for req in task.config().require {
+            match req {
+                crate::config::Requirement::Resource { .. } => {}
+                crate::config::Requirement::Task(dep_call) => {
+                    let dep_name = &*dep_call.name;
+                    let dep_profile = dep_call.profile.unwrap_or("").to_string();
+                    let dep_params = dep_call.vars.clone().to_owned();
+
+                    let Some(dep_base_task) = self.lookup_name(dep_name) else {
+                        continue;
+                    };
+                    let dep_config = &self.base_tasks[dep_base_task.idx()].config;
+                    if dep_config.kind != TaskKind::Service {
+                        continue;
+                    }
+                    let allow_multiple = dep_config.allow_multiple;
+                    let dep_task_name = self.base_tasks[dep_base_task.idx()].name.clone();
+                    if let Some((existing_profile, existing_params)) = service_variants.get(&dep_base_task) {
+                        let profile_conflict = match allow_multiple {
+                            AllowMultiple::True => false,
+                            AllowMultiple::DistinctProfiles => existing_profile == &dep_profile,
+                            AllowMultiple::SingleProfile | AllowMultiple::False => existing_profile != &dep_profile,
+                        };
+                        let params_conflict = matches!(
+                            allow_multiple,
+                            AllowMultiple::False | AllowMultiple::SingleProfile | AllowMultiple::DistinctProfiles
+                        ) && existing_params != &dep_params;
+                        if profile_conflict || params_conflict {
+                            return Err(format!(
+                                "Task '{}' has conflicting service requirements on '{}'",
+                                self.base_tasks[base_task.idx()].name.as_ref(),
+                                dep_task_name.as_ref()
+                            ));
+                        }
+                    } else {
+                        service_variants.insert(dep_base_task, (dep_profile, dep_params));
+                    }
+                }
+            }
+        }
+
+        let mut pred = self.plan_conflicts(base_task, &profile, force_restart, channel);
 
         for req in task.config().require {
             match req {
@@ -1641,8 +1716,14 @@ impl WorkspaceState {
     /// Callers must drive [`Self::next_scheduled`] after a terminal transition
     /// so any waiters can pick up the freed resources.
     #[track_caller]
-    pub fn update_job_status(&mut self, job_index: JobIndex, status: JobStatus) {
+    pub fn update_job_status(&mut self, job_index: JobIndex, status: JobStatus) -> Option<u32> {
         use JobStatus as S;
+
+        // Capture the public id before any side effects: a terminal transition
+        // can trigger `prune_history`, which may evict the just-finished job.
+        // Callers that broadcast on the wire need the public id even when the
+        // handle is no longer live by the time the broadcast runs.
+        let captured_public_id = self.jobs.public_id_of(job_index);
 
         let resources_to_acquire: SmallVec<[ResourceIndex; 2]> = match (&self.jobs[job_index].process_status, &status) {
             (S::Scheduled { after }, S::Starting) => after
@@ -1756,6 +1837,8 @@ impl WorkspaceState {
         if is_now_terminal && self.jobs.len() as u32 > self.max_job_history {
             self.prune_history();
         }
+
+        captured_public_id
     }
 
     /// Resolve a [`JobIndex`] without panicking — returns `None` for stale
@@ -1836,7 +1919,18 @@ impl WorkspaceState {
         self.service_jobs.retain_live(still_live);
 
         if let Some(tg) = &mut self.last_test_group {
-            tg.job_indices.retain(|ji| still_live(*ji));
+            // `base_tasks` and `job_indices` are parallel arrays. Filter both
+            // in lockstep so positions stay aligned for rerun and narrow.
+            let mut write = 0;
+            for read in 0..tg.job_indices.len() {
+                if still_live(tg.job_indices[read]) {
+                    tg.job_indices[write] = tg.job_indices[read];
+                    tg.base_tasks[write] = tg.base_tasks[read];
+                    write += 1;
+                }
+            }
+            tg.job_indices.truncate(write);
+            tg.base_tasks.truncate(write);
             if tg.job_indices.is_empty() {
                 self.last_test_group = None;
             }
@@ -3536,6 +3630,115 @@ mod scheduling_tests {
             }
             assert!(state.jobs.get(first).is_none());
             assert!(state.jobs.get(reused).is_some());
+        }
+
+        #[test]
+        fn cancel_scheduled_jobs_respects_history_cap() {
+            // `plan_conflicts` previously cancelled scheduled jobs by directly
+            // assigning `JobStatus::Cancelled`, sidestepping the canonical
+            // transition path. That left history pruning out of the loop, so
+            // repeated restarts could pile cancelled jobs above
+            // `max_job_history`. The fix is a `cancel_scheduled_jobs` helper
+            // routed through `update_job_status` for every transition.
+            let (mut state, base_task, spec) = fixture(128);
+            state.max_job_history = 32;
+
+            for _ in 0..200 {
+                let pc = state.base_tasks[base_task.idx()].spawn_counter as usize;
+                state.base_tasks[base_task.idx()].spawn_counter =
+                    state.base_tasks[base_task.idx()].spawn_counter.wrapping_add(1);
+                let log_group = LogGroup::new(base_task, pc);
+                let ji = state.jobs.insert(Job {
+                    process_status: JobStatus::Scheduled { after: Vec::new() },
+                    log_group,
+                    started_at: crate::clock::now(),
+                    cache_key: String::new(),
+                    spawn: spec.clone(),
+                    held_resources: SmallVec::new(),
+                });
+                state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
+                state.action_jobs.push_scheduled(ji);
+            }
+
+            assert_eq!(state.jobs.len(), 200, "all 200 scheduled jobs should be in the slab");
+            state.cancel_scheduled_jobs(base_task);
+            assert!(
+                state.jobs.len() as u32 <= state.max_job_history,
+                "canonical cancellation must trigger history pruning; got {} > {}",
+                state.jobs.len(),
+                state.max_job_history
+            );
+        }
+
+        #[test]
+        fn update_job_status_returns_public_id_even_when_pruned() {
+            // Reproduce a scenario where a terminal transition triggers a
+            // prune that evicts the just-finished job. When `c` exits with
+            // `max_job_history = 1` and one older terminal job in the slab,
+            // both `a` (oldest terminal) and `c` (newly terminal) get
+            // evicted. The broadcaster needs `c`'s public id to fan out the
+            // `JobExited` event, so `update_job_status` has to capture it
+            // before any side effects run.
+            let (mut state, base_task, spec) = fixture(128);
+
+            let a = insert_job(&mut state, base_task, spec.clone());
+            exit(&mut state, a, 0);
+            let _b = insert_job(&mut state, base_task, spec.clone());
+            let c = insert_job(&mut state, base_task, spec.clone());
+            let c_public_id = state.jobs.public_id_of(c).expect("c must be live before transition");
+
+            state.max_job_history = 1;
+            state.update_job_status(c, JobStatus::Running { process_index: 0, ready_state: None });
+            let returned = state.update_job_status(
+                c,
+                JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },
+            );
+
+            assert!(state.jobs.public_id_of(c).is_none(), "c must be evicted by its own terminal-transition prune");
+            assert_eq!(
+                returned,
+                Some(c_public_id),
+                "update_job_status must return the just-exited public id even if pruning evicted it"
+            );
+        }
+
+        #[test]
+        fn test_group_arrays_stay_aligned_after_pruning() {
+            let (mut state, base_task, spec) = fixture(128);
+
+            let a = insert_job(&mut state, base_task, spec.clone());
+            exit(&mut state, a, 0);
+            // started_at increments are coarse, sleep so the pruner can
+            // distinguish oldest from newest by `started_at`.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let b = insert_job(&mut state, base_task, spec.clone());
+            exit(&mut state, b, 0);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let c = insert_job(&mut state, base_task, spec.clone());
+            exit(&mut state, c, 0);
+
+            state.last_test_group = Some(TestGroup {
+                group_id: 0,
+                base_tasks: vec![BaseTaskIndex(10), BaseTaskIndex(11), BaseTaskIndex(12)],
+                job_indices: vec![a, b, c],
+            });
+
+            // Pin the cap below the current live count, then force another
+            // terminal transition so prune_history evicts the two oldest test
+            // jobs while leaving `c` alive.
+            state.max_job_history = 2;
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let filler = insert_job(&mut state, base_task, spec.clone());
+            exit(&mut state, filler, 0);
+
+            assert!(state.jobs.get(a).is_none(), "a should be evicted");
+            assert!(state.jobs.get(b).is_none(), "b should be evicted");
+            assert!(state.jobs.get(c).is_some(), "c should survive");
+
+            let tg = state.last_test_group.as_ref().expect("group should still hold the surviving job");
+            assert_eq!(tg.job_indices.len(), tg.base_tasks.len(), "parallel arrays must stay aligned after pruning");
+            assert_eq!(tg.job_indices, vec![c]);
+            assert_eq!(tg.base_tasks, vec![BaseTaskIndex(12)]);
         }
     }
 
