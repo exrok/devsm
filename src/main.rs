@@ -784,10 +784,8 @@ fn resolve_name_in_config(
         return Some((TaskKind::Test, test.to_task_config_expr()));
     }
 
-    if let Some((_, expr)) = config
-        .tasks
-        .iter()
-        .find(|(n, expr)| *n == short && kind_filter.map(|k| k == expr.kind).unwrap_or(true))
+    if let Some((_, expr)) =
+        config.tasks.iter().find(|(n, expr)| *n == short && kind_filter.map(|k| k == expr.kind).unwrap_or(true))
     {
         return Some((expr.kind, expr));
     }

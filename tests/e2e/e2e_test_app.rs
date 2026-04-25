@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use crate::harness::{TestAppServer, TestHarness};
+use crate::rpc::{CommandBody, SpawnTaskRequest, WorkspaceClient};
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -284,6 +285,226 @@ allow_multiple = true
         assert!(r1.success(), "client 1: stdout={}, stderr={}", r1.stdout, r1.stderr);
         assert!(r2.success(), "client 2: stdout={}, stderr={}", r2.stdout, r2.stderr);
     });
+}
+
+#[test]
+fn queued_profile_conflict_service_keeps_resource_requirements() {
+    let mut harness = TestHarness::new("queued_service_resource_require");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+require = [{{ resource = "shared" }}]
+
+[action.need_beta]
+cmd = ["test-app", "need_beta"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["svc:beta"]
+
+[action.uses_resource]
+cmd = ["test-app", "uses_resource"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = [{{ resource = "shared" }}]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["spawn", "svc:alpha"]);
+    assert!(result.success(), "spawn svc:alpha: stdout={}, stderr={}", result.stdout, result.stderr);
+    let mut alpha = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(alpha.name(), "svc");
+
+    std::thread::scope(|s| {
+        let beta_action = s.spawn(|| harness.run_client(&["run", "need_beta"]));
+
+        assert!(
+            alpha.wait_disconnected(Duration::from_secs(10)),
+            "svc:alpha should be stopped before svc:beta starts; server_log={}",
+            harness.server_log()
+        );
+
+        let mut beta = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(beta.name(), "svc");
+
+        let mut need_beta = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(need_beta.name(), "need_beta");
+
+        let resource_action = s.spawn(|| harness.run_client(&["run", "uses_resource"]));
+        if let Some(mut early) = ctrl.try_accept(Duration::from_millis(300)) {
+            let name = early.name().to_string();
+            early.exit(1);
+            panic!(
+                "{name} started while svc:beta's dependent was still running; queued svc:beta did not hold resource"
+            );
+        }
+
+        need_beta.exit(0);
+        let beta_result = beta_action.join().expect("need_beta client panicked");
+        assert!(beta_result.success(), "need_beta: stdout={}, stderr={}", beta_result.stdout, beta_result.stderr);
+
+        assert!(
+            beta.wait_disconnected(Duration::from_secs(10)),
+            "svc:beta should be stopped to free the resource; server_log={}",
+            harness.server_log()
+        );
+        let mut uses_resource = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(uses_resource.name(), "uses_resource");
+        uses_resource.exit(0);
+
+        let resource_result = resource_action.join().expect("uses_resource client panicked");
+        assert!(
+            resource_result.success(),
+            "uses_resource: stdout={}, stderr={}",
+            resource_result.stdout,
+            resource_result.stderr
+        );
+    });
+}
+
+#[test]
+fn single_profile_queued_requirement_waits_for_all_incompatible_instances() {
+    let mut harness = TestHarness::new("single_profile_waits_all");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc", {{ var = "id" }}]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+allow_multiple = "single_profile"
+var.id = {{ default = "default" }}
+
+[action.need_beta]
+cmd = ["test-app", "need_beta"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["svc:beta"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["spawn", "svc:alpha", "--id=one"]);
+    assert!(result.success(), "spawn alpha one: stdout={}, stderr={}", result.stdout, result.stderr);
+    let mut alpha_one = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(alpha_one.name(), "svc");
+
+    let result = harness.run_client(&["spawn", "svc:alpha", "--id=two"]);
+    assert!(result.success(), "spawn alpha two: stdout={}, stderr={}", result.stdout, result.stderr);
+    let mut alpha_two = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(alpha_two.name(), "svc");
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "need_beta",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "need_beta spawn rejected: {:?}", resp.body);
+
+    let mut beta = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(beta.name(), "svc");
+    assert!(
+        alpha_one.wait_disconnected(Duration::from_secs(1)) && alpha_two.wait_disconnected(Duration::from_secs(1)),
+        "svc:beta must not run while any svc:alpha instance is still alive; server_log={}",
+        harness.server_log()
+    );
+
+    let mut action = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(action.name(), "need_beta");
+    action.exit(0);
+    beta.exit(0);
+}
+
+#[test]
+fn test_batch_allows_schedulable_distinct_profile_service_requirements() {
+    let mut harness = TestHarness::new("test_batch_distinct_profiles");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+allow_multiple = "distinct_profiles"
+
+[test.needs_both]
+cmd = ["test-app", "needs_both"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["svc:alpha", "svc:beta"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    std::thread::scope(|s| {
+        let client = s.spawn(|| harness.run_client(&["test"]));
+
+        let mut svc1 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc1.name(), "svc");
+        let mut svc2 = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(svc2.name(), "svc");
+        let mut test = ctrl.accept(Duration::from_secs(10));
+        assert_eq!(test.name(), "needs_both");
+        test.exit(0);
+
+        let result = client.join().expect("test client panicked");
+        assert!(result.success(), "test command: stdout={}, stderr={}", result.stdout, result.stderr);
+        svc1.exit(0);
+        svc2.exit(0);
+    });
+}
+
+#[test]
+fn test_batch_rejects_unschedulable_same_profile_service_params() {
+    let mut harness = TestHarness::new("test_batch_params_conflict");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc", {{ var = "id" }}]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha"]
+allow_multiple = false
+
+[test.bad]
+cmd = ["test-app", "bad"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = [["svc:alpha", {{ id = "one" }}], ["svc:alpha", {{ id = "two" }}]]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "bad",
+        profile: "",
+        params: &[],
+        as_test: true,
+        cached: false,
+    });
+
+    assert!(
+        matches!(resp.body, CommandBody::Error(_)),
+        "test batch should reject impossible duplicate service params, got {:?}",
+        resp.body
+    );
 }
 
 /// allow_multiple = false (default): spawning same service kills old instance.

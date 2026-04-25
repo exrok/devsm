@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -436,6 +437,27 @@ impl TestAppServer {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+
+    pub fn try_accept(&self, timeout: Duration) -> Option<TestAppConn> {
+        self.listener.set_nonblocking(true).unwrap();
+        let start = Instant::now();
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let mut conn = TestAppConn { stream, args: Vec::new() };
+                    conn.read_connect();
+                    return Some(conn);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("accept error: {e}"),
+            }
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 pub struct TestAppConn {
@@ -498,6 +520,44 @@ impl TestAppConn {
 
     pub fn name(&self) -> &str {
         self.args.get(1).map(|s| s.as_str()).unwrap_or("<unknown>")
+    }
+
+    pub fn wait_disconnected(&mut self, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if self.is_disconnected() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    pub fn is_disconnected(&mut self) -> bool {
+        let mut byte = [0u8; 1];
+        let n = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                byte.as_mut_ptr().cast(),
+                byte.len(),
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if n == 0 {
+            return true;
+        }
+        if n > 0 {
+            return false;
+        }
+
+        let err = std::io::Error::last_os_error();
+        match err.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted => false,
+            std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof => true,
+            _ => true,
+        }
     }
 }
 

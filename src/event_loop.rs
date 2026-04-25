@@ -80,6 +80,36 @@ pub(crate) struct ActiveProcess {
     pub(crate) kill_sent_at: Option<std::time::Instant>,
 }
 
+struct UntrackedChildGuard {
+    child: Option<Child>,
+}
+
+impl UntrackedChildGuard {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("untracked child already disarmed")
+    }
+
+    fn disarm(mut self) -> Child {
+        self.child.take().expect("untracked child already disarmed")
+    }
+}
+
+impl Drop for UntrackedChildGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else { return };
+        let pid = child.id() as i32;
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 impl ActiveProcess {
     fn append_line(&mut self, text: &[u8], writer: &mut LogWriter) {
         if let Ok(text) = std::str::from_utf8(text) {
@@ -620,18 +650,19 @@ impl EventLoop {
         command.stdin(stdin);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
-        let mut child = command.spawn().context("Failed to spawn process")?;
+        let child = command.spawn().context("Failed to spawn process")?;
+        let mut untracked_child = UntrackedChildGuard::new(child);
 
-        if let (Some(mut stdin), Some(script)) = (child.stdin.take(), sh_script) {
+        if let (Some(mut stdin), Some(script)) = (untracked_child.child_mut().stdin.take(), sh_script) {
             use std::io::Write;
             let _ = stdin.write_all(script.as_bytes());
             let _ = stdin.flush();
             drop(stdin);
         }
-        if let Some(stdout) = &mut child.stdout {
+        if let Some(stdout) = &mut untracked_child.child_mut().stdout {
             unsafe {
                 if libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) == -1 {
-                    panic!("Failed to set non-blocking");
+                    bail!("Failed to set stdout non-blocking: {}", std::io::Error::last_os_error());
                 }
             }
             self.state.poll.registry().register(
@@ -640,10 +671,10 @@ impl EventLoop {
                 Interest::READABLE,
             )?;
         };
-        if let Some(stderr) = &mut child.stderr {
+        if let Some(stderr) = &mut untracked_child.child_mut().stderr {
             unsafe {
                 if libc::fcntl(stderr.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) == -1 {
-                    panic!("Failed to set non-blocking");
+                    bail!("Failed to set stderr non-blocking: {}", std::io::Error::last_os_error());
                 }
             }
             self.state.poll.registry().register(
@@ -683,6 +714,7 @@ impl EventLoop {
         if timeout_tracker.is_some() {
             self.state.timed_timeout_count += 1;
         }
+        let child = untracked_child.disarm();
         let process_index = self.state.processes.insert(ActiveProcess {
             workspace_index,
             job_index,
@@ -1785,4 +1817,29 @@ fn run_self_logs_forwarder(
 
     kvlog::info!("Self-logs forwarder exiting", index, reason = exit_reason);
     request_channel.send(ProcessRequest::ClientExited { index });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+
+    #[test]
+    fn untracked_child_guard_kills_and_reaps_child_on_drop() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("trap '' TERM; sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.process_group(0);
+
+        let child = command.spawn().expect("spawn child");
+        let pid = child.id() as i32;
+        drop(UntrackedChildGuard::new(child));
+
+        let still_alive = unsafe { libc::kill(pid, 0) == 0 };
+        assert!(!still_alive, "untracked child process should have been killed and reaped");
+    }
 }

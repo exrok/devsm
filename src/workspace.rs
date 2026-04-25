@@ -739,8 +739,8 @@ pub enum ServiceCompatibility {
     Compatible(JobIndex),
     /// No service is currently running.
     Available,
-    /// A service is running with a different profile than requested.
-    Conflict { running_job: JobIndex, running_profile: String, requested_profile: String },
+    /// One or more services must terminate before the request can run.
+    Conflict { running_jobs: Vec<JobIndex>, running_profiles: Vec<String>, requested_profile: String },
 }
 
 /// Key for deduplicating requirements across a batch of spawns.
@@ -949,9 +949,8 @@ impl WorkspaceState {
                     }
                 }
                 CacheKeyInput::ProfileChanged(task_name) => {
-                    let counter = self
-                        .lookup_name(task_name)
-                        .map_or(0, |bti| self.base_tasks[bti.idx()].profile_change_counter);
+                    let counter =
+                        self.lookup_name(task_name).map_or(0, |bti| self.base_tasks[bti.idx()].profile_change_counter);
                     self.cache_key_hasher.update(b"profile_changed:");
                     self.cache_key_hasher.update(task_name.as_bytes());
                     self.cache_key_hasher.update(b"=");
@@ -984,9 +983,8 @@ impl WorkspaceState {
                     }
                 }
                 CacheKeyInput::ProfileChanged(task_name) => {
-                    let counter = self
-                        .lookup_name(task_name)
-                        .map_or(0, |bti| self.base_tasks[bti.idx()].profile_change_counter);
+                    let counter =
+                        self.lookup_name(task_name).map_or(0, |bti| self.base_tasks[bti.idx()].profile_change_counter);
                     self.cache_key_hasher.update(b"profile_changed:");
                     self.cache_key_hasher.update(task_name.as_bytes());
                     self.cache_key_hasher.update(b"=");
@@ -1054,10 +1052,7 @@ impl WorkspaceState {
                 last_profile: None,
                 has_run_this_session: false,
             });
-            self.name_map.insert(
-                "~cargo".into(),
-                NameEntry { task: TaskEntry::Action(index), test: None },
-            );
+            self.name_map.insert("~cargo".into(), NameEntry { task: TaskEntry::Action(index), test: None });
             return Some(index);
         }
         self.lookup_name(name)
@@ -1302,19 +1297,16 @@ impl WorkspaceState {
                     if dep_config.kind != TaskKind::Service {
                         continue;
                     }
-                    let allow_multiple = dep_config.allow_multiple;
                     let dep_task_name = self.base_tasks[dep_base_task.idx()].name.clone();
+                    let dep_effective_profile = self.effective_profile_for_task(dep_base_task, &dep_profile);
                     if let Some((existing_profile, existing_params)) = service_variants.get(&dep_base_task) {
-                        let profile_conflict = match allow_multiple {
-                            AllowMultiple::True => false,
-                            AllowMultiple::DistinctProfiles => existing_profile == &dep_profile,
-                            AllowMultiple::SingleProfile | AllowMultiple::False => existing_profile != &dep_profile,
-                        };
-                        let params_conflict = matches!(
-                            allow_multiple,
-                            AllowMultiple::False | AllowMultiple::SingleProfile | AllowMultiple::DistinctProfiles
-                        ) && existing_params != &dep_params;
-                        if profile_conflict || params_conflict {
+                        if self.service_variants_conflict(
+                            dep_base_task,
+                            existing_profile,
+                            existing_params,
+                            &dep_effective_profile,
+                            &dep_params,
+                        ) {
                             return Err(format!(
                                 "Task '{}' has conflicting service requirements on '{}'",
                                 self.base_tasks[base_task.idx()].name.as_ref(),
@@ -1322,7 +1314,7 @@ impl WorkspaceState {
                             ));
                         }
                     } else {
-                        service_variants.insert(dep_base_task, (dep_profile, dep_params));
+                        service_variants.insert(dep_base_task, (dep_effective_profile, dep_params));
                     }
                 }
             }
@@ -1390,10 +1382,11 @@ impl WorkspaceState {
         base_task: BaseTaskIndex,
         params: ValueMap,
         profile: &str,
-        blocked_by: JobIndex,
+        blocked_by: Vec<JobIndex>,
         channel: &MioChannel,
         workspace_id: u32,
-    ) -> JobIndex {
+    ) -> Result<JobIndex, String> {
+        self.detect_require_problems(base_task)?;
         let task = {
             let spawner = &self.base_tasks[base_task.idx()];
             let eval_profile =
@@ -1407,10 +1400,61 @@ impl WorkspaceState {
             profile.to_string()
         };
         let params = params.to_owned();
-        let cache_key = task.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
-        let requirements = vec![ScheduleRequirement::Task { job: blocked_by, predicate: JobPredicate::Terminated }];
+        let cache_key = task
+            .config()
+            .cache
+            .as_ref()
+            .map_or(String::new(), |c| self.compute_cache_key_with_require(c.key, &profile, &params));
+        let mut requirements: Vec<ScheduleRequirement> = blocked_by
+            .into_iter()
+            .map(|job| ScheduleRequirement::Task { job, predicate: JobPredicate::Terminated })
+            .collect();
 
-        self.create_job(
+        let mut batch: SpawnBatch<()> = SpawnBatch::new();
+        let mut req_keys = Vec::new();
+
+        for req in task.config().require {
+            match req {
+                crate::config::Requirement::Resource { name, priority } => {
+                    let id = self.resources.intern(name);
+                    requirements.push(ScheduleRequirement::Resource { id, priority: *priority });
+                }
+                crate::config::Requirement::Task(dep_call) => {
+                    let dep_name = &*dep_call.name;
+                    let dep_profile = dep_call.profile.unwrap_or("");
+                    let dep_params = dep_call.vars.clone().to_owned();
+
+                    let Some(dep_base_task) = self.lookup_name(dep_name) else {
+                        kvlog::error!("unknown alias", dep_name);
+                        continue;
+                    };
+                    let dep_config = &self.base_tasks[dep_base_task.idx()].config;
+
+                    let predicate = match dep_config.kind {
+                        TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
+                        TaskKind::Service => JobPredicate::Active,
+                        TaskKind::Test => continue,
+                    };
+
+                    let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
+                    req_keys.push((key, predicate));
+                }
+            }
+        }
+
+        self.resolve_batch_requirements(workspace_id, channel, &mut batch)?;
+
+        for (key, predicate) in &req_keys {
+            match batch.get_resolved(key) {
+                Some(ResolvedRequirement::Cached) => {}
+                Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
+                    requirements.push(ScheduleRequirement::Task { job: *ji, predicate: predicate.clone() });
+                }
+                None => {}
+            }
+        }
+
+        Ok(self.create_job(
             base_task,
             task,
             &profile,
@@ -1420,7 +1464,7 @@ impl WorkspaceState {
             channel,
             workspace_id,
             ScheduleReason::ProfileConflict,
-        )
+        ))
     }
 
     fn create_job(
@@ -1708,6 +1752,32 @@ pub enum Scheduled {
 }
 
 impl WorkspaceState {
+    fn effective_profile_for_task(&self, base_task: BaseTaskIndex, profile: &str) -> String {
+        if profile.is_empty() {
+            self.base_tasks[base_task.idx()].config.profiles.first().copied().unwrap_or("").to_string()
+        } else {
+            profile.to_string()
+        }
+    }
+
+    fn service_variants_conflict(
+        &self,
+        base_task: BaseTaskIndex,
+        existing_profile: &str,
+        existing_params: &ValueMap,
+        requested_profile: &str,
+        requested_params: &ValueMap,
+    ) -> bool {
+        match self.base_tasks[base_task.idx()].config.allow_multiple {
+            AllowMultiple::True => false,
+            AllowMultiple::False => existing_profile != requested_profile || existing_params != requested_params,
+            AllowMultiple::DistinctProfiles => {
+                existing_profile == requested_profile && existing_params != requested_params
+            }
+            AllowMultiple::SingleProfile => existing_profile != requested_profile,
+        }
+    }
+
     /// Update a job's `JobStatus`, maintaining the side-tables that depend on it.
     ///
     /// On `Scheduled → Starting` this acquires every `Resource` requirement in
@@ -2127,6 +2197,7 @@ impl WorkspaceState {
         requested_params: &ValueMap,
     ) -> ServiceCompatibility {
         let spawner = &self.base_tasks[base_task.idx()];
+        let requested_effective_profile = self.effective_profile_for_task(base_task, requested_profile);
 
         for &ji in spawner.jobs.non_terminal() {
             let job = &self.jobs[ji];
@@ -2135,20 +2206,28 @@ impl WorkspaceState {
             }
         }
 
-        if let Some(&ji) = spawner.jobs.non_terminal().iter().next() {
+        let mut blockers = Vec::new();
+        for &ji in spawner.jobs.non_terminal() {
             let job = &self.jobs[ji];
-            match spawner.config.allow_multiple {
-                AllowMultiple::True | AllowMultiple::DistinctProfiles => {
-                    return ServiceCompatibility::Available;
-                }
-                AllowMultiple::False | AllowMultiple::SingleProfile => {
-                    return ServiceCompatibility::Conflict {
-                        running_job: ji,
-                        running_profile: job.spawn_profile().to_string(),
-                        requested_profile: requested_profile.to_string(),
-                    };
-                }
+            let blocks = match spawner.config.allow_multiple {
+                AllowMultiple::True => false,
+                AllowMultiple::False => true,
+                AllowMultiple::DistinctProfiles => job.spawn_profile() == requested_effective_profile,
+                AllowMultiple::SingleProfile => job.spawn_profile() != requested_effective_profile,
+            };
+            if blocks {
+                blockers.push(ji);
             }
+        }
+
+        if !blockers.is_empty() {
+            let running_profiles =
+                blockers.iter().map(|ji| self.jobs[*ji].spawn_profile().to_string()).collect::<Vec<_>>();
+            return ServiceCompatibility::Conflict {
+                running_jobs: blockers,
+                running_profiles,
+                requested_profile: requested_effective_profile.to_string(),
+            };
         }
 
         ServiceCompatibility::Available
@@ -2234,21 +2313,21 @@ impl WorkspaceState {
                                 batch.mark_resolved(key, ResolvedRequirement::Pending(ji));
                                 continue;
                             }
-                            ServiceCompatibility::Conflict { running_job, running_profile, requested_profile } => {
+                            ServiceCompatibility::Conflict { running_jobs, running_profiles, requested_profile } => {
                                 kvlog::warn!(
                                     "Service profile conflict, queuing",
                                     ?base_task,
-                                    running_profile,
+                                    running_profiles = ?running_profiles,
                                     requested_profile,
                                 );
                                 let queued_job = self.schedule_queued_service(
                                     base_task,
                                     params,
                                     &profile,
-                                    running_job,
+                                    running_jobs,
                                     channel,
                                     workspace_id,
-                                );
+                                )?;
                                 batch.mark_resolved(key, ResolvedRequirement::Pending(queued_job));
                                 continue;
                             }
@@ -2299,8 +2378,9 @@ impl WorkspaceState {
             let task_config = &matched.task_config;
             let mut requirements = Vec::new();
 
-            let mut service_profiles: hashbrown::HashMap<BaseTaskIndex, String> = hashbrown::HashMap::new();
-            let mut services_to_check: Vec<(String, String)> = task_config
+            let mut service_variants: hashbrown::HashMap<BaseTaskIndex, Vec<(String, ValueMap<'static>)>> =
+                hashbrown::HashMap::new();
+            let mut services_to_check: Vec<(String, String, ValueMap<'static>)> = task_config
                 .config()
                 .require
                 .iter()
@@ -2310,38 +2390,52 @@ impl WorkspaceState {
                     let dep_base_task = self.lookup_name(dep_name)?;
                     let dep_config = &self.base_tasks[dep_base_task.idx()].config;
                     if dep_config.kind == TaskKind::Service {
-                        Some((dep_name.to_string(), tc.profile.unwrap_or("").to_string()))
+                        Some((dep_name.to_string(), tc.profile.unwrap_or("").to_string(), tc.vars.clone().to_owned()))
                     } else {
                         None
                     }
                 })
                 .collect();
-            let mut visited_services: hashbrown::HashSet<BaseTaskIndex> = hashbrown::HashSet::new();
+            let mut visited_services: hashbrown::HashSet<RequirementKey> = hashbrown::HashSet::new();
 
-            while let Some((dep_name, dep_profile)) = services_to_check.pop() {
+            while let Some((dep_name, dep_profile, dep_params)) = services_to_check.pop() {
                 let Some(dep_base_task) = self.lookup_name(&dep_name) else {
                     continue;
                 };
                 let dep_config = &self.base_tasks[dep_base_task.idx()].config;
+                let dep_effective_profile = self.effective_profile_for_task(dep_base_task, &dep_profile);
 
-                if let Some(existing_profile) = service_profiles.get(&dep_base_task) {
-                    if *existing_profile != dep_profile {
+                if let Some(existing_variants) = service_variants.get(&dep_base_task) {
+                    if existing_variants.iter().any(|(existing_profile, existing_params)| {
+                        self.service_variants_conflict(
+                            dep_base_task,
+                            existing_profile,
+                            existing_params,
+                            &dep_effective_profile,
+                            &dep_params,
+                        )
+                    }) {
                         let test_name = self.base_tasks[matched.base_task_idx.idx()].name.as_ref();
                         let service_name = self.base_tasks[dep_base_task.idx()].name.as_ref();
                         return Err(format!(
-                            "Test '{}' has conflicting service requirements: '{}:{}' and '{}:{}'",
-                            test_name, service_name, existing_profile, service_name, dep_profile
+                            "Test '{}' has conflicting service requirements on '{}'",
+                            test_name, service_name
                         ));
                     }
+                }
+                let variants = service_variants.entry(dep_base_task).or_default();
+                if !variants.iter().any(|(profile, params)| profile == &dep_effective_profile && params == &dep_params)
+                {
+                    variants.push((dep_effective_profile.clone(), dep_params.clone()));
+                }
+
+                let visit_key = RequirementKey::new(dep_base_task, &dep_effective_profile, &dep_params);
+                if !visited_services.insert(visit_key) {
                     continue;
                 }
-                service_profiles.insert(dep_base_task, dep_profile.clone());
 
-                if !visited_services.insert(dep_base_task) {
-                    continue;
-                }
-
-                let env = Environment { profile: &dep_profile, param: ValueMap::new(), vars: dep_config.vars };
+                let env =
+                    Environment { profile: &dep_effective_profile, param: dep_params.clone(), vars: dep_config.vars };
                 if let Ok(srv_config) = dep_config.eval(&env) {
                     for req in srv_config.config().require.iter() {
                         let crate::config::Requirement::Task(tc) = req else { continue };
@@ -2351,7 +2445,11 @@ impl WorkspaceState {
                         };
                         let req_config = &self.base_tasks[req_base_task.idx()].config;
                         if req_config.kind == TaskKind::Service {
-                            services_to_check.push((req_name.to_string(), tc.profile.unwrap_or("").to_string()));
+                            services_to_check.push((
+                                req_name.to_string(),
+                                tc.profile.unwrap_or("").to_string(),
+                                tc.vars.clone().to_owned(),
+                            ));
                         }
                     }
                 }
@@ -3391,14 +3489,49 @@ mod scheduling_tests {
 
     mod service_compatibility_tests {
         use super::*;
+        use jsony_value::ValueMap;
+
+        fn manifest_path(relative: &str) -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+        }
+
+        fn params(json: &str) -> ValueMap<'static> {
+            jsony::from_json::<ValueMap>(json).expect("valid params").to_owned()
+        }
+
+        fn insert_running_service(
+            state: &mut WorkspaceState,
+            base_task: BaseTaskIndex,
+            profile: &str,
+            params: ValueMap<'static>,
+        ) -> JobIndex {
+            let config = state.base_tasks[base_task.idx()].config.clone();
+            let task =
+                config.eval(&Environment { profile, param: params.clone(), vars: config.vars }).expect("eval service");
+            let spec = state.cache_spawn_spec(base_task, profile, params, task);
+            let pc = state.base_tasks[base_task.idx()].spawn_counter as usize;
+            state.base_tasks[base_task.idx()].spawn_counter =
+                state.base_tasks[base_task.idx()].spawn_counter.wrapping_add(1);
+            let ji = state.jobs.insert(Job {
+                process_status: JobStatus::Running { process_index: pc, ready_state: None },
+                log_group: LogGroup::new(base_task, pc),
+                started_at: crate::clock::now(),
+                cache_key: String::new(),
+                spawn: spec,
+                held_resources: SmallVec::new(),
+            });
+            state.base_tasks[base_task.idx()].jobs.push_active(ji);
+            state.service_jobs.push_active(ji);
+            ji
+        }
 
         #[test]
         fn service_compatibility_enum_variants() {
             let compatible = ServiceCompatibility::Compatible(JobIndex::from_usize(0));
             let available = ServiceCompatibility::Available;
             let conflict = ServiceCompatibility::Conflict {
-                running_job: JobIndex::from_usize(1),
-                running_profile: "prod".to_string(),
+                running_jobs: vec![JobIndex::from_usize(1)],
+                running_profiles: vec!["prod".to_string()],
                 requested_profile: "test".to_string(),
             };
 
@@ -3413,12 +3546,38 @@ mod scheduling_tests {
             }
 
             match conflict {
-                ServiceCompatibility::Conflict { running_job, running_profile, requested_profile } => {
-                    assert_eq!(running_job.idx(), 1);
-                    assert_eq!(running_profile, "prod");
+                ServiceCompatibility::Conflict { running_jobs, running_profiles, requested_profile } => {
+                    assert_eq!(running_jobs, vec![JobIndex::from_usize(1)]);
+                    assert_eq!(running_profiles, vec!["prod".to_string()]);
                     assert_eq!(requested_profile, "test");
                 }
                 _ => panic!("Expected Conflict"),
+            }
+        }
+
+        #[test]
+        fn distinct_profiles_conflicts_with_same_profile_different_params() {
+            let mut state = WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).unwrap();
+            let base_task = state.lookup_name("multi_profile_service").unwrap();
+            let running = insert_running_service(&mut state, base_task, "dev", params(r#"{"id":"one"}"#));
+
+            match state.check_service_compatibility(base_task, "dev", &params(r#"{"id":"two"}"#)) {
+                ServiceCompatibility::Conflict { running_jobs, .. } => assert_eq!(running_jobs, vec![running]),
+                ServiceCompatibility::Available => panic!("same-profile distinct_profiles request must conflict"),
+                ServiceCompatibility::Compatible(_) => panic!("different params must not reuse the running service"),
+            }
+        }
+
+        #[test]
+        fn empty_profile_request_uses_default_profile_for_conflicts() {
+            let mut state = WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).unwrap();
+            let base_task = state.lookup_name("multi_profile_service").unwrap();
+            let running = insert_running_service(&mut state, base_task, "dev", params(r#"{"id":"one"}"#));
+
+            match state.check_service_compatibility(base_task, "", &params(r#"{"id":"two"}"#)) {
+                ServiceCompatibility::Conflict { running_jobs, .. } => assert_eq!(running_jobs, vec![running]),
+                ServiceCompatibility::Available => panic!("default-profile request must conflict with same profile"),
+                ServiceCompatibility::Compatible(_) => panic!("different params must not reuse the running service"),
             }
         }
     }

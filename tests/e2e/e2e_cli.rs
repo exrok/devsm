@@ -3043,7 +3043,11 @@ fn1 = { restart = "target" }
     std::thread::sleep(Duration::from_millis(200));
     let combined = format!("{}{}", result.stdout, result.stderr);
 
-    assert!(!marker.exists(), "stale target config must not run after reload removes it (combined output: {})", combined);
+    assert!(
+        !marker.exists(),
+        "stale target config must not run after reload removes it (combined output: {})",
+        combined
+    );
     assert!(
         combined.contains("not found"),
         "daemon should reject the removed task, got stdout: {}\nstderr: {}",
@@ -3051,4 +3055,3 @@ fn1 = { restart = "target" }
         result.stderr
     );
 }
-

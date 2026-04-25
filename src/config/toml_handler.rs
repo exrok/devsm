@@ -792,16 +792,10 @@ pub fn parse_workspace<'a>(
 
 fn validate_task_sub_name<'a>(name: &str, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<(), Failed> {
     if name.starts_with('~') {
-        return Err(ctx.report_custom_error(
-            &format!("task name `{}` is reserved (leading `~`)", name),
-            value,
-        ));
+        return Err(ctx.report_custom_error(&format!("task name `{}` is reserved (leading `~`)", name), value));
     }
     if let Some(bad) = name.chars().find(|c| *c == '.' || *c == ':') {
-        return Err(ctx.report_custom_error(
-            &format!("task name `{}` cannot contain `{}`", name, bad),
-            value,
-        ));
+        return Err(ctx.report_custom_error(&format!("task name `{}` cannot contain `{}`", name, bad), value));
     }
     Ok(())
 }
@@ -828,11 +822,7 @@ fn parse_root<'a>(
                         && prior != TaskKind::Action
                     {
                         return Err(ctx.report_custom_error(
-                            &format!(
-                                "task `{}` is declared as both `{}` and `action`",
-                                name.name,
-                                prior.as_str()
-                            ),
+                            &format!("task `{}` is declared as both `{}` and `action`", name.name, prior.as_str()),
                             task_value,
                         ));
                     }
@@ -849,11 +839,7 @@ fn parse_root<'a>(
                         && prior != TaskKind::Service
                     {
                         return Err(ctx.report_custom_error(
-                            &format!(
-                                "task `{}` is declared as both `{}` and `service`",
-                                name.name,
-                                prior.as_str()
-                            ),
+                            &format!("task `{}` is declared as both `{}` and `service`", name.name, prior.as_str()),
                             task_value,
                         ));
                     }

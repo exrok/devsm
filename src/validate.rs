@@ -195,13 +195,25 @@ fn resolve_qualified_reference<'a>(
     };
     match kind_filter {
         Some(TaskKind::Service) | Some(TaskKind::Action) => {
-            if name_kinds.get(short) == Some(&kind_filter.unwrap()) { Some(short) } else { None }
+            if name_kinds.get(short) == Some(&kind_filter.unwrap()) {
+                Some(short)
+            } else {
+                None
+            }
         }
         Some(TaskKind::Test) => {
-            if test_names.contains(short) { Some(short) } else { None }
+            if test_names.contains(short) {
+                Some(short)
+            } else {
+                None
+            }
         }
         None => {
-            if name_kinds.contains_key(name) || test_names.contains(name) { Some(name) } else { None }
+            if name_kinds.contains_key(name) || test_names.contains(name) {
+                Some(name)
+            } else {
+                None
+            }
         }
     }
 }
@@ -328,10 +340,7 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                 let available: Vec<_> = task_profiles.iter().filter(|(n, _)| *n == short).map(|(_, p)| *p).collect();
                 emit(
                     Diagnostic::error()
-                        .with_message(format!(
-                            "required task '{}' does not have profile '{}'",
-                            required_name, profile
-                        ))
+                        .with_message(format!("required task '{}' does not have profile '{}'", required_name, profile))
                         .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
                         .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
                 );
