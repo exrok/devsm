@@ -4,7 +4,7 @@ use crate::{
     config::{Command, ServiceHidden, TaskKind},
     function::FunctionAction,
     tui::constrain_scroll_offset,
-    workspace::{BaseTask, BaseTaskIndex, JobIndex, JobStatus, WorkspaceState},
+    workspace::{BaseTask, BaseTaskIndex, ExitCause, JobIndex, JobStatus, WorkspaceState},
 };
 
 fn task_is_visible(bt: &BaseTask) -> bool {
@@ -92,6 +92,8 @@ enum StatusKind {
     Skip,
     Done,
     Dead,
+    Quit,
+    Past,
     Fail,
     Pass,
 }
@@ -103,17 +105,22 @@ impl StatusKind {
             Starting => StatusKind::Wait,
             Scheduled { .. } => StatusKind::Wait,
             Running { .. } => StatusKind::Live,
-            Exited { status, .. } => {
-                if *status == 0 {
-                    match kind {
-                        TaskKind::Service => StatusKind::Dead,
-                        TaskKind::Action => StatusKind::Done,
-                        TaskKind::Test => StatusKind::Pass,
+            Exited { status, cause, .. } => match cause {
+                ExitCause::Restarted => StatusKind::Past,
+                ExitCause::Killed | ExitCause::ProfileConflict | ExitCause::Timeout => StatusKind::Quit,
+                ExitCause::SpawnFailed => StatusKind::Fail,
+                ExitCause::Unknown => {
+                    if *status == 0 {
+                        match kind {
+                            TaskKind::Service => StatusKind::Dead,
+                            TaskKind::Action => StatusKind::Done,
+                            TaskKind::Test => StatusKind::Pass,
+                        }
+                    } else {
+                        StatusKind::Fail
                     }
-                } else {
-                    StatusKind::Fail
                 }
-            }
+            },
             Cancelled => StatusKind::Skip,
         }
     }
@@ -127,6 +134,8 @@ impl StatusKind {
             Skip => AnsiColor::LightGoldenrod2,
             Done => AnsiColor(110),
             Dead => AnsiColor(215),
+            Quit => AnsiColor(215),
+            Past => AnsiColor(215),
             Fail => AnsiColor::NeonRed,
             Pass => AnsiColor::SpringGreen,
         }
@@ -140,6 +149,8 @@ impl StatusKind {
             Skip => AnsiColor::Wheat1,
             Done => AnsiColor(153),
             Dead => AnsiColor(223),
+            Quit => AnsiColor(223),
+            Past => AnsiColor(223),
             Fail => AnsiColor::MistyRose,
             Pass => AnsiColor(157),
         }
@@ -154,6 +165,8 @@ impl StatusKind {
             Done => " Done ",
             Fail => " Fail ",
             Dead => " Dead ",
+            Quit => " Quit ",
+            Past => " Past ",
             Pass => " Pass ",
         }
     }
