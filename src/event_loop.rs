@@ -444,6 +444,23 @@ impl EventLoop {
                     break;
                 }
 
+                if let Some((service_to_kill, exit_cause)) = state.service_to_terminate_for_resource() {
+                    let job = &state.jobs[service_to_kill];
+                    let job_id = job.log_group;
+                    let JobStatus::Running { process_index, .. } = job.process_status else {
+                        drop(state);
+                        continue;
+                    };
+                    drop(state);
+
+                    if let Some(process) = self.state.processes.get_mut(process_index)
+                        && process.log_group == job_id
+                    {
+                        process.request_termination(exit_cause);
+                    }
+                    break;
+                }
+
                 match state.next_scheduled() {
                     workspace::Scheduled::Ready(job_index) => {
                         let job = &state.jobs[job_index];

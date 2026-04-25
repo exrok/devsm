@@ -2629,6 +2629,214 @@ require = [{{ resource = "R", priority = 0 }}]
     );
 }
 
+/// A service holding a resource is evicted when another task requires the resource.
+/// Mirrors the eviction behaviour for `require` on a service with no active dependents.
+#[test]
+fn resource_evicts_service_holder() {
+    let mut harness = TestHarness::new("resource_evict_service");
+    let service_started = harness.temp_dir.join("service.started");
+    let action_done = harness.temp_dir.join("action.done");
+
+    harness.write_config(&format!(
+        r#"
+[service.holder]
+sh = """
+echo running > {service_started}
+while true; do sleep 1; done
+"""
+require = [{{ resource = "R" }}]
+
+[action.contender]
+sh = "echo done > {action_done}"
+require = [{{ resource = "R" }}]
+"#,
+        service_started = service_started.display(),
+        action_done = action_done.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "holder",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "holder spawn rejected: {:?}", resp.body);
+    assert!(harness.wait_for_file(&service_started, Duration::from_secs(3)), "service holder must start");
+
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "contender",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "contender spawn rejected: {:?}", resp.body);
+
+    assert!(
+        harness.wait_for_file(&action_done, Duration::from_secs(5)),
+        "contender must run after service is evicted; server log:\n{}",
+        harness.server_log(),
+    );
+}
+
+/// A service holding a resource is NOT evicted while it has active dependents.
+/// Once the dependent action finishes, the service can then be evicted for the
+/// queued resource contender.
+#[test]
+fn resource_waits_for_holder_dependents() {
+    let mut harness = TestHarness::new("resource_wait_deps");
+    let sequence = harness.temp_dir.join("seq.log");
+    let dep_started = harness.temp_dir.join("dep.started");
+
+    harness.write_config(&format!(
+        r#"
+[service.holder]
+sh = """
+echo holder_start >> {seq}
+while true; do sleep 1; done
+"""
+require = [{{ resource = "R" }}]
+
+[action.dependent]
+sh = "echo dep_started > {dep_started}; sleep 0.6; echo dep_end >> {seq}"
+require = ["holder"]
+
+[action.contender]
+sh = "echo contender >> {seq}"
+require = [{{ resource = "R" }}]
+"#,
+        seq = sequence.display(),
+        dep_started = dep_started.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "dependent",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "dependent spawn rejected: {:?}", resp.body);
+    assert!(harness.wait_for_file(&dep_started, Duration::from_secs(3)), "dependent must start");
+
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "contender",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "contender spawn rejected: {:?}", resp.body);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let log = fs::read_to_string(&sequence).unwrap_or_default();
+        if log.contains("contender") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let log = fs::read_to_string(&sequence).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    let pos_dep_end = lines.iter().position(|l| l.contains("dep_end"));
+    let pos_contender = lines.iter().position(|l| l.contains("contender"));
+    assert!(
+        pos_dep_end.is_some() && pos_contender.is_some(),
+        "expected both dep_end and contender in log; got: {:?}\nserver log:\n{}",
+        lines,
+        harness.server_log(),
+    );
+    assert!(
+        pos_dep_end.unwrap() < pos_contender.unwrap(),
+        "contender must run AFTER dependent finishes (so service was kept alive while dependent was active); got: {:?}",
+        lines,
+    );
+}
+
+/// An action holding a resource is NEVER evicted: the contender waits for the
+/// action to terminate naturally.
+#[test]
+fn resource_does_not_evict_action_holder() {
+    let mut harness = TestHarness::new("resource_no_evict_action");
+    let sequence = harness.temp_dir.join("seq.log");
+    let holder_started = harness.temp_dir.join("holder.started");
+
+    harness.write_config(&format!(
+        r#"
+[action.holder]
+sh = "echo holder_start > {holder_started}; sleep 0.6; echo holder_end >> {seq}"
+require = [{{ resource = "R" }}]
+
+[action.contender]
+sh = "echo contender >> {seq}"
+require = [{{ resource = "R" }}]
+"#,
+        seq = sequence.display(),
+        holder_started = holder_started.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "holder",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "holder spawn rejected: {:?}", resp.body);
+    assert!(harness.wait_for_file(&holder_started, Duration::from_secs(3)), "holder must start");
+
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "contender",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "contender spawn rejected: {:?}", resp.body);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let log = fs::read_to_string(&sequence).unwrap_or_default();
+        if log.contains("contender") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let log = fs::read_to_string(&sequence).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    let pos_holder_end = lines.iter().position(|l| l.contains("holder_end"));
+    let pos_contender = lines.iter().position(|l| l.contains("contender"));
+    assert!(
+        pos_holder_end.is_some() && pos_contender.is_some(),
+        "expected both holder_end and contender in log (holder must finish naturally, not be killed); got: {:?}\nserver log:\n{}",
+        lines,
+        harness.server_log(),
+    );
+    assert!(
+        pos_holder_end.unwrap() < pos_contender.unwrap(),
+        "contender must run AFTER holder action terminates naturally; got: {:?}",
+        lines,
+    );
+}
+
 /// A plain require cycle (A → B → A) errors at spawn time with the cycle path.
 #[test]
 fn plain_require_cycle_error() {

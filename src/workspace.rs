@@ -1918,6 +1918,44 @@ impl WorkspaceState {
         None
     }
 
+    /// Find a service that should be terminated to free a resource a scheduled
+    /// task is waiting on.
+    ///
+    /// Mirrors [`Self::service_to_terminate_for_queue`] but for
+    /// [`ScheduleRequirement::Resource`]: a scheduled task (any kind) is
+    /// blocked on a resource currently held by a running service that has no
+    /// active dependents. Actions and tests holding resources are never
+    /// evicted — they are expected to terminate on their own.
+    pub fn service_to_terminate_for_resource(&self) -> Option<(JobIndex, ExitCause)> {
+        for job_set in [&self.action_jobs, &self.service_jobs, &self.test_jobs] {
+            for &scheduled_ji in job_set.scheduled() {
+                let JobStatus::Scheduled { after } = &self[scheduled_ji].process_status else {
+                    continue;
+                };
+                for req in after {
+                    let ScheduleRequirement::Resource { id, .. } = req else { continue };
+                    if self.resources.is_free(*id) {
+                        continue;
+                    }
+                    let Some(holder_ji) = self.resources.holder(*id) else { continue };
+                    let holder = &self.jobs[holder_ji];
+                    if !holder.process_status.is_running() {
+                        continue;
+                    }
+                    let bti = holder.log_group.base_task_index();
+                    if self.base_tasks[bti.idx()].config.kind != TaskKind::Service {
+                        continue;
+                    }
+                    if !self.service_dependents.can_stop(holder_ji) {
+                        continue;
+                    }
+                    return Some((holder_ji, ExitCause::Killed));
+                }
+            }
+        }
+        None
+    }
+
     /// Check compatibility of a service request with running instances.
     ///
     /// Returns:

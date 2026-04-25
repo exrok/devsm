@@ -39,6 +39,10 @@ impl ResourceSlab {
         self.held_by[id.idx()].is_none()
     }
 
+    pub fn holder(&self, id: ResourceIndex) -> Option<JobIndex> {
+        self.held_by[id.idx()]
+    }
+
     pub fn acquire(&mut self, id: ResourceIndex, ji: JobIndex) {
         let slot = &mut self.held_by[id.idx()];
         debug_assert!(slot.is_none(), "resource '{}' already held", &self.names[id.idx()]);
