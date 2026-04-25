@@ -30,7 +30,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
     let root = match toml_spanner::parse(content, &arena) {
         Ok(value) => value,
         Err(err) => {
-            let diagnostic = toml_error_to_diagnostic(&err);
+            let diagnostic = toml_error_to_diagnostic(&err, content);
             emit_diagnostic(&file_name, content, &diagnostic);
             return Ok(false);
         }
@@ -136,19 +136,21 @@ fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptio
     };
 
     let arena = toml_spanner::Arena::new();
-    let workspace_config = match toml_handler::parse_with_arena(base_path, &bump, content, &arena, &mut emit) {
-        Ok(config) => config,
-        Err(_) => return Ok(false),
-    };
-    let root = match toml_spanner::parse(content, &arena) {
-        Ok(value) => value,
-        Err(_) => return Ok(false),
+    let mut doc = toml_spanner::parse_recoverable(content, &arena);
+    let workspace_config = toml_handler::parse_workspace(base_path, &bump, &mut doc).ok();
+    doc.compute_error_paths();
+    for err in doc.errors() {
+        emit(toml_error_to_diagnostic(err, content));
+    }
+
+    let Some(workspace_config) = workspace_config else {
+        return Ok(false);
     };
 
-    validate_cross_references(&workspace_config, root.table(), &mut emit);
+    validate_cross_references(&workspace_config, doc.table(), &mut emit);
 
     if !options.skip_path_checks {
-        validate_pwd_paths(&workspace_config, base_path, root.table(), &mut emit);
+        validate_pwd_paths(&workspace_config, base_path, doc.table(), &mut emit);
     }
 
     if has_errors {

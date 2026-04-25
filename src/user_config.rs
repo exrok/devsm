@@ -304,7 +304,7 @@ fn set_chain_label(keybinds: &mut Keybinds, mode: Mode, keys: &[InputEvent], lab
 fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserConfig, String> {
     let arena = toml_spanner::Arena::new();
     let toml = toml_spanner::parse(content, &arena).map_err(|e| {
-        let diagnostic = toml_error_to_diagnostic(&e);
+        let diagnostic = toml_error_to_diagnostic(&e, content);
         render_diagnostic(file_name, content, &diagnostic)
     })?;
 

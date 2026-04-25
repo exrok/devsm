@@ -13,7 +13,7 @@ use bumpalo::Bump;
 use jsony::Jsony;
 use jsony_value::{Value, ValueMap, ValueRef};
 
-use crate::diagnostic::{Diagnostic, emit_diagnostic, render_diagnostic};
+use crate::diagnostic::{Diagnostic, emit_diagnostic, render_diagnostic, toml_error_to_diagnostic};
 
 pub mod toml_handler;
 
@@ -280,12 +280,18 @@ pub fn load_workspace_config_from_path(
     let elapsed = kvlog::Timer::start();
     let bump = Box::leak(Box::new(Bump::new()));
     let base_path = Box::leak(Box::new(base_path.to_path_buf()));
+    let arena = Box::leak(Box::new(toml_spanner::Arena::new()));
     let file_name = config_path.display().to_string();
-    let mut had_error = false;
-    match toml_handler::parse(base_path, bump, content, &mut |diagnostic| {
-        emit_config_error(&file_name, content, &diagnostic);
-        had_error = true;
-    }) {
+
+    let mut doc = toml_spanner::parse_recoverable(content, arena);
+    let result = toml_handler::parse_workspace(base_path, bump, &mut doc);
+    doc.compute_error_paths();
+    let had_error = doc.has_errors();
+    for err in doc.errors() {
+        emit_config_error(&file_name, content, &toml_error_to_diagnostic(err, content));
+    }
+
+    match result {
         Ok(value) => {
             kvlog::info!("Workspace config loaded", path = config_path.as_os_str().as_bytes(), elapsed);
             Ok(value)
@@ -321,11 +327,18 @@ pub fn load_workspace_config_capturing(
     let bump = Box::leak(Box::new(Bump::new()));
     let base_path = config_path.parent().unwrap_or(Path::new("."));
     let base_path = Box::leak(Box::new(base_path.to_path_buf()));
+    let arena = Box::leak(Box::new(toml_spanner::Arena::new()));
     let file_name = config_path.display().to_string();
+
+    let mut doc = toml_spanner::parse_recoverable(content, arena);
+    let result = toml_handler::parse_workspace(base_path, bump, &mut doc);
+    doc.compute_error_paths();
     let mut errors = String::new();
-    match toml_handler::parse(base_path, bump, content, &mut |diagnostic| {
-        errors.push_str(&format_config_error(&file_name, content, &diagnostic));
-    }) {
+    for err in doc.errors() {
+        errors.push_str(&format_config_error(&file_name, content, &toml_error_to_diagnostic(err, content)));
+    }
+
+    match result {
         Ok(value) => {
             kvlog::info!("Workspace config loaded", path = config_path.as_os_str().as_bytes(), elapsed);
             Ok(value)
@@ -611,10 +624,17 @@ pub fn load_workspace_generation_capturing(
     let parse_bump = Bump::new();
     let base_path = config_path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let file_name = config_path.display().to_string();
+
+    let mut doc = toml_spanner::parse_recoverable(&content, &toml_arena);
+    let result = toml_handler::parse_workspace(&base_path, &parse_bump, &mut doc);
+    doc.compute_error_paths();
     let mut errors = String::new();
-    match toml_handler::parse_with_arena(&base_path, &parse_bump, &content, &toml_arena, &mut |diagnostic| {
-        errors.push_str(&format_config_error(&file_name, &content, &diagnostic));
-    }) {
+    for err in doc.errors() {
+        errors.push_str(&format_config_error(&file_name, &content, &toml_error_to_diagnostic(err, &content)));
+    }
+    drop(doc);
+
+    match result {
         Ok(value) => {
             let workspace = unsafe { std::mem::transmute::<WorkspaceConfig<'_>, WorkspaceConfig<'static>>(value) };
             kvlog::info!("Workspace config loaded", path = config_path.as_os_str().as_bytes(), elapsed);

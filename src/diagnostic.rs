@@ -116,21 +116,25 @@ pub fn emit_diagnostic(file_name: &str, content: &str, diagnostic: &Diagnostic) 
     eprint!("{}", render_diagnostic(file_name, content, diagnostic));
 }
 
-pub fn toml_error_to_diagnostic(err: &toml_spanner::Error) -> Diagnostic {
+pub fn toml_error_to_diagnostic(err: &toml_spanner::Error, source: &str) -> Diagnostic {
     let mut labels = Vec::new();
-    if let Some((span, name)) = err.primary_label() {
+    if let Some((span, text)) = err.primary_label() {
         let mut label = DiagnosticLabel::primary(span.range());
-        if name.is_empty() {
-            label = label.with_message(name);
+        if !text.is_empty() {
+            label = label.with_message(text);
         }
         labels.push(label);
     }
-    if let Some((span, name)) = err.secondary_label() {
+    if let Some((span, text)) = err.secondary_label() {
         let mut label = DiagnosticLabel::secondary(span.range());
-        if name.is_empty() {
-            label = label.with_message(name);
+        if !text.is_empty() {
+            label = label.with_message(text);
         }
         labels.push(label);
     }
-    Diagnostic { level: DiagnosticLevel::Error, message: err.message(""), labels, notes: Vec::new() }
+    let mut notes = Vec::new();
+    if let Some(path) = err.path() {
+        notes.push(format!("at `{}`", path));
+    }
+    Diagnostic { level: DiagnosticLevel::Error, message: err.message(source), labels, notes }
 }
