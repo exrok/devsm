@@ -4,6 +4,7 @@ use crate::rpc::{
     ONE_SHOT_FLAG, ResizeNotification, RpcMessageKind, WorkspaceRef,
 };
 use anyhow::bail;
+use kvlog::collector::UninitializedLogPolicy;
 use sendfd::SendWithFd;
 use std::{
     io::{ErrorKind, Read, Write},
@@ -47,6 +48,9 @@ mod welcome_message;
 mod workspace;
 
 fn main() {
+    // Don't emit logs until decide where we are going to send them.
+    kvlog::collector::set_uninitialized_log_policy(UninitializedLogPolicy::Buffer { max_bytes: 1024 * 1024 });
+
     let mut args = std::env::args();
     args.next();
     let args = args.collect::<Vec<_>>();
@@ -986,6 +990,56 @@ fn get_self_logs(follow: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_completion(candidate: &str, description: Option<&str>) {
+    if let Some(description) = description {
+        let description = completion_description(description);
+        if !description.is_empty() {
+            println!("{candidate}\t{description}");
+            return;
+        }
+    }
+    println!("{candidate}");
+}
+
+fn completion_description(description: &str) -> String {
+    let mut out = String::with_capacity(description.len());
+    let mut pending_space = false;
+
+    for ch in description.trim().chars() {
+        if ch.is_whitespace() || ch.is_control() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn completion_description_collapses_multiline_text() {
+        assert_eq!(
+            completion_description("  COMMAND=\"cargo run\"\nif true; then\n\tcargo test  "),
+            "COMMAND=\"cargo run\" if true; then cargo test"
+        );
+    }
+
+    #[test]
+    fn completion_description_removes_empty_whitespace() {
+        assert_eq!(completion_description("\n\t  \r\n"), "");
+    }
+}
+
 fn print_completions(context: cli::CompleteContext) -> bool {
     match context {
         cli::CompleteContext::Commands => {
@@ -1010,18 +1064,10 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             };
             for (name, expr) in workspace.tasks {
                 let preview = expr.command_preview();
-                if preview.is_empty() {
-                    println!("{name}");
-                } else {
-                    println!("{name}\t{preview}");
-                }
+                print_completion(name, Some(preview));
                 if expr.profiles.len() > 1 {
                     for profile in expr.profiles {
-                        if preview.is_empty() {
-                            println!("{name}:{profile}");
-                        } else {
-                            println!("{name}:{profile}\t{preview}");
-                        }
+                        print_completion(&format!("{name}:{profile}"), Some(preview));
                     }
                 }
             }
@@ -1033,11 +1079,7 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             };
             for (name, test) in workspace.tests {
                 let info = test.info;
-                if info.is_empty() {
-                    println!("{name}");
-                } else {
-                    println!("{name}\t{info}");
-                }
+                print_completion(name, Some(info));
             }
             true
         }
@@ -1064,11 +1106,7 @@ fn print_completions(context: cli::CompleteContext) -> bool {
                 if exclude.contains(name) {
                     continue;
                 }
-                if let Some(desc) = meta.description {
-                    println!("{name}\t{desc}");
-                } else {
-                    println!("{name}");
-                }
+                print_completion(name, meta.description);
             }
             for var in expr.collect_variables() {
                 if exclude.contains(&var) {

@@ -8,7 +8,7 @@ members = ["test-app"]
 
 [dependencies]
 anyhow = "1.0.100"
-kvlog = { version = "0.1.5", default-features = false }
+kvlog = { path = "/home/user/Projects/git/kvlog/kvlog", default-features = false }
 libc = "0.2.177"
 mio = { version = "1.0.4", features = [
     "os-poll",

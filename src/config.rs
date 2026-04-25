@@ -969,7 +969,7 @@ impl TaskConfigExpr<'static> {
     /// Returns a short preview of the command for display purposes.
     ///
     /// For `cmd` style commands, returns the first literal argument (usually the binary name).
-    /// For `sh` style commands, returns a truncated prefix of the shell script.
+    /// For `sh` style commands, returns the first non-comment line of the shell script.
     pub fn command_preview(&self) -> &'static str {
         match &self.command {
             CommandExpr::Cmd(list_expr) => first_literal_from_list(list_expr).unwrap_or(""),
@@ -997,14 +997,15 @@ fn first_literal_from_list(expr: &StringListExpr<'static>) -> Option<&'static st
 
 fn first_literal_from_string(expr: &StringExpr<'static>) -> Option<&'static str> {
     match expr {
-        StringExpr::Literal(s) => {
-            let s = s.trim();
-            if s.is_empty() { None } else { Some(s) }
-        }
+        StringExpr::Literal(s) => shell_preview_line(s),
         StringExpr::Var(_) => None,
         StringExpr::If(if_expr) => first_literal_from_string(&if_expr.then)
             .or_else(|| if_expr.or_else.as_ref().and_then(first_literal_from_string)),
     }
+}
+
+fn shell_preview_line(script: &'static str) -> Option<&'static str> {
+    script.lines().map(str::trim).find(|line| !line.is_empty() && !line.starts_with('#'))
 }
 
 #[cfg(test)]
@@ -1121,6 +1122,63 @@ mod tests {
         assert!(!vars.contains(&"$profile"), "should exclude $profile: {:?}", vars);
         assert!(vars.contains(&"user_var"), "should include user_var: {:?}", vars);
         assert_eq!(vars.len(), 1);
+    }
+
+    #[test]
+    fn shell_command_preview_uses_first_non_comment_line() {
+        static TEST_EXPR: TaskConfigExpr<'static> = TaskConfigExpr {
+            kind: TaskKind::Action,
+            info: "",
+            pwd: StringExpr::Literal("./"),
+            command: CommandExpr::Sh(StringExpr::Literal(
+                r#"
+                    # Setup
+                    COMMAND="cargo run"
+                    cargo test
+                "#,
+            )),
+            profiles: &[],
+            envvar: &[],
+            require: EMPTY_REQUIREMENTS,
+            cache: None,
+            ready: None,
+            timeout: None,
+            tags: &[],
+            managed: None,
+            hidden: ServiceHidden::Never,
+            allow_multiple: AllowMultiple::False,
+            vars: &[],
+        };
+
+        assert_eq!(TEST_EXPR.command_preview(), r#"COMMAND="cargo run""#);
+    }
+
+    #[test]
+    fn shell_command_preview_is_empty_for_empty_or_comment_only_script() {
+        static TEST_EXPR: TaskConfigExpr<'static> = TaskConfigExpr {
+            kind: TaskKind::Action,
+            info: "",
+            pwd: StringExpr::Literal("./"),
+            command: CommandExpr::Sh(StringExpr::Literal(
+                r#"
+                    # Setup
+                    # More setup
+                "#,
+            )),
+            profiles: &[],
+            envvar: &[],
+            require: EMPTY_REQUIREMENTS,
+            cache: None,
+            ready: None,
+            timeout: None,
+            tags: &[],
+            managed: None,
+            hidden: ServiceHidden::Never,
+            allow_multiple: AllowMultiple::False,
+            vars: &[],
+        };
+
+        assert_eq!(TEST_EXPR.command_preview(), "");
     }
 
     #[test]
