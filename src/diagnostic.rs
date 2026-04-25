@@ -113,7 +113,7 @@ pub fn render_diagnostic(file_name: &str, content: &str, diagnostic: &Diagnostic
 }
 
 pub fn emit_diagnostic(file_name: &str, content: &str, diagnostic: &Diagnostic) {
-    eprint!("{}", render_diagnostic(file_name, content, diagnostic));
+    eprintln!("{}", render_diagnostic(file_name, content, diagnostic));
 }
 
 pub fn toml_error_to_diagnostic(err: &toml_spanner::Error, source: &str) -> Diagnostic {
@@ -132,9 +132,9 @@ pub fn toml_error_to_diagnostic(err: &toml_spanner::Error, source: &str) -> Diag
         }
         labels.push(label);
     }
-    let mut notes = Vec::new();
-    if let Some(path) = err.path() {
-        notes.push(format!("at `{}`", path));
-    }
-    Diagnostic { level: DiagnosticLevel::Error, message: err.message(source), labels, notes }
+    let level = match err.kind() {
+        toml_spanner::ErrorKind::UnexpectedKey { .. } => DiagnosticLevel::Warning,
+        _ => DiagnosticLevel::Error,
+    };
+    Diagnostic { level, message: err.message_with_path(source), labels, notes: Vec::new() }
 }

@@ -6,7 +6,7 @@ use toml_spanner::{Item, Table, Value};
 
 use crate::config::toml_handler;
 use crate::config::{StringExpr, WorkspaceConfig};
-use crate::diagnostic::{Diagnostic, DiagnosticLabel, emit_diagnostic, toml_error_to_diagnostic};
+use crate::diagnostic::{Diagnostic, DiagnosticLabel, DiagnosticLevel, emit_diagnostic, toml_error_to_diagnostic};
 
 pub struct ValidateOptions {
     pub skip_path_checks: bool,
@@ -38,8 +38,12 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
     let root = root.table();
 
     let mut has_errors = false;
+    let mut warnings = 0usize;
     let mut emit = |diag: Diagnostic| {
-        has_errors = true;
+        match diag.level {
+            DiagnosticLevel::Error => has_errors = true,
+            DiagnosticLevel::Warning => warnings += 1,
+        }
         emit_diagnostic(&file_name, content, &diag);
     };
 
@@ -118,7 +122,7 @@ fn validate_user_config(path: &Path, content: &str) -> anyhow::Result<bool> {
     if has_errors {
         Ok(false)
     } else {
-        eprintln!("{} is valid", path.display());
+        eprintln!("{}", validity_summary(path, warnings));
         Ok(true)
     }
 }
@@ -130,8 +134,12 @@ fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptio
     let base_path = path.parent().unwrap_or(Path::new("."));
 
     let mut has_errors = false;
+    let mut warnings = 0usize;
     let mut emit = |diag: Diagnostic| {
-        has_errors = true;
+        match diag.level {
+            DiagnosticLevel::Error => has_errors = true,
+            DiagnosticLevel::Warning => warnings += 1,
+        }
         emit_diagnostic(&file_name, content, &diag);
     };
 
@@ -156,8 +164,16 @@ fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptio
     if has_errors {
         Ok(false)
     } else {
-        eprintln!("{} is valid", path.display());
+        eprintln!("{}", validity_summary(path, warnings));
         Ok(true)
+    }
+}
+
+fn validity_summary(path: &Path, warnings: usize) -> String {
+    match warnings {
+        0 => format!("{} is valid", path.display()),
+        1 => format!("{} is valid but has 1 warning.", path.display()),
+        n => format!("{} is valid but has {} warnings.", path.display(), n),
     }
 }
 

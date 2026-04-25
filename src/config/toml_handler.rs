@@ -7,13 +7,21 @@ use crate::config::{
     TestConfigExpr, TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
 };
 
-fn table_field<'a, 'b>(
-    table: &'b Table<'a>,
-    key: &str,
-    ctx: &mut Context<'a>,
-) -> Result<Option<&'b Table<'a>>, Failed> {
-    let Some(action) = table.get(key) else { return Ok(None) };
-    Ok(Some(action.require_table(ctx)?))
+fn parse_predicate<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Predicate<'a>, Failed> {
+    let table = value.require_table(ctx)?;
+    let mut profile: Option<&'a str> = None;
+    for (key, val) in table {
+        match key.name {
+            "profile" => profile = Some(val.require_string(ctx)?),
+            _ => {
+                ctx.report_unexpected_key(0, val, key.span);
+            }
+        }
+    }
+    match profile {
+        Some(p) => Ok(Predicate::Profile(p)),
+        None => Err(ctx.report_missing_field("profile", value)),
+    }
 }
 
 fn parse_string_expr<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<StringExpr<'a>, Failed> {
@@ -21,28 +29,34 @@ fn parse_string_expr<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a
         Value::String(&s) => Ok(StringExpr::Literal(s)),
         Value::Table(table) => {
             if let Some(var_val) = table.get("var") {
+                for (key, val) in table {
+                    if key.name != "var" {
+                        ctx.report_unexpected_key(0, val, key.span);
+                    }
+                }
                 return Ok(StringExpr::Var(var_val.require_string(ctx)?));
             }
-            if let Some(if_val) = table.get("if") {
-                let if_table = if_val.require_table(ctx)?;
-                let profile_val = if_table.get("profile").ok_or_else(|| ctx.report_missing_field("profile", if_val))?;
-                let profile = profile_val.require_string(ctx)?;
 
-                let then_val = table.get("then").ok_or_else(|| ctx.report_missing_field("then", value))?;
-                let then_expr = parse_string_expr(alloc, then_val, ctx)?;
+            let mut cond: Option<Predicate<'a>> = None;
+            let mut then_expr: Option<StringExpr<'a>> = None;
+            let mut or_else: Option<StringExpr<'a>> = None;
 
-                let or_else = match table.get("or_else").or_else(|| table.get("else")) {
-                    Some(else_val) => Some(parse_string_expr(alloc, else_val, ctx)?),
-                    None => None,
-                };
-
-                return Ok(StringExpr::If(alloc.alloc(If {
-                    cond: Predicate::Profile(profile),
-                    then: then_expr,
-                    or_else,
-                })));
+            for (key, val) in table {
+                match key.name {
+                    "if" => cond = Some(parse_predicate(val, ctx)?),
+                    "then" => then_expr = Some(parse_string_expr(alloc, val, ctx)?),
+                    "or_else" | "else" => or_else = Some(parse_string_expr(alloc, val, ctx)?),
+                    _ => {
+                        ctx.report_unexpected_key(0, val, key.span);
+                    }
+                }
             }
-            Err(ctx.report_custom_error("invalid string expression", value))
+
+            match (cond, then_expr) {
+                (Some(cond), Some(then)) => Ok(StringExpr::If(alloc.alloc(If { cond, then, or_else }))),
+                (Some(_), None) => Err(ctx.report_missing_field("then", value)),
+                _ => Err(ctx.report_custom_error("invalid string expression", value)),
+            }
         }
         _ => Err(ctx.report_expected_but_found(&"a string or table", value)),
     }
@@ -58,7 +72,9 @@ fn parse_var_meta<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<VarMeta
         match key.name {
             "description" => description = Some(val.require_string(ctx)?),
             "default" => default = Some(val.require_string(ctx)?),
-            _ => return Err(ctx.report_unexpected_key(0, val, key.span)),
+            _ => {
+                ctx.report_unexpected_key(0, val, key.span);
+            }
         }
     }
 
@@ -82,10 +98,70 @@ fn parse_timeout_predicate<'a>(
     when_value: &Item<'a>,
     ctx: &mut Context<'a>,
 ) -> Result<TimeoutPredicate<'a>, Failed> {
-    if let Some(output_contains_val) = when_table.get("output_contains") {
-        return Ok(TimeoutPredicate::OutputContains(output_contains_val.require_string(ctx)?));
+    let mut output_contains: Option<&'a str> = None;
+    for (key, val) in when_table {
+        match key.name {
+            "output_contains" => output_contains = Some(val.require_string(ctx)?),
+            _ => {
+                ctx.report_unexpected_key(0, val, key.span);
+            }
+        }
     }
-    Err(ctx.report_custom_error("`timeout.when` must specify a predicate (e.g., `output_contains`)", when_value))
+    match output_contains {
+        Some(s) => Ok(TimeoutPredicate::OutputContains(s)),
+        None => {
+            Err(ctx
+                .report_custom_error("`timeout.when` must specify a predicate (e.g., `output_contains`)", when_value))
+        }
+    }
+}
+
+fn parse_ready_predicate<'a>(
+    when_table: &Table<'a>,
+    when_value: &Item<'a>,
+    ctx: &mut Context<'a>,
+) -> Result<ReadyPredicate<'a>, Failed> {
+    let mut output_contains: Option<&'a str> = None;
+    for (key, val) in when_table {
+        match key.name {
+            "output_contains" => output_contains = Some(val.require_string(ctx)?),
+            _ => {
+                ctx.report_unexpected_key(0, val, key.span);
+            }
+        }
+    }
+    match output_contains {
+        Some(s) => Ok(ReadyPredicate::OutputContains(s)),
+        None => {
+            Err(ctx.report_custom_error("`ready.when` must specify a predicate (e.g., `output_contains`)", when_value))
+        }
+    }
+}
+
+fn parse_ready_config<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<ReadyConfig<'a>, Failed> {
+    let ready_table = value.require_table(ctx)?;
+    let mut when: Option<ReadyPredicate<'a>> = None;
+    let mut timeout: Option<f64> = None;
+
+    for (key, val) in ready_table {
+        match key.name {
+            "when" => {
+                let when_table = val.require_table(ctx)?;
+                when = Some(parse_ready_predicate(when_table, val, ctx)?);
+            }
+            "timeout" => match val.value() {
+                Value::Float(&f) => timeout = Some(f),
+                Value::Integer(&i) => timeout = Some(i.as_f64()),
+                _ => return Err(ctx.report_expected_but_found(&"a number", val)),
+            },
+            _ => {
+                ctx.report_unexpected_key(0, val, key.span);
+            }
+        }
+    }
+
+    let when = when.ok_or_else(|| ctx.report_missing_field("when", value))?;
+    Ok(ReadyConfig { when, timeout })
 }
 
 fn parse_timeout_config<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<TimeoutConfig<'a>, Failed> {
@@ -112,7 +188,9 @@ fn parse_timeout_config<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<T
                     "conditional" => conditional = Some(parse_duration_value(val, ctx)?),
                     "max" => max = Some(parse_duration_value(val, ctx)?),
                     "idle" => idle = Some(parse_duration_value(val, ctx)?),
-                    _ => return Err(ctx.report_unexpected_key(0, val, key.span)),
+                    _ => {
+                        ctx.report_unexpected_key(0, val, key.span);
+                    }
                 }
             }
 
@@ -144,28 +222,34 @@ fn parse_string_list_expr<'a>(
         }
         Value::Table(table) => {
             if let Some(var_val) = table.get("var") {
+                for (key, val) in table {
+                    if key.name != "var" {
+                        ctx.report_unexpected_key(0, val, key.span);
+                    }
+                }
                 return Ok(StringListExpr::Var(var_val.require_string(ctx)?));
             }
-            if let Some(if_val) = table.get("if") {
-                let if_table = if_val.require_table(ctx)?;
-                let profile_val = if_table.get("profile").ok_or_else(|| ctx.report_missing_field("profile", if_val))?;
-                let profile = profile_val.require_string(ctx)?;
 
-                let then_val = table.get("then").ok_or_else(|| ctx.report_missing_field("then", value))?;
-                let then_expr = parse_string_list_expr(alloc, then_val, ctx)?;
+            let mut cond: Option<Predicate<'a>> = None;
+            let mut then_expr: Option<StringListExpr<'a>> = None;
+            let mut or_else: Option<StringListExpr<'a>> = None;
 
-                let or_else = match table.get("or_else").or_else(|| table.get("else")) {
-                    Some(else_val) => Some(parse_string_list_expr(alloc, else_val, ctx)?),
-                    None => None,
-                };
-
-                return Ok(StringListExpr::If(alloc.alloc(If {
-                    cond: Predicate::Profile(profile),
-                    then: then_expr,
-                    or_else,
-                })));
+            for (key, val) in table {
+                match key.name {
+                    "if" => cond = Some(parse_predicate(val, ctx)?),
+                    "then" => then_expr = Some(parse_string_list_expr(alloc, val, ctx)?),
+                    "or_else" | "else" => or_else = Some(parse_string_list_expr(alloc, val, ctx)?),
+                    _ => {
+                        ctx.report_unexpected_key(0, val, key.span);
+                    }
+                }
             }
-            Err(ctx.report_custom_error("invalid string list expression", value))
+
+            match (cond, then_expr) {
+                (Some(cond), Some(then)) => Ok(StringListExpr::If(alloc.alloc(If { cond, then, or_else }))),
+                (Some(_), None) => Err(ctx.report_missing_field("then", value)),
+                _ => Err(ctx.report_custom_error("invalid string list expression", value)),
+            }
         }
         _ => Err(ctx.report_expected_but_found(&"a string, array, or table", value)),
     }
@@ -256,26 +340,7 @@ fn parse_task<'a>(
                 if kind != TaskKind::Service {
                     return Err(ctx.report_custom_error("`ready` is only valid for services", value));
                 }
-                let ready_table = value.require_table(ctx)?;
-                let when_value = ready_table.get("when").ok_or_else(|| ctx.report_missing_field("when", value))?;
-                let when_table = when_value.require_table(ctx)?;
-                let when = if let Some(output_contains_val) = when_table.get("output_contains") {
-                    ReadyPredicate::OutputContains(output_contains_val.require_string(ctx)?)
-                } else {
-                    return Err(ctx.report_custom_error(
-                        "`ready.when` must specify a predicate (e.g., `output_contains`)",
-                        when_value,
-                    ));
-                };
-                let ready_timeout = match ready_table.get("timeout") {
-                    Some(timeout_val) => match timeout_val.value() {
-                        Value::Float(&f) => Some(f),
-                        Value::Integer(&i) => Some(i.as_f64()),
-                        _ => return Err(ctx.report_expected_but_found(&"a number", timeout_val)),
-                    },
-                    None => None,
-                };
-                ready = Some(ReadyConfig { when, timeout: ready_timeout });
+                ready = Some(parse_ready_config(value, ctx)?);
             }
             "timeout" => timeout = Some(parse_timeout_config(value, ctx)?),
             "managed" => match value.value() {
@@ -314,7 +379,9 @@ fn parse_task<'a>(
                     vars_vec.push((var_key.name, meta));
                 }
             }
-            _ => return Err(ctx.report_unexpected_key(0, value, key.span)),
+            _ => {
+                ctx.report_unexpected_key(0, value, key.span);
+            }
         }
     }
 
@@ -348,6 +415,41 @@ fn parse_task<'a>(
     })
 }
 
+fn parse_cache_key_input<'a>(
+    alloc: &'a Bump,
+    item: &Item<'a>,
+    ctx: &mut Context<'a>,
+) -> Result<CacheKeyInput<'a>, Failed> {
+    let item_table = item.require_table(ctx)?;
+
+    if let Some(profile_val) = item_table.get("profile_changed") {
+        for (key, val) in item_table {
+            if key.name != "profile_changed" {
+                ctx.report_unexpected_key(0, val, key.span);
+            }
+        }
+        return Ok(CacheKeyInput::ProfileChanged(profile_val.require_string(ctx)?));
+    }
+
+    let mut paths: Option<&'a [&'a str]> = None;
+    let mut ignore: &'a [&'a str] = &[];
+
+    for (key, val) in item_table {
+        match key.name {
+            "modified" => paths = Some(parse_string_or_array(alloc, val, ctx)?),
+            "ignore" => ignore = parse_string_or_array(alloc, val, ctx)?,
+            _ => {
+                ctx.report_unexpected_key(0, val, key.span);
+            }
+        }
+    }
+
+    match paths {
+        Some(paths) => Ok(CacheKeyInput::Modified { paths, ignore }),
+        None => Err(ctx.report_custom_error("cache key input must have either `modified` or `profile_changed`", item)),
+    }
+}
+
 /// Parse cache config from a table (shared between tasks and tests).
 fn parse_cache_config<'a>(
     alloc: &'a Bump,
@@ -357,33 +459,24 @@ fn parse_cache_config<'a>(
     let mut key_inputs = bumpalo::collections::Vec::new_in(alloc);
     let mut never = false;
 
-    if let Some(never_value) = cache_table.get("never") {
-        match never_value.value() {
-            Value::Boolean(&b) => never = b,
-            _ => return Err(ctx.report_expected_but_found(&"a boolean", never_value)),
-        }
-    }
-
-    if let Some(key_value) = cache_table.get("key") {
-        let key_array = key_value.require_array(ctx)?;
-        for item in key_array {
-            let item_table = item.require_table(ctx)?;
-            if let Some(modified_val) = item_table.get("modified") {
-                let paths = parse_string_or_array(alloc, modified_val, ctx)?;
-                let ignore = match item_table.get("ignore") {
-                    Some(ignore_val) => parse_string_or_array(alloc, ignore_val, ctx)?,
-                    None => &[],
-                };
-                key_inputs.push(CacheKeyInput::Modified { paths, ignore });
-            } else if let Some(profile_val) = item_table.get("profile_changed") {
-                key_inputs.push(CacheKeyInput::ProfileChanged(profile_val.require_string(ctx)?));
-            } else {
-                return Err(
-                    ctx.report_custom_error("cache key input must have either `modified` or `profile_changed`", item)
-                );
+    for (key, val) in cache_table {
+        match key.name {
+            "never" => match val.value() {
+                Value::Boolean(&b) => never = b,
+                _ => return Err(ctx.report_expected_but_found(&"a boolean", val)),
+            },
+            "key" => {
+                let key_array = val.require_array(ctx)?;
+                for item in key_array {
+                    key_inputs.push(parse_cache_key_input(alloc, item, ctx)?);
+                }
+            }
+            _ => {
+                ctx.report_unexpected_key(0, val, key.span);
             }
         }
     }
+
     Ok(CacheConfig { key: key_inputs.into_bump_slice(), never })
 }
 
@@ -448,7 +541,9 @@ fn parse_test<'a>(
                     vars_vec.push((var_key.name, meta));
                 }
             }
-            _ => return Err(ctx.report_unexpected_key(0, value, key.span)),
+            _ => {
+                ctx.report_unexpected_key(0, value, key.span);
+            }
         }
     }
 
@@ -527,30 +622,39 @@ fn parse_function_action<'a>(
     func_value: &Item<'a>,
     ctx: &mut Context<'a>,
 ) -> Result<FunctionDefAction<'a>, Failed> {
-    if let Some(restart_val) = func_table.get("restart") {
-        return Ok(FunctionDefAction::Restart { task: restart_val.require_string(ctx)? });
-    }
+    let mut action: Option<FunctionDefAction<'a>> = None;
 
-    if let Some(kill_val) = func_table.get("kill") {
-        return Ok(FunctionDefAction::Kill { task: kill_val.require_string(ctx)? });
-    }
-
-    if let Some(spawn_val) = func_table.get("spawn") {
-        let tasks: &[TaskCall<'a>] = match spawn_val.value() {
-            Value::Array(arr) => {
-                let mut calls = bumpalo::collections::Vec::new_in(alloc);
-                for item in arr {
-                    calls.push(parse_task_call(item, ctx)?);
-                }
-                calls.into_bump_slice()
+    for (key, val) in func_table {
+        let parsed = match key.name {
+            "restart" => FunctionDefAction::Restart { task: val.require_string(ctx)? },
+            "kill" => FunctionDefAction::Kill { task: val.require_string(ctx)? },
+            "spawn" => {
+                let tasks: &[TaskCall<'a>] = match val.value() {
+                    Value::Array(arr) => {
+                        let mut calls = bumpalo::collections::Vec::new_in(alloc);
+                        for item in arr {
+                            calls.push(parse_task_call(item, ctx)?);
+                        }
+                        calls.into_bump_slice()
+                    }
+                    Value::String(_) => std::slice::from_ref(alloc.alloc(parse_task_call(val, ctx)?)),
+                    _ => return Err(ctx.report_expected_but_found(&"a string or array", val)),
+                };
+                FunctionDefAction::Spawn { tasks }
             }
-            Value::String(_) => std::slice::from_ref(alloc.alloc(parse_task_call(spawn_val, ctx)?)),
-            _ => return Err(ctx.report_expected_but_found(&"a string or array", spawn_val)),
+            _ => {
+                ctx.report_unexpected_key(0, val, key.span);
+                continue;
+            }
         };
-        return Ok(FunctionDefAction::Spawn { tasks });
+
+        if action.is_some() {
+            return Err(ctx.report_custom_error("function action keys are mutually exclusive", val));
+        }
+        action = Some(parsed);
     }
 
-    Err(ctx.report_custom_error("function must have 'restart', 'kill', or 'spawn' action", func_value))
+    action.ok_or_else(|| ctx.report_custom_error("function must have 'restart', 'kill', or 'spawn' action", func_value))
 }
 
 fn parse_functions<'a>(
@@ -619,56 +723,66 @@ fn parse_root<'a>(
     let mut tasks_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut tests_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut groups_vec = bumpalo::collections::Vec::new_in(alloc);
+    let mut function_table: Option<&Table<'a>> = None;
 
-    if let Some(action_table) = table_field(root, "action", ctx)? {
-        for (name, task_value) in action_table {
-            let task_table = task_value.require_table(ctx)?;
-            let task = parse_task(alloc, task_table, TaskKind::Action, ctx)?;
-            tasks_vec.push((name.name, task));
-        }
-    }
-
-    if let Some(service_table) = table_field(root, "service", ctx)? {
-        for (name, task_value) in service_table {
-            let task_table = task_value.require_table(ctx)?;
-            let task = parse_task(alloc, task_table, TaskKind::Service, ctx)?;
-            tasks_vec.push((name.name, task));
-        }
-    }
-
-    if let Some(group_table) = table_field(root, "group", ctx)? {
-        for (name, group_value) in group_table {
-            let group_array = group_value.require_array(ctx)?;
-            let mut calls = bumpalo::collections::Vec::new_in(alloc);
-            for item in group_array {
-                calls.push(parse_task_call(item, ctx)?);
-            }
-            groups_vec.push((name.name, calls.into_bump_slice()));
-        }
-    }
-
-    if let Some(test_table) = table_field(root, "test", ctx)? {
-        for (name, test_value) in test_table {
-            match test_value.value() {
-                Value::Table(single_test_table) => {
-                    let test = parse_test(alloc, single_test_table, ctx)?;
-                    let test_slice = std::slice::from_ref(alloc.alloc(test));
-                    tests_vec.push((name.name, test_slice));
+    for (key, value) in root {
+        match key.name {
+            "action" => {
+                let action_table = value.require_table(ctx)?;
+                for (name, task_value) in action_table {
+                    let task_table = task_value.require_table(ctx)?;
+                    let task = parse_task(alloc, task_table, TaskKind::Action, ctx)?;
+                    tasks_vec.push((name.name, task));
                 }
-                Value::Array(arr) => {
-                    let mut test_array = bumpalo::collections::Vec::new_in(alloc);
-                    for item in arr {
-                        let item_table = item.require_table(ctx)?;
-                        test_array.push(parse_test(alloc, item_table, ctx)?);
+            }
+            "service" => {
+                let service_table = value.require_table(ctx)?;
+                for (name, task_value) in service_table {
+                    let task_table = task_value.require_table(ctx)?;
+                    let task = parse_task(alloc, task_table, TaskKind::Service, ctx)?;
+                    tasks_vec.push((name.name, task));
+                }
+            }
+            "group" => {
+                let group_table = value.require_table(ctx)?;
+                for (name, group_value) in group_table {
+                    let group_array = group_value.require_array(ctx)?;
+                    let mut calls = bumpalo::collections::Vec::new_in(alloc);
+                    for item in group_array {
+                        calls.push(parse_task_call(item, ctx)?);
                     }
-                    tests_vec.push((name.name, test_array.into_bump_slice()));
+                    groups_vec.push((name.name, calls.into_bump_slice()));
                 }
-                _ => return Err(ctx.report_expected_but_found(&"a table or array", test_value)),
+            }
+            "test" => {
+                let test_table = value.require_table(ctx)?;
+                for (name, test_value) in test_table {
+                    match test_value.value() {
+                        Value::Table(single_test_table) => {
+                            let test = parse_test(alloc, single_test_table, ctx)?;
+                            let test_slice = std::slice::from_ref(alloc.alloc(test));
+                            tests_vec.push((name.name, test_slice));
+                        }
+                        Value::Array(arr) => {
+                            let mut test_array = bumpalo::collections::Vec::new_in(alloc);
+                            for item in arr {
+                                let item_table = item.require_table(ctx)?;
+                                test_array.push(parse_test(alloc, item_table, ctx)?);
+                            }
+                            tests_vec.push((name.name, test_array.into_bump_slice()));
+                        }
+                        _ => return Err(ctx.report_expected_but_found(&"a table or array", test_value)),
+                    }
+                }
+            }
+            "function" => function_table = Some(value.require_table(ctx)?),
+            _ => {
+                ctx.report_unexpected_key(0, value, key.span);
             }
         }
     }
 
-    let functions = parse_functions(alloc, table_field(root, "function", ctx)?, ctx)?;
+    let functions = parse_functions(alloc, function_table, ctx)?;
 
     Ok(WorkspaceConfig {
         base_path,
