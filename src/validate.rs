@@ -271,37 +271,35 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
         }
     }
 
-    for (test_name, test_variants) in config.tests.iter() {
-        for test_expr in test_variants.iter() {
-            for req in test_expr.require.iter() {
-                let crate::config::Requirement::Task(call) = req else { continue };
-                let required_name: &str = &call.name;
+    for (test_name, test_expr) in config.tests.iter() {
+        for req in test_expr.require.iter() {
+            let crate::config::Requirement::Task(call) = req else { continue };
+            let required_name: &str = &call.name;
 
-                if !task_names.contains(required_name) {
-                    if let Some(span) = find_test_require_span(root, test_name, required_name) {
-                        emit(
-                            Diagnostic::error()
-                                .with_message(format!("required task '{}' does not exist", required_name))
-                                .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                                .with_notes(vec![format!("in test '{}'", test_name)]),
-                        );
-                    }
-                } else if let Some(profile) = call.profile
-                    && !task_profiles.contains(&(required_name, profile))
-                    && let Some(span) = find_test_require_span(root, test_name, required_name)
-                {
-                    let available: Vec<_> =
-                        task_profiles.iter().filter(|(n, _)| *n == required_name).map(|(_, p)| *p).collect();
+            if !task_names.contains(required_name) {
+                if let Some(span) = find_test_require_span(root, test_name, required_name) {
                     emit(
                         Diagnostic::error()
-                            .with_message(format!(
-                                "required task '{}' does not have profile '{}'",
-                                required_name, profile
-                            ))
+                            .with_message(format!("required task '{}' does not exist", required_name))
                             .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                            .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
+                            .with_notes(vec![format!("in test '{}'", test_name)]),
                     );
                 }
+            } else if let Some(profile) = call.profile
+                && !task_profiles.contains(&(required_name, profile))
+                && let Some(span) = find_test_require_span(root, test_name, required_name)
+            {
+                let available: Vec<_> =
+                    task_profiles.iter().filter(|(n, _)| *n == required_name).map(|(_, p)| *p).collect();
+                emit(
+                    Diagnostic::error()
+                        .with_message(format!(
+                            "required task '{}' does not have profile '{}'",
+                            required_name, profile
+                        ))
+                        .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                        .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
+                );
             }
         }
     }
@@ -321,13 +319,12 @@ fn validate_require_graph(config: &WorkspaceConfig, root: &Table, emit: &mut dyn
         name_kind.push(*name);
     }
 
-    for (name, variants) in config.tests.iter() {
+    for (name, test_expr) in config.tests.iter() {
         if name_map.contains_key(*name) {
             continue;
         }
-        let Some(first) = variants.first() else { continue };
         name_map.insert(*name, tasks.len());
-        tasks.push(TaskInput { name, kind: TaskKind::Test, require: first.require });
+        tasks.push(TaskInput { name, kind: TaskKind::Test, require: test_expr.require });
         name_kind.push(*name);
     }
 
@@ -395,20 +392,18 @@ fn validate_pwd_paths(config: &WorkspaceConfig, base_path: &Path, root: &Table, 
         }
     }
 
-    for (test_name, test_variants) in config.tests.iter() {
-        for test_expr in test_variants.iter() {
-            if let StringExpr::Literal(pwd_literal) = test_expr.pwd {
-                let full_path = base_path.join(pwd_literal);
-                if !full_path.exists()
-                    && let Some(span) = find_test_pwd_span(root, test_name)
-                {
-                    emit(
-                        Diagnostic::error()
-                            .with_message(format!("pwd path '{}' does not exist", pwd_literal))
-                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("path not found")])
-                            .with_notes(vec![format!("resolved to: {}", full_path.display())]),
-                    );
-                }
+    for (test_name, test_expr) in config.tests.iter() {
+        if let StringExpr::Literal(pwd_literal) = test_expr.pwd {
+            let full_path = base_path.join(pwd_literal);
+            if !full_path.exists()
+                && let Some(span) = find_test_pwd_span(root, test_name)
+            {
+                emit(
+                    Diagnostic::error()
+                        .with_message(format!("pwd path '{}' does not exist", pwd_literal))
+                        .with_labels(vec![DiagnosticLabel::primary(span).with_message("path not found")])
+                        .with_notes(vec![format!("resolved to: {}", full_path.display())]),
+                );
             }
         }
     }

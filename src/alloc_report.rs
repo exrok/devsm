@@ -89,16 +89,10 @@ fn collect_restart_measurements(relative: &str) -> Vec<ScenarioMeasurement> {
             measurements.push(measurement);
         }
     }
-    for (base_name, variants) in config.tests {
-        for (variant_index, test) in variants.iter().enumerate() {
-            let name = if variants.len() == 1 {
-                format!("~test/{base_name}")
-            } else {
-                format!("~test/{base_name}.{variant_index}")
-            };
-            if let Some(measurement) = measure_restart_scenario(name, test.to_task_config_expr(), "") {
-                measurements.push(measurement);
-            }
+    for (base_name, test) in config.tests {
+        let name = format!("test.{base_name}");
+        if let Some(measurement) = measure_restart_scenario(name, test.to_task_config_expr(), "") {
+            measurements.push(measurement);
         }
     }
     measurements

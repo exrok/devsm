@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use crate::config::{Requirement, TaskKind};
-use crate::workspace::BaseTaskIndex;
+use crate::workspace::{BaseTaskIndex, NameEntry, TaskEntry};
 
 /// Static view of a single task as input to the analyzer. Both
 /// [`crate::workspace::WorkspaceState`] and `devsm validate` materialize a
@@ -94,9 +94,28 @@ pub trait NameLookup {
     fn lookup(&self, name: &str) -> Option<usize>;
 }
 
-impl NameLookup for hashbrown::HashMap<Box<str>, BaseTaskIndex> {
+impl NameLookup for hashbrown::HashMap<Box<str>, NameEntry> {
     fn lookup(&self, name: &str) -> Option<usize> {
-        self.get(name).map(|bti| bti.idx())
+        let (kind_filter, short) = match name.split_once('.') {
+            Some(("service", rest)) => (Some(TaskKind::Service), rest),
+            Some(("action", rest)) => (Some(TaskKind::Action), rest),
+            Some(("test", rest)) => (Some(TaskKind::Test), rest),
+            _ => (None, name),
+        };
+        let entry = self.get(short)?;
+        let bti = match kind_filter {
+            Some(TaskKind::Service) => match entry.task {
+                TaskEntry::Service(i) => Some(i),
+                _ => None,
+            },
+            Some(TaskKind::Action) => match entry.task {
+                TaskEntry::Action(i) => Some(i),
+                _ => None,
+            },
+            Some(TaskKind::Test) => entry.test,
+            None => entry.task.index().or(entry.test),
+        }?;
+        Some(bti.idx())
     }
 }
 

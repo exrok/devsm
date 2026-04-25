@@ -790,6 +790,22 @@ pub fn parse_workspace<'a>(
     parse_root(base_path, alloc, root, ctx)
 }
 
+fn validate_task_sub_name<'a>(name: &str, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<(), Failed> {
+    if name.starts_with('~') {
+        return Err(ctx.report_custom_error(
+            &format!("task name `{}` is reserved (leading `~`)", name),
+            value,
+        ));
+    }
+    if let Some(bad) = name.chars().find(|c| *c == '.' || *c == ':') {
+        return Err(ctx.report_custom_error(
+            &format!("task name `{}` cannot contain `{}`", name, bad),
+            value,
+        ));
+    }
+    Ok(())
+}
+
 fn parse_root<'a>(
     base_path: &'a std::path::Path,
     alloc: &'a Bump,
@@ -800,12 +816,26 @@ fn parse_root<'a>(
     let mut tests_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut groups_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut function_table: Option<&Table<'a>> = None;
+    let mut task_kinds: hashbrown::HashMap<&'a str, TaskKind> = hashbrown::HashMap::new();
 
     for (key, value) in root {
         match key.name {
             "action" => {
                 let action_table = value.require_table(ctx)?;
                 for (name, task_value) in action_table {
+                    validate_task_sub_name(name.name, task_value, ctx)?;
+                    if let Some(prior) = task_kinds.insert(name.name, TaskKind::Action)
+                        && prior != TaskKind::Action
+                    {
+                        return Err(ctx.report_custom_error(
+                            &format!(
+                                "task `{}` is declared as both `{}` and `action`",
+                                name.name,
+                                prior.as_str()
+                            ),
+                            task_value,
+                        ));
+                    }
                     let task_table = task_value.require_table(ctx)?;
                     let task = parse_task(alloc, task_table, TaskKind::Action, ctx)?;
                     tasks_vec.push((name.name, task));
@@ -814,6 +844,19 @@ fn parse_root<'a>(
             "service" => {
                 let service_table = value.require_table(ctx)?;
                 for (name, task_value) in service_table {
+                    validate_task_sub_name(name.name, task_value, ctx)?;
+                    if let Some(prior) = task_kinds.insert(name.name, TaskKind::Service)
+                        && prior != TaskKind::Service
+                    {
+                        return Err(ctx.report_custom_error(
+                            &format!(
+                                "task `{}` is declared as both `{}` and `service`",
+                                name.name,
+                                prior.as_str()
+                            ),
+                            task_value,
+                        ));
+                    }
                     let task_table = task_value.require_table(ctx)?;
                     let task = parse_task(alloc, task_table, TaskKind::Service, ctx)?;
                     tasks_vec.push((name.name, task));
@@ -833,22 +876,10 @@ fn parse_root<'a>(
             "test" => {
                 let test_table = value.require_table(ctx)?;
                 for (name, test_value) in test_table {
-                    match test_value.value() {
-                        Value::Table(single_test_table) => {
-                            let test = parse_test(alloc, single_test_table, ctx)?;
-                            let test_slice = std::slice::from_ref(alloc.alloc(test));
-                            tests_vec.push((name.name, test_slice));
-                        }
-                        Value::Array(arr) => {
-                            let mut test_array = bumpalo::collections::Vec::new_in(alloc);
-                            for item in arr {
-                                let item_table = item.require_table(ctx)?;
-                                test_array.push(parse_test(alloc, item_table, ctx)?);
-                            }
-                            tests_vec.push((name.name, test_array.into_bump_slice()));
-                        }
-                        _ => return Err(ctx.report_expected_but_found(&"a table or array", test_value)),
-                    }
+                    validate_task_sub_name(name.name, test_value, ctx)?;
+                    let single_test_table = test_value.require_table(ctx)?;
+                    let test = parse_test(alloc, single_test_table, ctx)?;
+                    tests_vec.push((name.name, &*alloc.alloc(test)));
                 }
             }
             "function" => function_table = Some(value.require_table(ctx)?),
@@ -1134,6 +1165,87 @@ mod test {
             "expected message about mixed keys, got: {:?}",
             messages
         );
+    }
+
+    #[test]
+    fn reject_dot_in_task_name() {
+        let text = "[action.\"foo.bar\"]\ncmd = [\"echo\"]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("cannot contain `.`") && m.contains("foo.bar")),
+            "expected `.`-rejected message, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn reject_colon_in_task_name() {
+        let text = "[action.\"foo:bar\"]\ncmd = [\"echo\"]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("cannot contain `:`") && m.contains("foo:bar")),
+            "expected `:`-rejected message, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn reject_tilde_prefix_in_task_name() {
+        let text = "[action.\"~mine\"]\ncmd = [\"echo\"]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("reserved") && m.contains("~mine")),
+            "expected reserved-name message, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn reject_action_service_collision() {
+        let text = "[action.alpha]\ncmd = [\"echo\"]\n[service.alpha]\ncmd = [\"true\"]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("declared as both")),
+            "expected duplicate-name message, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn allow_action_test_same_name() {
+        let text = "[action.alpha]\ncmd = [\"echo\"]\n[test.alpha]\ncmd = [\"true\"]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "action+test of same name should be allowed: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        assert_eq!(config.tasks.len(), 1);
+        assert_eq!(config.tests.len(), 1);
+    }
+
+    #[test]
+    fn reject_test_array_form() {
+        let text = "[[test.foo]]\ncmd = [\"echo\"]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (_doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
     }
 
     #[test]

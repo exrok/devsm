@@ -23,7 +23,7 @@ fn task_inputs<'a>(base_tasks: &'a [BaseTask]) -> Vec<TaskInput<'a>> {
 
 fn build_require_analysis(
     base_tasks: &[BaseTask],
-    name_map: &hashbrown::HashMap<Box<str>, BaseTaskIndex>,
+    name_map: &hashbrown::HashMap<Box<str>, NameEntry>,
 ) -> RequireAnalysis {
     RequireAnalysis::build(&task_inputs(base_tasks), name_map)
 }
@@ -210,6 +210,31 @@ impl BaseTaskIndex {
     pub fn idx(self) -> usize {
         self.0 as usize
     }
+}
+
+/// At most one of `service` / `action` may be present (mutually exclusive),
+/// alongside an optional test sharing the same short name.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum TaskEntry {
+    #[default]
+    None,
+    Service(BaseTaskIndex),
+    Action(BaseTaskIndex),
+}
+
+impl TaskEntry {
+    pub fn index(self) -> Option<BaseTaskIndex> {
+        match self {
+            TaskEntry::None => None,
+            TaskEntry::Service(i) | TaskEntry::Action(i) => Some(i),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NameEntry {
+    pub task: TaskEntry,
+    pub test: Option<BaseTaskIndex>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -471,25 +496,38 @@ impl LatestConfig {
     pub fn update_base_tasks(
         &self,
         base_tasks: &mut Vec<BaseTask>,
-        name_map: &mut hashbrown::HashMap<Box<str>, BaseTaskIndex>,
+        name_map: &mut hashbrown::HashMap<Box<str>, NameEntry>,
     ) {
         for base_task in base_tasks.iter_mut() {
             base_task.removed = true;
         }
         let generation = self.current.clone();
-        for (task_index, (name, _)) in self.current.workspace().tasks.iter().enumerate() {
+        for (task_index, (name, expr)) in self.current.workspace().tasks.iter().enumerate() {
             let config = TaskConfigSource::from_workspace_task(generation.clone(), task_index);
-            if let Some(&index) = name_map.get(*name) {
+            let entry = name_map.entry((*name).into()).or_default();
+            let existing = match expr.kind {
+                TaskKind::Service => match entry.task {
+                    TaskEntry::Service(i) => Some(i),
+                    _ => None,
+                },
+                TaskKind::Action => match entry.task {
+                    TaskEntry::Action(i) => Some(i),
+                    _ => None,
+                },
+                TaskKind::Test => unreachable!("workspace.tasks contains only action/service"),
+            };
+            if let Some(index) = existing {
                 let base_task = &mut base_tasks[index.idx()];
                 base_task.removed = false;
                 base_task.config = config;
                 continue;
             }
-            if base_tasks.len() > u32::MAX as usize {
-                panic!("Too many base tasks");
-            }
-            let index = BaseTaskIndex(base_tasks.len() as u32);
-            name_map.insert((*name).into(), index);
+            let index = BaseTaskIndex::new_or_panic(base_tasks.len());
+            entry.task = match expr.kind {
+                TaskKind::Service => TaskEntry::Service(index),
+                TaskKind::Action => TaskEntry::Action(index),
+                TaskKind::Test => unreachable!(),
+            };
             base_tasks.push(BaseTask {
                 name: (*name).into(),
                 config,
@@ -503,16 +541,17 @@ impl LatestConfig {
         }
         for (derived_index, derived) in self.current.derived_tests.iter().enumerate() {
             let config = TaskConfigSource::from_derived_test(generation.clone(), derived_index);
-            if let Some(&index) = name_map.get(derived.entry_name.as_ref()) {
+            let entry = name_map.entry(derived.name.clone()).or_default();
+            if let Some(index) = entry.test {
                 let base_task = &mut base_tasks[index.idx()];
                 base_task.removed = false;
                 base_task.config = config;
                 continue;
             }
             let index = BaseTaskIndex::new_or_panic(base_tasks.len());
-            name_map.insert(derived.entry_name.clone(), index);
+            entry.test = Some(index);
             base_tasks.push(BaseTask {
-                name: derived.display_name.clone(),
+                name: derived.name.clone(),
                 config,
                 removed: false,
                 jobs: JobIndexList::default(),
@@ -825,7 +864,7 @@ pub struct WorkspaceState {
     pub config: LatestConfig,
     pub base_tasks: Vec<BaseTask>,
     pub change_number: u32,
-    pub name_map: hashbrown::HashMap<Box<str>, BaseTaskIndex>,
+    pub name_map: hashbrown::HashMap<Box<str>, NameEntry>,
     pub jobs: JobStore,
     /// Maximum live jobs retained in `jobs` before history pruning kicks in.
     pub max_job_history: u32,
@@ -886,9 +925,8 @@ impl WorkspaceState {
                 }
                 CacheKeyInput::ProfileChanged(task_name) => {
                     let counter = self
-                        .name_map
-                        .get(*task_name)
-                        .map_or(0, |&bti| self.base_tasks[bti.idx()].profile_change_counter);
+                        .lookup_name(task_name)
+                        .map_or(0, |bti| self.base_tasks[bti.idx()].profile_change_counter);
                     self.cache_key_hasher.update(b"profile_changed:");
                     self.cache_key_hasher.update(task_name.as_bytes());
                     self.cache_key_hasher.update(b"=");
@@ -922,9 +960,8 @@ impl WorkspaceState {
                 }
                 CacheKeyInput::ProfileChanged(task_name) => {
                     let counter = self
-                        .name_map
-                        .get(*task_name)
-                        .map_or(0, |&bti| self.base_tasks[bti.idx()].profile_change_counter);
+                        .lookup_name(task_name)
+                        .map_or(0, |bti| self.base_tasks[bti.idx()].profile_change_counter);
                     self.cache_key_hasher.update(b"profile_changed:");
                     self.cache_key_hasher.update(task_name.as_bytes());
                     self.cache_key_hasher.update(b"=");
@@ -948,12 +985,40 @@ impl WorkspaceState {
         self.cache_key_hasher.finalize_hex()
     }
 
-    pub fn base_index_by_name(&mut self, name: &str) -> Option<BaseTaskIndex> {
-        if let Some(index) = self.name_map.get(name) {
-            return Some(*index);
+    /// Resolves a task name (bare or `kind.name`) to a `BaseTaskIndex` using
+    /// the priority rules: action/service of the same short name win over a
+    /// test of that name. Does not create the synthetic `~cargo` task — for
+    /// that, use `base_index_by_name`.
+    pub fn lookup_name(&self, name: &str) -> Option<BaseTaskIndex> {
+        let (kind_filter, short) = match name.split_once('.') {
+            Some(("service", rest)) => (Some(TaskKind::Service), rest),
+            Some(("action", rest)) => (Some(TaskKind::Action), rest),
+            Some(("test", rest)) => (Some(TaskKind::Test), rest),
+            _ => (None, name),
+        };
+        let entry = self.name_map.get(short)?;
+        match kind_filter {
+            Some(TaskKind::Service) => match entry.task {
+                TaskEntry::Service(i) => Some(i),
+                _ => None,
+            },
+            Some(TaskKind::Action) => match entry.task {
+                TaskEntry::Action(i) => Some(i),
+                _ => None,
+            },
+            Some(TaskKind::Test) => entry.test,
+            None => entry.task.index().or(entry.test),
         }
+    }
+
+    pub fn base_index_by_name(&mut self, name: &str) -> Option<BaseTaskIndex> {
         if name == "~cargo" {
-            let index = self.base_tasks.len();
+            if let Some(entry) = self.name_map.get("~cargo")
+                && let Some(index) = entry.task.index()
+            {
+                return Some(index);
+            }
+            let index = BaseTaskIndex::new_or_panic(self.base_tasks.len());
             self.base_tasks.push(BaseTask {
                 name: "~cargo".into(),
                 config: TaskConfigSource::Static(&CARGO_AUTO_EXPR),
@@ -964,14 +1029,13 @@ impl WorkspaceState {
                 last_profile: None,
                 has_run_this_session: false,
             });
-            if index > u32::MAX as usize {
-                panic!("Too many base tasks");
-            }
-            let index = BaseTaskIndex(index as u32);
-            self.name_map.insert("~cargo".into(), index);
+            self.name_map.insert(
+                "~cargo".into(),
+                NameEntry { task: TaskEntry::Action(index), test: None },
+            );
             return Some(index);
         }
-        None
+        self.lookup_name(name)
     }
 
     fn refresh_config(&mut self) {
@@ -1202,7 +1266,7 @@ impl WorkspaceState {
                     let dep_profile = dep_call.profile.unwrap_or("");
                     let dep_params = dep_call.vars.clone().to_owned();
 
-                    let Some(&dep_base_task) = self.name_map.get(dep_name) else {
+                    let Some(dep_base_task) = self.lookup_name(dep_name) else {
                         kvlog::error!("unknown alias", dep_name);
                         continue;
                     };
@@ -1351,15 +1415,15 @@ impl std::ops::Index<JobIndex> for WorkspaceState {
 }
 
 impl WorkspaceState {
-    /// Returns the name used to look up a base task in `name_map` / to pass to
-    /// `SpawnSpec::task`. Tests are registered under a `~test/` prefix, so their
-    /// display name (`BaseTask::name`) is not a valid spawn key on its own.
+    /// Returns the canonical full name (`kind.name`) for a base task — the
+    /// form passed across RPC boundaries and used by `SpawnSpec::task`.
+    /// `~cargo` is the one synthetic exception kept as a bare name.
     pub fn spawn_name_for(&self, bti: BaseTaskIndex) -> String {
         let bt = &self.base_tasks[bti.idx()];
-        match bt.config.kind {
-            TaskKind::Test => format!("~test/{}", bt.name),
-            _ => bt.name.to_string(),
+        if bt.name.as_ref() == "~cargo" {
+            return "~cargo".to_string();
         }
+        format!("{}.{}", bt.config.kind.as_str(), bt.name)
     }
 
     /// Returns all job indices for tasks of the given kind.
@@ -2149,7 +2213,7 @@ impl WorkspaceState {
                 .filter_map(|req| {
                     let crate::config::Requirement::Task(tc) = req else { return None };
                     let dep_name = &*tc.name;
-                    let dep_base_task = self.name_map.get(dep_name)?;
+                    let dep_base_task = self.lookup_name(dep_name)?;
                     let dep_config = &self.base_tasks[dep_base_task.idx()].config;
                     if dep_config.kind == TaskKind::Service {
                         Some((dep_name.to_string(), tc.profile.unwrap_or("").to_string()))
@@ -2161,7 +2225,7 @@ impl WorkspaceState {
             let mut visited_services: hashbrown::HashSet<BaseTaskIndex> = hashbrown::HashSet::new();
 
             while let Some((dep_name, dep_profile)) = services_to_check.pop() {
-                let Some(&dep_base_task) = self.name_map.get(&*dep_name) else {
+                let Some(dep_base_task) = self.lookup_name(&dep_name) else {
                     continue;
                 };
                 let dep_config = &self.base_tasks[dep_base_task.idx()].config;
@@ -2188,7 +2252,7 @@ impl WorkspaceState {
                     for req in srv_config.config().require.iter() {
                         let crate::config::Requirement::Task(tc) = req else { continue };
                         let req_name = &*tc.name;
-                        let Some(&req_base_task) = self.name_map.get(req_name) else {
+                        let Some(req_base_task) = self.lookup_name(req_name) else {
                             continue;
                         };
                         let req_config = &self.base_tasks[req_base_task.idx()].config;
@@ -2211,7 +2275,7 @@ impl WorkspaceState {
                         let dep_profile = tc.profile.unwrap_or("");
                         let dep_params = tc.vars.clone().to_owned();
 
-                        let Some(&dep_base_task) = self.name_map.get(dep_name) else {
+                        let Some(dep_base_task) = self.lookup_name(dep_name) else {
                             continue;
                         };
                         let dep_config = &self.base_tasks[dep_base_task.idx()].config;
@@ -2638,7 +2702,7 @@ impl Workspace {
             // Phase 1: Gather info needed for cache key computation (hold lock briefly)
             let (cache_info, profile) = {
                 let state = self.state.read().unwrap();
-                let Some(&base_index) = state.name_map.get(name) else {
+                let Some(base_index) = state.lookup_name(name) else {
                     return Err(format!("Task '{}' not found", name));
                 };
                 let bt = &state.base_tasks[base_index.idx()];
@@ -2682,9 +2746,8 @@ impl Workspace {
                         },
                         CacheKeyInput::ProfileChanged(task_name) => {
                             let counter = state
-                                .name_map
-                                .get(*task_name)
-                                .map_or(0, |&bti| state.base_tasks[bti.idx()].profile_change_counter);
+                                .lookup_name(task_name)
+                                .map_or(0, |bti| state.base_tasks[bti.idx()].profile_change_counter);
                             CacheKeyInfoItem::ProfileChanged { task_name: task_name.to_string(), counter }
                         }
                     })
@@ -3073,8 +3136,8 @@ mod scheduling_tests {
         #[test]
         fn get_or_create_spawn_spec_reuses_cached_spec_before_eval() {
             let mut state = WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).unwrap();
-            let base_task = state.name_map["simple_cmd"];
-            let failing_task = state.name_map["with_var"];
+            let base_task = state.lookup_name("simple_cmd").unwrap();
+            let failing_task = state.lookup_name("with_var").unwrap();
 
             let config = state.base_tasks[base_task.idx()].config.clone();
             let task = config.eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars }).unwrap();
@@ -3281,7 +3344,7 @@ mod scheduling_tests {
             let mut state =
                 WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).expect("load test config");
             state.max_job_history = max;
-            let base_task = state.name_map["simple_cmd"];
+            let base_task = state.lookup_name("simple_cmd").unwrap();
             let config = state.base_tasks[base_task.idx()].config.clone();
             let task = config
                 .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
@@ -3487,7 +3550,7 @@ mod scheduling_tests {
             let mut state =
                 WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).expect("load test config");
             state.max_job_history = 1024;
-            let base_task = state.name_map["simple_cmd"];
+            let base_task = state.lookup_name("simple_cmd").unwrap();
             let config = state.base_tasks[base_task.idx()].config.clone();
             let task = config
                 .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })

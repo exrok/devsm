@@ -78,6 +78,16 @@ pub enum TaskKind {
     Test,
 }
 
+impl TaskKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskKind::Service => "service",
+            TaskKind::Action => "action",
+            TaskKind::Test => "test",
+        }
+    }
+}
+
 /// Controls when a service is visible in the task list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ServiceHidden {
@@ -375,9 +385,7 @@ pub fn load_workspace_config_capturing(
 pub struct WorkspaceConfig<'a> {
     pub base_path: &'a Path,
     pub tasks: &'a [(&'a str, TaskConfigExpr<'a>)],
-    /// Tests stored as (name, variants) where variants is an array of test configs.
-    /// Single tests `[test.name]` have one variant, arrays `[[test.name]]` have multiple.
-    pub tests: &'a [(&'a str, &'a [TestConfigExpr<'a>])],
+    pub tests: &'a [(&'a str, &'a TestConfigExpr<'a>)],
     pub groups: &'a [(&'a str, &'a [TaskCall<'a>])],
     /// Saved function definitions (fn1, fn2).
     pub functions: &'a [FunctionDef<'a>],
@@ -486,8 +494,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
 static NEXT_CONFIG_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct DerivedTestTask {
-    pub(crate) entry_name: Box<str>,
-    pub(crate) display_name: Box<str>,
+    pub(crate) name: Box<str>,
     pub(crate) expr: TaskConfigExpr<'static>,
 }
 
@@ -513,38 +520,27 @@ impl ConfigGeneration {
         workspace: WorkspaceConfig<'static>,
     ) -> Arc<Self> {
         let mut derived_tests = Vec::new();
-        for (base_name, variants) in workspace.tests {
-            for (variant_index, config) in variants.iter().enumerate() {
-                let (display_name, entry_name): (Box<str>, Box<str>) = if variants.len() == 1 {
-                    ((*base_name).into(), format!("~test/{base_name}").into_boxed_str())
-                } else {
-                    (
-                        format!("{base_name}.{variant_index}").into_boxed_str(),
-                        format!("~test/{base_name}.{variant_index}").into_boxed_str(),
-                    )
-                };
-                derived_tests.push(DerivedTestTask {
-                    entry_name,
-                    display_name,
-                    expr: TaskConfigExpr {
-                        kind: TaskKind::Test,
-                        info: config.info,
-                        pwd: config.pwd,
-                        command: config.command.clone(),
-                        profiles: &[],
-                        envvar: config.envvar,
-                        require: config.require,
-                        cache: config.cache.clone(),
-                        ready: None,
-                        timeout: config.timeout.clone(),
-                        tags: config.tags,
-                        managed: None,
-                        hidden: ServiceHidden::Never,
-                        allow_multiple: AllowMultiple::False,
-                        vars: config.vars,
-                    },
-                });
-            }
+        for (base_name, config) in workspace.tests {
+            derived_tests.push(DerivedTestTask {
+                name: (*base_name).into(),
+                expr: TaskConfigExpr {
+                    kind: TaskKind::Test,
+                    info: config.info,
+                    pwd: config.pwd,
+                    command: config.command.clone(),
+                    profiles: &[],
+                    envvar: config.envvar,
+                    require: config.require,
+                    cache: config.cache.clone(),
+                    ready: None,
+                    timeout: config.timeout.clone(),
+                    tags: config.tags,
+                    managed: None,
+                    hidden: ServiceHidden::Never,
+                    allow_multiple: AllowMultiple::False,
+                    vars: config.vars,
+                },
+            });
         }
         Arc::new(Self {
             id: NEXT_CONFIG_GENERATION_ID.fetch_add(1, Ordering::Relaxed),

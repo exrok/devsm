@@ -130,12 +130,12 @@ env.TEST_APP_SOCKET = "{ctrl_path}"
 profiles = ["alpha", "beta"]
 ready = {{ when = {{ output_contains = "SVC_READY" }} }}
 
-[[test.alpha_test]]
+[test.alpha_test]
 cmd = ["test-app", "alpha_test"]
 env.TEST_APP_SOCKET = "{ctrl_path}"
 require = ["svc:alpha"]
 
-[[test.beta_test]]
+[test.beta_test]
 cmd = ["test-app", "beta_test"]
 env.TEST_APP_SOCKET = "{ctrl_path}"
 require = ["svc:beta"]
@@ -198,12 +198,12 @@ cmd = ["test-app", "svc"]
 env.TEST_APP_SOCKET = "{ctrl_path}"
 ready = {{ when = {{ output_contains = "SVC_READY" }} }}
 
-[[test.first]]
+[test.first]
 cmd = ["test-app", "first"]
 env.TEST_APP_SOCKET = "{ctrl_path}"
 require = ["svc"]
 
-[[test.second]]
+[test.second]
 cmd = ["test-app", "second"]
 env.TEST_APP_SOCKET = "{ctrl_path}"
 require = ["svc"]

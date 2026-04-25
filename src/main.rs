@@ -652,20 +652,21 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
     let workspace_config = config::load_from_env()?;
     let (name, _profile) = job.rsplit_once(':').unwrap_or((job, ""));
 
-    let (job, as_test) = if let Some(test_name) = name.strip_prefix("test.") {
-        let has_test =
-            workspace_config.tests.iter().any(|(n, _)| *n == test_name || test_name.starts_with(&format!("{n}.")));
-        if !has_test {
-            bail!("Test not found: {}", test_name);
+    let resolved = resolve_name_in_config(&workspace_config, name);
+    let as_test = match resolved {
+        Some((kind, _)) => as_test || kind == config::TaskKind::Test,
+        None => {
+            if name != "~cargo" {
+                bail!("Task not found: {}", name);
+            }
+            as_test
         }
-        (format!("~test/{}", &job["test.".len()..]), true)
-    } else {
-        (job.to_owned(), as_test)
     };
+    let job = job.to_owned();
 
     if name != "~cargo"
         && !as_test
-        && let Some((_, expr)) = workspace_config.tasks.iter().find(|(n, _)| *n == name)
+        && let Some((_, expr)) = resolved
         && expr.managed == Some(false)
     {
         bail!(
@@ -762,43 +763,53 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
     Ok(())
 }
 
+/// Resolves a user-typed name (with optional `kind.` prefix) to its `TaskKind`
+/// and `TaskConfigExpr` from a parsed config. Implements the same priority
+/// rules as the daemon's `base_index_by_name`: bare names prefer the
+/// action/service of that name over a test of the same short name.
+fn resolve_name_in_config(
+    config: &config::WorkspaceConfig<'static>,
+    name: &str,
+) -> Option<(config::TaskKind, &'static config::TaskConfigExpr<'static>)> {
+    use config::TaskKind;
+    let (kind_filter, short) = match name.split_once('.') {
+        Some(("service", rest)) => (Some(TaskKind::Service), rest),
+        Some(("action", rest)) => (Some(TaskKind::Action), rest),
+        Some(("test", rest)) => (Some(TaskKind::Test), rest),
+        _ => (None, name),
+    };
+
+    if kind_filter == Some(TaskKind::Test) {
+        let (_, test) = config.tests.iter().find(|(n, _)| *n == short)?;
+        return Some((TaskKind::Test, test.to_task_config_expr()));
+    }
+
+    if let Some((_, expr)) = config
+        .tasks
+        .iter()
+        .find(|(n, expr)| *n == short && kind_filter.map(|k| k == expr.kind).unwrap_or(true))
+    {
+        return Some((expr.kind, expr));
+    }
+
+    if kind_filter.is_none()
+        && let Some((_, test)) = config.tests.iter().find(|(n, _)| *n == short)
+    {
+        return Some((TaskKind::Test, test.to_task_config_expr()));
+    }
+
+    None
+}
+
 /// Executes a task directly, bypassing the daemon and ignoring dependencies.
 fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
     let workspace_config = config::load_from_env()?;
     let (name, profile) = job.rsplit_once(':').unwrap_or((job, ""));
 
-    let task_expr = if let Some(test_name) = name.strip_prefix("test.") {
-        let (base_name, variant_suffix) = test_name.rsplit_once('.').unwrap_or((test_name, ""));
-        let variant_index: Option<usize> = variant_suffix.parse().ok();
-
-        let lookup_name = if variant_index.is_some() { base_name } else { test_name };
-
-        let Some((_, variants)) = workspace_config.tests.iter().find(|(n, _)| *n == lookup_name) else {
-            bail!("Test not found: {}", test_name);
-        };
-
-        if let Some(idx) = variant_index {
-            if idx >= variants.len() {
-                bail!("Test '{}' has {} variant(s), index {} is out of range", lookup_name, variants.len(), idx);
-            }
-            variants[idx].to_task_config_expr()
-        } else {
-            if variants.len() > 1 {
-                bail!(
-                    "Test '{}' has {} variants, specify one with test.{}.0 .. test.{}.{}",
-                    test_name,
-                    variants.len(),
-                    test_name,
-                    test_name,
-                    variants.len() - 1
-                );
-            }
-            variants[0].to_task_config_expr()
-        }
-    } else if name == "~cargo" {
+    let task_expr = if name == "~cargo" {
         &config::CARGO_AUTO_EXPR
     } else {
-        let Some((_, expr)) = workspace_config.tasks.iter().find(|(n, _)| *n == name) else {
+        let Some((_, expr)) = resolve_name_in_config(&workspace_config, name) else {
             bail!("Task not found: {}", name);
         };
         expr
@@ -1022,8 +1033,8 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             let Ok(workspace) = config::load_from_env() else {
                 return false;
             };
-            for (name, variants) in workspace.tests {
-                let info = variants.first().map(|v| v.info).unwrap_or("");
+            for (name, test) in workspace.tests {
+                let info = test.info;
                 if info.is_empty() {
                     println!("{name}");
                 } else {
@@ -1099,11 +1110,9 @@ fn print_completions(context: cli::CompleteContext) -> bool {
                     tags.insert(*tag);
                 }
             }
-            for (_, variants) in workspace.tests {
-                for variant in *variants {
-                    for tag in variant.tags {
-                        tags.insert(*tag);
-                    }
+            for (_, test) in workspace.tests {
+                for tag in test.tags {
+                    tags.insert(*tag);
                 }
             }
             for tag in tags {

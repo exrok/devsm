@@ -47,7 +47,7 @@ profiles = ["default", "verbose"]
 cmd = ["ping", "127.0.0.1"]
 profiles = ["alpha", "beta"]
 
-[[test.srv]]
+[test.srv_alpha]
 sh = """
 echo hello >> /tmp/trigger.alpha
 inotifywait /tmp/trigger.alpha
@@ -55,7 +55,7 @@ echo ALPHA test finished
 """
 require = ["srv:alpha"]
 
-[[test.srv]]
+[test.srv_beta]
 sh = """
 echo hello >> /tmp/trigger.beta
 inotifywait /tmp/trigger.beta

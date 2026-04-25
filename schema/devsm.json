@@ -23,7 +23,7 @@
       "type": "object",
       "description": "Tests are test suites that can be filtered by tags",
       "additionalProperties": {
-        "$ref": "#/definitions/testEntry"
+        "$ref": "#/definitions/test"
       }
     },
     "group": {
@@ -616,21 +616,6 @@
       "x-taplo": {
         "initKeys": ["cmd"]
       }
-    },
-    "testEntry": {
-      "description": "Test entry - either a single test or an array of test variants",
-      "oneOf": [
-        {
-          "$ref": "#/definitions/test"
-        },
-        {
-          "type": "array",
-          "description": "Multiple test variants with the same name",
-          "items": {
-            "$ref": "#/definitions/test"
-          }
-        }
-      ]
     },
     "functionDef": {
       "type": "object",

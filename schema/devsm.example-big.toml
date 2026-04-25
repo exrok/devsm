@@ -446,36 +446,35 @@ require = ["simple_cmd", "with_cache_empty"]
 cache.key = [{ modified = "tests/" }, { modified = "src/" }]
 info = "Comprehensive test suite with all features"
 
-# Multiple test variants using array syntax
-[[test.variant_tests]]
+# Independently-named test entries (formerly array variants)
+[test.variant_tests_lib]
 cmd = ["cargo", "test", "--lib"]
 tag = "lib"
 info = "Library tests"
 
-[[test.variant_tests]]
+[test.variant_tests_bins]
 cmd = ["cargo", "test", "--bins"]
 tag = "bin"
 info = "Binary tests"
 
-[[test.variant_tests]]
+[test.variant_tests_doc]
 cmd = ["cargo", "test", "--doc"]
 tag = "doc"
 info = "Documentation tests"
 
-# Complex array tests
-[[test.complex_variants]]
+[test.complex_variants_mysql]
 cmd = ["./test-mysql.sh"]
 tag = ["database", "mysql"]
 env.DB_TYPE = "mysql"
 cache.key = [{ modified = "tests/mysql/" }]
 
-[[test.complex_variants]]
+[test.complex_variants_postgres]
 cmd = ["./test-postgres.sh"]
 tag = ["database", "postgres"]
 env.DB_TYPE = "postgres"
 cache.key = [{ modified = "tests/postgres/" }]
 
-[[test.complex_variants]]
+[test.complex_variants_sqlite]
 cmd = ["./test-sqlite.sh"]
 tag = ["database", "sqlite", "fast"]
 env.DB_TYPE = "sqlite"

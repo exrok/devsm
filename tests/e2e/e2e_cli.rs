@@ -1655,7 +1655,7 @@ fn same_test_conflicting_profiles_error() {
 cmd = ["sleep", "infinity"]
 profiles = ["alpha", "beta"]
 
-[[test.bad_test]]
+[test.bad_test]
 cmd = ["true"]
 require = ["srv:alpha", "srv:beta"]
 "#,
@@ -1695,7 +1695,7 @@ require = ["base_srv:alpha"]
 cmd = ["sleep", "infinity"]
 require = ["base_srv:beta"]
 
-[[test.bad_test]]
+[test.bad_test]
 cmd = ["true"]
 require = ["srv_alpha", "srv_beta"]
 "#,
@@ -1735,7 +1735,7 @@ require = ["srv:alpha"]
 cmd = ["true"]
 require = ["srv:beta"]
 
-[[test.good_test]]
+[test.good_test]
 sh = "echo done > {marker}"
 require = ["action_alpha", "action_beta"]
 "#,
@@ -1767,11 +1767,11 @@ fn service_profile_queuing() {
 sh = "echo $PROFILE started >> {sequence}; while true; do sleep 0.1; done"
 profiles = ["alpha", "beta"]
 
-[[test.alpha_test]]
+[test.alpha_test]
 sh = "echo alpha_test_running >> {sequence}; sleep 0.2; echo done > {alpha}"
 require = ["srv:alpha"]
 
-[[test.beta_test]]
+[test.beta_test]
 sh = "echo beta_test_running >> {sequence}; echo done > {beta}"
 require = ["srv:beta"]
 "#,
