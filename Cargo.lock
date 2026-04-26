@@ -216,6 +216,7 @@ dependencies = [
 [[package]]
 name = "kvlog"
 version = "0.1.5"
+source = "git+https://github.com/exrok/kvlog?rev=e3e0e9b4b966c9d47bc6019259f4b2036b06c8a3#e3e0e9b4b966c9d47bc6019259f4b2036b06c8a3"
 dependencies = [
  "itoa",
  "kvlog-macros",
@@ -320,6 +321,7 @@ version = "0.1.0"
 [[package]]
 name = "toml-spanner"
 version = "1.0.2"
+source = "git+https://github.com/exrok/toml-spanner?rev=95f04e879babef0b66fc445a45f215a46d69565a#95f04e879babef0b66fc445a45f215a46d69565a"
 dependencies = [
  "foldhash",
 ]

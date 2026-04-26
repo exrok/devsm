@@ -8,7 +8,7 @@ members = ["test-app"]
 
 [dependencies]
 anyhow = "1.0.100"
-kvlog = { path = "/home/user/Projects/git/kvlog/kvlog", default-features = false }
+kvlog = { git = "https://github.com/exrok/kvlog", rev = "e3e0e9b4b966c9d47bc6019259f4b2036b06c8a3", default-features = false }
 libc = "0.2.177"
 mio = { version = "1.0.4", features = [
     "os-poll",
@@ -22,7 +22,8 @@ bumpalo = { version = "3.19.0", features = ["collections"] }
 memchr = "2.7.6"
 sendfd = "0.4.4"
 jsony_value = "0.0.1"
-toml-spanner.path = "/code/toml-spanner"
+toml-spanner.rev = "95f04e879babef0b66fc445a45f215a46d69565a"
+toml-spanner.git = "https://github.com/exrok/toml-spanner"
 toml-spanner.default-features = false
 toml-spanner.features = ["from-toml"]
 hashbrown = { version = "0.16.1", default-features = false, features = [
