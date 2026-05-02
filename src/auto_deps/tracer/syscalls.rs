@@ -20,15 +20,24 @@ pub enum Effect {
     Unlink,
     Mkdir,
     /// open-family: read/write determined from the flags arg.
-    Open { flags_arg: u8 },
+    Open {
+        flags_arg: u8,
+    },
     /// getdents-family: dirfd is in `arg.path` slot (it's an fd, not a path).
-    ListDir { fd_arg: u8 },
+    ListDir {
+        fd_arg: u8,
+    },
     /// chdir / fchdir: update tracee cwd, no event emitted.
     Chdir,
-    Fchdir { fd_arg: u8 },
+    Fchdir {
+        fd_arg: u8,
+    },
     /// rename-family: a single event is emitted on the source (Unlink) plus
     /// a Write on the destination.
-    Rename { dst_dirfd: Option<u8>, dst_path: u8 },
+    Rename {
+        dst_dirfd: Option<u8>,
+        dst_path: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,18 +93,13 @@ pub fn classify(nr: Sysno) -> Option<SyscallShape> {
         Sysno::fchdir => s(Effect::Fchdir { fd_arg: 0 }, None),
 
         #[cfg(target_arch = "x86_64")]
-        Sysno::rename => s(
-            Effect::Rename { dst_dirfd: None, dst_path: 1 },
-            Some(PathArg { dirfd: None, path: 0 }),
-        ),
-        Sysno::renameat => s(
-            Effect::Rename { dst_dirfd: Some(2), dst_path: 3 },
-            Some(PathArg { dirfd: Some(0), path: 1 }),
-        ),
-        Sysno::renameat2 => s(
-            Effect::Rename { dst_dirfd: Some(2), dst_path: 3 },
-            Some(PathArg { dirfd: Some(0), path: 1 }),
-        ),
+        Sysno::rename => s(Effect::Rename { dst_dirfd: None, dst_path: 1 }, Some(PathArg { dirfd: None, path: 0 })),
+        Sysno::renameat => {
+            s(Effect::Rename { dst_dirfd: Some(2), dst_path: 3 }, Some(PathArg { dirfd: Some(0), path: 1 }))
+        }
+        Sysno::renameat2 => {
+            s(Effect::Rename { dst_dirfd: Some(2), dst_path: 3 }, Some(PathArg { dirfd: Some(0), path: 1 }))
+        }
 
         _ => None,
     }
@@ -110,7 +114,11 @@ pub fn effect_to_event_kind(effect: Effect, opened_write: bool) -> Option<PathEv
         Effect::Unlink => PathEventKind::Unlink,
         Effect::Mkdir => PathEventKind::Mkdir,
         Effect::Open { .. } => {
-            if opened_write { PathEventKind::Write } else { PathEventKind::Read }
+            if opened_write {
+                PathEventKind::Write
+            } else {
+                PathEventKind::Read
+            }
         }
         Effect::ListDir { .. } => PathEventKind::ListDir,
         Effect::Chdir | Effect::Fchdir { .. } | Effect::Rename { .. } => return None,

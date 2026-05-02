@@ -14,14 +14,14 @@
 mod event;
 #[path = "auto_deps/inference.rs"]
 mod inference;
-#[path = "auto_deps/tracer.rs"]
-mod tracer;
-#[path = "auto_deps/toml_writer.rs"]
-mod toml_writer;
 #[path = "auto_deps/recording.rs"]
 pub mod recording;
+#[path = "auto_deps/toml_writer.rs"]
+mod toml_writer;
+#[path = "auto_deps/tracer.rs"]
+mod tracer;
 
-pub use toml_writer::{UpdateOutcome, update_cache_key};
+pub use toml_writer::{UpdateOutcome, group_modified_paths, update_cache_key};
 
 use std::path::Path;
 use std::process::Command;
@@ -29,10 +29,10 @@ use std::time::Duration;
 
 pub use event::{PathEvent, PathEventKind, TraceReport};
 pub use inference::{FrameworkSignal, InferredDeps, InferredPath};
-#[cfg(target_os = "linux")]
-pub use tracer::{TRACED_SYSCALLS, Tracer, install_ptrace_traceme};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use tracer::install_seccomp_filter;
+#[cfg(target_os = "linux")]
+pub use tracer::{TRACED_SYSCALLS, Tracer, install_ptrace_traceme};
 
 /// Owned, serializable form of an [`InferredDeps`] result for shipping
 /// to the run client over RPC. Paths are project-root-relative strings
@@ -103,10 +103,7 @@ pub fn trace_command(cmd: Command, opts: TraceOptions) -> anyhow::Result<TraceRe
 /// (indexed by the raw syscall number; arch-specific). Used by the tracer
 /// benchmark to identify pathological syscall floods.
 #[cfg(target_os = "linux")]
-pub fn trace_command_with_histogram(
-    cmd: Command,
-    opts: TraceOptions,
-) -> anyhow::Result<(TraceReport, Vec<u64>)> {
+pub fn trace_command_with_histogram(cmd: Command, opts: TraceOptions) -> anyhow::Result<(TraceReport, Vec<u64>)> {
     tracer::trace_command_with_histogram(cmd, opts)
 }
 

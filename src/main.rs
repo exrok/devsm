@@ -812,9 +812,7 @@ fn apply_trace_report(
         return;
     }
     if report.truncated {
-        eprintln!(
-            "warning: trace exceeded the 1M event cap and is incomplete — refusing to write a partial cache.key"
-        );
+        eprintln!("warning: trace exceeded the 1M event cap and is incomplete — refusing to write a partial cache.key");
         return;
     }
     if report.paths.is_empty() {

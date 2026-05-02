@@ -119,12 +119,8 @@ pub fn infer(report: &TraceReport, project_root: &Path) -> InferredDeps {
         if *path == project_root {
             continue;
         }
-        let depth_from_root = path
-            .strip_prefix(&project_root)
-            .map(|r| r.components().count())
-            .unwrap_or(usize::MAX);
-        let keep = flags.read
-            || (flags.stat && !path.exists() && depth_from_root <= 1);
+        let depth_from_root = path.strip_prefix(&project_root).map(|r| r.components().count()).unwrap_or(usize::MAX);
+        let keep = flags.read || (flags.stat && !path.exists() && depth_from_root <= 1);
         if !keep {
             continue;
         }
@@ -147,8 +143,10 @@ pub fn infer(report: &TraceReport, project_root: &Path) -> InferredDeps {
     // entry so the cache key stays narrow (e.g. don't promote `test-app`
     // just because cargo opened `test-app/Cargo.toml`).
     for ld in &listed_dirs {
-        let has_tracked_child =
-            by_parent.get(ld).map(|v| !v.is_empty()).unwrap_or(false);
+        let has_tracked_child = by_parent.get(ld).map(|v| !v.is_empty()).unwrap_or(false);
+        if !has_tracked_child && is_unread_cargo_target_probe_dir(ld, &project_root) {
+            continue;
+        }
         if !has_tracked_child {
             final_paths.insert(ld.clone());
         }
@@ -171,6 +169,7 @@ pub fn infer(report: &TraceReport, project_root: &Path) -> InferredDeps {
         }
     }
 
+    coalesce_cargo_src_dirs(&mut final_paths, &project_root);
     collapse_under_directories(&mut final_paths);
 
     let surviving: Vec<PathBuf> = final_paths.iter().cloned().collect();
@@ -192,6 +191,7 @@ pub fn infer(report: &TraceReport, project_root: &Path) -> InferredDeps {
     for add in additions {
         final_paths.insert(add);
     }
+    coalesce_cargo_src_dirs(&mut final_paths, &project_root);
     collapse_under_directories(&mut final_paths);
 
     let mut sorted: Vec<PathBuf> = final_paths.into_iter().collect();
@@ -219,6 +219,49 @@ fn build_user_excludes(home: Option<&Path>, xdg_cache: Option<&Path>) -> Vec<Pat
 
 fn is_under(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
+}
+
+fn coalesce_cargo_src_dirs(paths: &mut HashSet<PathBuf>, project_root: &Path) {
+    let mut src_dirs = HashSet::new();
+    for path in paths.iter() {
+        if let Some(src) = cargo_src_dir_for_path(path, project_root) {
+            src_dirs.insert(src);
+        }
+    }
+
+    for src in src_dirs {
+        paths.retain(|p| p == &src || !is_under(p, &src));
+        paths.insert(src);
+    }
+}
+
+fn cargo_src_dir_for_path(path: &Path, project_root: &Path) -> Option<PathBuf> {
+    for dir in path.ancestors() {
+        if !is_under(dir, project_root) {
+            break;
+        }
+        let cargo_toml = dir.join("Cargo.toml");
+        if cargo_toml.is_file() {
+            let src = dir.join("src");
+            if is_under(path, &src) {
+                return Some(src);
+            }
+        }
+    }
+    None
+}
+
+fn is_unread_cargo_target_probe_dir(path: &Path, project_root: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if !matches!(name, "examples" | "tests" | "benches") {
+        return false;
+    }
+    let Some(package_dir) = path.parent() else {
+        return false;
+    };
+    is_under(package_dir, project_root) && package_dir.join("Cargo.toml").is_file()
 }
 
 /// Drop any path that lives strictly under another path already in the

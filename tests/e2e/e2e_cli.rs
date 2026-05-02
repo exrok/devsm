@@ -2294,6 +2294,61 @@ require = ["gen"]
 }
 
 #[test]
+fn cache_modified_supports_brace_expansion() {
+    let mut harness = TestHarness::new("cache_brace_modified");
+    let counter = harness.temp_dir.join("counter.txt");
+    let pkg = harness.temp_dir.join("pkg");
+    let cargo_toml = pkg.join("Cargo.toml");
+    let lib_rs = pkg.join("src/lib.rs");
+
+    fs::create_dir_all(pkg.join("src")).unwrap();
+    fs::write(&cargo_toml, "[package]\nname = \"pkg\"\n").unwrap();
+    fs::write(&lib_rs, "pub fn f() {}\n").unwrap();
+    fs::write(&counter, "0").unwrap();
+
+    harness.write_config(&format!(
+        r#"
+[action.gen]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+'''
+cache.key = [{{ modified = "pkg/{{Cargo.toml,src/lib.rs}}" }}]
+
+[action.consumer]
+sh = "cat {counter}"
+require = ["gen"]
+"#,
+        counter = counter.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success on first run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "gen should run first time");
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success on second run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "gen should be cached");
+
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&cargo_toml, "[package]\nname = \"pkg2\"\n").unwrap();
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success after Cargo.toml update, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "gen should run after Cargo.toml modified");
+
+    std::thread::sleep(Duration::from_millis(10));
+    fs::write(&lib_rs, "pub fn f() { println!(\"updated\"); }\n").unwrap();
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success after lib.rs update, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "3", "gen should run after lib.rs modified");
+}
+
+#[test]
 fn restart_cached_flag_skips_on_cache_hit() {
     let mut harness = TestHarness::new("restart_cached");
     let trigger = harness.temp_dir.join("trigger.txt");

@@ -13,6 +13,49 @@ fn create_test_tree(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn brace_expansion_expands_literal_path_alternatives() {
+    assert_eq!(
+        expand_modified_path("lib/utc/{Cargo.toml,src/lib.rs}"),
+        vec!["lib/utc/Cargo.toml".to_string(), "lib/utc/src/lib.rs".to_string()]
+    );
+    assert_eq!(
+        expand_modified_path("{a,b}/{c,d}"),
+        vec!["a/c".to_string(), "a/d".to_string(), "b/c".to_string(), "b/d".to_string()]
+    );
+}
+
+#[test]
+fn malformed_braces_stay_literal() {
+    assert_eq!(expand_modified_path("lib/{utc/src"), vec!["lib/{utc/src".to_string()]);
+    assert_eq!(expand_modified_path("lib/utc}/src"), vec!["lib/utc}/src".to_string()]);
+    assert_eq!(expand_modified_path("lib/{a,{b,c}}"), vec!["lib/{a,{b,c}}".to_string()]);
+}
+
+#[test]
+fn brace_expansion_hashes_like_explicit_paths() {
+    let dir = create_test_tree("brace_expansion");
+    fs::create_dir_all(dir.join("lib/utc/src")).unwrap();
+    fs::write(dir.join("lib/utc/Cargo.toml"), "[package]\nname = \"utc\"\n").unwrap();
+    fs::write(dir.join("lib/utc/src/lib.rs"), "pub fn utc() {}\n").unwrap();
+
+    let mut grouped = CacheKeyHasherPosix::new();
+    grouped.update(b"modified:");
+    for rel in expand_modified_path("lib/utc/{Cargo.toml,src/lib.rs}") {
+        grouped.hash_path(&dir.join(rel), &[]);
+    }
+    let grouped_hash = grouped.finalize_hex();
+
+    let mut explicit = CacheKeyHasherPosix::new();
+    explicit.update(b"modified:");
+    explicit.hash_path(&dir.join("lib/utc/Cargo.toml"), &[]);
+    explicit.hash_path(&dir.join("lib/utc/src/lib.rs"), &[]);
+    let explicit_hash = explicit.finalize_hex();
+
+    assert_eq!(grouped_hash, explicit_hash);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn hash_single_file() {
     let dir = create_test_tree("single_file");
     let file = dir.join("test.txt");

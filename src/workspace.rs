@@ -1,5 +1,5 @@
 use crate::{
-    cache_key::CacheKeyHasher,
+    cache_key::{CacheKeyHasher, expand_modified_path},
     cli::TestFilter,
     config::{
         AllowMultiple, CARGO_AUTO_EXPR, CacheKeyInput, Command, ConfigGeneration, Environment, TaskConfigRc,
@@ -30,7 +30,7 @@ fn build_require_analysis(
 use jsony_value::{Value, ValueMap, ValueNumber, ValueRef};
 use smallvec::SmallVec;
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock, Weak},
     time::{Instant, SystemTime},
 };
@@ -59,6 +59,12 @@ enum CacheKeyInfoItem {
 struct CacheKeyInfo {
     base_index: BaseTaskIndex,
     cache_key_inputs: Vec<CacheKeyInfoItem>,
+}
+
+fn hash_modified_path(hasher: &mut CacheKeyHasher, base_path: &Path, path: &str, ignore: &[&str]) {
+    for expanded in expand_modified_path(path) {
+        hasher.hash_path(&base_path.join(expanded), ignore);
+    }
 }
 
 /// Compute cache key without holding the workspace lock.
@@ -950,9 +956,9 @@ impl WorkspaceState {
             match input {
                 CacheKeyInput::Modified { paths, ignore } => {
                     self.cache_key_hasher.update(b"modified:");
+                    let base_path = self.config.current.base_path();
                     for path in *paths {
-                        let full_path = self.config.current.base_path().join(path);
-                        self.cache_key_hasher.hash_path(&full_path, ignore);
+                        hash_modified_path(&mut self.cache_key_hasher, base_path, path, ignore);
                     }
                 }
                 CacheKeyInput::ProfileChanged(task_name) => {
@@ -984,9 +990,9 @@ impl WorkspaceState {
             match input {
                 CacheKeyInput::Modified { paths, ignore } => {
                     self.cache_key_hasher.update(b"modified:");
+                    let base_path = self.config.current.base_path();
                     for path in *paths {
-                        let full_path = self.config.current.base_path().join(path);
-                        self.cache_key_hasher.hash_path(&full_path, ignore);
+                        hash_modified_path(&mut self.cache_key_hasher, base_path, path, ignore);
                     }
                 }
                 CacheKeyInput::ProfileChanged(task_name) => {
@@ -2626,13 +2632,7 @@ pub struct SpawnSpec {
 impl SpawnSpec {
     pub fn task(name: &str, profile: &str, params: ValueMap<'static>, force_restart: bool) -> Self {
         SpawnSpec {
-            tasks: vec![TaskSpec {
-                name: name.into(),
-                profile: profile.into(),
-                params,
-                force_restart,
-                trace: false,
-            }],
+            tasks: vec![TaskSpec { name: name.into(), profile: profile.into(), params, force_restart, trace: false }],
             test_group: false,
         }
     }
@@ -2974,7 +2974,12 @@ impl Workspace {
                     .iter()
                     .map(|input| match input {
                         CacheKeyInput::Modified { paths, ignore } => CacheKeyInfoItem::Modified {
-                            paths: paths.iter().map(|p| base_path.join(p)).collect(),
+                            paths: paths
+                                .iter()
+                                .flat_map(|p| {
+                                    expand_modified_path(p).into_iter().map(|expanded| base_path.join(expanded))
+                                })
+                                .collect(),
                             ignore,
                         },
                         CacheKeyInput::ProfileChanged(task_name) => {

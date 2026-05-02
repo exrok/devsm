@@ -9,6 +9,7 @@
 //! via `Formatting::preserved_from(...).with_span_projection_identity()`
 //! so unrelated whitespace and comments survive untouched.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, anyhow, bail};
@@ -40,15 +41,13 @@ pub fn update_cache_key(
     modified_paths: &[String],
     ignore_per_path: &[Vec<String>],
 ) -> anyhow::Result<UpdateOutcome> {
-    let original = std::fs::read_to_string(toml_path)
-        .with_context(|| format!("failed to read {}", toml_path.display()))?;
+    let original =
+        std::fs::read_to_string(toml_path).with_context(|| format!("failed to read {}", toml_path.display()))?;
 
     let new_content = render_with_updated_cache_key(&original, task_name, modified_paths, ignore_per_path)?;
 
     let parent = toml_path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = toml_path
-        .file_name()
-        .ok_or_else(|| anyhow!("invalid devsm.toml path: {}", toml_path.display()))?;
+    let file_name = toml_path.file_name().ok_or_else(|| anyhow!("invalid devsm.toml path: {}", toml_path.display()))?;
     let mut tmp_name = file_name.to_os_string();
     tmp_name.push(format!(".tmp.{}", std::process::id()));
     let tmp_path = parent.join(&tmp_name);
@@ -80,10 +79,55 @@ pub fn render_with_updated_cache_key(
     let new_cache_value = build_cache_value(&arena, modified_paths, ignore_per_path, task_table.get("cache"));
     task_table.insert(Key::new(arena.alloc_str("cache")), new_cache_value, &arena);
 
-    let bytes = Formatting::preserved_from(&doc)
-        .with_span_projection_identity()
-        .format_table_to_bytes(table, &arena);
+    let bytes = Formatting::preserved_from(&doc).with_span_projection_identity().format_table_to_bytes(table, &arena);
     String::from_utf8(bytes).map_err(|_| anyhow!("emitted non-utf8 bytes"))
+}
+
+pub fn group_modified_paths(modified_paths: &[String]) -> Vec<String> {
+    let mut by_parent: BTreeMap<&str, Vec<(usize, &str)>> = BTreeMap::new();
+    for (idx, path) in modified_paths.iter().enumerate() {
+        let Some((parent, leaf)) = path.rsplit_once('/') else {
+            continue;
+        };
+        if parent.is_empty() || leaf.is_empty() {
+            continue;
+        }
+        by_parent.entry(parent).or_default().push((idx, leaf));
+    }
+
+    let mut replacements: HashMap<usize, String> = HashMap::new();
+    let mut skip: HashSet<usize> = HashSet::new();
+    for (parent, leaves) in by_parent {
+        if leaves.len() < 2 {
+            continue;
+        }
+        let leaf_list = leaves.iter().map(|(_, leaf)| *leaf).collect::<Vec<_>>().join(",");
+        let grouped = format!("{parent}/{{{leaf_list}}}");
+        let explicit_rendered_len = leaves.iter().map(|(_, leaf)| parent.len() + 1 + leaf.len() + 2).sum::<usize>()
+            + leaves.len().saturating_sub(1) * 2;
+        let grouped_rendered_len = grouped.len() + 2;
+        if grouped_rendered_len >= explicit_rendered_len {
+            continue;
+        }
+        let first_idx = leaves[0].0;
+        replacements.insert(first_idx, grouped);
+        for (idx, _) in leaves.iter().skip(1) {
+            skip.insert(*idx);
+        }
+    }
+
+    let mut out = Vec::with_capacity(modified_paths.len().saturating_sub(skip.len()));
+    for (idx, path) in modified_paths.iter().enumerate() {
+        if skip.contains(&idx) {
+            continue;
+        }
+        if let Some(grouped) = replacements.remove(&idx) {
+            out.push(grouped);
+        } else {
+            out.push(path.clone());
+        }
+    }
+    out
 }
 
 /// Render the existing `cache.key` value of the named task as a TOML
@@ -122,14 +166,12 @@ fn locate_task_table_mut<'a, 'de>(
             break;
         }
     }
-    let kind = found_kind
-        .ok_or_else(|| anyhow!("task `{}` not found in devsm.toml under action/service/test", task_name))?;
+    let kind =
+        found_kind.ok_or_else(|| anyhow!("task `{}` not found in devsm.toml under action/service/test", task_name))?;
     let kind_item = root.get_mut(kind).expect("located above");
     let kind_table = kind_item.as_table_mut().expect("checked above");
     let task_item = kind_table.get_mut(task_name).expect("contains_key just confirmed presence");
-    task_item
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("task `{}.{}` is not a table", kind, task_name))
+    task_item.as_table_mut().ok_or_else(|| anyhow!("task `{}.{}` is not a table", kind, task_name))
 }
 
 /// Build the value for the `cache` key of the task. When the task
@@ -160,14 +202,11 @@ fn build_cache_value<'de>(
 
 /// Build the `cache.key` array — exactly one inline table, optionally
 /// with an `ignore` array, holding the inferred paths.
-fn build_key_array<'de>(
-    arena: &'de Arena,
-    modified_paths: &[String],
-    ignore_per_path: &[Vec<String>],
-) -> Item<'de> {
-    let mut paths_array = toml_spanner::Array::try_with_capacity(modified_paths.len(), arena)
-        .expect("capacity within u32");
-    for p in modified_paths {
+fn build_key_array<'de>(arena: &'de Arena, modified_paths: &[String], ignore_per_path: &[Vec<String>]) -> Item<'de> {
+    let modified_paths = group_modified_paths(modified_paths);
+    let mut paths_array =
+        toml_spanner::Array::try_with_capacity(modified_paths.len(), arena).expect("capacity within u32");
+    for p in &modified_paths {
         paths_array.push(Item::string(arena.alloc_str(p)), arena);
     }
     paths_array.set_style(ArrayStyle::Inline);
@@ -184,13 +223,12 @@ fn build_key_array<'de>(
         }
     }
 
-    let mut entry_table =
-        toml_spanner::Table::try_with_capacity(if ignore_flat.is_empty() { 1 } else { 2 }, arena)
-            .expect("capacity within u32");
+    let mut entry_table = toml_spanner::Table::try_with_capacity(if ignore_flat.is_empty() { 1 } else { 2 }, arena)
+        .expect("capacity within u32");
     entry_table.insert(Key::new(arena.alloc_str("modified")), paths_array.into_item(), arena);
     if !ignore_flat.is_empty() {
-        let mut ignore_array = toml_spanner::Array::try_with_capacity(ignore_flat.len(), arena)
-            .expect("capacity within u32");
+        let mut ignore_array =
+            toml_spanner::Array::try_with_capacity(ignore_flat.len(), arena).expect("capacity within u32");
         for s in &ignore_flat {
             ignore_array.push(Item::string(arena.alloc_str(s)), arena);
         }
@@ -292,5 +330,19 @@ cache.never = true
         assert!(out.contains("ignore"), "expected ignore key in:\n{out}");
         assert!(out.contains("\"target\""));
         assert!(out.contains("\"build/\""));
+    }
+
+    #[test]
+    fn sibling_paths_are_grouped_with_braces() {
+        let src = "[action.foo]\nsh = \"x\"\n";
+        let out = render_with_updated_cache_key(
+            src,
+            "foo",
+            &["lib/utc/Cargo.toml".to_string(), "lib/utc/src".to_string(), "Cargo.toml".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert!(out.contains("\"lib/utc/{Cargo.toml,src}\""), "expected grouped path in:\n{out}");
+        assert!(out.contains("\"Cargo.toml\""), "root path should stay ungrouped:\n{out}");
     }
 }

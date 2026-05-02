@@ -109,11 +109,40 @@ fn cargo_rule_adds_lockfile_and_src_dir() {
 }
 
 #[test]
-fn write_then_read_intermediate_is_dropped() {
+fn cargo_package_src_read_collapses_to_package_src() {
     let (_tmp, _r, deps) = run(
-        |_| {},
-        "echo data > out.txt && cat out.txt > /dev/null",
+        |dir| {
+            let pkg = dir.join("lib/utc");
+            fs::create_dir_all(pkg.join("src/nested")).unwrap();
+            fs::write(pkg.join("Cargo.toml"), b"[package]\nname = \"utc\"\n").unwrap();
+            fs::write(pkg.join("src/lib.rs"), b"pub mod nested;\n").unwrap();
+            fs::write(pkg.join("src/nested/mod.rs"), b"pub fn f() {}\n").unwrap();
+        },
+        "cat lib/utc/Cargo.toml > /dev/null; \
+         cat lib/utc/src/lib.rs > /dev/null; \
+         cat lib/utc/src/nested/mod.rs > /dev/null",
     );
+    assert_inputs(&deps, &["lib/utc/Cargo.toml", "lib/utc/src"]);
+}
+
+#[test]
+fn cargo_package_non_src_read_does_not_add_src() {
+    let (_tmp, _r, deps) = run(
+        |dir| {
+            let pkg = dir.join("lib/utc");
+            fs::create_dir_all(pkg.join("src")).unwrap();
+            fs::write(pkg.join("Cargo.toml"), b"[package]\nname = \"utc\"\n").unwrap();
+            fs::write(pkg.join("build.rs"), b"fn main() {}\n").unwrap();
+            fs::write(pkg.join("src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        },
+        "cat lib/utc/Cargo.toml > /dev/null; cat lib/utc/build.rs > /dev/null",
+    );
+    assert_inputs(&deps, &["lib/utc/Cargo.toml", "lib/utc/build.rs"]);
+}
+
+#[test]
+fn write_then_read_intermediate_is_dropped() {
+    let (_tmp, _r, deps) = run(|_| {}, "echo data > out.txt && cat out.txt > /dev/null");
     let got = dep_paths(&deps);
     assert!(!got.contains("out.txt"), "out.txt should not be an input, got {got:?}");
     assert!(deps.dropped_intermediate >= 1, "expected at least one intermediate drop");
@@ -191,10 +220,7 @@ fn missing_ancestor_collapses_missing_descendant() {
          true",
     );
     let got = dep_paths(&deps);
-    assert!(
-        !got.contains(".cargo/config.toml"),
-        ".cargo/config.toml should collapse into .cargo, got {got:?}"
-    );
+    assert!(!got.contains(".cargo/config.toml"), ".cargo/config.toml should collapse into .cargo, got {got:?}");
 }
 
 #[test]
@@ -229,14 +255,8 @@ fn listed_dir_with_tracked_child_is_not_promoted() {
         "ls member > /dev/null; cat member/Cargo.toml > /dev/null",
     );
     let got = dep_paths(&deps);
-    assert!(
-        got.contains("member/Cargo.toml"),
-        "tracked child should appear, got {got:?}"
-    );
-    assert!(
-        !got.contains("member"),
-        "listed dir with tracked children should not promote to the dir, got {got:?}"
-    );
+    assert!(got.contains("member/Cargo.toml"), "tracked child should appear, got {got:?}");
+    assert!(!got.contains("member"), "listed dir with tracked children should not promote to the dir, got {got:?}");
 }
 
 #[test]
@@ -255,6 +275,38 @@ fn listed_dir_without_tracked_children_is_kept() {
     );
     let got = dep_paths(&deps);
     assert!(got.contains("examples"), "untouched listed dir should remain, got {got:?}");
+}
+
+#[test]
+fn unread_cargo_example_and_test_probe_dirs_are_dropped() {
+    let (_tmp, _r, deps) = run(
+        |dir| {
+            fs::write(dir.join("Cargo.toml"), b"[package]\nname=\"m\"\n").unwrap();
+            fs::create_dir(dir.join("examples")).unwrap();
+            fs::create_dir(dir.join("tests")).unwrap();
+            fs::create_dir(dir.join("benches")).unwrap();
+            fs::write(dir.join("src-anchor.rs"), b"a").unwrap();
+        },
+        "ls examples > /dev/null; \
+         ls tests > /dev/null; \
+         ls benches > /dev/null; \
+         cat Cargo.toml > /dev/null; \
+         cat src-anchor.rs > /dev/null",
+    );
+    assert_inputs(&deps, &["Cargo.toml", "src-anchor.rs"]);
+}
+
+#[test]
+fn read_cargo_example_file_is_kept() {
+    let (_tmp, _r, deps) = run(
+        |dir| {
+            fs::write(dir.join("Cargo.toml"), b"[package]\nname=\"m\"\n").unwrap();
+            fs::create_dir(dir.join("examples")).unwrap();
+            fs::write(dir.join("examples/demo.rs"), b"fn main() {}\n").unwrap();
+        },
+        "ls examples > /dev/null; cat Cargo.toml > /dev/null; cat examples/demo.rs > /dev/null",
+    );
+    assert_inputs(&deps, &["Cargo.toml", "examples/demo.rs"]);
 }
 
 #[test]

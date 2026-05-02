@@ -5,8 +5,8 @@ use crate::auto_deps::tracer::mem_read::read_cstr;
 use crate::auto_deps::tracer::seccomp;
 use crate::auto_deps::tracer::state::{FdEntry, PendingSyscall, Stage, TraceeState};
 use crate::auto_deps::tracer::syscalls::{
-    Effect, classify, effect_needs_exit, effect_to_event_kind, open_flags_is_cloexec,
-    open_flags_is_directory, open_flags_is_write,
+    Effect, classify, effect_needs_exit, effect_to_event_kind, open_flags_is_cloexec, open_flags_is_directory,
+    open_flags_is_write,
 };
 
 use std::collections::HashMap;
@@ -123,11 +123,8 @@ impl Tracer {
     /// TRACEEXEC` and resumes the tracee with `PTRACE_SYSCALL`.
     pub fn attach(root_pid: i32, opts: TraceOptions) -> anyhow::Result<Self> {
         let use_seccomp = cfg!(target_arch = "x86_64") && opts.use_seccomp;
-        let trace_opts =
-            BASE_TRACE_OPTIONS | if use_seccomp { libc::PTRACE_O_TRACESECCOMP } else { 0 };
-        if unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, root_pid, 0i64, trace_opts as i64) }
-            == -1
-        {
+        let trace_opts = BASE_TRACE_OPTIONS | if use_seccomp { libc::PTRACE_O_TRACESECCOMP } else { 0 };
+        if unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, root_pid, 0i64, trace_opts as i64) } == -1 {
             anyhow::bail!("PTRACE_SETOPTIONS: {}", io::Error::last_os_error());
         }
 
@@ -262,9 +259,7 @@ impl Tracer {
             libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
                 self.stats.fork_clones += 1;
                 let mut child_pid: u64 = 0;
-                let r = unsafe {
-                    libc::ptrace(libc::PTRACE_GETEVENTMSG, pid, 0i64, &mut child_pid as *mut u64)
-                };
+                let r = unsafe { libc::ptrace(libc::PTRACE_GETEVENTMSG, pid, 0i64, &mut child_pid as *mut u64) };
                 if r == -1 {
                     return;
                 }
@@ -278,8 +273,7 @@ impl Tracer {
                     s.pending = None;
                     self.tracees.insert(child_pid, s);
                 } else {
-                    let cwd =
-                        std::fs::read_link(format!("/proc/{}/cwd", child_pid)).unwrap_or_default();
+                    let cwd = std::fs::read_link(format!("/proc/{}/cwd", child_pid)).unwrap_or_default();
                     self.tracees.insert(child_pid, TraceeState::new(cwd));
                 }
             }
@@ -405,10 +399,7 @@ impl Tracer {
         if let Some(slot) = self.syscall_histogram.get_mut(nr) {
             *slot += 1;
         }
-        let state = self
-            .tracees
-            .entry(pid)
-            .or_insert_with(|| TraceeState::new(PathBuf::new()));
+        let state = self.tracees.entry(pid).or_insert_with(|| TraceeState::new(PathBuf::new()));
         let read_cstr_calls = &mut self.stats.read_cstr_calls;
         state.pending = Sysno::new(nr).and_then(|sysno| {
             let shape = classify(sysno)?;
@@ -438,15 +429,7 @@ impl Tracer {
             Effect::Stat | Effect::ReadLink | Effect::Exec | Effect::Unlink | Effect::Mkdir => {
                 let Some(path) = resolved_path else { return };
                 let Some(kind) = effect_to_event_kind(effect, false) else { return };
-                push_event(
-                    &mut self.events,
-                    &mut self.seq,
-                    self.max_events,
-                    &mut self.truncated,
-                    kind,
-                    path,
-                    pid,
-                );
+                push_event(&mut self.events, &mut self.seq, self.max_events, &mut self.truncated, kind, path, pid);
             }
             Effect::Chdir => {
                 if let Some(path) = resolved_path {
@@ -459,10 +442,7 @@ impl Tracer {
                     state.cwd = entry.path.clone();
                 }
             }
-            Effect::Open { .. }
-            | Effect::ListDir { .. }
-            | Effect::Rename { .. }
-            | Effect::Read => {}
+            Effect::Open { .. } | Effect::ListDir { .. } | Effect::Rename { .. } | Effect::Read => {}
         }
     }
 
@@ -482,10 +462,7 @@ impl Tracer {
                 let cloexec = open_flags_is_cloexec(flags);
                 let fd = rval as i32;
                 if fd >= 0 {
-                    state.fds.insert(
-                        fd,
-                        FdEntry { path: path.clone(), opened_write, cloexec },
-                    );
+                    state.fds.insert(fd, FdEntry { path: path.clone(), opened_write, cloexec });
                 }
                 // O_DIRECTORY opens are the prelude to `getdents64`. Don't
                 // emit a Read event - the listing surfaces the dependency,
@@ -507,7 +484,15 @@ impl Tracer {
                 let fd = args[fd_arg as usize] as i32;
                 if let Some(entry) = state.fds.get(&fd) {
                     let path = entry.path.clone();
-                    push_event(&mut self.events, &mut self.seq, self.max_events, &mut self.truncated, PathEventKind::ListDir, path, pid);
+                    push_event(
+                        &mut self.events,
+                        &mut self.seq,
+                        self.max_events,
+                        &mut self.truncated,
+                        PathEventKind::ListDir,
+                        path,
+                        pid,
+                    );
                 }
             }
             Effect::Chdir => {
@@ -529,10 +514,26 @@ impl Tracer {
                     resolve_path(state, &args, dst_dirfd, raw)
                 });
                 if let Some(p) = src {
-                    push_event(&mut self.events, &mut self.seq, self.max_events, &mut self.truncated, PathEventKind::Unlink, p, pid);
+                    push_event(
+                        &mut self.events,
+                        &mut self.seq,
+                        self.max_events,
+                        &mut self.truncated,
+                        PathEventKind::Unlink,
+                        p,
+                        pid,
+                    );
                 }
                 if let Some(p) = dst {
-                    push_event(&mut self.events, &mut self.seq, self.max_events, &mut self.truncated, PathEventKind::Write, p, pid);
+                    push_event(
+                        &mut self.events,
+                        &mut self.seq,
+                        self.max_events,
+                        &mut self.truncated,
+                        PathEventKind::Write,
+                        p,
+                        pid,
+                    );
                 }
             }
             Effect::Read => {}
@@ -619,10 +620,7 @@ pub fn trace_command(cmd: Command, opts: TraceOptions) -> anyhow::Result<TraceRe
     trace_command_with_histogram(cmd, opts).map(|(r, _)| r)
 }
 
-pub fn trace_command_with_histogram(
-    mut cmd: Command,
-    opts: TraceOptions,
-) -> anyhow::Result<(TraceReport, Vec<u64>)> {
+pub fn trace_command_with_histogram(mut cmd: Command, opts: TraceOptions) -> anyhow::Result<(TraceReport, Vec<u64>)> {
     let _guard = BLOCKING_TRACE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     install_ptrace_traceme(&mut cmd);
