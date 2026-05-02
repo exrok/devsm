@@ -5,8 +5,27 @@ pub struct FatSearch {
 }
 // todo optimize
 fn normalize(text: &str) -> String {
-    let norm = text.to_lowercase();
+    let norm = text.to_ascii_lowercase();
     norm.replace("_", " ")
+}
+
+fn normalize_into(text: &str, buf: &mut Vec<u8>) {
+    buf.reserve(text.len());
+    let raw = buf.spare_capacity_mut();
+    assert!(raw.len() >= text.len());
+    for (i, ch) in text.as_bytes().iter().enumerate() {
+        let ch = if *ch == b'_' {
+            b' '
+        } else if *ch >= b'A' && *ch <= b'Z' {
+            *ch + 32
+        } else {
+            *ch
+        };
+        raw[i].write(ch);
+    }
+    unsafe {
+        buf.set_len(buf.len() + text.len());
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -34,7 +53,7 @@ impl Entry {
 impl FatSearch {
     pub fn insert(&mut self, text: &str) {
         let offset = self.buffer.len();
-        self.buffer.extend_from_slice(normalize(text).as_bytes());
+        normalize_into(text, &mut self.buffer);
         self.buffer.push(255);
         self.indices.push(offset)
     }
