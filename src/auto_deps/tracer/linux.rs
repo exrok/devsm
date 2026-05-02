@@ -1,5 +1,5 @@
 use crate::auto_deps::TraceOptions;
-use crate::auto_deps::event::{PathEvent, PathEventKind, TraceReport};
+use crate::auto_deps::event::{PathEvent, PathEventKind, TraceReport, TraceStatsSnapshot};
 use crate::auto_deps::tracer::mem_read::read_cstr;
 use crate::auto_deps::tracer::state::{FdEntry, PendingSyscall, Stage, TraceeState};
 use crate::auto_deps::tracer::syscalls::{
@@ -52,6 +52,19 @@ pub fn install_ptrace_traceme(cmd: &mut Command) {
 /// ptrace operations (`PTRACE_GET_SYSCALL_INFO`, `PTRACE_SYSCALL`, etc.) to
 /// continue the trace. Splitting it this way avoids a `waitpid(-1)` race
 /// between the tracer and any other reaper sharing the same process.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TraceStats {
+    pub status_total: u64,
+    pub syscall_stops: u64,
+    pub event_stops: u64,
+    pub signal_stops: u64,
+    pub exit_stops: u64,
+    pub get_syscall_info_calls: u64,
+    pub resume_calls: u64,
+    pub read_cstr_calls: u64,
+    pub fork_clones: u64,
+}
+
 pub struct Tracer {
     root_pid: i32,
     max_events: usize,
@@ -60,6 +73,14 @@ pub struct Tracer {
     seq: u64,
     truncated: bool,
     root_exit: Option<ExitStatus>,
+    stats: TraceStats,
+    syscall_histogram: Vec<u64>,
+}
+
+impl Tracer {
+    pub fn stats(&self) -> TraceStats {
+        self.stats
+    }
 }
 
 impl Tracer {
@@ -89,12 +110,20 @@ impl Tracer {
             seq: 0,
             truncated: false,
             root_exit: None,
+            stats: TraceStats::default(),
+            syscall_histogram: vec![0u64; 1024],
         })
+    }
+
+    pub fn syscall_histogram(&self) -> &[u64] {
+        &self.syscall_histogram
     }
 
     /// Process a wait status for `pid`. Idempotent for unknown pids.
     pub fn on_status(&mut self, pid: i32, status: i32) {
+        self.stats.status_total += 1;
         if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            self.stats.exit_stops += 1;
             self.tracees.remove(&pid);
             if pid == self.root_pid {
                 self.root_exit = Some(ExitStatus::from_raw(status));
@@ -106,23 +135,42 @@ impl Tracer {
         }
         let sig = libc::WSTOPSIG(status);
         if sig == (libc::SIGTRAP | 0x80) {
+            self.stats.syscall_stops += 1;
             self.handle_syscall_stop(pid);
             if self.truncated {
                 let _ = unsafe { libc::ptrace(libc::PTRACE_DETACH, pid, 0i64, 0i64) };
                 return;
             }
+            self.stats.resume_calls += 1;
             let _ = resume_syscall(pid, 0);
         } else if sig == libc::SIGTRAP {
+            self.stats.event_stops += 1;
             let event = (status >> 16) & 0xffff;
             self.handle_ptrace_event(pid, event as i32);
+            self.stats.resume_calls += 1;
             let _ = resume_syscall(pid, 0);
-        } else if sig == libc::SIGSTOP && !self.tracees.contains_key(&pid) {
-            // Brand-new tracee from fork/vfork/clone whose stop reached us
-            // before its parent's PTRACE_EVENT_*. Best-effort init.
-            let cwd = std::fs::read_link(format!("/proc/{}/cwd", pid)).unwrap_or_default();
-            self.tracees.insert(pid, TraceeState::new(cwd));
+        } else if sig == libc::SIGSTOP {
+            self.stats.signal_stops += 1;
+            // The kernel emits an initial SIGSTOP for every tracee created via
+            // PTRACE_O_TRACEFORK/VFORK/CLONE. It looks like a real signal but
+            // it is the post-clone group-stop notification — must be resumed
+            // with sig=0. Re-injecting SIGSTOP is catastrophic: SIGSTOP cannot
+            // be blocked, the tracee re-enters stopped state, the kernel
+            // re-notifies us, and we busy-loop on that pid. This race fires
+            // whenever the parent's PTRACE_EVENT_CLONE is processed before
+            // the child's SIGSTOP (the common order under heavy threading).
+            //
+            // We don't need to preserve real-SIGSTOP semantics for a build
+            // tracer, so swallow all SIGSTOPs unconditionally.
+            if !self.tracees.contains_key(&pid) {
+                let cwd = std::fs::read_link(format!("/proc/{}/cwd", pid)).unwrap_or_default();
+                self.tracees.insert(pid, TraceeState::new(cwd));
+            }
+            self.stats.resume_calls += 1;
             let _ = resume_syscall(pid, 0);
         } else {
+            self.stats.signal_stops += 1;
+            self.stats.resume_calls += 1;
             let _ = resume_syscall(pid, sig);
         }
     }
@@ -140,17 +188,35 @@ impl Tracer {
     }
 
     pub fn finish(self) -> TraceReport {
-        TraceReport {
+        let (report, _) = self.finish_with_histogram();
+        report
+    }
+
+    pub fn finish_with_histogram(self) -> (TraceReport, Vec<u64>) {
+        let report = TraceReport {
             events: self.events,
             root_pid: self.root_pid,
             exit_status: self.root_exit.unwrap_or_else(|| ExitStatus::from_raw(0)),
             truncated: self.truncated,
-        }
+            stats: TraceStatsSnapshot {
+                status_total: self.stats.status_total,
+                syscall_stops: self.stats.syscall_stops,
+                event_stops: self.stats.event_stops,
+                signal_stops: self.stats.signal_stops,
+                exit_stops: self.stats.exit_stops,
+                get_syscall_info_calls: self.stats.get_syscall_info_calls,
+                resume_calls: self.stats.resume_calls,
+                read_cstr_calls: self.stats.read_cstr_calls,
+                fork_clones: self.stats.fork_clones,
+            },
+        };
+        (report, self.syscall_histogram)
     }
 
     fn handle_ptrace_event(&mut self, pid: i32, event: i32) {
         match event {
             libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
+                self.stats.fork_clones += 1;
                 let mut child_pid: u64 = 0;
                 let r = unsafe {
                     libc::ptrace(libc::PTRACE_GETEVENTMSG, pid, 0i64, &mut child_pid as *mut u64)
@@ -184,41 +250,76 @@ impl Tracer {
     }
 
     fn handle_syscall_stop(&mut self, pid: i32) {
+        // We track ENTRY vs EXIT in `state.stage` so that we can skip the
+        // PTRACE_GET_SYSCALL_INFO syscall on the EXIT side of any uninteresting
+        // syscall (i.e. when nothing was pending). Without seccomp filtering we
+        // see two stops per tracee syscall, and the vast majority are syscalls
+        // we don't classify — paying for an extra ptrace call on each of those
+        // EXITs is the dominant per-stop cost.
+        let stage = self.tracees.get(&pid).map(|s| s.stage).unwrap_or(Stage::AwaitingEntry);
+
+        if matches!(stage, Stage::InsideSyscall) {
+            let state = match self.tracees.get_mut(&pid) {
+                Some(s) => s,
+                None => return,
+            };
+            state.stage = Stage::AwaitingEntry;
+            let Some(pending) = state.pending.take() else { return };
+
+            self.stats.get_syscall_info_calls += 1;
+            let info = match get_syscall_info(pid) {
+                Ok(info) => info,
+                Err(_) => return,
+            };
+            if info.op != libc::PTRACE_SYSCALL_INFO_EXIT {
+                return;
+            }
+            let exit = unsafe { info.u.exit };
+            if exit.is_error != 0 {
+                return;
+            }
+            let rval = exit.sval;
+            self.handle_syscall_exit(pid, pending, rval);
+            return;
+        }
+
+        self.stats.get_syscall_info_calls += 1;
         let info = match get_syscall_info(pid) {
             Ok(info) => info,
             Err(_) => return,
         };
+        if info.op != libc::PTRACE_SYSCALL_INFO_ENTRY {
+            return;
+        }
+        let nr = unsafe { info.u.entry.nr } as usize;
+        let args = unsafe { info.u.entry.args };
+        if let Some(slot) = self.syscall_histogram.get_mut(nr) {
+            *slot += 1;
+        }
         let state = self
             .tracees
             .entry(pid)
             .or_insert_with(|| TraceeState::new(PathBuf::new()));
-
-        if info.op == libc::PTRACE_SYSCALL_INFO_ENTRY {
-            let nr = unsafe { info.u.entry.nr } as usize;
-            let args = unsafe { info.u.entry.args };
-            state.stage = Stage::InsideSyscall;
-            state.pending = Sysno::new(nr).and_then(|sysno| {
-                let shape = classify(sysno)?;
-                let resolved_path = shape.path.and_then(|parg| {
-                    let path_addr = args[parg.path as usize];
-                    let bytes = read_cstr(pid, path_addr).ok()?;
-                    let raw = PathBuf::from(OsString::from_vec(bytes));
-                    Some(resolve_path(state, &args, parg.dirfd, raw))
-                });
-                Some(PendingSyscall { effect: shape.effect, args, resolved_path })
+        state.stage = Stage::InsideSyscall;
+        let read_cstr_calls = &mut self.stats.read_cstr_calls;
+        state.pending = Sysno::new(nr).and_then(|sysno| {
+            let shape = classify(sysno)?;
+            let resolved_path = shape.path.and_then(|parg| {
+                let path_addr = args[parg.path as usize];
+                *read_cstr_calls += 1;
+                let bytes = read_cstr(pid, path_addr).ok()?;
+                let raw = PathBuf::from(OsString::from_vec(bytes));
+                Some(resolve_path(state, &args, parg.dirfd, raw))
             });
-            return;
-        }
-        if info.op != libc::PTRACE_SYSCALL_INFO_EXIT {
-            return;
-        }
-        let exit = unsafe { info.u.exit };
-        state.stage = Stage::AwaitingEntry;
-        let Some(pending) = state.pending.take() else { return };
-        if exit.is_error != 0 {
-            return;
-        }
-        let rval = exit.sval;
+            Some(PendingSyscall { effect: shape.effect, args, resolved_path })
+        });
+    }
+
+    fn handle_syscall_exit(&mut self, pid: i32, pending: PendingSyscall, rval: i64) {
+        let state = match self.tracees.get_mut(&pid) {
+            Some(s) => s,
+            None => return,
+        };
         let PendingSyscall { effect, args, resolved_path } = pending;
 
         match effect {
@@ -350,7 +451,14 @@ static BLOCKING_TRACE_LOCK: Mutex<()> = Mutex::new(());
 /// Spawn `cmd` and drive a [`Tracer`] to completion using `waitpid(-1)` in
 /// the calling thread. Convenience for tests and CLI; **not** safe to call
 /// from the daemon process (it would race the event loop's reaper).
-pub fn trace_command(mut cmd: Command, opts: TraceOptions) -> anyhow::Result<TraceReport> {
+pub fn trace_command(cmd: Command, opts: TraceOptions) -> anyhow::Result<TraceReport> {
+    trace_command_with_histogram(cmd, opts).map(|(r, _)| r)
+}
+
+pub fn trace_command_with_histogram(
+    mut cmd: Command,
+    opts: TraceOptions,
+) -> anyhow::Result<(TraceReport, Vec<u64>)> {
     let _guard = BLOCKING_TRACE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     install_ptrace_traceme(&mut cmd);
@@ -383,5 +491,5 @@ pub fn trace_command(mut cmd: Command, opts: TraceOptions) -> anyhow::Result<Tra
         tracer.on_status(pid, status);
     }
 
-    Ok(tracer.finish())
+    Ok(tracer.finish_with_histogram())
 }

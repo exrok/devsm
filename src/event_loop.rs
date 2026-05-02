@@ -1153,17 +1153,16 @@ impl EventLoop {
         #[cfg(not(target_os = "linux"))]
         let any_traced = false;
 
-        let flags = libc::WNOHANG
-            | {
-                #[cfg(target_os = "linux")]
-                {
-                    if any_traced { libc::__WALL } else { 0 }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    0
-                }
-            };
+        let flags = libc::WNOHANG | {
+            #[cfg(target_os = "linux")]
+            {
+                if any_traced { libc::__WALL } else { 0 }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                0
+            }
+        };
 
         loop {
             let mut status: i32 = 0;
@@ -1196,11 +1195,8 @@ impl EventLoop {
         // Initial SIGTRAP from `execve` for a freshly-spawned traced root:
         // construct the Tracer and resume.
         if let Some(&process_index) = self.state.traced_root_pids.get(&pid) {
-            let needs_attach = self
-                .state
-                .processes
-                .get(process_index)
-                .is_some_and(|p| p.is_traced && p.tracer.is_none());
+            let needs_attach =
+                self.state.processes.get(process_index).is_some_and(|p| p.is_traced && p.tracer.is_none());
             if needs_attach {
                 if libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGTRAP {
                     match crate::auto_deps::Tracer::attach(pid, crate::auto_deps::TraceOptions::default()) {
@@ -1234,13 +1230,9 @@ impl EventLoop {
         for (idx, process) in &mut self.state.processes {
             if let Some(tracer) = process.tracer.as_deref_mut() {
                 tracer.on_status(pid, status);
-                let is_root_exit = self
-                    .state
-                    .traced_root_pids
-                    .get(&pid)
-                    .copied()
-                    .is_some_and(|root_idx| root_idx == idx)
-                    && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status));
+                let is_root_exit =
+                    self.state.traced_root_pids.get(&pid).copied().is_some_and(|root_idx| root_idx == idx)
+                        && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status));
                 if is_root_exit {
                     owning_index = Some(idx);
                 }

@@ -30,9 +30,13 @@ pub fn read_cstr(pid: i32, addr: u64) -> io::Result<Vec<u8>> {
     if addr == 0 {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "null path pointer"));
     }
-    let mut out: Vec<u8> = Vec::with_capacity(256);
+    // Stack buffer covers the typical case (paths < 256 bytes) without any
+    // heap allocation. The Vec is constructed only when the first read finds
+    // the NUL, sized exactly to the path length.
+    let mut buf = [0u8; 256];
+    let mut out: Vec<u8> = Vec::new();
     let mut offset: usize = 0;
-    let mut chunk: usize = 256;
+    let mut chunk: usize = buf.len();
     loop {
         if offset + chunk > PATH_MAX {
             chunk = PATH_MAX - offset;
@@ -40,7 +44,6 @@ pub fn read_cstr(pid: i32, addr: u64) -> io::Result<Vec<u8>> {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "path exceeds PATH_MAX"));
             }
         }
-        let mut buf = vec![0u8; chunk];
         let local = IoVec { iov_base: buf.as_mut_ptr() as *mut c_void, iov_len: chunk };
         let remote = IoVec { iov_base: (addr as usize + offset) as *mut c_void, iov_len: chunk };
         let n = unsafe { process_vm_readv(pid, &local, 1, &remote, 1, 0) };
@@ -56,13 +59,16 @@ pub fn read_cstr(pid: i32, addr: u64) -> io::Result<Vec<u8>> {
         }
         let read = n as usize;
         if let Some(nul_idx) = buf[..read].iter().position(|&b| b == 0) {
+            if out.is_empty() {
+                return Ok(buf[..nul_idx].to_vec());
+            }
             out.extend_from_slice(&buf[..nul_idx]);
             return Ok(out);
         }
-        out.extend_from_slice(&buf[..read]);
         if read < chunk {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no NUL terminator"));
         }
+        out.extend_from_slice(&buf[..read]);
         offset += read;
         if offset >= PATH_MAX {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "path exceeds PATH_MAX"));

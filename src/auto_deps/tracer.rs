@@ -23,6 +23,14 @@ pub fn trace_command(cmd: Command, opts: TraceOptions) -> anyhow::Result<TraceRe
     linux::trace_command(cmd, opts)
 }
 
+#[cfg(target_os = "linux")]
+pub fn trace_command_with_histogram(
+    cmd: Command,
+    opts: TraceOptions,
+) -> anyhow::Result<(TraceReport, Vec<u64>)> {
+    linux::trace_command_with_histogram(cmd, opts)
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn trace_command(_cmd: Command, _opts: TraceOptions) -> anyhow::Result<TraceReport> {
     anyhow::bail!("auto_deps tracing requires Linux")

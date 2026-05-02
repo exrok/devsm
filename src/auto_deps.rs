@@ -87,6 +87,17 @@ pub fn trace_command(cmd: Command, opts: TraceOptions) -> anyhow::Result<TraceRe
     tracer::trace_command(cmd, opts)
 }
 
+/// Like [`trace_command`], but also returns a per-syscall-number histogram
+/// (indexed by the raw syscall number; arch-specific). Used by the tracer
+/// benchmark to identify pathological syscall floods.
+#[cfg(target_os = "linux")]
+pub fn trace_command_with_histogram(
+    cmd: Command,
+    opts: TraceOptions,
+) -> anyhow::Result<(TraceReport, Vec<u64>)> {
+    tracer::trace_command_with_histogram(cmd, opts)
+}
+
 /// Reduce a raw trace into a minimal set of input dependencies, rooted at
 /// `project_root`.
 pub fn infer(report: &TraceReport, project_root: &Path) -> InferredDeps {
