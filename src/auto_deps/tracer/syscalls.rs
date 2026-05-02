@@ -131,3 +131,60 @@ pub fn open_flags_is_write(flags: u64) -> bool {
 pub fn open_flags_is_cloexec(flags: u64) -> bool {
     (flags as i32) & libc::O_CLOEXEC != 0
 }
+
+/// Static list of every syscall [`classify`] recognizes that is safe to put
+/// in the seccomp-BPF filter. Used to seed the filter so the kernel only
+/// stops the tracee on syscalls we actually inspect.
+///
+/// `execve` and `execveat` are intentionally **excluded**: the filter is
+/// installed in the child's pre-exec hook, but the parent doesn't set
+/// `PTRACE_O_TRACESECCOMP` until *after* the initial `execve`-induced
+/// `SIGTRAP`. A `RET_TRACE` from the filter on that first execve, with no
+/// `TRACESECCOMP` option yet, makes the kernel return `-ENOSYS` for the
+/// syscall — the child then fails to exec at all. Exec events are surfaced
+/// via `PTRACE_EVENT_EXEC` instead, which fires after a successful exec
+/// regardless of seccomp.
+pub const TRACED_SYSCALLS: &[Sysno] = &[
+    Sysno::openat,
+    #[cfg(target_arch = "x86_64")]
+    Sysno::open,
+    #[cfg(target_arch = "x86_64")]
+    Sysno::creat,
+    #[cfg(target_arch = "x86_64")]
+    Sysno::stat,
+    #[cfg(target_arch = "x86_64")]
+    Sysno::lstat,
+    Sysno::newfstatat,
+    Sysno::statx,
+    #[cfg(target_arch = "x86_64")]
+    Sysno::access,
+    Sysno::faccessat,
+    Sysno::faccessat2,
+    #[cfg(target_arch = "x86_64")]
+    Sysno::readlink,
+    Sysno::readlinkat,
+    #[cfg(target_arch = "x86_64")]
+    Sysno::unlink,
+    Sysno::unlinkat,
+    #[cfg(target_arch = "x86_64")]
+    Sysno::mkdir,
+    Sysno::mkdirat,
+    Sysno::getdents64,
+    #[cfg(target_arch = "x86_64")]
+    Sysno::getdents,
+    Sysno::chdir,
+    Sysno::fchdir,
+    #[cfg(target_arch = "x86_64")]
+    Sysno::rename,
+    Sysno::renameat,
+    Sysno::renameat2,
+];
+
+/// True when `effect`'s downstream handling needs the syscall return value
+/// (an fd to bind to a path, or a second path read at exit). Drives the
+/// tracer's resume choice in seccomp mode: read-value effects need
+/// `PTRACE_SYSCALL` so we observe the EXIT stop; the rest can run full-speed
+/// via `PTRACE_CONT`.
+pub fn effect_needs_exit(effect: Effect) -> bool {
+    matches!(effect, Effect::Open { .. } | Effect::ListDir { .. } | Effect::Rename { .. })
+}

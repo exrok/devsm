@@ -8,6 +8,9 @@ mod linux;
 #[cfg(target_os = "linux")]
 #[path = "tracer/mem_read.rs"]
 mod mem_read;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "tracer/seccomp.rs"]
+mod seccomp;
 #[cfg(target_os = "linux")]
 #[path = "tracer/state.rs"]
 mod state;
@@ -17,6 +20,10 @@ mod syscalls;
 
 #[cfg(target_os = "linux")]
 pub use linux::{Tracer, install_ptrace_traceme};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use linux::install_seccomp_filter;
+#[cfg(target_os = "linux")]
+pub use syscalls::TRACED_SYSCALLS;
 
 #[cfg(target_os = "linux")]
 pub fn trace_command(cmd: Command, opts: TraceOptions) -> anyhow::Result<TraceReport> {

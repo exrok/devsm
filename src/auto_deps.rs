@@ -28,7 +28,9 @@ use std::time::Duration;
 pub use event::{PathEvent, PathEventKind, TraceReport};
 pub use inference::{FrameworkSignal, InferredDeps, InferredPath};
 #[cfg(target_os = "linux")]
-pub use tracer::{Tracer, install_ptrace_traceme};
+pub use tracer::{TRACED_SYSCALLS, Tracer, install_ptrace_traceme};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use tracer::install_seccomp_filter;
 
 /// Owned, serializable form of an [`InferredDeps`] result for shipping
 /// to the run client over RPC. Paths are project-root-relative strings
@@ -74,11 +76,19 @@ pub struct TraceOptions {
     pub max_events: usize,
     pub timeout: Option<Duration>,
     pub follow_forks: bool,
+    /// Install a seccomp-BPF filter on traced children that promotes the
+    /// classified syscalls (and only those) into `PTRACE_EVENT_SECCOMP`
+    /// stops. Eliminates the per-syscall ENTRY stop on every uninteresting
+    /// syscall, which is the dominant cost without seccomp.
+    ///
+    /// x86_64 only — silently ignored on other architectures, where the
+    /// tracer falls back to the per-syscall path.
+    pub use_seccomp: bool,
 }
 
 impl Default for TraceOptions {
     fn default() -> Self {
-        Self { max_events: 1_000_000, timeout: None, follow_forks: true }
+        Self { max_events: 1_000_000, timeout: None, follow_forks: true, use_seccomp: true }
     }
 }
 

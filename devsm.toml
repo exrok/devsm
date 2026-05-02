@@ -68,6 +68,9 @@ key = [{ modified = ["Cargo.lock", "Cargo.toml", "README.md", "src", "test-app",
 cmd = ["cargo", "test", "--features=fuzz"]
 require = [{resource = "cargo-bin"}]
 
+[test.cargo-build]
+cmd = ["cargo", "build"]
+
 [test.auto-deps]
 cmd = ["cargo", "test", "--test", "auto_deps"]
 require = [{resource = "cargo-bin"}]

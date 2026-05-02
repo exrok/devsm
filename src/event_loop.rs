@@ -665,6 +665,11 @@ impl EventLoop {
         #[cfg(target_os = "linux")]
         let installed_traceme = if trace_requested {
             crate::auto_deps::install_ptrace_traceme(&mut command);
+            #[cfg(target_arch = "x86_64")]
+            crate::auto_deps::install_seccomp_filter(
+                &mut command,
+                crate::auto_deps::TRACED_SYSCALLS,
+            );
             true
         } else {
             false

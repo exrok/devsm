@@ -1,9 +1,12 @@
 use crate::auto_deps::TraceOptions;
 use crate::auto_deps::event::{PathEvent, PathEventKind, TraceReport, TraceStatsSnapshot};
 use crate::auto_deps::tracer::mem_read::read_cstr;
+#[cfg(target_arch = "x86_64")]
+use crate::auto_deps::tracer::seccomp;
 use crate::auto_deps::tracer::state::{FdEntry, PendingSyscall, Stage, TraceeState};
 use crate::auto_deps::tracer::syscalls::{
-    Effect, classify, effect_to_event_kind, open_flags_is_cloexec, open_flags_is_write,
+    Effect, classify, effect_needs_exit, effect_to_event_kind, open_flags_is_cloexec,
+    open_flags_is_write,
 };
 
 use std::collections::HashMap;
@@ -17,7 +20,7 @@ use std::process::{Command, ExitStatus};
 use std::sync::Mutex;
 use syscalls::Sysno;
 
-const TRACE_OPTIONS: i32 = libc::PTRACE_O_TRACESYSGOOD
+const BASE_TRACE_OPTIONS: i32 = libc::PTRACE_O_TRACESYSGOOD
     | libc::PTRACE_O_TRACEFORK
     | libc::PTRACE_O_TRACEVFORK
     | libc::PTRACE_O_TRACECLONE
@@ -43,6 +46,23 @@ pub fn install_ptrace_traceme(cmd: &mut Command) {
     }
 }
 
+/// Build a seccomp-BPF filter from `syscalls` and install it from `cmd`'s
+/// pre-exec hook. The filter is built **before** the closure runs (in the
+/// parent) and moved into the closure, so the post-fork child only does
+/// syscalls — never an allocation.
+///
+/// Pair with [`install_ptrace_traceme`]. With `PTRACE_O_TRACESECCOMP` set on
+/// the tracer side, every listed syscall raises a `PTRACE_EVENT_SECCOMP`
+/// stop instead of a normal syscall-entry stop, and the kernel never wakes
+/// the tracer for any other syscall.
+#[cfg(target_arch = "x86_64")]
+pub fn install_seccomp_filter(cmd: &mut Command, syscalls: &[Sysno]) {
+    let prog = seccomp::build_filter(syscalls);
+    unsafe {
+        cmd.pre_exec(move || seccomp::install(&prog));
+    }
+}
+
 /// State machine that converts ptrace stop notifications into [`PathEvent`]s.
 ///
 /// The tracer does not call `waitpid` itself — the caller (a test driver or
@@ -65,9 +85,21 @@ pub struct TraceStats {
     pub fork_clones: u64,
 }
 
+#[derive(Clone, Copy)]
+enum ResumeMode {
+    /// Stop on the next syscall entry/exit. Used as the default outside
+    /// seccomp mode, and to bridge a SECCOMP entry through to its EXIT for
+    /// effects that need the syscall return value.
+    Syscall,
+    /// Run free until the next event-stop (PTRACE_EVENT_*). Default in
+    /// seccomp mode.
+    Cont,
+}
+
 pub struct Tracer {
     root_pid: i32,
     max_events: usize,
+    use_seccomp: bool,
     tracees: HashMap<i32, TraceeState>,
     events: Vec<PathEvent>,
     seq: u64,
@@ -90,7 +122,10 @@ impl Tracer {
     /// Sets `PTRACE_O_TRACESYSGOOD | TRACEFORK | TRACEVFORK | TRACECLONE |
     /// TRACEEXEC` and resumes the tracee with `PTRACE_SYSCALL`.
     pub fn attach(root_pid: i32, opts: TraceOptions) -> anyhow::Result<Self> {
-        if unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, root_pid, 0i64, TRACE_OPTIONS as i64) }
+        let use_seccomp = cfg!(target_arch = "x86_64") && opts.use_seccomp;
+        let trace_opts =
+            BASE_TRACE_OPTIONS | if use_seccomp { libc::PTRACE_O_TRACESECCOMP } else { 0 };
+        if unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, root_pid, 0i64, trace_opts as i64) }
             == -1
         {
             anyhow::bail!("PTRACE_SETOPTIONS: {}", io::Error::last_os_error());
@@ -100,11 +135,13 @@ impl Tracer {
         let initial_cwd = std::fs::read_link(format!("/proc/{}/cwd", root_pid))?;
         tracees.insert(root_pid, TraceeState::new(initial_cwd));
 
-        resume_syscall(root_pid, 0)?;
+        let initial_resume = if use_seccomp { ResumeMode::Cont } else { ResumeMode::Syscall };
+        resume(root_pid, 0, initial_resume)?;
 
         Ok(Self {
             root_pid,
             max_events: opts.max_events,
+            use_seccomp,
             tracees,
             events: Vec::new(),
             seq: 0,
@@ -133,6 +170,7 @@ impl Tracer {
         if !libc::WIFSTOPPED(status) {
             return;
         }
+        let default_mode = if self.use_seccomp { ResumeMode::Cont } else { ResumeMode::Syscall };
         let sig = libc::WSTOPSIG(status);
         if sig == (libc::SIGTRAP | 0x80) {
             self.stats.syscall_stops += 1;
@@ -142,13 +180,19 @@ impl Tracer {
                 return;
             }
             self.stats.resume_calls += 1;
-            let _ = resume_syscall(pid, 0);
+            let _ = resume(pid, 0, default_mode);
         } else if sig == libc::SIGTRAP {
             self.stats.event_stops += 1;
             let event = (status >> 16) & 0xffff;
+            if event as i32 == libc::PTRACE_EVENT_SECCOMP {
+                let mode = self.handle_seccomp_stop(pid);
+                self.stats.resume_calls += 1;
+                let _ = resume(pid, 0, mode);
+                return;
+            }
             self.handle_ptrace_event(pid, event as i32);
             self.stats.resume_calls += 1;
-            let _ = resume_syscall(pid, 0);
+            let _ = resume(pid, 0, default_mode);
         } else if sig == libc::SIGSTOP {
             self.stats.signal_stops += 1;
             // The kernel emits an initial SIGSTOP for every tracee created via
@@ -167,11 +211,11 @@ impl Tracer {
                 self.tracees.insert(pid, TraceeState::new(cwd));
             }
             self.stats.resume_calls += 1;
-            let _ = resume_syscall(pid, 0);
+            let _ = resume(pid, 0, default_mode);
         } else {
             self.stats.signal_stops += 1;
             self.stats.resume_calls += 1;
-            let _ = resume_syscall(pid, sig);
+            let _ = resume(pid, sig, default_mode);
         }
     }
 
@@ -244,18 +288,36 @@ impl Tracer {
                     state.fds.retain(|_, e| !e.cloexec);
                     state.pending = None;
                 }
+                // `execve` is excluded from the seccomp filter (see
+                // `TRACED_SYSCALLS`), so this event is the only place we
+                // observe an exec in seccomp mode. Emit it here so both
+                // modes produce the same trace shape. /proc/<pid>/exe
+                // resolves to the *new* binary because the kernel raises
+                // PTRACE_EVENT_EXEC after the address-space swap.
+                if self.use_seccomp {
+                    if let Ok(path) = std::fs::read_link(format!("/proc/{}/exe", pid)) {
+                        push_event(
+                            &mut self.events,
+                            &mut self.seq,
+                            self.max_events,
+                            &mut self.truncated,
+                            PathEventKind::Exec,
+                            path,
+                            pid,
+                        );
+                    }
+                }
             }
             _ => {}
         }
     }
 
     fn handle_syscall_stop(&mut self, pid: i32) {
-        // We track ENTRY vs EXIT in `state.stage` so that we can skip the
-        // PTRACE_GET_SYSCALL_INFO syscall on the EXIT side of any uninteresting
-        // syscall (i.e. when nothing was pending). Without seccomp filtering we
-        // see two stops per tracee syscall, and the vast majority are syscalls
-        // we don't classify — paying for an extra ptrace call on each of those
-        // EXITs is the dominant per-stop cost.
+        // In non-seccomp mode we use `state.stage` to skip the
+        // PTRACE_GET_SYSCALL_INFO call on the EXIT side of any uninteresting
+        // syscall (the vast majority). In seccomp mode the only syscall_stops
+        // we ever see are EXITs of effects we explicitly bridged with
+        // PTRACE_SYSCALL — Stage tracking is redundant but harmless.
         let stage = self.tracees.get(&pid).map(|s| s.stage).unwrap_or(Stage::AwaitingEntry);
 
         if matches!(stage, Stage::InsideSyscall) {
@@ -293,6 +355,53 @@ impl Tracer {
         }
         let nr = unsafe { info.u.entry.nr } as usize;
         let args = unsafe { info.u.entry.args };
+        self.record_entry(pid, nr, args);
+        if let Some(state) = self.tracees.get_mut(&pid) {
+            state.stage = Stage::InsideSyscall;
+        }
+    }
+
+    /// Handle a `PTRACE_EVENT_SECCOMP` stop — the seccomp filter promoted a
+    /// classified syscall to a tracer-visible event. Mirrors the ENTRY half
+    /// of `handle_syscall_stop` (fetches args via `PTRACE_GET_SYSCALL_INFO`
+    /// with `op == SECCOMP`, runs `record_entry`) but then chooses how to
+    /// resume per-effect: `PTRACE_SYSCALL` for effects that need the syscall
+    /// return value (so the existing EXIT path runs unchanged), `PTRACE_CONT`
+    /// for everything else (and the entry-side event is emitted now).
+    fn handle_seccomp_stop(&mut self, pid: i32) -> ResumeMode {
+        self.stats.get_syscall_info_calls += 1;
+        let info = match get_syscall_info(pid) {
+            Ok(info) => info,
+            Err(_) => return ResumeMode::Cont,
+        };
+        if info.op != libc::PTRACE_SYSCALL_INFO_SECCOMP {
+            return ResumeMode::Cont;
+        }
+        let nr = unsafe { info.u.seccomp.nr } as usize;
+        let args = unsafe { info.u.seccomp.args };
+        self.record_entry(pid, nr, args);
+
+        let pending = match self.tracees.get_mut(&pid) {
+            Some(s) => s.pending.clone(),
+            None => return ResumeMode::Cont,
+        };
+        let Some(pending) = pending else { return ResumeMode::Cont };
+
+        if effect_needs_exit(pending.effect) {
+            if let Some(state) = self.tracees.get_mut(&pid) {
+                state.stage = Stage::InsideSyscall;
+            }
+            ResumeMode::Syscall
+        } else {
+            if let Some(state) = self.tracees.get_mut(&pid) {
+                state.pending = None;
+            }
+            self.process_entry_only_effect(pid, pending);
+            ResumeMode::Cont
+        }
+    }
+
+    fn record_entry(&mut self, pid: i32, nr: usize, args: [u64; 6]) {
         if let Some(slot) = self.syscall_histogram.get_mut(nr) {
             *slot += 1;
         }
@@ -300,7 +409,6 @@ impl Tracer {
             .tracees
             .entry(pid)
             .or_insert_with(|| TraceeState::new(PathBuf::new()));
-        state.stage = Stage::InsideSyscall;
         let read_cstr_calls = &mut self.stats.read_cstr_calls;
         state.pending = Sysno::new(nr).and_then(|sysno| {
             let shape = classify(sysno)?;
@@ -313,6 +421,49 @@ impl Tracer {
             });
             Some(PendingSyscall { effect: shape.effect, args, resolved_path })
         });
+    }
+
+    /// Emit events / update state for effects where we don't need the
+    /// syscall return value: `Stat`, `ReadLink`, `Exec`, `Unlink`, `Mkdir`,
+    /// `Chdir`, `Fchdir`. The `Open`/`ListDir`/`Rename`/`Read` arms are
+    /// unreachable here — those effects are dispatched through
+    /// `handle_syscall_exit` after a `PTRACE_SYSCALL` resume.
+    fn process_entry_only_effect(&mut self, pid: i32, pending: PendingSyscall) {
+        let state = match self.tracees.get_mut(&pid) {
+            Some(s) => s,
+            None => return,
+        };
+        let PendingSyscall { effect, args, resolved_path } = pending;
+        match effect {
+            Effect::Stat | Effect::ReadLink | Effect::Exec | Effect::Unlink | Effect::Mkdir => {
+                let Some(path) = resolved_path else { return };
+                let Some(kind) = effect_to_event_kind(effect, false) else { return };
+                push_event(
+                    &mut self.events,
+                    &mut self.seq,
+                    self.max_events,
+                    &mut self.truncated,
+                    kind,
+                    path,
+                    pid,
+                );
+            }
+            Effect::Chdir => {
+                if let Some(path) = resolved_path {
+                    state.cwd = path;
+                }
+            }
+            Effect::Fchdir { fd_arg } => {
+                let fd = args[fd_arg as usize] as i32;
+                if let Some(entry) = state.fds.get(&fd) {
+                    state.cwd = entry.path.clone();
+                }
+            }
+            Effect::Open { .. }
+            | Effect::ListDir { .. }
+            | Effect::Rename { .. }
+            | Effect::Read => {}
+        }
     }
 
     fn handle_syscall_exit(&mut self, pid: i32, pending: PendingSyscall, rval: i64) {
@@ -380,14 +531,18 @@ impl Tracer {
     }
 }
 
-fn resume_syscall(pid: i32, signo: i32) -> anyhow::Result<()> {
-    let r = unsafe { libc::ptrace(libc::PTRACE_SYSCALL, pid, 0i64, signo as i64) };
+fn resume(pid: i32, signo: i32, mode: ResumeMode) -> anyhow::Result<()> {
+    let (op, name) = match mode {
+        ResumeMode::Syscall => (libc::PTRACE_SYSCALL, "PTRACE_SYSCALL"),
+        ResumeMode::Cont => (libc::PTRACE_CONT, "PTRACE_CONT"),
+    };
+    let r = unsafe { libc::ptrace(op, pid, 0i64, signo as i64) };
     if r == -1 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
             return Ok(());
         }
-        anyhow::bail!("PTRACE_SYSCALL pid={} sig={}: {}", pid, signo, err);
+        anyhow::bail!("{} pid={} sig={}: {}", name, pid, signo, err);
     }
     Ok(())
 }
@@ -462,6 +617,10 @@ pub fn trace_command_with_histogram(
     let _guard = BLOCKING_TRACE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     install_ptrace_traceme(&mut cmd);
+    #[cfg(target_arch = "x86_64")]
+    if opts.use_seccomp {
+        install_seccomp_filter(&mut cmd, crate::auto_deps::tracer::syscalls::TRACED_SYSCALLS);
+    }
     let child = cmd.spawn()?;
     let root_pid = child.id() as i32;
     // The wait loop below reaps the tracee; std's Child::wait would race.
