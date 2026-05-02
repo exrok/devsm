@@ -552,6 +552,141 @@ require = ["gen"]
 }
 
 #[test]
+fn persistent_cache_survives_daemon_restart() {
+    let mut harness = TestHarness::new("cache_persistent_restart");
+    let db_path = harness.temp_dir.join("devsm.db");
+    let counter = harness.temp_dir.join("counter.txt");
+
+    fs::write(&counter, "0").unwrap();
+
+    harness.write_config(&format!(
+        r#"
+[action.gen]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+'''
+cache.persistent = true
+
+[action.consumer]
+sh = "true"
+require = ["gen"]
+"#,
+        counter = counter.display()
+    ));
+
+    harness.spawn_server_with_db(&db_path);
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success on first run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "gen should run first time");
+
+    harness.stop_server();
+    harness.spawn_server_with_db(&db_path);
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created after restart");
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success after restart, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "gen should be cached after restart");
+}
+
+#[test]
+fn persistent_cache_expires_after_max_age() {
+    let mut harness = TestHarness::new("cache_persistent_max_age");
+    let db_path = harness.temp_dir.join("devsm.db");
+    let counter = harness.temp_dir.join("counter.txt");
+
+    fs::write(&counter, "0").unwrap();
+
+    harness.write_config(&format!(
+        r#"
+[action.gen]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+'''
+cache.persistent = true
+cache.max-age = "1ms"
+
+[action.consumer]
+sh = "true"
+require = ["gen"]
+"#,
+        counter = counter.display()
+    ));
+
+    harness.spawn_server_with_db(&db_path);
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success on first run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "gen should run first time");
+
+    harness.stop_server();
+    std::thread::sleep(Duration::from_millis(25));
+    harness.spawn_server_with_db(&db_path);
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created after restart");
+
+    let result = harness.run_client(&["run", "consumer"]);
+    assert!(result.success(), "Expected success after restart, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "gen should rerun after cache expiry");
+}
+
+#[test]
+fn test_persistent_cache_survives_daemon_restart() {
+    let mut harness = TestHarness::new("test_cache_persistent_restart");
+    let db_path = harness.temp_dir.join("devsm.db");
+    let counter = harness.temp_dir.join("counter.txt");
+
+    fs::write(&counter, "0").unwrap();
+
+    harness.write_config(&format!(
+        r#"
+[test.foo]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+'''
+cache.persistent = true
+"#,
+        counter = counter.display()
+    ));
+
+    harness.spawn_server_with_db(&db_path);
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test", "foo"]);
+    assert!(result.success(), "Expected success on first test run, got: {}", result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "test should run first time");
+
+    harness.stop_server();
+    harness.spawn_server_with_db(&db_path);
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created after restart");
+
+    let result = harness.run_client(&["test", "foo"]);
+    assert!(result.success(), "Expected success after restart, got: {}", result.stderr);
+    assert!(
+        result.stdout.contains("1 test skipped via cache"),
+        "Expected cache skip summary, got stdout:\n{}",
+        result.stdout
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "test should be cached after restart");
+
+    let result = harness.run_client(&["test", "--force", "foo"]);
+    assert!(result.success(), "Expected success with --force, got: {}", result.stderr);
+    assert!(
+        !result.stdout.contains("skipped via cache"),
+        "--force should not report a cache skip, got stdout:\n{}",
+        result.stdout
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "2", "--force should rerun cached test");
+}
+
+#[test]
 fn cache_profile_changed() {
     let mut harness = TestHarness::new("cache_profile");
     let dep_counter = harness.temp_dir.join("dep_counter.txt");

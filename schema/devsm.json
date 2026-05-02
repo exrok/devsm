@@ -275,10 +275,19 @@
           "type": "boolean",
           "description": "When true, the task is never considered initially satisfied - always re-runs when required",
           "default": false
+        },
+        "persistent": {
+          "type": "boolean",
+          "description": "When true, successful cache entries are persisted across daemon restarts",
+          "default": false
+        },
+        "max-age": {
+          "$ref": "#/definitions/duration",
+          "description": "Maximum age of a successful cache entry before it is considered stale"
         }
       },
       "x-taplo": {
-        "initKeys": ["key"]
+        "initKeys": ["key", "persistent", "max-age"]
       }
     },
     "readyPredicate": {

@@ -490,10 +490,19 @@ fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData)
         } else {
             AnsiColor::SpringGreen.with_fg(AnsiColor::Black)
         };
+        let done = ts.passed + ts.cached;
         if ts.running > 0 {
-            r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ({}) ", ts.passed, ts.total, ts.running));
+            if ts.cached > 0 {
+                r = r
+                    .with(test_style)
+                    .fmt(frame, format_args!(" T:{}+{}/{} ({}) ", ts.passed, ts.cached, ts.total, ts.running));
+            } else {
+                r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ({}) ", done, ts.total, ts.running));
+            }
+        } else if ts.cached > 0 {
+            r = r.with(test_style).fmt(frame, format_args!(" T:{}+{}/{} ", ts.passed, ts.cached, ts.total));
         } else {
-            r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ", ts.passed, ts.total));
+            r = r.with(test_style).fmt(frame, format_args!(" T:{}/{} ", done, ts.total));
         }
     }
 
@@ -807,7 +816,7 @@ fn process_key(
                     tui.overlay = FocusOverlap::None;
                 }
                 TestFilterAction::Start { filters } => {
-                    match workspace.start_test_run(&filters) {
+                    match workspace.start_test_run(&filters, false) {
                         Ok(_) => {
                             let count = filters.len();
                             let msg = if count == 0 {

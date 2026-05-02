@@ -77,6 +77,7 @@ pub struct TestFilters<'a> {
     pub include_tags: Vec<&'a str>,
     pub exclude_tags: Vec<&'a str>,
     pub include_names: Vec<&'a str>,
+    pub force: bool,
 }
 
 /// Query parameters for the logs command.

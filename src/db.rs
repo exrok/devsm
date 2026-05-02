@@ -65,7 +65,7 @@ pub struct Db {
     disabled: bool,
 }
 
-fn resolve_db_path() -> Option<PathBuf> {
+pub(crate) fn resolve_db_path() -> Option<PathBuf> {
     if let Ok(env_path) = std::env::var("DEVSM_DB") {
         if env_path == "/dev/null" {
             return None;

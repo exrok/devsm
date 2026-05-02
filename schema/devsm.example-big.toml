@@ -136,6 +136,8 @@ cache = {  }
 [action.with_cache_modified]
 cmd = ["cargo", "build"]
 cache.key = [{ modified = "Cargo.toml" }]
+cache.persistent = true
+cache.max-age = "2d"
 
 # Action with cache key using profile_changed
 [action.with_cache_profile_changed]
@@ -422,6 +424,7 @@ cache = {  }
 [test.test_with_cache_key]
 cmd = ["cargo", "test"]
 cache.key = [{ modified = "src/" }, { profile_changed = "full_basic" }]
+cache.max-age = "1d"
 
 # Test with timeout
 [test.test_with_timeout]

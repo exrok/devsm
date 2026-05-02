@@ -135,12 +135,7 @@ impl RecordedTrace {
         let events = self
             .events
             .into_iter()
-            .map(|e| PathEvent {
-                kind: e.kind.into(),
-                path: PathBuf::from(e.path),
-                pid: e.pid,
-                seq: e.seq,
-            })
+            .map(|e| PathEvent { kind: e.kind.into(), path: PathBuf::from(e.path), pid: e.pid, seq: e.seq })
             .collect();
         TraceReport {
             events,

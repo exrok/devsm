@@ -1505,7 +1505,7 @@ impl EventLoop {
         };
 
         let ws = &self.state.workspaces[ws_index as usize];
-        let test_run = match ws.handle.start_test_run(&test_filters) {
+        let test_run = match ws.handle.start_test_run(&test_filters, filters.force) {
             Ok(run) => run,
             Err(err) => {
                 let mut file = unsafe { std::fs::File::from_raw_fd(stdout.as_raw_fd()) };

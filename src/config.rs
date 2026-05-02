@@ -6,6 +6,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::bail;
@@ -70,7 +71,7 @@ pub struct VarMeta<'a> {
     pub default: Option<&'a str>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Jsony)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Jsony)]
 #[jsony(rename_all = "snake_case")]
 pub enum TaskKind {
     Service,
@@ -134,6 +135,11 @@ pub struct CacheConfig<'a> {
     /// For actions: always re-run when required, ignoring any cached results.
     /// For services: always restart when required, even if already running.
     pub never: bool,
+    /// When true, successful cache entries are saved and can satisfy future
+    /// daemon sessions.
+    pub persistent: bool,
+    /// Optional upper bound on how long successful cache entries remain valid.
+    pub max_age: Option<Duration>,
 }
 
 /// Predicate determining when a service is ready.

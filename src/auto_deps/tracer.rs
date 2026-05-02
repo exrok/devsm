@@ -18,10 +18,10 @@ mod state;
 #[path = "tracer/syscalls.rs"]
 mod syscalls;
 
-#[cfg(target_os = "linux")]
-pub use linux::{Tracer, install_ptrace_traceme};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub use linux::install_seccomp_filter;
+#[cfg(target_os = "linux")]
+pub use linux::{Tracer, install_ptrace_traceme};
 #[cfg(target_os = "linux")]
 pub use syscalls::TRACED_SYSCALLS;
 
@@ -31,10 +31,7 @@ pub fn trace_command(cmd: Command, opts: TraceOptions) -> anyhow::Result<TraceRe
 }
 
 #[cfg(target_os = "linux")]
-pub fn trace_command_with_histogram(
-    cmd: Command,
-    opts: TraceOptions,
-) -> anyhow::Result<(TraceReport, Vec<u64>)> {
+pub fn trace_command_with_histogram(cmd: Command, opts: TraceOptions) -> anyhow::Result<(TraceReport, Vec<u64>)> {
     linux::trace_command_with_histogram(cmd, opts)
 }
 

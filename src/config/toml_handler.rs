@@ -1,4 +1,5 @@
 use bumpalo::Bump;
+use std::time::Duration;
 use toml_spanner::{Context, Document, Failed, Item, Table, Value};
 
 use crate::config::{
@@ -91,6 +92,17 @@ fn parse_duration_value<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<f
         },
         _ => Err(ctx.report_expected_but_found(&"a number or duration string", value)),
     }
+}
+
+fn parse_duration_config<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Duration, Failed> {
+    let secs = parse_duration_value(value, ctx)?;
+    if !secs.is_finite() {
+        return Err(ctx.report_custom_error("duration must be finite", value));
+    }
+    if secs < 0.0 {
+        return Err(ctx.report_custom_error("duration cannot be negative", value));
+    }
+    Ok(Duration::from_secs_f64(secs))
 }
 
 fn parse_timeout_predicate<'a>(
@@ -459,6 +471,8 @@ fn parse_cache_config<'a>(
 ) -> Result<CacheConfig<'a>, Failed> {
     let mut key_inputs = bumpalo::collections::Vec::new_in(alloc);
     let mut never = false;
+    let mut persistent = false;
+    let mut max_age = None;
 
     for (key, val) in cache_table {
         match key.name {
@@ -466,6 +480,13 @@ fn parse_cache_config<'a>(
                 Value::Boolean(&b) => never = b,
                 _ => return Err(ctx.report_expected_but_found(&"a boolean", val)),
             },
+            "persistent" => match val.value() {
+                Value::Boolean(&b) => persistent = b,
+                _ => return Err(ctx.report_expected_but_found(&"a boolean", val)),
+            },
+            "max-age" | "max_age" => {
+                max_age = Some(parse_duration_config(val, ctx)?);
+            }
             "key" => {
                 let key_array = val.require_array(ctx)?;
                 for item in key_array {
@@ -478,7 +499,7 @@ fn parse_cache_config<'a>(
         }
     }
 
-    Ok(CacheConfig { key: key_inputs.into_bump_slice(), never })
+    Ok(CacheConfig { key: key_inputs.into_bump_slice(), never, persistent, max_age })
 }
 
 /// Parse a test configuration from a TOML table.
@@ -1087,6 +1108,20 @@ mod test {
             CacheKeyInput::ProfileChanged(task_name) => assert_eq!(*task_name, "backend"),
             _ => panic!("Expected ProfileChanged cache key input"),
         }
+    }
+
+    #[test]
+    fn test_parse_cache_persistent_and_max_age() {
+        let text = "[test.foo]\ncmd = \"ls\"\ncache.persistent = true\ncache.max-age = \"2d\"\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "Expected successful parse: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let (_, test) = config.tests[0];
+        let cache = test.cache.as_ref().expect("cache should be present");
+        assert!(cache.persistent);
+        assert_eq!(cache.max_age, Some(Duration::from_secs(2 * 24 * 60 * 60)));
     }
 
     #[test]

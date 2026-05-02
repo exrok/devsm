@@ -209,6 +209,8 @@ complete -c devsm -n '__fish_devsm_using_command spawn' -l cached -d 'Only spawn
 complete -c devsm -n '__fish_devsm_using_command test' -xa '(__fish_devsm_tests)'
 complete -c devsm -n '__fish_devsm_using_command test' -xa '(for tag in (__fish_devsm_tags); printf "+%s\tInclude tag\n" $tag; end)'
 complete -c devsm -n '__fish_devsm_using_command test' -xa '(for tag in (__fish_devsm_tags); printf "-%s\tExclude tag\n" $tag; end)'
+complete -c devsm -n '__fish_devsm_using_command test' -l force -d 'Run tests even when cache would skip them'
+complete -c devsm -n '__fish_devsm_using_command test' -l no-cache -d 'Run tests even when cache would skip them'
 
 # Rerun-tests command options
 complete -c devsm -n '__fish_devsm_using_command rerun-tests' -l only-failed -d 'Only rerun failed tests'

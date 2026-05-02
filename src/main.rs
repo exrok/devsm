@@ -130,9 +130,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Test { filters } => {
+        cli::Command::Test { filters, force } => {
             let _log_guard = self_log::init_client_logging();
-            if let Err(err) = test_client(filters) {
+            if let Err(err) = test_client(filters, force) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -227,7 +227,7 @@ fn main() {
     }
 }
 
-fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
+fn test_client(filters: Vec<cli::TestFilter>, force: bool) -> anyhow::Result<()> {
     reset_terminal_to_canonical();
 
     let cwd = std::env::current_dir()?;
@@ -250,7 +250,7 @@ fn test_client(filters: Vec<cli::TestFilter>) -> anyhow::Result<()> {
         }
     }
 
-    let test_filters = daemon::TestFilters { include_tags, exclude_tags, include_names };
+    let test_filters = daemon::TestFilters { include_tags, exclude_tags, include_names, force };
 
     socket.send_with_fd(
         &jsony::to_binary(&daemon::RequestMessage {
@@ -1266,7 +1266,8 @@ Commands:
   spawn <job>        Spawn a job via the daemon
   restart-selected   Restart the currently selected task in TUI
   kill <task>        Terminate a running task (by name or index)
-  test [filters]     Run tests with optional filters
+  test [options] [filters]
+                     Run tests with optional filters
   logs [options]     View and stream logs from tasks
   validate [path]    Validate a config file
   get <resource>     Get information from the daemon
@@ -1287,6 +1288,9 @@ Test Filters:
   +tag              Include tests with this tag
   -tag              Exclude tests with this tag
   name              Include tests matching this name
+
+Test Options:
+  --force, --no-cache  Run matching tests even when cache would skip them
 
 Validate Options:
   --skip-path-checks     Skip validation of pwd paths

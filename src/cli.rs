@@ -88,7 +88,7 @@ pub enum Command<'a> {
     Exec { job: &'a str, value_map: ValueMap<'a> },
     Run { job: &'a str, value_map: ValueMap<'a>, as_test: bool, derive_cache_key: bool },
     Kill { job: &'a str },
-    Test { filters: Vec<TestFilter<'a>> },
+    Test { filters: Vec<TestFilter<'a>>, force: bool },
     RerunTests { only_failed: bool },
     Validate { path: Option<&'a str>, skip_path_checks: bool },
     Get { resource: GetResource },
@@ -330,6 +330,7 @@ fn parse_validate<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
 /// - `name` includes tests with name
 fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     let mut filters = Vec::new();
+    let mut force = false;
     for component in parser.by_ref() {
         match component {
             Component::Term(arg) => {
@@ -342,7 +343,11 @@ fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<
                 }
             }
             Component::Long(long) => {
-                bail!("Unexpected flag --{} in test command", long);
+                if matches!(long, "force" | "no-cache") {
+                    force = true;
+                } else {
+                    bail!("Unexpected flag --{} in test command", long);
+                }
             }
             Component::Flags(flags) => {
                 // Check if this is actually a negative tag filter (e.g., -slow)
@@ -358,7 +363,7 @@ fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<
             }
         }
     }
-    Ok(Command::Test { filters })
+    Ok(Command::Test { filters, force })
 }
 
 fn parse_rerun_tests<'a>(parser: &mut ArgParser<'a>) -> Command<'a> {

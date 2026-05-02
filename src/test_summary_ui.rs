@@ -46,6 +46,14 @@ fn format_duration(secs: f64) -> String {
     }
 }
 
+fn skipped_via_cache_text(count: usize) -> String {
+    if count == 1 { "1 test skipped via cache".to_string() } else { format!("{count} tests skipped via cache") }
+}
+
+fn is_terminal_status(status: TestJobStatus) -> bool {
+    matches!(status, TestJobStatus::Passed | TestJobStatus::Cached | TestJobStatus::Failed(_))
+}
+
 fn send_termination(encoder: &mut Encoder, socket: &mut Option<UnixStream>) {
     let Some(socket) = socket.as_mut() else { return };
     encoder.encode_empty(RpcMessageKind::TerminateAck, 0);
@@ -269,7 +277,7 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
     for (i, test_job) in test_run.test_jobs.iter().enumerate() {
         let display = &mut tui_state.tests[i];
 
-        if matches!(display.status, TestJobStatus::Passed | TestJobStatus::Failed(_)) {
+        if is_terminal_status(display.status) {
             continue;
         }
 
@@ -284,7 +292,9 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
                 (TestJobStatus::Running, None)
             }
             JobStatus::Exited { status, cause, .. } => {
-                if *status == 0 {
+                if job.cache_synthetic {
+                    (TestJobStatus::Cached, None)
+                } else if *status == 0 {
                     (TestJobStatus::Passed, None)
                 } else {
                     let timeout = if *cause == ExitCause::Timeout {
@@ -302,7 +312,7 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
             if new_status == TestJobStatus::Running && display.started_at.is_none() {
                 display.started_at = Some(crate::clock::now());
             }
-            if matches!(new_status, TestJobStatus::Passed | TestJobStatus::Failed(_)) {
+            if is_terminal_status(new_status) {
                 display.finished_at = Some(crate::clock::now());
                 display.timeout_info = timeout_info;
             }
@@ -345,6 +355,7 @@ fn status_color(status: TestJobStatus) -> AnsiColor {
         TestJobStatus::Pending => AnsiColor::Grey[17],
         TestJobStatus::Running => AnsiColor::DarkOliveGreen,
         TestJobStatus::Passed => AnsiColor::SpringGreen,
+        TestJobStatus::Cached => AnsiColor::Cyan1,
         TestJobStatus::Failed(_) => AnsiColor::NeonRed,
     }
 }
@@ -358,15 +369,16 @@ fn render_tui(buf: &mut Vec<u8>, state: &TuiState) {
     let failed: Vec<_> = state.tests.iter().filter(|t| matches!(t.status, TestJobStatus::Failed(_))).collect();
     let pending: Vec<_> = state.tests.iter().filter(|t| t.status == TestJobStatus::Pending).collect();
     let passed: Vec<_> = state.tests.iter().filter(|t| t.status == TestJobStatus::Passed).collect();
+    let cached: Vec<_> = state.tests.iter().filter(|t| t.status == TestJobStatus::Cached).collect();
 
     let lines_per_test_with_logs = 1 + MAX_RECENT_LOGS;
     let tests_with_logs = running.len() + failed.len() + pending.len();
-    let total_lines_needed = tests_with_logs * lines_per_test_with_logs + passed.len();
+    let total_lines_needed = tests_with_logs * lines_per_test_with_logs + passed.len() + cached.len();
     let show_logs = total_lines_needed <= available_lines;
 
     let mut row: u16 = 0;
 
-    for test in running.iter().chain(failed.iter()).chain(pending.iter()).chain(passed.iter()) {
+    for test in running.iter().chain(failed.iter()).chain(pending.iter()).chain(cached.iter()).chain(passed.iter()) {
         if row as usize >= available_lines {
             break;
         }
@@ -374,7 +386,7 @@ fn render_tui(buf: &mut Vec<u8>, state: &TuiState) {
         render_test_header(buf, test, state.width, row);
         row += 1;
 
-        let dominated = test.status != TestJobStatus::Passed;
+        let dominated = !matches!(test.status, TestJobStatus::Passed | TestJobStatus::Cached);
         if show_logs && dominated && !test.recent_logs.is_empty() {
             for log_line in &test.recent_logs {
                 if row as usize >= available_lines {
@@ -404,6 +416,7 @@ fn render_test_header(buf: &mut Vec<u8>, test: &TestDisplay, _width: u16, row: u
         TestJobStatus::Pending => "WAIT",
         TestJobStatus::Running => "RUN ",
         TestJobStatus::Passed => "PASS",
+        TestJobStatus::Cached => "CACH",
         TestJobStatus::Failed(_) => "FAIL",
     };
 
@@ -447,13 +460,14 @@ fn render_status_line(buf: &mut Vec<u8>, state: &TuiState, row: u16) {
     buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
 
     let passed = state.tests.iter().filter(|t| t.status == TestJobStatus::Passed).count();
+    let cached = state.tests.iter().filter(|t| t.status == TestJobStatus::Cached).count();
     let failed = state.tests.iter().filter(|t| matches!(t.status, TestJobStatus::Failed(_))).count();
     let running = state.tests.iter().filter(|t| t.status == TestJobStatus::Running).count();
     let pending = state.tests.iter().filter(|t| t.status == TestJobStatus::Pending).count();
     let total = state.tests.len();
 
     AnsiColor::Grey[4].with_fg(AnsiColor::Grey[25]).write_to_buffer(buf);
-    write!(buf, " Tests: {}/{} ", passed + failed, total).ok();
+    write!(buf, " Tests: {}/{} ", passed + cached + failed, total).ok();
 
     if running > 0 {
         AnsiColor::DarkOliveGreen.with_fg(AnsiColor::Black).write_to_buffer(buf);
@@ -466,6 +480,10 @@ fn render_status_line(buf: &mut Vec<u8>, state: &TuiState, row: u16) {
     if passed > 0 {
         AnsiColor::SpringGreen.with_fg(AnsiColor::Black).write_to_buffer(buf);
         write!(buf, " {} passed ", passed).ok();
+    }
+    if cached > 0 {
+        AnsiColor::Cyan1.with_fg(AnsiColor::Black).write_to_buffer(buf);
+        write!(buf, " {} cached ", cached).ok();
     }
     if failed > 0 {
         AnsiColor::NeonRed.with_fg(AnsiColor::Black).write_to_buffer(buf);
@@ -480,9 +498,13 @@ fn write_color_summary(buf: &mut Vec<u8>, state: &TuiState, workspace: &Workspac
     let elapsed = state.started_at.elapsed();
 
     let passed = state.tests.iter().filter(|t| t.status == TestJobStatus::Passed).count();
+    let cached = state.tests.iter().filter(|t| t.status == TestJobStatus::Cached).count();
     let failed: Vec<_> = state.tests.iter().filter(|t| matches!(t.status, TestJobStatus::Failed(_))).collect();
 
     splat!(buf, "\n", "Tests: ", AnsiColor(2).as_fg(), passed, " passed", vt::CLEAR_STYLE);
+    if cached > 0 {
+        splat!(buf, ", ", AnsiColor::Cyan1.as_fg(), skipped_via_cache_text(cached), vt::CLEAR_STYLE);
+    }
     if !failed.is_empty() {
         splat!(buf, ", ", AnsiColor(1).as_fg(), failed.len(), " failed", vt::CLEAR_STYLE);
     }
@@ -513,6 +535,7 @@ fn write_cancelled_summary(buf: &mut Vec<u8>, state: &TuiState) {
     let elapsed = state.started_at.elapsed();
 
     let passed = state.tests.iter().filter(|t| t.status == TestJobStatus::Passed).count();
+    let cached = state.tests.iter().filter(|t| t.status == TestJobStatus::Cached).count();
     let failed = state.tests.iter().filter(|t| matches!(t.status, TestJobStatus::Failed(_))).count();
     let running = state.tests.iter().filter(|t| t.status == TestJobStatus::Running).count();
     let pending = state.tests.iter().filter(|t| t.status == TestJobStatus::Pending).count();
@@ -523,20 +546,26 @@ fn write_cancelled_summary(buf: &mut Vec<u8>, state: &TuiState) {
     if passed > 0 {
         splat!(buf, AnsiColor(2).as_fg(), passed, " passed", vt::CLEAR_STYLE);
     }
-    if failed > 0 {
+    if cached > 0 {
         if passed > 0 {
+            buf.extend_from_slice(b", ");
+        }
+        splat!(buf, AnsiColor::Cyan1.as_fg(), skipped_via_cache_text(cached), vt::CLEAR_STYLE);
+    }
+    if failed > 0 {
+        if passed > 0 || cached > 0 {
             buf.extend_from_slice(b", ");
         }
         splat!(buf, AnsiColor(1).as_fg(), failed, " failed", vt::CLEAR_STYLE);
     }
     if running > 0 {
-        if passed > 0 || failed > 0 {
+        if passed > 0 || cached > 0 || failed > 0 {
             buf.extend_from_slice(b", ");
         }
         splat!(buf, running, " cancelled while running");
     }
     if pending > 0 {
-        if passed > 0 || failed > 0 || running > 0 {
+        if passed > 0 || cached > 0 || failed > 0 || running > 0 {
             buf.extend_from_slice(b", ");
         }
         splat!(buf, pending, " not started");
@@ -555,7 +584,7 @@ fn update_test_statuses(
     let mut all_done = true;
 
     for test_job in &mut test_run.test_jobs {
-        if matches!(test_job.status, TestJobStatus::Passed | TestJobStatus::Failed(_)) {
+        if is_terminal_status(test_job.status) {
             continue;
         }
 
@@ -570,7 +599,9 @@ fn update_test_statuses(
                 (TestJobStatus::Running, None)
             }
             JobStatus::Exited { status, cause, .. } => {
-                if *status == 0 {
+                if job.cache_synthetic {
+                    (TestJobStatus::Cached, None)
+                } else if *status == 0 {
                     (TestJobStatus::Passed, None)
                 } else {
                     let timeout = if *cause == ExitCause::Timeout {
@@ -591,6 +622,9 @@ fn update_test_statuses(
             match new_status {
                 TestJobStatus::Passed => {
                     writeln!(buf, "=== PASS {}", display_name).ok();
+                }
+                TestJobStatus::Cached => {
+                    writeln!(buf, "=== CACHE {}", display_name).ok();
                 }
                 TestJobStatus::Failed(code) => {
                     let base_path = state.config.current.base_path();
@@ -655,8 +689,13 @@ fn format_test_name(test_job: &TestJob, base_tasks: &[BaseTask]) -> String {
 fn print_summary(buf: &mut Vec<u8>, test_run: &TestRun, _base_tasks: &[BaseTask]) {
     let elapsed = test_run.started_at.elapsed();
     let passed = test_run.test_jobs.iter().filter(|j| matches!(j.status, TestJobStatus::Passed)).count();
+    let cached = test_run.test_jobs.iter().filter(|j| matches!(j.status, TestJobStatus::Cached)).count();
     let failed = test_run.test_jobs.iter().filter(|j| matches!(j.status, TestJobStatus::Failed(_))).count();
 
     writeln!(buf).ok();
-    writeln!(buf, "Tests: {} passed, {} failed ({:.1}s)", passed, failed, elapsed.as_secs_f64()).ok();
+    write!(buf, "Tests: {} passed, {} failed", passed, failed).ok();
+    if cached > 0 {
+        write!(buf, ", {}", skipped_via_cache_text(cached)).ok();
+    }
+    writeln!(buf, " ({:.1}s)", elapsed.as_secs_f64()).ok();
 }

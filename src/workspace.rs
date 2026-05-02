@@ -32,12 +32,14 @@ use smallvec::SmallVec;
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock, Weak},
-    time::{Instant, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 mod job_index_list;
 mod job_store;
+mod persistent_cache;
 pub mod require_graph;
 mod resource;
+use persistent_cache::PersistentCache;
 
 /// Lower bound on `[daemon] max_job_history`. Values below this are clamped
 /// up so eviction still has room to work — the 25% churn per batch would
@@ -59,6 +61,8 @@ enum CacheKeyInfoItem {
 struct CacheKeyInfo {
     base_index: BaseTaskIndex,
     cache_key_inputs: Vec<CacheKeyInfoItem>,
+    persistent: bool,
+    max_age: Option<Duration>,
 }
 
 fn hash_modified_path(hasher: &mut CacheKeyHasher, base_path: &Path, path: &str, ignore: &[&str]) {
@@ -272,6 +276,9 @@ pub struct Job {
     pub started_at: Instant,
     /// Computed cache key for cache invalidation. Empty string means no key-based caching.
     pub cache_key: String,
+    /// True for a synthetic success job created to represent a cache hit in
+    /// views that require a job handle. Synthetic jobs do not refresh caches.
+    pub cache_synthetic: bool,
     pub spawn: Arc<ResolvedSpawnSpec>,
     /// Resources currently held by this job. Populated on `Scheduled → Starting`,
     /// drained on any terminal transition.
@@ -448,6 +455,17 @@ impl JobStatus {
     pub fn is_running(&self) -> bool {
         matches!(self, JobStatus::Running { .. })
     }
+}
+
+fn finished_within_max_age(status: &JobStatus, max_age: Option<Duration>) -> bool {
+    let Some(max_age) = max_age else {
+        return true;
+    };
+    let JobStatus::Exited { finished_at, .. } = status else {
+        return true;
+    };
+    let elapsed = crate::clock::now().checked_duration_since(*finished_at).unwrap_or_default();
+    elapsed <= max_age
 }
 
 pub struct LatestConfig {
@@ -671,6 +689,7 @@ pub enum TestJobStatus {
     Pending,
     Running,
     Passed,
+    Cached,
     Failed(i32),
 }
 
@@ -924,6 +943,7 @@ pub struct WorkspaceState {
     /// O(1) lookup via [`detect_require_problems`].
     pub require_analysis: RequireAnalysis,
     cache_key_hasher: CacheKeyHasher,
+    persistent_cache: PersistentCache,
     spawn_specs: hashbrown::HashMap<u64, Vec<Weak<ResolvedSpawnSpec>>>,
 }
 
@@ -946,34 +966,6 @@ impl WorkspaceState {
 
         total != non_scheduled
     }
-    fn compute_cache_key(&mut self, cache_key_inputs: &[CacheKeyInput]) -> String {
-        if cache_key_inputs.is_empty() {
-            return String::new();
-        }
-        self.cache_key_hasher.reset();
-
-        for input in cache_key_inputs {
-            match input {
-                CacheKeyInput::Modified { paths, ignore } => {
-                    self.cache_key_hasher.update(b"modified:");
-                    let base_path = self.config.current.base_path();
-                    for path in *paths {
-                        hash_modified_path(&mut self.cache_key_hasher, base_path, path, ignore);
-                    }
-                }
-                CacheKeyInput::ProfileChanged(task_name) => {
-                    let counter =
-                        self.lookup_name(task_name).map_or(0, |bti| self.base_tasks[bti.idx()].profile_change_counter);
-                    self.cache_key_hasher.update(b"profile_changed:");
-                    self.cache_key_hasher.update(task_name.as_bytes());
-                    self.cache_key_hasher.update(b"=");
-                    self.cache_key_hasher.update_u32(counter);
-                }
-            }
-        }
-        self.cache_key_hasher.finalize_hex()
-    }
-
     fn compute_cache_key_with_require(
         &mut self,
         cache_key_inputs: &[CacheKeyInput],
@@ -1019,6 +1011,47 @@ impl WorkspaceState {
             }
         }
         self.cache_key_hasher.finalize_hex()
+    }
+
+    fn job_cache_key_matches(job: &Job, expected_cache_key: &str) -> bool {
+        expected_cache_key.is_empty() || job.cache_key == expected_cache_key
+    }
+
+    fn successful_job_satisfies_cache(job: &Job, expected_cache_key: &str, max_age: Option<Duration>) -> bool {
+        !job.cache_synthetic
+            && job.process_status.is_successful_completion()
+            && Self::job_cache_key_matches(job, expected_cache_key)
+            && finished_within_max_age(&job.process_status, max_age)
+    }
+
+    fn persistent_cache_hit(
+        &self,
+        base_task: BaseTaskIndex,
+        expected_cache_key: &str,
+        max_age: Option<Duration>,
+    ) -> bool {
+        let bt = &self.base_tasks[base_task.idx()];
+        if bt.config.kind == TaskKind::Service {
+            return false;
+        }
+        self.persistent_cache.is_fresh(bt.config.kind, bt.name.as_ref(), expected_cache_key, max_age)
+    }
+
+    fn completed_cache_hit(
+        &self,
+        base_task: BaseTaskIndex,
+        expected_cache_key: &str,
+        max_age: Option<Duration>,
+        persistent: bool,
+    ) -> bool {
+        let bt = &self.base_tasks[base_task.idx()];
+        for &ji in bt.jobs.all().iter().rev() {
+            let job = &self.jobs[ji];
+            if Self::successful_job_satisfies_cache(job, expected_cache_key, max_age) {
+                return true;
+            }
+        }
+        persistent && self.persistent_cache_hit(base_task, expected_cache_key, max_age)
     }
 
     /// Resolves a task name (bare or `kind.name`) to a `BaseTaskIndex` using
@@ -1520,6 +1553,7 @@ impl WorkspaceState {
             log_group: job_id,
             started_at: crate::clock::now(),
             cache_key,
+            cache_synthetic: false,
             spawn: spec.clone(),
             held_resources: SmallVec::new(),
             trace,
@@ -1540,6 +1574,49 @@ impl WorkspaceState {
         kvlog::info!("Job scheduled", task_name = task_name.as_ref(), job_index, reason = reason.name());
         channel.wake();
         let _ = (task, job_id);
+        job_index
+    }
+
+    fn create_cached_success_job(
+        &mut self,
+        base_task: BaseTaskIndex,
+        task: TaskConfigRc,
+        profile: &str,
+        params: ValueMap<'static>,
+        cache_key: String,
+        reason: ScheduleReason,
+    ) -> JobIndex {
+        let spec = self.cache_spawn_spec(base_task, profile, params, task);
+        let (task_kind, job_id) = {
+            let bt = &mut self.base_tasks[base_task.idx()];
+            let task_kind = bt.config.kind;
+            let pc = bt.spawn_counter as usize;
+            bt.spawn_counter = bt.spawn_counter.wrapping_add(1);
+            (task_kind, LogGroup::new(base_task, pc))
+        };
+        let now = crate::clock::now();
+        let job_index = self.jobs.insert(Job {
+            process_status: JobStatus::Exited { finished_at: now, cause: ExitCause::Unknown, status: 0 },
+            log_group: job_id,
+            started_at: now,
+            cache_key,
+            cache_synthetic: true,
+            spawn: spec,
+            held_resources: SmallVec::new(),
+            trace: false,
+            trace_report: None,
+        });
+
+        self.base_tasks[base_task.idx()].jobs.push_terminated(job_index);
+        let global_list = match task_kind {
+            TaskKind::Action => &mut self.action_jobs,
+            TaskKind::Test => &mut self.test_jobs,
+            TaskKind::Service => &mut self.service_jobs,
+        };
+        global_list.push_terminated(job_index);
+        self.change_number = self.change_number.wrapping_add(1);
+
+        kvlog::info!("Created cached success job", ?base_task, ?job_index, reason = reason.name());
         job_index
     }
 }
@@ -1593,7 +1670,9 @@ impl WorkspaceState {
                 JobStatus::Scheduled { .. } | JobStatus::Starting => summary.pending += 1,
                 JobStatus::Running { .. } => summary.running += 1,
                 JobStatus::Exited { status, .. } => {
-                    if *status == 0 {
+                    if job.cache_synthetic {
+                        summary.cached += 1;
+                    } else if *status == 0 {
                         summary.passed += 1;
                     } else {
                         summary.failed += 1;
@@ -1660,6 +1739,8 @@ impl WorkspaceState {
         name: &str,
         base_index: BaseTaskIndex,
         expected_cache_key: &str,
+        max_age: Option<Duration>,
+        persistent: bool,
     ) -> Option<String> {
         if expected_cache_key.is_empty() {
             return None;
@@ -1680,7 +1761,7 @@ impl WorkspaceState {
 
             match task_kind {
                 TaskKind::Action => {
-                    if job.process_status.is_successful_completion() {
+                    if Self::successful_job_satisfies_cache(job, expected_cache_key, max_age) {
                         return Some(format!("Task '{}' cache hit (already completed)", name));
                     }
                     if job.process_status.is_pending_completion() {
@@ -1697,6 +1778,10 @@ impl WorkspaceState {
                 }
                 TaskKind::Test => {}
             }
+        }
+
+        if persistent && self.persistent_cache_hit(base_index, expected_cache_key, max_age) {
+            return Some(format!("Task '{}' cache hit (persistent)", name));
         }
 
         None
@@ -1849,7 +1934,8 @@ impl WorkspaceState {
         let job = &mut self.jobs[job_index];
         let job_id = job.log_group;
         let base_task = &mut self.base_tasks[job_id.base_task_index().idx()];
-        let task_name = base_task.name.as_ref();
+        let task_name_owned = base_task.name.clone();
+        let task_name = task_name_owned.as_ref();
         let task_kind = base_task.config.kind;
         let jobs_list = &mut base_task.jobs;
 
@@ -1919,6 +2005,7 @@ impl WorkspaceState {
             _ => {}
         }
 
+        let should_record_persistent_cache = matches!(&status, S::Exited { status, .. } if *status == 0);
         let is_now_terminal = matches!(status, S::Exited { .. } | S::Cancelled);
         self.jobs[job_index].process_status = status;
 
@@ -1933,6 +2020,21 @@ impl WorkspaceState {
             let to_release = std::mem::take(&mut self.jobs[job_index].held_resources);
             for id in to_release {
                 self.resources.release(id);
+            }
+        }
+
+        if should_record_persistent_cache && task_kind != TaskKind::Service {
+            let cache_key = {
+                let job = &self.jobs[job_index];
+                let cache_config = job.task().config().cache.as_ref();
+                if !job.cache_synthetic && cache_config.is_some_and(|cache| cache.persistent && !cache.never) {
+                    Some(job.cache_key.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(cache_key) = cache_key {
+                self.persistent_cache.record_success(task_kind, task_name_owned.as_ref(), &cache_key);
             }
         }
 
@@ -2042,7 +2144,7 @@ impl WorkspaceState {
     }
 
     pub fn new(config_path: PathBuf) -> Result<WorkspaceState, crate::config::ConfigError> {
-        let config = LatestConfig::new(config_path)?;
+        let config = LatestConfig::new(config_path.clone())?;
         let mut base_tasks = Vec::new();
         let mut name_map = hashbrown::HashMap::new();
         config.update_base_tasks(&mut base_tasks, &mut name_map);
@@ -2066,6 +2168,7 @@ impl WorkspaceState {
             resources: ResourceSlab::default(),
             require_analysis,
             cache_key_hasher: CacheKeyHasher::new(),
+            persistent_cache: PersistentCache::new(&config_path),
             spawn_specs: hashbrown::HashMap::new(),
         })
     }
@@ -2295,6 +2398,8 @@ impl WorkspaceState {
                     if let Some(cache_config) = dep_config.cache.as_ref()
                         && !cache_config.never
                     {
+                        let max_age = cache_config.max_age;
+                        let persistent = cache_config.persistent;
                         let expected_cache_key =
                             self.compute_cache_key_with_require(cache_config.key, &profile, &params);
                         let spawner = &self.base_tasks[base_task.idx()];
@@ -2305,7 +2410,7 @@ impl WorkspaceState {
                                 continue;
                             }
                             if job.process_status.is_successful_completion() {
-                                if expected_cache_key.is_empty() || job.cache_key == expected_cache_key {
+                                if Self::successful_job_satisfies_cache(job, &expected_cache_key, max_age) {
                                     resolved = Some(ResolvedRequirement::Cached);
                                     break;
                                 }
@@ -2317,6 +2422,12 @@ impl WorkspaceState {
                                 resolved = Some(ResolvedRequirement::Pending(ji));
                                 break;
                             }
+                        }
+                        if resolved.is_none()
+                            && persistent
+                            && self.persistent_cache_hit(base_task, &expected_cache_key, max_age)
+                        {
+                            resolved = Some(ResolvedRequirement::Cached);
                         }
                     }
 
@@ -2394,8 +2505,10 @@ impl WorkspaceState {
         run_id: u32,
         channel: &MioChannel,
         workspace_id: u32,
+        force: bool,
     ) -> Result<TestRun, String> {
         struct TestRequirements {
+            position: usize,
             base_task_idx: BaseTaskIndex,
             task_config: TaskConfigRc,
             spawn_profile: String,
@@ -2405,11 +2518,47 @@ impl WorkspaceState {
         }
 
         let mut batch: SpawnBatch<TestRequirements> = SpawnBatch::new();
+        let mut test_jobs: Vec<Option<TestJob>> = Vec::new();
 
         for matched in matched_tests {
             self.detect_require_problems(matched.base_task_idx)?;
 
+            let position = test_jobs.len();
+            test_jobs.push(None);
+
             let task_config = &matched.task_config;
+            if !force
+                && let Some(cache_config) = task_config.config().cache.as_ref()
+                && !cache_config.never
+            {
+                let cache_key = self.compute_cache_key_with_require(
+                    cache_config.key,
+                    &matched.spawn_profile,
+                    &matched.spawn_params,
+                );
+                if self.completed_cache_hit(
+                    matched.base_task_idx,
+                    &cache_key,
+                    cache_config.max_age,
+                    cache_config.persistent,
+                ) {
+                    let job_index = self.create_cached_success_job(
+                        matched.base_task_idx,
+                        matched.task_config.clone(),
+                        &matched.spawn_profile,
+                        matched.spawn_params,
+                        cache_key,
+                        ScheduleReason::TestRun,
+                    );
+                    test_jobs[position] = Some(TestJob {
+                        base_task_index: matched.base_task_idx,
+                        job_index,
+                        status: TestJobStatus::Cached,
+                    });
+                    continue;
+                }
+            }
+
             let mut requirements = Vec::new();
 
             let mut service_variants: hashbrown::HashMap<BaseTaskIndex, Vec<(String, ValueMap<'static>)>> =
@@ -2519,6 +2668,7 @@ impl WorkspaceState {
             }
 
             batch.add_task(TestRequirements {
+                position,
                 base_task_idx: matched.base_task_idx,
                 task_config: task_config.clone(),
                 spawn_profile: matched.spawn_profile,
@@ -2531,7 +2681,6 @@ impl WorkspaceState {
         self.resolve_batch_requirements(workspace_id, channel, &mut batch)?;
 
         let tasks = batch.take_tasks();
-        let mut test_jobs = Vec::new();
 
         for task in tasks {
             let task_config = task.task_data.task_config;
@@ -2551,8 +2700,9 @@ impl WorkspaceState {
                 pred.push(ScheduleRequirement::Resource { id, priority });
             }
 
-            let cache_key =
-                task_config.config().cache.as_ref().map_or(String::new(), |c| self.compute_cache_key(c.key));
+            let cache_key = task_config.config().cache.as_ref().map_or(String::new(), |c| {
+                self.compute_cache_key_with_require(c.key, &task.task_data.spawn_profile, &task.task_data.spawn_params)
+            });
 
             let job_index = self.create_job(
                 task.task_data.base_task_idx,
@@ -2567,13 +2717,15 @@ impl WorkspaceState {
                 false,
             );
 
-            test_jobs.push(TestJob {
+            test_jobs[task.task_data.position] = Some(TestJob {
                 base_task_index: task.task_data.base_task_idx,
                 job_index,
                 status: TestJobStatus::Pending,
             });
         }
 
+        let test_jobs: Vec<TestJob> =
+            test_jobs.into_iter().map(|job| job.expect("test job slot should be filled")).collect();
         let test_run = TestRun { run_id, started_at: crate::clock::now(), test_jobs };
         self.active_test_run =
             Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
@@ -2780,7 +2932,7 @@ impl Workspace {
             matched_tests.push(MatchedTest { base_task_idx, task_config, spawn_profile, spawn_params });
         }
 
-        state.run_test_batch(matched_tests, run_id, &self.process_channel, self.workspace_id)
+        state.run_test_batch(matched_tests, run_id, &self.process_channel, self.workspace_id, false)
     }
 }
 
@@ -2991,7 +3143,15 @@ impl Workspace {
                     })
                     .collect();
 
-                (CacheKeyInfo { base_index, cache_key_inputs }, profile)
+                (
+                    CacheKeyInfo {
+                        base_index,
+                        cache_key_inputs,
+                        persistent: cache_config.persistent,
+                        max_age: cache_config.max_age,
+                    },
+                    profile,
+                )
             };
             // Lock released here
 
@@ -3000,7 +3160,13 @@ impl Workspace {
 
             // Phase 3: Check for cache hit and spawn if needed (re-acquire lock)
             let state = &mut *self.state.write().unwrap();
-            if let Some(msg) = state.check_cache_hit_with_key(name, cache_info.base_index, &expected_cache_key) {
+            if let Some(msg) = state.check_cache_hit_with_key(
+                name,
+                cache_info.base_index,
+                &expected_cache_key,
+                cache_info.max_age,
+                cache_info.persistent,
+            ) {
                 return Ok(Some(msg));
             }
 
@@ -3025,7 +3191,7 @@ impl Workspace {
         state.lookup_and_terminate_task(&self.process_channel, name)
     }
 
-    pub fn start_test_run(&self, filters: &[TestFilter]) -> Result<TestRun, String> {
+    pub fn start_test_run(&self, filters: &[TestFilter], force: bool) -> Result<TestRun, String> {
         let state = &mut *self.state.write().unwrap();
         state.change_number = state.change_number.wrapping_add(1);
         state.refresh_config();
@@ -3054,7 +3220,7 @@ impl Workspace {
             });
         }
 
-        state.run_test_batch(matched_tests, run_id, &self.process_channel, self.workspace_id)
+        state.run_test_batch(matched_tests, run_id, &self.process_channel, self.workspace_id, force)
     }
 
     /// Narrows the test group by removing passed tests.
@@ -3108,6 +3274,7 @@ pub struct TestGroup {
 pub struct TestGroupSummary {
     pub total: u32,
     pub passed: u32,
+    pub cached: u32,
     pub failed: u32,
     pub running: u32,
     pub pending: u32,
@@ -3563,6 +3730,7 @@ mod scheduling_tests {
                 log_group: LogGroup::new(base_task, pc),
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
+                cache_synthetic: false,
                 spawn: spec,
                 held_resources: SmallVec::new(),
                 trace: false,
@@ -3664,6 +3832,7 @@ mod scheduling_tests {
                 log_group,
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
+                cache_synthetic: false,
                 spawn: spec,
                 held_resources: SmallVec::new(),
                 trace: false,
@@ -3753,6 +3922,7 @@ mod scheduling_tests {
                 log_group: LogGroup::new(base_task, 999),
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
+                cache_synthetic: false,
                 spawn: spec.clone(),
                 held_resources: SmallVec::new(),
                 trace: false,
@@ -3864,6 +4034,7 @@ mod scheduling_tests {
                     log_group,
                     started_at: crate::clock::now(),
                     cache_key: String::new(),
+                    cache_synthetic: false,
                     spawn: spec.clone(),
                     held_resources: SmallVec::new(),
                     trace: false,
@@ -3992,6 +4163,7 @@ mod scheduling_tests {
                 log_group,
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
+                cache_synthetic: false,
                 spawn: spec,
                 held_resources: SmallVec::new(),
                 trace: false,

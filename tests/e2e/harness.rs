@@ -84,6 +84,15 @@ impl TestHarness {
     ///
     /// Server output is captured to a log file for debugging on failure.
     pub fn spawn_server(&mut self) -> &mut Self {
+        self.spawn_server_with_db_path(Path::new("/dev/null"))
+    }
+
+    /// Spawns the server with a specific DB path.
+    pub fn spawn_server_with_db(&mut self, db_path: &Path) -> &mut Self {
+        self.spawn_server_with_db_path(db_path)
+    }
+
+    fn spawn_server_with_db_path(&mut self, db_path: &Path) -> &mut Self {
         let log_file = fs::File::create(&self.server_log_path).expect("Failed to create server log");
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
@@ -91,7 +100,7 @@ impl TestHarness {
             .arg("server")
             .current_dir(&self.temp_dir)
             .env("DEVSM_SOCKET", &self.socket_path)
-            .env("DEVSM_DB", "/dev/null")
+            .env("DEVSM_DB", db_path)
             .env("DEVSM_LOG_STDOUT", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
@@ -101,6 +110,12 @@ impl TestHarness {
 
         self.server = Some(server);
         self
+    }
+
+    /// Stops the test server if it is running.
+    pub fn stop_server(&mut self) {
+        terminate_server(&mut self.server);
+        let _ = fs::remove_file(&self.socket_path);
     }
 
     /// Spawns the server from a specific directory (not the config directory).
@@ -231,21 +246,25 @@ impl TestHarness {
 
 impl Drop for TestHarness {
     fn drop(&mut self) {
-        if let Some(ref mut server) = self.server {
-            let pid = server.id() as i32;
-            unsafe {
-                libc::kill(pid, libc::SIGTERM);
-            }
-            for _ in 0..50 {
-                if let Ok(Some(_)) = server.try_wait() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            let _ = server.kill();
-            let _ = server.wait();
-        }
+        terminate_server(&mut self.server);
         let _ = fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
+fn terminate_server(server: &mut Option<Child>) {
+    if let Some(mut server) = server.take() {
+        let pid = server.id() as i32;
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        for _ in 0..50 {
+            if let Ok(Some(_)) = server.try_wait() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = server.kill();
+        let _ = server.wait();
     }
 }
 

@@ -89,18 +89,9 @@ pub fn install(prog: &[libc::sock_filter]) -> io::Result<()> {
     if r == -1 {
         return Err(io::Error::last_os_error());
     }
-    let fprog = libc::sock_fprog {
-        len: prog.len() as u16,
-        filter: prog.as_ptr() as *mut libc::sock_filter,
-    };
+    let fprog = libc::sock_fprog { len: prog.len() as u16, filter: prog.as_ptr() as *mut libc::sock_filter };
     let r = unsafe {
-        libc::prctl(
-            libc::PR_SET_SECCOMP,
-            libc::SECCOMP_MODE_FILTER,
-            &fprog as *const libc::sock_fprog as usize,
-            0,
-            0,
-        )
+        libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &fprog as *const libc::sock_fprog as usize, 0, 0)
     };
     if r == -1 {
         return Err(io::Error::last_os_error());
