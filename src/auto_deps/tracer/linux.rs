@@ -6,7 +6,7 @@ use crate::auto_deps::tracer::seccomp;
 use crate::auto_deps::tracer::state::{FdEntry, PendingSyscall, Stage, TraceeState};
 use crate::auto_deps::tracer::syscalls::{
     Effect, classify, effect_needs_exit, effect_to_event_kind, open_flags_is_cloexec,
-    open_flags_is_write,
+    open_flags_is_directory, open_flags_is_write,
 };
 
 use std::collections::HashMap;
@@ -478,6 +478,7 @@ impl Tracer {
                 let Some(path) = resolved_path else { return };
                 let flags = args[flags_arg as usize];
                 let opened_write = open_flags_is_write(flags);
+                let opened_dir = open_flags_is_directory(flags);
                 let cloexec = open_flags_is_cloexec(flags);
                 let fd = rval as i32;
                 if fd >= 0 {
@@ -485,6 +486,14 @@ impl Tracer {
                         fd,
                         FdEntry { path: path.clone(), opened_write, cloexec },
                     );
+                }
+                // O_DIRECTORY opens are the prelude to `getdents64`. Don't
+                // emit a Read event - the listing surfaces the dependency,
+                // and recording a Read here pulls the directory itself
+                // into `input_paths` and lets it collapse over its own
+                // children.
+                if opened_dir {
+                    return;
                 }
                 let kind = if opened_write { PathEventKind::Write } else { PathEventKind::Read };
                 push_event(&mut self.events, &mut self.seq, self.max_events, &mut self.truncated, kind, path, pid);

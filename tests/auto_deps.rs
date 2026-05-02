@@ -176,6 +176,88 @@ fn end_to_end_trace_writes_cache_key_into_devsm_toml() {
 }
 
 #[test]
+fn missing_ancestor_collapses_missing_descendant() {
+    // `test -e` issues an `access` syscall, which the tracer records as
+    // a Stat. Both `.cargo` and `.cargo/config.toml` end up as
+    // stat-only-and-missing events; the descendant should collapse into
+    // the ancestor instead of appearing alongside it.
+    let (_tmp, _r, deps) = run(
+        |dir| {
+            fs::write(dir.join("anchor.txt"), b"a").unwrap();
+        },
+        "cat anchor.txt > /dev/null; \
+         test -e .cargo/config.toml; \
+         test -e .cargo; \
+         true",
+    );
+    let got = dep_paths(&deps);
+    assert!(
+        !got.contains(".cargo/config.toml"),
+        ".cargo/config.toml should collapse into .cargo, got {got:?}"
+    );
+}
+
+#[test]
+fn stat_only_existing_file_is_dropped() {
+    // Mirrors cargo's `[package].readme` auto-detection: stat the file
+    // to confirm it exists, never open it. Such probes should not
+    // pollute the cache key.
+    let (_tmp, _r, deps) = run(
+        |dir| {
+            fs::write(dir.join("README.md"), b"r").unwrap();
+            fs::write(dir.join("data.txt"), b"d").unwrap();
+        },
+        "test -e README.md; cat data.txt > /dev/null",
+    );
+    let got = dep_paths(&deps);
+    assert!(got.contains("data.txt"), "real read missing, got {got:?}");
+    assert!(!got.contains("README.md"), "stat-only existing file should drop, got {got:?}");
+}
+
+#[test]
+fn listed_dir_with_tracked_child_is_not_promoted() {
+    // Models a cargo workspace member: cargo lists `member/`, opens
+    // `member/Cargo.toml`, never touches anything else. We want the
+    // specific file in the cache key, not the whole `member/` subtree.
+    let (_tmp, _r, deps) = run(
+        |dir| {
+            let m = dir.join("member");
+            fs::create_dir(&m).unwrap();
+            fs::write(m.join("Cargo.toml"), b"[package]\nname=\"m\"\n").unwrap();
+            fs::write(m.join("other.txt"), b"o").unwrap();
+        },
+        "ls member > /dev/null; cat member/Cargo.toml > /dev/null",
+    );
+    let got = dep_paths(&deps);
+    assert!(
+        got.contains("member/Cargo.toml"),
+        "tracked child should appear, got {got:?}"
+    );
+    assert!(
+        !got.contains("member"),
+        "listed dir with tracked children should not promote to the dir, got {got:?}"
+    );
+}
+
+#[test]
+fn listed_dir_without_tracked_children_is_kept() {
+    // The opposite case: cargo probes a dir for auto-detected targets
+    // but doesn't open anything (because no target matches the build
+    // request). The listing itself is still a dependency - adding a
+    // file later would change behavior.
+    let (_tmp, _r, deps) = run(
+        |dir| {
+            let e = dir.join("examples");
+            fs::create_dir(&e).unwrap();
+            fs::write(dir.join("anchor.txt"), b"a").unwrap();
+        },
+        "ls examples > /dev/null; cat anchor.txt > /dev/null",
+    );
+    let got = dep_paths(&deps);
+    assert!(got.contains("examples"), "untouched listed dir should remain, got {got:?}");
+}
+
+#[test]
 fn paths_outside_project_root_are_excluded() {
     let (_tmp, report, deps) = run(
         |dir| {

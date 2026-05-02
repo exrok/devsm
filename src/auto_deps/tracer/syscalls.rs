@@ -132,6 +132,14 @@ pub fn open_flags_is_cloexec(flags: u64) -> bool {
     (flags as i32) & libc::O_CLOEXEC != 0
 }
 
+/// True when the open requests a directory fd (typically the prelude to
+/// `getdents64`). Inference treats these specially: the open itself
+/// isn't a content read, and the subsequent `ListDir` already records
+/// the dependency.
+pub fn open_flags_is_directory(flags: u64) -> bool {
+    (flags as i32) & libc::O_DIRECTORY != 0
+}
+
 /// Static list of every syscall [`classify`] recognizes that is safe to put
 /// in the seccomp-BPF filter. Used to seed the filter so the kernel only
 /// stops the tracee on syscalls we actually inspect.

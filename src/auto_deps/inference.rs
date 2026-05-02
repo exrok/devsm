@@ -25,6 +25,13 @@ pub struct InferredDeps {
     pub dropped_intermediate: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct PathFlags {
+    read: bool,
+    stat: bool,
+    listdir: bool,
+}
+
 const SYSTEM_PREFIXES: &[&str] =
     &["/usr", "/lib", "/lib64", "/etc", "/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp"];
 
@@ -79,23 +86,49 @@ pub fn infer(report: &TraceReport, project_root: &Path) -> InferredDeps {
         })
         .collect();
 
+    let mut path_kinds: HashMap<&Path, PathFlags> = HashMap::new();
     let mut listed_dirs: HashSet<PathBuf> = HashSet::new();
-    let mut input_paths: HashSet<PathBuf> = HashSet::new();
     for ev in &kept {
         match ev.kind {
             PathEventKind::ListDir => {
                 listed_dirs.insert(ev.path.clone());
+                path_kinds.entry(ev.path.as_path()).or_default().listdir = true;
             }
-            PathEventKind::Read
-            | PathEventKind::Stat
-            | PathEventKind::ReadLink
-            | PathEventKind::Exec => {
-                if ev.path != project_root {
-                    input_paths.insert(ev.path.clone());
-                }
+            PathEventKind::Read | PathEventKind::Exec => {
+                path_kinds.entry(ev.path.as_path()).or_default().read = true;
+            }
+            PathEventKind::Stat | PathEventKind::ReadLink => {
+                path_kinds.entry(ev.path.as_path()).or_default().stat = true;
             }
             _ => {}
         }
+    }
+
+    // A path is a real content dependency only when it was actually read
+    // (`Read`/`Exec`). Bare `Stat` on an existing path is an existence
+    // probe (e.g. cargo's `[package].readme` auto-detect) and gets
+    // dropped. Bare `Stat` on a *missing* path is kept only when it
+    // sits directly under the project root - top-level configs like
+    // `.cargo` or `rust-toolchain.toml` whose absence really is the
+    // dependency. Deeper missing-stats are cargo's per-package
+    // auto-detect sweep (e.g. probing `<member>/build.rs`,
+    // `<member>/README.md`); keeping them inflates `by_parent` and
+    // would cause spurious whole-directory promotion.
+    let mut input_paths: HashSet<PathBuf> = HashSet::new();
+    for (path, flags) in &path_kinds {
+        if *path == project_root {
+            continue;
+        }
+        let depth_from_root = path
+            .strip_prefix(&project_root)
+            .map(|r| r.components().count())
+            .unwrap_or(usize::MAX);
+        let keep = flags.read
+            || (flags.stat && !path.exists() && depth_from_root <= 1);
+        if !keep {
+            continue;
+        }
+        input_paths.insert(path.to_path_buf());
     }
 
     let mut by_parent: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -107,12 +140,22 @@ pub fn infer(report: &TraceReport, project_root: &Path) -> InferredDeps {
 
     let mut final_paths: HashSet<PathBuf> = input_paths.clone();
 
+    // A listed-but-untouched directory captures cargo's "did you add a
+    // workspace member / example / test target here?" probes - the
+    // listing itself is the dependency. When individual files inside it
+    // already appear in `input_paths` we deliberately skip the broader
+    // entry so the cache key stays narrow (e.g. don't promote `test-app`
+    // just because cargo opened `test-app/Cargo.toml`).
     for ld in &listed_dirs {
-        final_paths.insert(ld.clone());
+        let has_tracked_child =
+            by_parent.get(ld).map(|v| !v.is_empty()).unwrap_or(false);
+        if !has_tracked_child {
+            final_paths.insert(ld.clone());
+        }
     }
 
     for parent in by_parent.keys() {
-        if listed_dirs.contains(parent) {
+        if final_paths.contains(parent) {
             continue;
         }
         let files = &by_parent[parent];
@@ -178,9 +221,18 @@ fn is_under(path: &Path, root: &Path) -> bool {
     path == root || path.starts_with(root)
 }
 
+/// Drop any path that lives strictly under another path already in the
+/// set. Pure structural collapse - we deliberately do not condition on
+/// `is_dir()` because cargo emits stat events for ancestors that don't
+/// exist on disk (e.g. `.cargo` while searching for
+/// `.cargo/config.toml`), and we still want those to absorb their own
+/// children.
 fn collapse_under_directories(paths: &mut HashSet<PathBuf>) {
-    let dirs: Vec<PathBuf> = paths.iter().filter(|p| p.is_dir()).cloned().collect();
-    for d in dirs {
+    let candidates: Vec<PathBuf> = paths.iter().cloned().collect();
+    for d in candidates {
+        if !paths.contains(&d) {
+            continue;
+        }
         paths.retain(|p| p == &d || !is_under(p, &d));
     }
 }

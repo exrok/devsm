@@ -18,6 +18,8 @@ mod inference;
 mod tracer;
 #[path = "auto_deps/toml_writer.rs"]
 mod toml_writer;
+#[path = "auto_deps/recording.rs"]
+pub mod recording;
 
 pub use toml_writer::{UpdateOutcome, update_cache_key};
 
