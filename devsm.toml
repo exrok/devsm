@@ -64,3 +64,8 @@ cmd = ["cargo", "check"]
 [test.cargo-test]
 cmd = ["cargo", "test", "--features=fuzz"]
 require = [{resource = "cargo-bin"}]
+
+[test.auto-deps]
+cmd = ["cargo", "test", "--test", "auto_deps"]
+require = [{resource = "cargo-bin"}]
+tag = ["auto_deps"]

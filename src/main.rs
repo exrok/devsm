@@ -19,6 +19,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[cfg(test)]
 mod alloc_report;
+mod auto_deps;
 mod cache_key;
 mod cli;
 mod clock;
