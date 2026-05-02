@@ -78,6 +78,12 @@ pub(crate) struct ActiveProcess {
     pub(crate) timeout_tracker: Option<TimeoutTracker>,
     /// When SIGINT was sent (for SIGKILL escalation after timeout).
     pub(crate) kill_sent_at: Option<std::time::Instant>,
+    /// Active ptrace tracer when the job was spawned with `--derive-cache-key`.
+    /// `None` if untraced or before the initial `SIGTRAP` is observed.
+    #[cfg(target_os = "linux")]
+    pub(crate) tracer: Option<Box<crate::auto_deps::Tracer>>,
+    /// True if `install_ptrace_traceme` was applied to this child's command.
+    pub(crate) is_traced: bool,
 }
 
 struct UntrackedChildGuard {
@@ -247,6 +253,11 @@ struct State {
     timed_ready_count: u32,
     timed_timeout_count: u32,
     db: crate::db::Db,
+    /// Pid → process_index for jobs spawned under ptrace. Empty in steady
+    /// state — checked with `is_empty()` in the reap loop to keep the
+    /// non-traced fast path identical to the un-modified version.
+    #[cfg(target_os = "linux")]
+    traced_root_pids: HashMap<i32, usize>,
 }
 
 pub(crate) struct EventLoop {
@@ -604,7 +615,7 @@ impl EventLoop {
         let index = self.state.processes.vacant_key();
         let tc = task.config();
         let workspace = &self.state.workspaces[workspace_index as usize];
-        let path = {
+        let (path, trace_requested) = {
             let ws = &mut *workspace.handle.state.write().unwrap();
             ws.change_number = ws.change_number.wrapping_add(1);
             match &ws[job_index].process_status {
@@ -616,7 +627,7 @@ impl EventLoop {
                 JobStatus::Exited { .. } => bail!("Attempt start already exited job"),
                 JobStatus::Cancelled => return Ok(()),
             }
-            ws.config.current.base_path().join(tc.pwd)
+            (ws.config.current.base_path().join(tc.pwd), ws[job_index].trace)
         };
 
         let (mut command, sh_script) = match &tc.command {
@@ -650,8 +661,30 @@ impl EventLoop {
         command.stdin(stdin);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
+
+        #[cfg(target_os = "linux")]
+        let installed_traceme = if trace_requested {
+            crate::auto_deps::install_ptrace_traceme(&mut command);
+            true
+        } else {
+            false
+        };
+        #[cfg(not(target_os = "linux"))]
+        let installed_traceme = {
+            if trace_requested {
+                bail!("--derive-cache-key is only supported on Linux");
+            }
+            false
+        };
+
         let child = command.spawn().context("Failed to spawn process")?;
         let mut untracked_child = UntrackedChildGuard::new(child);
+
+        #[cfg(target_os = "linux")]
+        if installed_traceme {
+            let pid = untracked_child.child_mut().id() as i32;
+            self.state.traced_root_pids.insert(pid, index);
+        }
 
         if let (Some(mut stdin), Some(script)) = (untracked_child.child_mut().stdin.take(), sh_script) {
             use std::io::Write;
@@ -728,6 +761,9 @@ impl EventLoop {
             ready_checker,
             timeout_tracker,
             kill_sent_at: None,
+            #[cfg(target_os = "linux")]
+            tracer: None,
+            is_traced: installed_traceme,
         });
         {
             let mut ws = workspace.handle.state.write().unwrap();
@@ -762,7 +798,7 @@ impl EventLoop {
 
 pub(crate) enum AttachKind {
     Tui,
-    Run { task_name: Box<str>, params: Vec<u8>, as_test: bool },
+    Run { task_name: Box<str>, params: Vec<u8>, as_test: bool, derive_cache_key: bool },
     TestRun { filters: Vec<u8> },
     Rpc { subscribe: bool },
     Logs { query: Vec<u8> },
@@ -997,12 +1033,21 @@ impl EventLoop {
                         };
                         self.attach_tui_client(stdin, stdout, socket, ws_index);
                     }
-                    AttachKind::Run { task_name, params, as_test } => {
+                    AttachKind::Run { task_name, params, as_test, derive_cache_key } => {
                         let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
                             kvlog::error!("Run client requires stdin/stdout FDs");
                             return false;
                         };
-                        self.attach_run_client(stdin, stdout, socket, ws_index, &task_name, params, as_test);
+                        self.attach_run_client(
+                            stdin,
+                            stdout,
+                            socket,
+                            ws_index,
+                            &task_name,
+                            params,
+                            as_test,
+                            derive_cache_key,
+                        );
                     }
                     AttachKind::TestRun { filters } => {
                         let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
@@ -1099,14 +1144,147 @@ impl EventLoop {
     }
 
     fn reap_children(&mut self) {
+        // Fast path: when no traced jobs are active the loop is identical
+        // to the un-modified version (single waitpid flag, no extra
+        // dispatch). The HashMap probe is one branch on a cache-resident
+        // pointer.
+        #[cfg(target_os = "linux")]
+        let any_traced = !self.state.traced_root_pids.is_empty();
+        #[cfg(not(target_os = "linux"))]
+        let any_traced = false;
+
+        let flags = libc::WNOHANG
+            | {
+                #[cfg(target_os = "linux")]
+                {
+                    if any_traced { libc::__WALL } else { 0 }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    0
+                }
+            };
+
         loop {
             let mut status: i32 = 0;
-            let pid = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG) };
+            let pid = unsafe { libc::waitpid(-1, &mut status, flags) };
             if pid <= 0 {
                 break;
             }
-            self.handle_process_exited(pid as u32, status as u32);
+
+            #[cfg(target_os = "linux")]
+            if any_traced && self.dispatch_traced_status(pid, status) {
+                continue;
+            }
+
+            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                self.handle_process_exited(pid as u32, status as u32);
+            }
         }
+    }
+
+    /// Routes a `waitpid` status to the appropriate `Tracer`.
+    ///
+    /// Returns `true` when the status was fully consumed by the trace
+    /// machinery and the caller should skip the normal exit path. Returns
+    /// `false` when the status corresponds to the root tracee's terminal
+    /// exit and `handle_process_exited` should still run.
+    ///
+    /// Idempotent for unknown pids — see [`crate::auto_deps::Tracer::on_status`].
+    #[cfg(target_os = "linux")]
+    fn dispatch_traced_status(&mut self, pid: i32, status: i32) -> bool {
+        // Initial SIGTRAP from `execve` for a freshly-spawned traced root:
+        // construct the Tracer and resume.
+        if let Some(&process_index) = self.state.traced_root_pids.get(&pid) {
+            let needs_attach = self
+                .state
+                .processes
+                .get(process_index)
+                .is_some_and(|p| p.is_traced && p.tracer.is_none());
+            if needs_attach {
+                if libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == libc::SIGTRAP {
+                    match crate::auto_deps::Tracer::attach(pid, crate::auto_deps::TraceOptions::default()) {
+                        Ok(tracer) => {
+                            if let Some(p) = self.state.processes.get_mut(process_index) {
+                                p.tracer = Some(Box::new(tracer));
+                            }
+                            return true;
+                        }
+                        Err(err) => {
+                            kvlog::error!("Tracer::attach failed", pid, ?err);
+                            self.state.traced_root_pids.remove(&pid);
+                            // Fall through; the child will continue running but
+                            // without ptrace bookkeeping. No trace report is
+                            // delivered.
+                            return false;
+                        }
+                    }
+                } else {
+                    // Unexpected pre-attach status — let the standard path
+                    // handle it (probably a spawn failure).
+                    return false;
+                }
+            }
+        }
+
+        // Forward to every active tracer. With at most one traced root in
+        // the typical case the iteration cost is negligible. The Tracer is
+        // documented idempotent for unknown pids.
+        let mut owning_index: Option<usize> = None;
+        for (idx, process) in &mut self.state.processes {
+            if let Some(tracer) = process.tracer.as_deref_mut() {
+                tracer.on_status(pid, status);
+                let is_root_exit = self
+                    .state
+                    .traced_root_pids
+                    .get(&pid)
+                    .copied()
+                    .is_some_and(|root_idx| root_idx == idx)
+                    && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status));
+                if is_root_exit {
+                    owning_index = Some(idx);
+                }
+            }
+        }
+
+        let Some(idx) = owning_index else {
+            // Status fully consumed by a tracer (stop, fork notification,
+            // non-root tracee exit, or unknown pid).
+            return true;
+        };
+
+        // Root tracee exited: finalize the report and stash it on the job.
+        // Returning `false` lets `handle_process_exited` run the normal
+        // cleanup path (drain pipes, deliver `JobExited`, drop process).
+        let (process_pid, ws_index, job_index) = {
+            let p = &self.state.processes[idx];
+            (p.child.id() as i32, p.workspace_index, p.job_index)
+        };
+        self.state.traced_root_pids.remove(&process_pid);
+        let tracer = self.state.processes[idx].tracer.take();
+        if let Some(tracer) = tracer {
+            // The Tracer may still be waiting on descendant exits; drive
+            // them out synchronously so the report is complete. Bounded
+            // by `__WALL` waits on the same pid set the kernel still owns.
+            let mut tracer = *tracer;
+            while !tracer.is_done() {
+                let mut s: i32 = 0;
+                let p = unsafe { libc::waitpid(-1, &mut s, libc::__WALL) };
+                if p <= 0 {
+                    break;
+                }
+                tracer.on_status(p, s);
+            }
+            let report = tracer.finish();
+            let exit_code = report.exit_status.code().unwrap_or(-1);
+            let truncated = report.truncated;
+            let workspace = &self.state.workspaces[ws_index as usize];
+            let project_root = workspace.handle.state.read().unwrap().config.current.base_path().to_path_buf();
+            let inferred = crate::auto_deps::infer(&report, &project_root);
+            let payload = crate::auto_deps::TraceReportPayload::from_inferred(inferred, exit_code, truncated);
+            workspace.handle.state.write().unwrap()[job_index].trace_report = Some(payload);
+        }
+        false
     }
 
     fn handle_process_exited(&mut self, pid: u32, status: u32) {
@@ -1268,6 +1446,7 @@ impl EventLoop {
         task_name: &str,
         params: Vec<u8>,
         as_test: bool,
+        derive_cache_key: bool,
     ) {
         let params = jsony::from_binary::<ValueMap>(&params).unwrap_or_else(|_| ValueMap::new()).to_owned();
         let (name, profile) = task_name.rsplit_once(":").unwrap_or((task_name, ""));
@@ -1276,6 +1455,11 @@ impl EventLoop {
 
         let mut spec = workspace::SpawnSpec::task(name, profile, params, false);
         spec.test_group = as_test;
+        if derive_cache_key {
+            if let Some(task) = spec.tasks.first_mut() {
+                task.trace = true;
+            }
+        }
         let result = match ws.handle.submit(spec) {
             Ok(result) => result,
             Err(e) => {
@@ -1546,6 +1730,8 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
             timed_ready_count: 0,
             timed_timeout_count: 0,
             db,
+            #[cfg(target_os = "linux")]
+            traced_root_pids: HashMap::new(),
         },
     };
     loop {

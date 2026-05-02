@@ -574,6 +574,7 @@ impl EventLoop {
                     req.task_name,
                     req.params.to_vec(),
                     req.as_test,
+                    req.derive_cache_key,
                 );
                 Ok(AttachOutcome::Attached)
             }

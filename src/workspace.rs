@@ -270,6 +270,13 @@ pub struct Job {
     /// Resources currently held by this job. Populated on `Scheduled → Starting`,
     /// drained on any terminal transition.
     pub held_resources: SmallVec<[ResourceIndex; 2]>,
+    /// When true, the spawned process is run under ptrace and a trace
+    /// report is delivered to the attached run client at exit. Always
+    /// false for tasks materialized by `require` chains.
+    pub trace: bool,
+    /// Trace report attached on exit when `trace == true`, consumed by
+    /// the log forwarder to send a `JobTraceReport` RPC message.
+    pub trace_report: Option<crate::auto_deps::TraceReportPayload>,
 }
 
 pub struct ResolvedSpawnSpec {
@@ -1262,6 +1269,7 @@ impl WorkspaceState {
         profile: &str,
         reason: ScheduleReason,
         force_restart: bool,
+        trace: bool,
     ) -> Result<JobIndex, String> {
         self.detect_require_problems(base_task)?;
 
@@ -1369,7 +1377,7 @@ impl WorkspaceState {
             .as_ref()
             .map_or(String::new(), |c| self.compute_cache_key_with_require(c.key, &profile, spec.params.as_ref()));
 
-        Ok(self.create_job(base_task, task, &profile, params, pred, cache_key, channel, workspace_id, reason))
+        Ok(self.create_job(base_task, task, &profile, params, pred, cache_key, channel, workspace_id, reason, trace))
     }
 
     /// Schedule a queued service that waits for a blocking service to terminate.
@@ -1464,6 +1472,7 @@ impl WorkspaceState {
             channel,
             workspace_id,
             ScheduleReason::ProfileConflict,
+            false,
         ))
     }
 
@@ -1478,6 +1487,7 @@ impl WorkspaceState {
         channel: &MioChannel,
         _workspace_id: u32,
         reason: ScheduleReason,
+        trace: bool,
     ) -> JobIndex {
         let spec = self.cache_spawn_spec(base_task, profile, params, task.clone());
         let (task_name, task_kind, job_id) = {
@@ -1506,6 +1516,8 @@ impl WorkspaceState {
             cache_key,
             spawn: spec.clone(),
             held_resources: SmallVec::new(),
+            trace,
+            trace_report: None,
         });
 
         self.base_tasks[base_task.idx()].jobs.push_scheduled(job_index);
@@ -1603,6 +1615,19 @@ impl WorkspaceState {
         profile: &str,
         force_restart: bool,
     ) -> Result<(BaseTaskIndex, JobIndex), String> {
+        self.lookup_and_spawn_task_with_trace(workspace_id, channel, name, params, profile, force_restart, false)
+    }
+
+    pub fn lookup_and_spawn_task_with_trace(
+        &mut self,
+        workspace_id: u32,
+        channel: &MioChannel,
+        name: &str,
+        params: ValueMap,
+        profile: &str,
+        force_restart: bool,
+        trace: bool,
+    ) -> Result<(BaseTaskIndex, JobIndex), String> {
         let Some(base_index) = self.base_index_by_name(name) else {
             return Err(format!("Task '{}' not found", name));
         };
@@ -1615,6 +1640,7 @@ impl WorkspaceState {
             profile,
             ScheduleReason::Requested,
             force_restart,
+            trace,
         )?;
         Ok((base_index, job_index))
     }
@@ -2301,6 +2327,7 @@ impl WorkspaceState {
                         &profile,
                         ScheduleReason::Dependency,
                         false,
+                        false,
                     )?;
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
@@ -2342,6 +2369,7 @@ impl WorkspaceState {
                         params,
                         &profile,
                         ScheduleReason::Dependency,
+                        false,
                         false,
                     )?;
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
@@ -2530,6 +2558,7 @@ impl WorkspaceState {
                 channel,
                 workspace_id,
                 ScheduleReason::TestRun,
+                false,
             );
 
             test_jobs.push(TestJob {
@@ -2582,6 +2611,11 @@ pub struct TaskSpec {
     pub profile: String,
     pub params: ValueMap<'static>,
     pub force_restart: bool,
+    /// When true, the spawned process is traced via ptrace and an
+    /// `InferredDeps` report is delivered to the run client at exit.
+    /// Only set on the leaf task requested by the user — never on
+    /// services or actions materialized by `require` chains.
+    pub trace: bool,
 }
 
 pub struct SpawnSpec {
@@ -2592,7 +2626,13 @@ pub struct SpawnSpec {
 impl SpawnSpec {
     pub fn task(name: &str, profile: &str, params: ValueMap<'static>, force_restart: bool) -> Self {
         SpawnSpec {
-            tasks: vec![TaskSpec { name: name.into(), profile: profile.into(), params, force_restart }],
+            tasks: vec![TaskSpec {
+                name: name.into(),
+                profile: profile.into(),
+                params,
+                force_restart,
+                trace: false,
+            }],
             test_group: false,
         }
     }
@@ -2610,13 +2650,14 @@ impl Workspace {
 
         let mut jobs = Vec::new();
         for task in &spec.tasks {
-            let (bti, ji) = state.lookup_and_spawn_task(
+            let (bti, ji) = state.lookup_and_spawn_task_with_trace(
                 self.workspace_id,
                 &self.process_channel,
                 &task.name,
                 task.params.clone(),
                 &task.profile,
                 task.force_restart,
+                task.trace,
             )?;
             jobs.push((bti, ji));
         }
@@ -3519,6 +3560,8 @@ mod scheduling_tests {
                 cache_key: String::new(),
                 spawn: spec,
                 held_resources: SmallVec::new(),
+                trace: false,
+                trace_report: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_active(ji);
             state.service_jobs.push_active(ji);
@@ -3618,6 +3661,8 @@ mod scheduling_tests {
                 cache_key: String::new(),
                 spawn: spec,
                 held_resources: SmallVec::new(),
+                trace: false,
+                trace_report: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_active(ji);
             state.action_jobs.push_active(ji);
@@ -3705,6 +3750,8 @@ mod scheduling_tests {
                 cache_key: String::new(),
                 spawn: spec.clone(),
                 held_resources: SmallVec::new(),
+                trace: false,
+                trace_report: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(b);
 
@@ -3814,6 +3861,8 @@ mod scheduling_tests {
                     cache_key: String::new(),
                     spawn: spec.clone(),
                     held_resources: SmallVec::new(),
+                    trace: false,
+                    trace_report: None,
                 });
                 state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
                 state.action_jobs.push_scheduled(ji);
@@ -3940,6 +3989,8 @@ mod scheduling_tests {
                 cache_key: String::new(),
                 spawn: spec,
                 held_resources: SmallVec::new(),
+                trace: false,
+                trace_report: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
             state.action_jobs.push_scheduled(ji);

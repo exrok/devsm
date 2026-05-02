@@ -123,6 +123,7 @@ pub enum Request<'a> {
         name: Box<str>,
         params: ValueMap<'a>,
         as_test: bool,
+        derive_cache_key: bool,
     },
     AttachTests {
         #[jsony(with = unix_path)]
@@ -185,8 +186,8 @@ fn handle_request(
                 kind: crate::event_loop::AttachKind::Tui,
             });
         }
-        Request::AttachRun { config, name, params, as_test } => {
-            kvlog::info!("Receiving FD for run command", as_test);
+        Request::AttachRun { config, name, params, as_test, derive_cache_key } => {
+            kvlog::info!("Receiving FD for run command", as_test, derive_cache_key);
             let ReceivedFds::Pair([stdin, stdout]) = fds else {
                 bail!("Expected 2 FDs");
             };
@@ -199,6 +200,7 @@ fn handle_request(
                     task_name: name,
                     params: jsony::to_binary(&params),
                     as_test,
+                    derive_cache_key,
                 },
             });
         }

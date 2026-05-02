@@ -1,7 +1,7 @@
 use crate::daemon::socket_path;
 use crate::rpc::{
     ClientProtocol, CommandBody, CommandResponse, DecodeResult, Encoder, JobExitedEvent, JobStatusEvent, JobStatusKind,
-    ONE_SHOT_FLAG, ResizeNotification, RpcMessageKind, WorkspaceRef,
+    JobTraceReportEvent, ONE_SHOT_FLAG, ResizeNotification, RpcMessageKind, WorkspaceRef,
 };
 use anyhow::bail;
 use kvlog::collector::UninitializedLogPolicy;
@@ -117,9 +117,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Run { job, value_map, as_test } => {
+        cli::Command::Run { job, value_map, as_test, derive_cache_key } => {
             let _log_guard = self_log::init_client_logging();
-            if let Err(err) = run_client(job, value_map, as_test) {
+            if let Err(err) = run_client(job, value_map, as_test, derive_cache_key) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -647,7 +647,7 @@ fn reset_terminal_to_canonical() {
     }
 }
 
-fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow::Result<()> {
+fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool, derive_cache_key: bool) -> anyhow::Result<()> {
     reset_terminal_to_canonical();
 
     let cwd = std::env::current_dir()?;
@@ -656,6 +656,7 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
 
     let workspace_config = config::load_from_env()?;
     let (name, _profile) = job.rsplit_once(':').unwrap_or((job, ""));
+    let bare_task_name = name.split_once('.').map_or(name, |(_, rest)| rest).to_string();
 
     let resolved = resolve_name_in_config(&workspace_config, name);
     let as_test = match resolved {
@@ -690,7 +691,13 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
     socket.send_with_fd(
         &jsony::to_binary(&daemon::RequestMessage {
             cwd: &cwd,
-            request: daemon::Request::AttachRun { config: &config, name: (&*job).into(), params, as_test },
+            request: daemon::Request::AttachRun {
+                config: &config,
+                name: (&*job).into(),
+                params,
+                as_test,
+                derive_cache_key,
+            },
         }),
         &[0, 1],
     )?;
@@ -699,6 +706,7 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
     let mut read_buf = Vec::with_capacity(1024);
     let mut exit_status: Option<i32> = None;
     let mut terminated_by_user = false;
+    let mut trace_report: Option<JobTraceReportEvent> = None;
 
     loop {
         let flags = SIGNAL_FLAGS.swap(0, Ordering::Relaxed);
@@ -731,6 +739,9 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
                                 } else if let Some(status) = exit_status {
                                     eprintln!("Task exited (code {})", status);
                                 }
+                                if derive_cache_key {
+                                    apply_trace_report(&bare_task_name, &config, trace_report.take(), exit_status);
+                                }
                                 return Ok(());
                             }
                             RpcMessageKind::JobStatus => {
@@ -746,6 +757,11 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
                             RpcMessageKind::JobExited => {
                                 if let Ok(event) = jsony::from_binary::<JobExitedEvent>(payload) {
                                     exit_status = Some(event.exit_code);
+                                }
+                            }
+                            RpcMessageKind::JobTraceReport => {
+                                if let Ok(event) = jsony::from_binary::<JobTraceReportEvent>(payload) {
+                                    trace_report = Some(event);
                                 }
                             }
                             _ => {}
@@ -766,6 +782,68 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool) -> anyhow
     }
 
     Ok(())
+}
+
+/// Apply an inferred-deps report received from the daemon to the user's
+/// `devsm.toml`, replacing the named task's `cache.key` field.
+///
+/// Refuses to write when the task exited non-zero or the trace was
+/// truncated — both produce unreliable dep sets.
+fn apply_trace_report(
+    bare_task_name: &str,
+    toml_path: &std::path::Path,
+    report: Option<JobTraceReportEvent>,
+    exit_status: Option<i32>,
+) {
+    let Some(report) = report else {
+        eprintln!(
+            "warning: --derive-cache-key requested but no trace report was received from the daemon. \
+             devsm.toml was not modified."
+        );
+        return;
+    };
+
+    let exit_code = exit_status.unwrap_or(report.exit_code);
+    if exit_code != 0 {
+        eprintln!(
+            "warning: traced task exited with code {} — refusing to write cache.key from a failed run",
+            exit_code
+        );
+        return;
+    }
+    if report.truncated {
+        eprintln!(
+            "warning: trace exceeded the 1M event cap and is incomplete — refusing to write a partial cache.key"
+        );
+        return;
+    }
+    if report.paths.is_empty() {
+        eprintln!("warning: trace observed no in-project file accesses — devsm.toml was not modified");
+        return;
+    }
+
+    match auto_deps::update_cache_key(toml_path, bare_task_name, &report.paths, &report.ignore_per_path) {
+        Ok(outcome) => {
+            if let Some(prev) = outcome.previous_cache_key {
+                eprintln!("Replaced existing cache.key:\n  {}", prev);
+            }
+            let signal_summary = if report.framework_signals.is_empty() {
+                String::new()
+            } else {
+                format!(" (signals: {})", report.framework_signals.join(", "))
+            };
+            eprintln!(
+                "Wrote cache.key for `{}` with {} path(s) into {}{}",
+                bare_task_name,
+                report.paths.len(),
+                toml_path.display(),
+                signal_summary,
+            );
+        }
+        Err(err) => {
+            eprintln!("error: failed to update {}: {:?}", toml_path.display(), err);
+        }
+    }
 }
 
 /// Resolves a user-typed name (with optional `kind.` prefix) to its `TaskKind`
@@ -1185,6 +1263,7 @@ Commands:
   (default)          Launch the TUI interface (or workspace selector if not in a workspace)
   global             Open global workspace selector
   run <job>          Run a job and display its output
+                     --derive-cache-key: trace and write cache.key into devsm.toml
   exec <job>         Execute a task directly, bypassing the daemon
   spawn <job>        Spawn a job via the daemon
   restart-selected   Restart the currently selected task in TUI

@@ -25,7 +25,7 @@ jsony_value = "0.0.1"
 toml-spanner.rev = "95f04e879babef0b66fc445a45f215a46d69565a"
 toml-spanner.git = "https://github.com/exrok/toml-spanner"
 toml-spanner.default-features = false
-toml-spanner.features = ["from-toml"]
+toml-spanner.features = ["from-toml", "to-toml"]
 hashbrown = { version = "0.16.1", default-features = false, features = [
     "default-hasher",
 ] }

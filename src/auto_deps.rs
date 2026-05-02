@@ -16,6 +16,10 @@ mod event;
 mod inference;
 #[path = "auto_deps/tracer.rs"]
 mod tracer;
+#[path = "auto_deps/toml_writer.rs"]
+mod toml_writer;
+
+pub use toml_writer::{UpdateOutcome, update_cache_key};
 
 use std::path::Path;
 use std::process::Command;
@@ -25,6 +29,43 @@ pub use event::{PathEvent, PathEventKind, TraceReport};
 pub use inference::{FrameworkSignal, InferredDeps, InferredPath};
 #[cfg(target_os = "linux")]
 pub use tracer::{Tracer, install_ptrace_traceme};
+
+/// Owned, serializable form of an [`InferredDeps`] result for shipping
+/// to the run client over RPC. Paths are project-root-relative strings
+/// using forward slashes.
+#[derive(Debug, Clone, Default)]
+pub struct TraceReportPayload {
+    pub paths: Vec<String>,
+    pub ignore_per_path: Vec<Vec<String>>,
+    pub framework_signals: Vec<String>,
+    pub exit_code: i32,
+    pub truncated: bool,
+    pub dropped_outside_root: u64,
+    pub dropped_intermediate: u64,
+}
+
+impl TraceReportPayload {
+    /// Convert an `InferredDeps` together with the root process exit
+    /// status and truncation flag into the wire-shaped payload.
+    pub fn from_inferred(deps: InferredDeps, exit_code: i32, truncated: bool) -> Self {
+        let mut paths = Vec::with_capacity(deps.paths.len());
+        let mut ignore_per_path = Vec::with_capacity(deps.paths.len());
+        for entry in deps.paths {
+            paths.push(entry.path.to_string_lossy().into_owned());
+            ignore_per_path.push(entry.ignore);
+        }
+        let framework_signals = deps.framework_signals.into_iter().map(|s| s.name.to_string()).collect();
+        Self {
+            paths,
+            ignore_per_path,
+            framework_signals,
+            exit_code,
+            truncated,
+            dropped_outside_root: deps.dropped_outside_root as u64,
+            dropped_intermediate: deps.dropped_intermediate as u64,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TraceOptions {

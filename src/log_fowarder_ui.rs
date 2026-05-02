@@ -16,7 +16,10 @@ use crate::daemon::LogsQuery;
 use crate::event_loop::ClientChannel;
 use crate::line_width::{strip_ansi_to_buffer, strip_ansi_to_buffer_preserve_case};
 use crate::log_storage::{BaseTaskSet, LogEntry, LogFilter, LogGroup, LogId, Logs};
-use crate::rpc::{Encoder, ExitCause as RpcExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, RpcMessageKind};
+use crate::rpc::{
+    Encoder, ExitCause as RpcExitCause, JobExitedEvent, JobStatusEvent, JobStatusKind, JobTraceReportEvent,
+    RpcMessageKind,
+};
 use crate::workspace::{BaseTaskIndex, ExitCause, JobIndex, JobStatus, Workspace};
 
 const SPAN_COLORS: &[&str] = &[
@@ -595,6 +598,24 @@ fn forward_new_logs(
                         ExitCause::ProfileConflict => (-1, RpcExitCause::ProfileConflict),
                         ExitCause::Timeout => (-1, RpcExitCause::Timeout),
                     };
+                    if let Some(report) = job.trace_report.clone() {
+                        let event = JobTraceReportEvent {
+                            job_index: public_id,
+                            paths: report.paths,
+                            ignore_per_path: report.ignore_per_path,
+                            framework_signals: report.framework_signals,
+                            exit_code: report.exit_code,
+                            truncated: report.truncated,
+                            dropped_outside_root: report.dropped_outside_root,
+                            dropped_intermediate: report.dropped_intermediate,
+                        };
+                        encoder.encode_push(RpcMessageKind::JobTraceReport, &event);
+                        if let Some(s) = socket.as_mut() {
+                            use std::io::Write;
+                            let _ = s.write_all(encoder.output());
+                            encoder.clear();
+                        }
+                    }
                     return Ok((true, Some(code), Some(rpc_cause)));
                 }
                 JobStatus::Cancelled => {

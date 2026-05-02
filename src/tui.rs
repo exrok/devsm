@@ -730,6 +730,7 @@ fn process_key(
                                         profile: task.profile.unwrap_or_default().to_string(),
                                         params: task.vars.clone().to_owned(),
                                         force_restart: false,
+                                        trace: false,
                                     })
                                     .collect(),
                                 test_group: false,

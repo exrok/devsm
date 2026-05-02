@@ -86,7 +86,7 @@ pub enum Command<'a> {
     RestartSelected,
     Spawn { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
     Exec { job: &'a str, value_map: ValueMap<'a> },
-    Run { job: &'a str, value_map: ValueMap<'a>, as_test: bool },
+    Run { job: &'a str, value_map: ValueMap<'a>, as_test: bool, derive_cache_key: bool },
     Kill { job: &'a str },
     Test { filters: Vec<TestFilter<'a>> },
     RerunTests { only_failed: bool },
@@ -247,6 +247,7 @@ fn parse_exec<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
 
 fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     let mut as_test = false;
+    let mut derive_cache_key = false;
     let mut job = None;
     let mut value_map = ValueMap::new();
 
@@ -254,6 +255,9 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
         match component {
             Component::Long("as-test") => {
                 as_test = true;
+            }
+            Component::Long("derive-cache-key") => {
+                derive_cache_key = true;
             }
             Component::Long(key) => {
                 let Some(val) = parser.next_value() else {
@@ -286,7 +290,7 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
         bail!("Missing name of job");
     };
 
-    Ok(Command::Run { job, value_map, as_test })
+    Ok(Command::Run { job, value_map, as_test, derive_cache_key })
 }
 
 /// Parse validate command arguments.

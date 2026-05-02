@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use auto_deps::{InferredDeps, TraceOptions, TraceReport, infer, trace_command};
+use auto_deps::{InferredDeps, TraceOptions, TraceReport, infer, trace_command, update_cache_key};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -131,6 +131,48 @@ fn fork_is_followed_into_child() {
     let got = dep_paths(&deps);
     assert!(got.contains("parent.txt"), "got {got:?}");
     assert!(got.contains("child.txt"), "expected child.txt (follow-fork), got {got:?}");
+}
+
+#[test]
+fn end_to_end_trace_writes_cache_key_into_devsm_toml() {
+    // Full pipeline: trace a shell that reads a couple of files, infer
+    // the dep set, then mutate a devsm.toml in-place. Exercises the
+    // same code path the daemon takes after a `--derive-cache-key` run.
+    let tmp = Tmp::new();
+    fs::write(tmp.path.join("Cargo.toml"), b"[package]\nname=\"x\"\n").unwrap();
+    fs::write(tmp.path.join("Cargo.lock"), b"# auto\n").unwrap();
+    fs::create_dir(tmp.path.join("src")).unwrap();
+    fs::write(tmp.path.join("src/main.rs"), b"fn main(){}\n").unwrap();
+    let toml_path = tmp.path.join("devsm.toml");
+    fs::write(
+        &toml_path,
+        "# header comment\n\
+         [action.build]\n\
+         sh = \"cat Cargo.toml > /dev/null\"\n",
+    )
+    .unwrap();
+
+    let report = trace_command(
+        sh(&tmp.path, "cat Cargo.toml > /dev/null; cat src/main.rs > /dev/null"),
+        TraceOptions::default(),
+    )
+    .expect("trace");
+    assert!(report.exit_status.success());
+    let deps = infer(&report, &tmp.path);
+    assert!(!deps.paths.is_empty());
+
+    let modified: Vec<String> = deps.paths.iter().map(|p| p.path.to_string_lossy().into_owned()).collect();
+    let ignore: Vec<Vec<String>> = deps.paths.iter().map(|p| p.ignore.clone()).collect();
+
+    let outcome = update_cache_key(&toml_path, "build", &modified, &ignore).expect("update_cache_key");
+    assert!(outcome.previous_cache_key.is_none(), "no prior cache.key expected");
+
+    let written = fs::read_to_string(&toml_path).unwrap();
+    assert!(written.contains("# header comment"), "comment lost:\n{written}");
+    assert!(written.contains("modified"), "modified field missing:\n{written}");
+    assert!(written.contains("Cargo.toml"), "Cargo.toml dep missing:\n{written}");
+    assert!(written.contains("src"), "src dep missing:\n{written}");
+    assert!(written.contains("[action.build]"), "task header lost:\n{written}");
 }
 
 #[test]

@@ -61,6 +61,9 @@ cmd = ["typos", "--color", "always"]
 [test.check]
 cmd = ["cargo", "check"]
 
+[test.check.cache]
+key = [{ modified = ["Cargo.lock", "Cargo.toml", "README.md", "src", "test-app", "tests"] }]
+
 [test.cargo-test]
 cmd = ["cargo", "test", "--features=fuzz"]
 require = [{resource = "cargo-bin"}]

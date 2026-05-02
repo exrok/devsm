@@ -161,6 +161,7 @@ pub enum RpcMessageKind {
     JobStatus = 0x0301,
     JobExited = 0x0302,
     DebugTrace = 0x0303,
+    JobTraceReport = 0x0304,
     Disconnect = 0x03FF,
 }
 
@@ -196,6 +197,7 @@ impl RpcMessageKind {
             0x0301 => Some(Self::JobStatus),
             0x0302 => Some(Self::JobExited),
             0x0303 => Some(Self::DebugTrace),
+            0x0304 => Some(Self::JobTraceReport),
             0x03FF => Some(Self::Disconnect),
             _ => None,
         }
@@ -917,6 +919,21 @@ pub struct JobExitedEvent {
     pub cause: ExitCause,
 }
 
+/// Inferred-deps report shipped to the run client when a `--derive-cache-key`
+/// task exits. Paths are project-root-relative.
+#[derive(Jsony, Debug, Default)]
+#[jsony(Binary)]
+pub struct JobTraceReportEvent {
+    pub job_index: u32,
+    pub paths: Vec<String>,
+    pub ignore_per_path: Vec<Vec<String>>,
+    pub framework_signals: Vec<String>,
+    pub exit_code: i32,
+    pub truncated: bool,
+    pub dropped_outside_root: u64,
+    pub dropped_intermediate: u64,
+}
+
 #[derive(Jsony)]
 #[jsony(Binary)]
 pub struct DebugTraceEvent<'a> {
@@ -1138,6 +1155,7 @@ pub struct AttachRunRequest<'a> {
     pub task_name: &'a str,
     pub params: &'a [u8],
     pub as_test: bool,
+    pub derive_cache_key: bool,
 }
 
 /// Filters for test selection (serializable for IPC).
