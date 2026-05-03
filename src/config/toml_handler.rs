@@ -488,8 +488,11 @@ fn parse_cache_config<'a>(
                 max_age = Some(parse_duration_config(val, ctx)?);
             }
             "key" => {
-                let key_array = val.require_array(ctx)?;
-                for item in key_array {
+                let slice = match val.value() {
+                    Value::Array(array) => array.as_slice(),
+                    _ => std::slice::from_ref(val),
+                };
+                for item in slice {
                     key_inputs.push(parse_cache_key_input(alloc, item, ctx)?);
                 }
             }

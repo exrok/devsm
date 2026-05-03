@@ -44,8 +44,8 @@ syscalls = { version = "0.8.1", default-features = false, features = [
     "all",
 ] }
 
-# [patch."https://github.com/exrok/extui"]
-# extui = { path = "/home/user/Projects/git/extui" }
+[patch."https://github.com/exrok/extui"]
+extui = { path = "/home/user/Projects/git/extui" }
 
 [dev-dependencies]
 vt100 = "*"

@@ -4,8 +4,8 @@
 //! The writer parses the source document with `toml_spanner`, locates
 //! the target task's table (under `action`, `service`, or `test`) by
 //! walking the same key shape `parse_workspace` does, builds a fresh
-//! `cache.key = [{ modified = [...], ignore = [...] }]` value by
-//! constructing `Item`/`Array`/`Table` directly, and emits the document
+//! `cache.key.modified = [...]` (with an optional `cache.key.ignore`)
+//! value by constructing `Item`/`Table` directly, and emits the document
 //! via `Formatting::preserved_from(...).with_span_projection_identity()`
 //! so unrelated whitespace and comments survive untouched.
 
@@ -25,9 +25,9 @@ pub struct UpdateOutcome {
 }
 
 /// Replace the `cache.key` field of the named task in `toml_path` with
-/// a single `{ modified = [...], ignore = [...] }` entry containing the
-/// inferred deps. Other fields under `cache` (notably `cache.never`)
-/// are preserved.
+/// a dotted-key form `cache.key.modified = [...]` (and `cache.key.ignore`
+/// when ignore paths are present) containing the inferred deps. Other
+/// fields under `cache` (notably `cache.never`) are preserved.
 ///
 /// `task_name` is the bare task name (no `kind.` prefix and no profile
 /// suffix). The function searches `action`, `service`, and `test`
@@ -177,14 +177,27 @@ fn locate_task_table_mut<'a, 'de>(
 /// Build the value for the `cache` key of the task. When the task
 /// already has a `cache` table we keep its other fields (e.g.
 /// `cache.never = true`) and replace only the `key` entry. Otherwise
-/// emit a fresh inline `{ key = [...] }` table.
+/// emit a fresh inline `{ key = ... }` table.
+///
+/// Existing `cache.key` entries that aren't path-based (currently:
+/// `profile_changed`) are carried over so that running `--derive-cache-key`
+/// doesn't drop them. When any such entries survive, the value has to
+/// stay an array-of-tables since dotted form can only express a single
+/// entry. Otherwise we emit the more compact `cache.key.modified = [...]`
+/// dotted form.
 fn build_cache_value<'de>(
     arena: &'de Arena,
     modified_paths: &[String],
     ignore_per_path: &[Vec<String>],
     existing_cache: Option<&Item<'de>>,
 ) -> Item<'de> {
-    let key_array_item = build_key_array(arena, modified_paths, ignore_per_path);
+    let preserved = collect_preserved_key_entries(arena, existing_cache);
+
+    let key_value = if preserved.is_empty() {
+        build_modified_key_table(arena, modified_paths, ignore_per_path, TableStyle::Dotted).into_item()
+    } else {
+        build_key_array(arena, modified_paths, ignore_per_path, preserved)
+    };
 
     let mut cache_table = if let Some(existing) = existing_cache.and_then(|i| i.as_table()) {
         existing.clone_in(arena)
@@ -192,17 +205,59 @@ fn build_cache_value<'de>(
         toml_spanner::Table::try_with_capacity(1, arena).expect("capacity 1 within u32")
     };
 
-    cache_table.insert(Key::new(arena.alloc_str("key")), key_array_item, arena);
-    cache_table.set_style(TableStyle::Header);
+    cache_table.insert(Key::new(arena.alloc_str("key")), key_value, arena);
+    cache_table.set_style(TableStyle::Dotted);
 
-    let mut item = cache_table.into_item();
-    item.set_ignore_source_formatting_recursively();
-    item
+    cache_table.into_item()
 }
 
-/// Build the `cache.key` array — exactly one inline table, optionally
-/// with an `ignore` array, holding the inferred paths.
-fn build_key_array<'de>(arena: &'de Arena, modified_paths: &[String], ignore_per_path: &[Vec<String>]) -> Item<'de> {
+/// Collect existing `cache.key` entries that should survive the rewrite.
+/// Path-based entries (`modified`/`ignore`) are dropped because the new
+/// arguments are the source of truth. `profile_changed` entries (and any
+/// other shape we don't recognize as path-based) are cloned through.
+fn collect_preserved_key_entries<'de>(
+    arena: &'de Arena,
+    existing_cache: Option<&Item<'de>>,
+) -> Vec<Item<'de>> {
+    let mut preserved = Vec::new();
+    let Some(cache_table) = existing_cache.and_then(|i| i.as_table()) else { return preserved };
+    let Some(key_item) = cache_table.get("key") else { return preserved };
+
+    let entries: &[Item<'de>] = match key_item.as_array() {
+        Some(arr) => arr.as_slice(),
+        None => std::slice::from_ref(key_item),
+    };
+    for entry in entries {
+        if is_path_only_entry(entry) {
+            continue;
+        }
+        preserved.push(entry.clone_in(arena));
+    }
+    preserved
+}
+
+/// Whether `entry` is a `{ modified = ..., ignore = ... }` shape, i.e.
+/// fully owned by the new arguments and safe to drop.
+fn is_path_only_entry(entry: &Item<'_>) -> bool {
+    let Some(table) = entry.as_table() else { return false };
+    for (key, _) in table {
+        if key.name != "modified" && key.name != "ignore" {
+            return false;
+        }
+    }
+    true
+}
+
+/// Build a `{ modified = [...], ignore = [...] }` table for the inferred
+/// paths. With `TableStyle::Dotted` it emits as the multi-line dotted
+/// form when nested under `cache.key`. With `TableStyle::Inline` it emits
+/// as `{ modified = [...], ignore = [...] }` for use inside an array.
+fn build_modified_key_table<'de>(
+    arena: &'de Arena,
+    modified_paths: &[String],
+    ignore_per_path: &[Vec<String>],
+    style: TableStyle,
+) -> toml_spanner::Table<'de> {
     let modified_paths = group_modified_paths(modified_paths);
     let mut paths_array =
         toml_spanner::Array::try_with_capacity(modified_paths.len(), arena).expect("capacity within u32");
@@ -211,9 +266,8 @@ fn build_key_array<'de>(arena: &'de Arena, modified_paths: &[String], ignore_per
     }
     paths_array.set_style(ArrayStyle::Inline);
 
-    // Collect any non-empty per-path ignore entries into a single flat
-    // array. The `cache` schema permits one shared `ignore` list per
-    // entry, so de-duplicate.
+    // The `cache` schema permits one shared `ignore` list per entry, so
+    // flatten and de-duplicate the per-path ignore entries.
     let mut ignore_flat: Vec<&str> = Vec::new();
     for list in ignore_per_path {
         for s in list {
@@ -223,9 +277,9 @@ fn build_key_array<'de>(arena: &'de Arena, modified_paths: &[String], ignore_per
         }
     }
 
-    let mut entry_table = toml_spanner::Table::try_with_capacity(if ignore_flat.is_empty() { 1 } else { 2 }, arena)
+    let mut key_table = toml_spanner::Table::try_with_capacity(if ignore_flat.is_empty() { 1 } else { 2 }, arena)
         .expect("capacity within u32");
-    entry_table.insert(Key::new(arena.alloc_str("modified")), paths_array.into_item(), arena);
+    key_table.insert(Key::new(arena.alloc_str("modified")), paths_array.into_item(), arena);
     if !ignore_flat.is_empty() {
         let mut ignore_array =
             toml_spanner::Array::try_with_capacity(ignore_flat.len(), arena).expect("capacity within u32");
@@ -233,12 +287,27 @@ fn build_key_array<'de>(arena: &'de Arena, modified_paths: &[String], ignore_per
             ignore_array.push(Item::string(arena.alloc_str(s)), arena);
         }
         ignore_array.set_style(ArrayStyle::Inline);
-        entry_table.insert(Key::new(arena.alloc_str("ignore")), ignore_array.into_item(), arena);
+        key_table.insert(Key::new(arena.alloc_str("ignore")), ignore_array.into_item(), arena);
     }
-    entry_table.set_style(TableStyle::Inline);
+    key_table.set_style(style);
+    key_table
+}
 
-    let mut outer = toml_spanner::Array::try_with_capacity(1, arena).expect("capacity within u32");
-    outer.push(entry_table.into_item(), arena);
+/// Build the `cache.key` value as an inline array of tables, with the
+/// new modified entry first followed by the preserved entries.
+fn build_key_array<'de>(
+    arena: &'de Arena,
+    modified_paths: &[String],
+    ignore_per_path: &[Vec<String>],
+    preserved: Vec<Item<'de>>,
+) -> Item<'de> {
+    let modified_table = build_modified_key_table(arena, modified_paths, ignore_per_path, TableStyle::Inline);
+
+    let mut outer = toml_spanner::Array::try_with_capacity(1 + preserved.len(), arena).expect("capacity within u32");
+    outer.push(modified_table.into_item(), arena);
+    for entry in preserved {
+        outer.push(entry, arena);
+    }
     outer.set_style(ArrayStyle::Inline);
 
     let mut item = outer.into_item();
@@ -251,14 +320,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn target_format_matches_dotted_modified_form() {
+        let src = "\
+[test.check]
+cmd = [\"cargo\", \"check\"]
+";
+        let paths = vec![
+            ".cargo".to_string(),
+            "Cargo.lock".to_string(),
+            "Cargo.toml".to_string(),
+            "build.rs".to_string(),
+            "test-app/Cargo.toml".to_string(),
+        ];
+        let out = render_with_updated_cache_key(src, "check", &paths, &[]).unwrap();
+        let expected = "\
+[test.check]
+cmd = [\"cargo\", \"check\"]
+cache.key.modified = [\".cargo\", \"Cargo.lock\", \"Cargo.toml\", \"build.rs\", \"test-app/Cargo.toml\"]
+";
+        assert_eq!(out, expected, "exact emit mismatch");
+    }
+
+    #[test]
     fn nested_header_layout_round_trips() {
         let src = "\
 [action.foo]
 sh = \"echo hi\"
 ";
         let out = render_with_updated_cache_key(src, "foo", &["src".into(), "Cargo.toml".into()], &[]).unwrap();
-        assert!(out.contains("cache"), "missing cache section in:\n{out}");
-        assert!(out.contains("modified"), "missing modified key in:\n{out}");
+        assert!(out.contains("cache.key.modified"), "expected dotted cache.key.modified in:\n{out}");
+        assert!(!out.contains("[{"), "should not emit array-of-tables form in:\n{out}");
         assert!(out.contains("\"src\""), "missing src in:\n{out}");
         assert!(out.contains("\"Cargo.toml\""), "missing Cargo.toml in:\n{out}");
         assert!(out.contains("sh = \"echo hi\""), "original sh field lost:\n{out}");
@@ -330,6 +421,39 @@ cache.never = true
         assert!(out.contains("ignore"), "expected ignore key in:\n{out}");
         assert!(out.contains("\"target\""));
         assert!(out.contains("\"build/\""));
+    }
+
+    #[test]
+    fn profile_changed_entry_is_preserved_and_forces_array() {
+        let src = "\
+[action.foo]
+sh = \"echo hi\"
+cache.key = [
+  { modified = [\"old\"] },
+  { profile_changed = \"backend\" },
+]
+";
+        let out = render_with_updated_cache_key(src, "foo", &["new".into()], &[]).unwrap();
+        assert!(
+            out.contains("profile_changed") && out.contains("\"backend\""),
+            "profile_changed entry lost:\n{out}"
+        );
+        assert!(out.contains("\"new\""), "new modified path missing:\n{out}");
+        assert!(!out.contains("\"old\""), "old modified path should have been replaced:\n{out}");
+        assert!(!out.contains("cache.key.modified"), "should fall back to array form:\n{out}");
+    }
+
+    #[test]
+    fn single_profile_changed_only_value_is_preserved() {
+        let src = "\
+[action.foo]
+sh = \"echo hi\"
+cache.key = { profile_changed = \"backend\" }
+";
+        let out = render_with_updated_cache_key(src, "foo", &["new".into()], &[]).unwrap();
+        assert!(out.contains("profile_changed"), "profile_changed entry lost:\n{out}");
+        assert!(out.contains("\"backend\""), "profile_changed value lost:\n{out}");
+        assert!(out.contains("\"new\""), "new modified path missing:\n{out}");
     }
 
     #[test]

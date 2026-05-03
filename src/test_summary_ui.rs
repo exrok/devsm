@@ -9,13 +9,10 @@ use std::{
     io::{IsTerminal, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-use extui::{
-    AnsiColor, TerminalFlags, splat,
-    vt::{self, BufferWrite},
-};
+use extui::{AnsiColor, DoubleBuffer, Rect, Rgb, Style, TerminalFlags, splat, vt, vt::Modifier};
 
 use crate::config::Command;
 use crate::line_width::strip_ansi_to_buffer_preserve_case;
@@ -165,17 +162,17 @@ fn run_tui_mode(
     test_run: TestRun,
     channel: Arc<ClientChannel>,
 ) -> anyhow::Result<()> {
-    let mode = TerminalFlags::RAW_MODE | TerminalFlags::HIDE_CURSOR | TerminalFlags::ALT_SCREEN;
+    let mode = TerminalFlags::RAW_MODE | TerminalFlags::HIDE_CURSOR;
     let mut terminal = extui::Terminal::new(stdout.as_raw_fd(), mode)?;
 
     let (width, height) = terminal.size()?;
     let mut tui_state = init_tui_state(&test_run, workspace, width, height);
 
     let mut encoder = Encoder::new();
-    let mut buf = Vec::with_capacity(4096);
+    let mut db = DoubleBuffer::new(width, 1);
+    let mut prev_inline_height: u16 = 0;
 
-    render_tui(&mut buf, &tui_state);
-    terminal.write_all(&buf)?;
+    prev_inline_height = paint_frame(&mut db, &mut terminal, &tui_state, prev_inline_height, false)?;
 
     let exit_reason = loop {
         if channel.is_terminated() {
@@ -183,18 +180,23 @@ fn run_tui_mode(
         }
 
         let (all_done, changed) = update_tui_state(&mut tui_state, workspace, &test_run);
+        let has_running = tui_state.tests.iter().any(|t| t.status == TestJobStatus::Running);
 
-        if changed {
-            buf.clear();
-            render_tui(&mut buf, &tui_state);
-            terminal.write_all(&buf)?;
+        let (new_width, new_height) = terminal.size()?;
+        let resized = new_width != tui_state.width || new_height != tui_state.height;
+        tui_state.width = new_width;
+        tui_state.height = new_height;
+
+        if changed || has_running || resized {
+            prev_inline_height = paint_frame(&mut db, &mut terminal, &tui_state, prev_inline_height, false)?;
         }
 
         if all_done {
             break ExitReason::Completed;
         }
 
-        match extui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), None) {
+        let timeout = if has_running { Duration::from_millis(200) } else { Duration::from_secs(60) };
+        match extui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), Some(timeout)) {
             Ok(extui::event::Polled::ReadReady) => {
                 let mut input_buf = [0u8; 64];
                 let n = unsafe { libc::read(stdin.as_raw_fd(), input_buf.as_mut_ptr() as *mut _, input_buf.len()) };
@@ -207,36 +209,25 @@ fn run_tui_mode(
             }
             Ok(extui::event::Polled::Woken) | Ok(extui::event::Polled::TimedOut) | Err(_) => {}
         }
-
-        let (new_width, new_height) = terminal.size()?;
-        if new_width != tui_state.width || new_height != tui_state.height {
-            tui_state.width = new_width;
-            tui_state.height = new_height;
-            buf.clear();
-            buf.extend_from_slice(vt::MOVE_CURSOR_TO_ORIGIN);
-            buf.extend_from_slice(vt::CLEAR_BELOW);
-            render_tui(&mut buf, &tui_state);
-            terminal.write_all(&buf)?;
-        }
     };
 
+    let _ = paint_frame(&mut db, &mut terminal, &tui_state, prev_inline_height, true)?;
+
+    drop(db);
     drop(terminal);
 
-    buf.clear();
+    let mut buf = Vec::with_capacity(4096);
     match exit_reason {
-        ExitReason::Completed => {
-            write_color_summary(&mut buf, &tui_state, workspace);
-        }
-        ExitReason::Cancelled => {
-            write_cancelled_summary(&mut buf, &tui_state);
-        }
+        ExitReason::Completed => write_color_summary(&mut buf, &tui_state, workspace),
+        ExitReason::Cancelled => write_cancelled_summary(&mut buf, &tui_state),
         ExitReason::Detached => {
             let _ = writeln!(buf, "\nDetached. Tests will continue running in background.");
         }
         ExitReason::Terminated => {}
     }
-
-    let _ = unsafe { libc::write(stdout.as_raw_fd(), buf.as_ptr() as *const _, buf.len()) };
+    if !buf.is_empty() {
+        let _ = unsafe { libc::write(stdout.as_raw_fd(), buf.as_ptr() as *const _, buf.len()) };
+    }
 
     send_termination(&mut encoder, &mut socket);
     Ok(())
@@ -360,137 +351,282 @@ fn status_color(status: TestJobStatus) -> AnsiColor {
     }
 }
 
-fn render_tui(buf: &mut Vec<u8>, state: &TuiState) {
-    vt::MoveCursor(0, 0).write_to_buffer(buf);
+/// Render-time layout decision: which tests to render in what order, and how
+/// many log lines each one shows. Headers are always rendered. Log lines are
+/// dropped to fit the budget when one is supplied.
+struct Layout {
+    /// Indices into `TuiState::tests`, in render order.
+    order: Vec<usize>,
+    /// Parallel to `order`; how many log lines each test gets (0..=3).
+    log_lines: Vec<u16>,
+    /// Total painted height: headers + log lines + 1 status line.
+    height: u16,
+}
 
-    let available_lines = state.height.saturating_sub(2) as usize;
+fn render_priority(status: TestJobStatus) -> u8 {
+    match status {
+        TestJobStatus::Running => 0,
+        TestJobStatus::Failed(_) => 1,
+        TestJobStatus::Pending => 2,
+        TestJobStatus::Cached => 3,
+        TestJobStatus::Passed => 4,
+    }
+}
 
-    let running: Vec<_> = state.tests.iter().filter(|t| t.status == TestJobStatus::Running).collect();
-    let failed: Vec<_> = state.tests.iter().filter(|t| matches!(t.status, TestJobStatus::Failed(_))).collect();
-    let pending: Vec<_> = state.tests.iter().filter(|t| t.status == TestJobStatus::Pending).collect();
-    let passed: Vec<_> = state.tests.iter().filter(|t| t.status == TestJobStatus::Passed).collect();
-    let cached: Vec<_> = state.tests.iter().filter(|t| t.status == TestJobStatus::Cached).collect();
+fn drop_priority(status: TestJobStatus) -> u8 {
+    match status {
+        TestJobStatus::Passed => 0,
+        TestJobStatus::Cached => 1,
+        TestJobStatus::Pending => 2,
+        TestJobStatus::Running => 3,
+        TestJobStatus::Failed(_) => 4,
+    }
+}
 
-    let lines_per_test_with_logs = 1 + MAX_RECENT_LOGS;
-    let tests_with_logs = running.len() + failed.len() + pending.len();
-    let total_lines_needed = tests_with_logs * lines_per_test_with_logs + passed.len() + cached.len();
-    let show_logs = total_lines_needed <= available_lines;
+fn compute_layout(state: &TuiState, budget: Option<u16>) -> Layout {
+    let mut order: Vec<usize> = (0..state.tests.len()).collect();
+    order.sort_by_key(|&i| (render_priority(state.tests[i].status), i));
 
-    let mut row: u16 = 0;
+    let mut log_lines: Vec<u16> =
+        order.iter().map(|&i| state.tests[i].recent_logs.len().min(MAX_RECENT_LOGS) as u16).collect();
 
-    for test in running.iter().chain(failed.iter()).chain(pending.iter()).chain(cached.iter()).chain(passed.iter()) {
-        if row as usize >= available_lines {
-            break;
+    let total = |log_lines: &[u16]| -> u16 {
+        let header = log_lines.len() as u16;
+        let logs: u16 = log_lines.iter().copied().sum();
+        header + logs + 1
+    };
+
+    if let Some(budget) = budget {
+        let mut drop_order: Vec<usize> = (0..order.len()).collect();
+        drop_order.sort_by_key(|&i| drop_priority(state.tests[order[i]].status));
+
+        for idx in drop_order {
+            if total(&log_lines) <= budget {
+                break;
+            }
+            log_lines[idx] = 0;
         }
 
-        render_test_header(buf, test, state.width, row);
-        row += 1;
-
-        let dominated = !matches!(test.status, TestJobStatus::Passed | TestJobStatus::Cached);
-        if show_logs && dominated && !test.recent_logs.is_empty() {
-            for log_line in &test.recent_logs {
-                if row as usize >= available_lines {
-                    break;
-                }
-                render_log_line(buf, log_line, state.width, row);
-                row += 1;
+        if total(&log_lines) > budget {
+            let max_tests = budget.saturating_sub(1) as usize;
+            if max_tests < order.len() {
+                order.truncate(max_tests);
+                log_lines.truncate(max_tests);
             }
         }
     }
 
-    while row < state.height.saturating_sub(1) {
-        vt::MoveCursor(0, row).write_to_buffer(buf);
-        buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
-        row += 1;
-    }
-
-    render_status_line(buf, state, state.height.saturating_sub(1));
+    let height = total(&log_lines);
+    Layout { order, log_lines, height }
 }
 
-fn render_test_header(buf: &mut Vec<u8>, test: &TestDisplay, _width: u16, row: u16) {
-    vt::MoveCursor(0, row).write_to_buffer(buf);
-    buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+fn paint_frame(
+    db: &mut DoubleBuffer,
+    terminal: &mut extui::Terminal,
+    state: &TuiState,
+    prev_inline_height: u16,
+    unbounded: bool,
+) -> std::io::Result<u16> {
+    let budget = if unbounded { None } else { Some(state.height.saturating_sub(1).max(1)) };
+    let layout = compute_layout(state, budget);
 
-    let color = status_color(test.status);
+    db.resize(state.width, layout.height.max(1));
+
+    let mut row: u16 = 0;
+    for (slot, &test_idx) in layout.order.iter().enumerate() {
+        let test = &state.tests[test_idx];
+        render_test_header(row_rect(db, row), db, test);
+        row += 1;
+        let log_count = layout.log_lines[slot] as usize;
+        let skip = test.recent_logs.len().saturating_sub(log_count);
+        for log in test.recent_logs.iter().skip(skip) {
+            render_log_line(row_rect(db, row), db, log);
+            row += 1;
+        }
+    }
+
+    render_status_line(row_rect(db, row), db, state);
+
+    db.render_inline(terminal, prev_inline_height)
+}
+
+fn row_rect(db: &DoubleBuffer, row: u16) -> Rect {
+    Rect { x: 0, y: row, w: db.width(), h: 1 }
+}
+
+fn render_test_header(rect: Rect, db: &mut DoubleBuffer, test: &TestDisplay) {
+    let badge_style = status_color(test.status).with_fg(AnsiColor::Black);
     let status_str = match test.status {
         TestJobStatus::Pending => "WAIT",
         TestJobStatus::Running => "RUN ",
         TestJobStatus::Passed => "PASS",
-        TestJobStatus::Cached => "CACH",
+        TestJobStatus::Cached => "SKIP",
         TestJobStatus::Failed(_) => "FAIL",
     };
 
-    color.with_fg(AnsiColor::Black).write_to_buffer(buf);
-    write!(buf, " {} ", status_str).ok();
-    buf.extend_from_slice(vt::CLEAR_STYLE);
+    let r = rect.display();
+    let r = r.with(badge_style).fmt(db, format_args!(" {} ", status_str));
+    let r = r.with(Style::DEFAULT).fmt(db, format_args!(" {}", test.name));
 
-    write!(buf, " {}", test.name).ok();
+    let grey = AnsiColor::Grey[14].as_fg();
+    let mut r = r;
 
     if let Some(started) = test.started_at {
         let elapsed = test.finished_at.unwrap_or_else(Instant::now).duration_since(started);
-        AnsiColor::Grey[14].as_fg().write_to_buffer(buf);
-        write!(buf, " ({:.1}s)", elapsed.as_secs_f64()).ok();
-        buf.extend_from_slice(vt::CLEAR_STYLE);
+        r = r.with(grey).fmt(db, format_args!(" ({:.1}s)", elapsed.as_secs_f64()));
     }
 
     if let TestJobStatus::Failed(code) = test.status {
-        AnsiColor::Grey[14].as_fg().write_to_buffer(buf);
-        if let Some(timeout_secs) = test.timeout_info {
-            write!(buf, " terminated: exceeded timeout of {}", format_duration(timeout_secs)).ok();
+        r = if let Some(timeout_secs) = test.timeout_info {
+            r.with(grey).fmt(db, format_args!(" terminated: exceeded timeout of {}", format_duration(timeout_secs)))
         } else {
-            write!(buf, " exit {}", code).ok();
+            r.with(grey).fmt(db, format_args!(" exit {}", code))
+        };
+    }
+
+    r.with(grey).fmt(db, format_args!(" $ {}", test.command));
+}
+
+fn render_log_line(rect: Rect, db: &mut DoubleBuffer, line: &str) {
+    let bytes = line.as_bytes();
+    let mut r = rect.display().skip(4);
+    let mut style = Style::DEFAULT;
+    let mut chunk_start = 0usize;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'[') {
+            if i > chunk_start {
+                r = r.with(style).text(db, &line[chunk_start..i]);
+            }
+            let csi_start = i + 2;
+            let mut j = csi_start;
+            while j < bytes.len() && !bytes[j].is_ascii_alphabetic() {
+                j += 1;
+            }
+            if j < bytes.len() {
+                if bytes[j] == b'm'
+                    && let Ok(params) = std::str::from_utf8(&bytes[csi_start..j])
+                {
+                    style = apply_sgr(style, params);
+                }
+                i = j + 1;
+            } else {
+                i = bytes.len();
+            }
+            chunk_start = i;
+        } else {
+            i += 1;
         }
-        buf.extend_from_slice(vt::CLEAR_STYLE);
     }
-
-    AnsiColor::Grey[14].as_fg().write_to_buffer(buf);
-    write!(buf, " $ {}", test.command).ok();
-    buf.extend_from_slice(vt::CLEAR_STYLE);
+    if chunk_start < bytes.len() {
+        r.with(style).text(db, &line[chunk_start..]);
+    }
 }
 
-fn render_log_line(buf: &mut Vec<u8>, line: &str, _width: u16, row: u16) {
-    vt::MoveCursor(0, row).write_to_buffer(buf);
-    buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
-    write!(buf, "    {}", line).ok();
-    buf.extend_from_slice(vt::CLEAR_STYLE);
+fn parse_sgr_param<'a, I: Iterator<Item = &'a str>>(parts: &mut std::iter::Peekable<I>) -> Option<u32> {
+    let raw = parts.next()?;
+    if raw.is_empty() { Some(0) } else { raw.parse().ok() }
 }
 
-fn render_status_line(buf: &mut Vec<u8>, state: &TuiState, row: u16) {
-    vt::MoveCursor(0, row).write_to_buffer(buf);
-    buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+fn apply_sgr(mut style: Style, params: &str) -> Style {
+    let mut parts = params.split(';').peekable();
+    while let Some(n) = parse_sgr_param(&mut parts) {
+        match n {
+            0 => style = Style::DEFAULT,
+            1 => style = style.with_modifier(Modifier::BOLD),
+            2 => style = style.with_modifier(Modifier::DIM),
+            3 => style = style.with_modifier(Modifier::ITALIC),
+            4 => style = style.with_modifier(Modifier::UNDERLINED),
+            7 => style = style.with_modifier(Modifier::REVERSED),
+            22 => style = style.without_modifier(Modifier::BOLD).without_modifier(Modifier::DIM),
+            23 => style = style.without_modifier(Modifier::ITALIC),
+            24 => style = style.without_modifier(Modifier::UNDERLINED),
+            27 => style = style.without_modifier(Modifier::REVERSED),
+            30..=37 => style = style.with_fg(AnsiColor((n - 30) as u8)),
+            38 => match parse_sgr_param(&mut parts) {
+                Some(5) => {
+                    if let Some(idx) = parse_sgr_param(&mut parts) {
+                        style = style.with_fg(AnsiColor(idx as u8));
+                    }
+                }
+                Some(2) => {
+                    let r = parse_sgr_param(&mut parts).unwrap_or(0) as u8;
+                    let g = parse_sgr_param(&mut parts).unwrap_or(0) as u8;
+                    let b = parse_sgr_param(&mut parts).unwrap_or(0) as u8;
+                    style = style.with_fg(Rgb(r, g, b));
+                }
+                _ => {}
+            },
+            39 => style = style.without_fg(),
+            40..=47 => style = style.with_bg(AnsiColor((n - 40) as u8)),
+            48 => match parse_sgr_param(&mut parts) {
+                Some(5) => {
+                    if let Some(idx) = parse_sgr_param(&mut parts) {
+                        style = style.with_bg(AnsiColor(idx as u8));
+                    }
+                }
+                Some(2) => {
+                    let r = parse_sgr_param(&mut parts).unwrap_or(0) as u8;
+                    let g = parse_sgr_param(&mut parts).unwrap_or(0) as u8;
+                    let b = parse_sgr_param(&mut parts).unwrap_or(0) as u8;
+                    style = style.with_bg(Rgb(r, g, b));
+                }
+                _ => {}
+            },
+            49 => style = style.without_bg(),
+            90..=97 => style = style.with_fg(AnsiColor((n - 90 + 8) as u8)),
+            100..=107 => style = style.with_bg(AnsiColor((n - 100 + 8) as u8)),
+            _ => {}
+        }
+    }
+    style
+}
 
-    let passed = state.tests.iter().filter(|t| t.status == TestJobStatus::Passed).count();
-    let cached = state.tests.iter().filter(|t| t.status == TestJobStatus::Cached).count();
-    let failed = state.tests.iter().filter(|t| matches!(t.status, TestJobStatus::Failed(_))).count();
-    let running = state.tests.iter().filter(|t| t.status == TestJobStatus::Running).count();
-    let pending = state.tests.iter().filter(|t| t.status == TestJobStatus::Pending).count();
+fn render_status_line(rect: Rect, db: &mut DoubleBuffer, state: &TuiState) {
+    let counts = status_counts(state);
     let total = state.tests.len();
+    let done = counts.passed + counts.cached + counts.failed;
 
-    AnsiColor::Grey[4].with_fg(AnsiColor::Grey[25]).write_to_buffer(buf);
-    write!(buf, " Tests: {}/{} ", passed + cached + failed, total).ok();
+    let r = rect.display();
+    let r = r.with(Style::DEFAULT).fmt(db, format_args!(" Tests: {}/{} ", done, total));
 
-    if running > 0 {
-        AnsiColor::DarkOliveGreen.with_fg(AnsiColor::Black).write_to_buffer(buf);
-        write!(buf, " {} running ", running).ok();
+    let chip_styles = [
+        (counts.running, "running", AnsiColor::DarkOliveGreen.with_fg(AnsiColor::Black)),
+        (counts.pending, "pending", AnsiColor::Grey[17].with_fg(AnsiColor::Black)),
+        (counts.passed, "passed", AnsiColor::SpringGreen.with_fg(AnsiColor::Black)),
+        (counts.cached, "cached", AnsiColor::Cyan1.with_fg(AnsiColor::Black)),
+        (counts.failed, "failed", AnsiColor::NeonRed.with_fg(AnsiColor::Black)),
+    ];
+    let mut r = r;
+    for (count, label, style) in chip_styles {
+        if count > 0 {
+            r = r.with(style).fmt(db, format_args!(" {} {} ", count, label));
+        }
     }
-    if pending > 0 {
-        AnsiColor::Grey[17].with_fg(AnsiColor::Black).write_to_buffer(buf);
-        write!(buf, " {} pending ", pending).ok();
-    }
-    if passed > 0 {
-        AnsiColor::SpringGreen.with_fg(AnsiColor::Black).write_to_buffer(buf);
-        write!(buf, " {} passed ", passed).ok();
-    }
-    if cached > 0 {
-        AnsiColor::Cyan1.with_fg(AnsiColor::Black).write_to_buffer(buf);
-        write!(buf, " {} cached ", cached).ok();
-    }
-    if failed > 0 {
-        AnsiColor::NeonRed.with_fg(AnsiColor::Black).write_to_buffer(buf);
-        write!(buf, " {} failed ", failed).ok();
-    }
+}
 
-    buf.extend_from_slice(vt::CLEAR_STYLE);
+#[derive(Default)]
+struct StatusCounts {
+    passed: usize,
+    cached: usize,
+    failed: usize,
+    running: usize,
+    pending: usize,
+}
+
+fn status_counts(state: &TuiState) -> StatusCounts {
+    let mut counts = StatusCounts::default();
+    for test in &state.tests {
+        match test.status {
+            TestJobStatus::Passed => counts.passed += 1,
+            TestJobStatus::Cached => counts.cached += 1,
+            TestJobStatus::Failed(_) => counts.failed += 1,
+            TestJobStatus::Running => counts.running += 1,
+            TestJobStatus::Pending => counts.pending += 1,
+        }
+    }
+    counts
 }
 
 fn write_color_summary(buf: &mut Vec<u8>, state: &TuiState, workspace: &Workspace) {
