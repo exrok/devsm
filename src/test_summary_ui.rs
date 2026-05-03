@@ -12,7 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use extui::{AnsiColor, DoubleBuffer, Rect, Rgb, Style, TerminalFlags, splat, vt, vt::Modifier};
+use extui::{
+    AnsiColor, DoubleBuffer, Rect, Rgb, Style, TerminalFlags, splat, vt,
+    vt::{BufferWrite, Modifier, MoveCursorUp},
+};
 
 use crate::config::Command;
 use crate::line_width::strip_ansi_to_buffer_preserve_case;
@@ -183,9 +186,15 @@ fn run_tui_mode(
         let has_running = tui_state.tests.iter().any(|t| t.status == TestJobStatus::Running);
 
         let (new_width, new_height) = terminal.size()?;
+        let old_width = tui_state.width;
         let resized = new_width != tui_state.width || new_height != tui_state.height;
         tui_state.width = new_width;
         tui_state.height = new_height;
+
+        if resized {
+            cleanup_inline_region(&mut terminal, prev_inline_height, old_width, new_width)?;
+            prev_inline_height = 0;
+        }
 
         if changed || has_running || resized {
             prev_inline_height = paint_frame(&mut db, &mut terminal, &tui_state, prev_inline_height, false)?;
@@ -418,6 +427,36 @@ fn compute_layout(state: &TuiState, budget: Option<u16>) -> Layout {
 
     let height = total(&log_lines);
     Layout { order, log_lines, height }
+}
+
+/// Erases the previously painted inline region after a terminal resize.
+///
+/// `extui::DoubleBuffer::render_inline` assumes the cursor is one row below a
+/// region with exactly `prev_height` terminal rows. A width shrink causes the
+/// terminal to re-wrap previously emitted rows, which inflates the actual
+/// footprint and breaks that assumption. Move up by the worst-case wrapped
+/// row count and clear from there to the bottom of the screen, so the next
+/// `render_inline` call can start fresh from the current cursor position with
+/// `prev_height = 0`.
+fn cleanup_inline_region(
+    terminal: &mut extui::Terminal,
+    prev_height: u16,
+    old_width: u16,
+    new_width: u16,
+) -> std::io::Result<()> {
+    if prev_height == 0 {
+        return Ok(());
+    }
+    let wrap_factor: u32 =
+        if new_width == 0 || old_width <= new_width { 1 } else { (old_width as u32).div_ceil(new_width as u32) };
+    let rows_up = (prev_height as u32).saturating_mul(wrap_factor).min(u16::MAX as u32) as u16;
+    let mut buf = Vec::with_capacity(16);
+    buf.push(b'\r');
+    if rows_up > 0 {
+        MoveCursorUp(rows_up).write_to_buffer(&mut buf);
+    }
+    buf.extend_from_slice(vt::CLEAR_BELOW);
+    terminal.write_all(&buf)
 }
 
 fn paint_frame(

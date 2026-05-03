@@ -215,10 +215,7 @@ fn build_cache_value<'de>(
 /// Path-based entries (`modified`/`ignore`) are dropped because the new
 /// arguments are the source of truth. `profile_changed` entries (and any
 /// other shape we don't recognize as path-based) are cloned through.
-fn collect_preserved_key_entries<'de>(
-    arena: &'de Arena,
-    existing_cache: Option<&Item<'de>>,
-) -> Vec<Item<'de>> {
+fn collect_preserved_key_entries<'de>(arena: &'de Arena, existing_cache: Option<&Item<'de>>) -> Vec<Item<'de>> {
     let mut preserved = Vec::new();
     let Some(cache_table) = existing_cache.and_then(|i| i.as_table()) else { return preserved };
     let Some(key_item) = cache_table.get("key") else { return preserved };
@@ -434,10 +431,7 @@ cache.key = [
 ]
 ";
         let out = render_with_updated_cache_key(src, "foo", &["new".into()], &[]).unwrap();
-        assert!(
-            out.contains("profile_changed") && out.contains("\"backend\""),
-            "profile_changed entry lost:\n{out}"
-        );
+        assert!(out.contains("profile_changed") && out.contains("\"backend\""), "profile_changed entry lost:\n{out}");
         assert!(out.contains("\"new\""), "new modified path missing:\n{out}");
         assert!(!out.contains("\"old\""), "old modified path should have been replaced:\n{out}");
         assert!(!out.contains("cache.key.modified"), "should fall back to array form:\n{out}");
