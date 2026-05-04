@@ -360,22 +360,25 @@ impl LogStack {
             } else if self.last_separator.as_ref() != Some(&current_sep) {
                 extui::vt::MoveCursor(br.x, br.y).write_to_buffer(buf);
                 AnsiColor::Grey[6].with_fg(AnsiColor::Grey[25]).write_to_buffer(buf);
-                if selection_state.job.is_none() {
-                    if let Some(bti) = selection_state.base_task {
-                        let ws_state = ws.state();
-                        let name = &ws_state.base_tasks[bti.idx()].name;
-                        buf.extend_from_slice(b" NOT ");
-                        buf.extend_from_slice(name.as_bytes());
-                    } else if let Some(kind) = selection_state.meta_group {
-                        buf.extend_from_slice(b" NOT ");
-                        let label = match kind {
-                            MetaGroupKind::Services => "@services",
-                            MetaGroupKind::Actions => "@actions",
-                            MetaGroupKind::Tests => "@tests",
-                        };
-                        buf.extend_from_slice(label.as_bytes());
-                    }
-                }
+
+                // buf.extend_from_slice(" ╱ Selected ╲".as_bytes());
+                // buf.extend_from_slice(" ╲ Other ╱ ".as_bytes());
+                // if selection_state.job.is_none() {
+                //     if let Some(bti) = selection_state.base_task {
+                //         let ws_state = ws.state();
+                //         let name = &ws_state.base_tasks[bti.idx()].name;
+                //         buf.extend_from_slice(b" NOT ");
+                //         buf.extend_from_slice(name.as_bytes());
+                //     } else if let Some(kind) = selection_state.meta_group {
+                //         buf.extend_from_slice(b" NOT ");
+                //         let label = match kind {
+                //             MetaGroupKind::Services => "@services",
+                //             MetaGroupKind::Actions => "@actions",
+                //             MetaGroupKind::Tests => "@tests",
+                //         };
+                //         buf.extend_from_slice(label.as_bytes());
+                //     }
+                // }
                 extui::vt::CLEAR_LINE_TO_RIGHT.write_to_buffer(buf);
                 extui::vt::CLEAR_STYLE.write_to_buffer(buf);
                 self.last_separator = Some(current_sep);

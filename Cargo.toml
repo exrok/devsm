@@ -53,6 +53,7 @@ vt100 = "*"
 [profile.release]
 debug = 1
 
+
 [features]
 fuzz = []
 mimalloc = ["dep:mimalloc"]

@@ -360,26 +360,18 @@ fn status_color(status: TestJobStatus) -> AnsiColor {
     }
 }
 
-/// Render-time layout decision: which tests to render in what order, and how
-/// many log lines each one shows. Headers are always rendered. Log lines are
+/// Render-time layout decision: how many log lines each test shows. Tests
+/// render in their original order. Headers are always rendered. Each test
+/// reserves `MAX_RECENT_LOGS` log rows even when it has fewer log lines, so
+/// the layout stays vertically stable as logs arrive. Log allocations are
 /// dropped to fit the budget when one is supplied.
 struct Layout {
     /// Indices into `TuiState::tests`, in render order.
     order: Vec<usize>,
-    /// Parallel to `order`; how many log lines each test gets (0..=3).
+    /// Parallel to `order`; how many log rows each test reserves (0..=3).
     log_lines: Vec<u16>,
-    /// Total painted height: headers + log lines + 1 status line.
+    /// Total painted height: headers + reserved log rows + 1 status line.
     height: u16,
-}
-
-fn render_priority(status: TestJobStatus) -> u8 {
-    match status {
-        TestJobStatus::Running => 0,
-        TestJobStatus::Failed(_) => 1,
-        TestJobStatus::Pending => 2,
-        TestJobStatus::Cached => 3,
-        TestJobStatus::Passed => 4,
-    }
 }
 
 fn drop_priority(status: TestJobStatus) -> u8 {
@@ -394,10 +386,7 @@ fn drop_priority(status: TestJobStatus) -> u8 {
 
 fn compute_layout(state: &TuiState, budget: Option<u16>) -> Layout {
     let mut order: Vec<usize> = (0..state.tests.len()).collect();
-    order.sort_by_key(|&i| (render_priority(state.tests[i].status), i));
-
-    let mut log_lines: Vec<u16> =
-        order.iter().map(|&i| state.tests[i].recent_logs.len().min(MAX_RECENT_LOGS) as u16).collect();
+    let mut log_lines: Vec<u16> = vec![MAX_RECENT_LOGS as u16; order.len()];
 
     let total = |log_lines: &[u16]| -> u16 {
         let header = log_lines.len() as u16;
@@ -477,11 +466,13 @@ fn paint_frame(
         render_test_header(row_rect(db, row), db, test);
         row += 1;
         let log_count = layout.log_lines[slot] as usize;
-        let skip = test.recent_logs.len().saturating_sub(log_count);
+        let actual = test.recent_logs.len().min(log_count);
+        let skip = test.recent_logs.len() - actual;
         for log in test.recent_logs.iter().skip(skip) {
             render_log_line(row_rect(db, row), db, log);
             row += 1;
         }
+        row += (log_count - actual) as u16;
     }
 
     render_status_line(row_rect(db, row), db, state);
@@ -493,6 +484,8 @@ fn row_rect(db: &DoubleBuffer, row: u16) -> Rect {
     Rect { x: 0, y: row, w: db.width(), h: 1 }
 }
 
+const HEADER_BG: AnsiColor = AnsiColor::Grey[3];
+
 fn render_test_header(rect: Rect, db: &mut DoubleBuffer, test: &TestDisplay) {
     let badge_style = status_color(test.status).with_fg(AnsiColor::Black);
     let status_str = match test.status {
@@ -503,12 +496,13 @@ fn render_test_header(rect: Rect, db: &mut DoubleBuffer, test: &TestDisplay) {
         TestJobStatus::Failed(_) => "FAIL",
     };
 
-    let r = rect.display();
-    let r = r.with(badge_style).fmt(db, format_args!(" {} ", status_str));
-    let r = r.with(Style::DEFAULT).fmt(db, format_args!(" {}", test.name));
+    let header_bg = HEADER_BG.as_bg();
+    let name_style = header_bg;
+    let grey = AnsiColor::Grey[14].with_bg(HEADER_BG);
 
-    let grey = AnsiColor::Grey[14].as_fg();
-    let mut r = r;
+    let r = rect.display().with(header_bg).fill(db);
+    let r = r.with(badge_style).fmt(db, format_args!(" {} ", status_str));
+    let mut r = r.with(name_style).fmt(db, format_args!(" {}", test.name));
 
     if let Some(started) = test.started_at {
         let elapsed = test.finished_at.unwrap_or_else(Instant::now).duration_since(started);
