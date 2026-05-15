@@ -846,6 +846,17 @@ pub(crate) enum ProcessRequest {
         script: Box<str>,
         env_vars: Vec<(Box<str>, Box<str>)>,
     },
+    /// Run clipboard helper commands on the event-loop thread.
+    ///
+    /// `fork`/`spawn` must stay centralized here because this thread owns child
+    /// process creation and wait/reap behavior. TUI/client threads may request
+    /// a copy, but must not spawn clipboard helpers directly.
+    ClipboardCopy {
+        text: Box<str>,
+        /// `Some(command)` runs that exact shell command; `None` tries platform defaults.
+        command: Option<Box<str>>,
+        response: std::sync::mpsc::SyncSender<std::io::Result<String>>,
+    },
     GlobalTermination,
 }
 
@@ -985,6 +996,94 @@ impl State {
         Ok(index)
     }
 }
+
+struct ClipboardCommand {
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
+#[cfg(target_os = "macos")]
+const CLIPBOARD_COMMANDS: &[ClipboardCommand] = &[ClipboardCommand { program: "pbcopy", args: &[] }];
+
+#[cfg(target_os = "linux")]
+const CLIPBOARD_COMMANDS: &[ClipboardCommand] = &[
+    ClipboardCommand { program: "wl-copy", args: &[] },
+    ClipboardCommand { program: "xsel", args: &["--clipboard", "--input"] },
+    ClipboardCommand { program: "xclip", args: &["-selection", "clipboard"] },
+];
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const CLIPBOARD_COMMANDS: &[ClipboardCommand] = &[];
+
+fn run_clipboard_copy_command(text: &str, preferred_command: Option<&str>) -> std::io::Result<String> {
+    let mut errors = Vec::new();
+
+    if let Some(command) = preferred_command {
+        run_shell_clipboard_command(command, text)?;
+        return Ok(command.to_string());
+    }
+
+    for command in CLIPBOARD_COMMANDS {
+        match run_named_clipboard_command(command, text) {
+            Ok(()) => return Ok(command.program.to_string()),
+            Err(err) => errors.push(format!("{}: {err}", command.program)),
+        }
+    }
+
+    if errors.is_empty() {
+        Err(std::io::Error::other("no clipboard commands configured for this OS"))
+    } else {
+        Err(std::io::Error::other(errors.join("; ")))
+    }
+}
+
+fn configure_clipboard_command(cmd: &mut std::process::Command) {
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+}
+
+fn run_shell_clipboard_command(command: &str, text: &str) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c").arg(command);
+    configure_clipboard_command(&mut cmd);
+    let mut child = cmd.spawn()?;
+    wait_for_clipboard_process(&mut child, text)
+}
+
+fn run_named_clipboard_command(command: &ClipboardCommand, text: &str) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new(command.program);
+    cmd.args(command.args);
+    configure_clipboard_command(&mut cmd);
+    let mut child = cmd.spawn()?;
+    wait_for_clipboard_process(&mut child, text)
+}
+
+fn wait_for_clipboard_process(child: &mut Child, text: &str) -> std::io::Result<()> {
+    {
+        let mut stdin =
+            child.stdin.take().ok_or_else(|| std::io::Error::other("clipboard command stdin unavailable"))?;
+        stdin.write_all(text.as_bytes())?;
+    }
+
+    for _ in 0..30 {
+        if let Some(status) = child.try_wait()? {
+            return if status.success() { Ok(()) } else { Err(std::io::Error::other(format!("exited with {status}"))) };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // xsel/xclip may stay alive to own the X selection. Once stdin has been
+    // accepted and the process remains running briefly, treat that as success.
+    Ok(())
+}
+
 impl EventLoop {
     fn handle_request(&mut self, req: ProcessRequest) -> bool {
         match req {
@@ -1101,6 +1200,11 @@ impl EventLoop {
                         kvlog::error!("Failed to spawn shell command", ?err, script = &*script);
                     }
                 }
+                false
+            }
+            ProcessRequest::ClipboardCopy { text, command, response } => {
+                let result = run_clipboard_copy_command(&text, command.as_deref());
+                let _ = response.send(result);
                 false
             }
             ProcessRequest::GlobalTermination => {
@@ -1420,6 +1524,7 @@ impl EventLoop {
         let ws_handle = ws.handle.clone();
         kvlog::info!("Client Attached");
         let keybinds = global_keybinds();
+        let clipboard_config = global_clipboard_config();
 
         let output_mode = if std::env::var("DEVSM_JSON_STATE_STREAM").is_ok() {
             crate::tui::OutputMode::JsonStateStream
@@ -1427,7 +1532,7 @@ impl EventLoop {
             crate::tui::OutputMode::Terminal
         };
         self.spawn_client_channel("tui", index, move || {
-            crate::tui::run(stdin, stdout, &ws_handle, channel, keybinds, output_mode)
+            crate::tui::run(stdin, stdout, &ws_handle, channel, keybinds, clipboard_config, output_mode)
         });
     }
 
@@ -1884,6 +1989,8 @@ fn setup_signal_handler(sig: i32, handler: unsafe extern "C" fn(i32)) -> anyhow:
 
 pub(crate) static GLOBAL_WAKER: std::sync::OnceLock<&'static Waker> = std::sync::OnceLock::new();
 static GLOBAL_KEYBINDS: std::sync::OnceLock<Mutex<Arc<crate::keybinds::Keybinds>>> = std::sync::OnceLock::new();
+static GLOBAL_CLIPBOARD_CONFIG: std::sync::OnceLock<Mutex<Arc<crate::clipboard::ClipboardConfig>>> =
+    std::sync::OnceLock::new();
 static GLOBAL_USER_CONFIG_LOADED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 pub(crate) fn global_keybinds() -> Arc<crate::keybinds::Keybinds> {
@@ -1892,8 +1999,18 @@ pub(crate) fn global_keybinds() -> Arc<crate::keybinds::Keybinds> {
             let config = crate::user_config::UserConfig::load();
             GLOBAL_USER_CONFIG_LOADED.get_or_init(|| config.loaded_from_file);
             crate::user_config::set_global_max_job_history(config.max_job_history);
+            GLOBAL_CLIPBOARD_CONFIG.get_or_init(|| Mutex::new(Arc::new(config.clipboard.clone())));
             Mutex::new(Arc::new(config.keybinds))
         })
+        .lock()
+        .unwrap()
+        .clone()
+}
+
+pub(crate) fn global_clipboard_config() -> Arc<crate::clipboard::ClipboardConfig> {
+    let _ = global_keybinds();
+    GLOBAL_CLIPBOARD_CONFIG
+        .get_or_init(|| Mutex::new(Arc::new(crate::clipboard::ClipboardConfig::default())))
         .lock()
         .unwrap()
         .clone()
@@ -1902,6 +2019,12 @@ pub(crate) fn global_keybinds() -> Arc<crate::keybinds::Keybinds> {
 pub(crate) fn update_global_keybinds(keybinds: crate::keybinds::Keybinds) {
     if let Some(mutex) = GLOBAL_KEYBINDS.get() {
         *mutex.lock().unwrap() = Arc::new(keybinds);
+    }
+}
+
+pub(crate) fn update_global_clipboard_config(config: crate::clipboard::ClipboardConfig) {
+    if let Some(mutex) = GLOBAL_CLIPBOARD_CONFIG.get() {
+        *mutex.lock().unwrap() = Arc::new(config);
     }
 }
 

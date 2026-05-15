@@ -22,6 +22,7 @@ mod alloc_report;
 mod auto_deps;
 mod cache_key;
 mod cli;
+mod clipboard;
 mod clock;
 mod collection;
 mod config;

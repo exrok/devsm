@@ -26,6 +26,8 @@ pub struct LogScrollWidget {
     /// The last skip_rect (log-overlay cutout) that was rendered against.
     /// A change in this value forces a full re-render just like a rect change.
     pub(crate) last_skip_rect: Option<Rect>,
+    /// The last full-line log selection that was rendered.
+    pub(crate) last_selection: Option<LogSelection>,
 }
 
 impl LogScrollWidget {
@@ -126,11 +128,19 @@ impl LogScrollWidget {
     /// Renders with delta optimization when possible.
     /// Handles highlight-only changes efficiently by only re-rendering affected entries.
     pub fn render_reset_if_needed(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
-        if rect == self.previous && style.highlight == self.last_highlight && style.skip_rect == self.last_skip_rect {
+        if rect == self.previous
+            && style.highlight == self.last_highlight
+            && style.skip_rect == self.last_skip_rect
+            && style.selection == self.last_selection
+        {
             return;
         }
 
-        if rect == self.previous && self.last_skip_rect == style.skip_rect && style.skip_rect.is_none() {
+        if rect == self.previous
+            && self.last_skip_rect == style.skip_rect
+            && style.skip_rect.is_none()
+            && style.selection == self.last_selection
+        {
             self.delta_highlight_only(buf, rect, view, style);
         } else {
             self.render_reset(buf, rect, view, style);
@@ -141,6 +151,7 @@ impl LogScrollWidget {
         self.previous = rect;
         self.last_highlight = style.highlight;
         self.last_skip_rect = style.skip_rect;
+        self.last_selection = style.selection.clone();
         self.tail = view.tail;
 
         while let Some(id) = self.ids.get(self.top_index) {
@@ -176,6 +187,39 @@ impl LogScrollWidget {
                 }
             }
         }
+    }
+
+    pub(crate) fn log_id_at_row(&self, view: &LogView, style: &LogStyle, rect: Rect, row: u16) -> Option<LogId> {
+        if rect.w == 0 || row >= rect.h {
+            return None;
+        }
+
+        let logs = view.logs.indexer();
+        let mut current = 0u16;
+
+        let first_id = *self.ids.get(self.top_index)?;
+        let first_entry = logs[first_id];
+        let first_height = get_entry_height(&first_entry, style, rect.w as u32) as u16;
+        let first_visible = first_height.saturating_sub(self.scroll_shift_up).min(rect.h);
+        if row < first_visible {
+            return Some(first_id);
+        }
+        current += first_visible;
+
+        for &id in &self.ids[self.top_index + 1..] {
+            if current >= rect.h {
+                return None;
+            }
+            let entry = logs[id];
+            let height = get_entry_height(&entry, style, rect.w as u32) as u16;
+            let end = current.saturating_add(height).min(rect.h);
+            if row < end {
+                return Some(id);
+            }
+            current = end;
+        }
+
+        None
     }
 
     pub(crate) fn render_top_lines(

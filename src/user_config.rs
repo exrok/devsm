@@ -2,6 +2,7 @@ use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::clipboard::{ClipboardConfig, ClipboardMechanism};
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, render_diagnostic, toml_error_to_diagnostic};
 use crate::function::SetFunctionAction;
 use crate::keybinds::{BindingEntry, ChainGroup, Command, InputEvent, Keybinds, Mode};
@@ -10,6 +11,7 @@ use crate::workspace::{DEFAULT_JOB_HISTORY, MAX_JOB_HISTORY, MIN_JOB_HISTORY};
 /// User configuration loaded from ~/.config/devsm.user.toml
 pub struct UserConfig {
     pub keybinds: Keybinds,
+    pub clipboard: ClipboardConfig,
     /// Whether the config was loaded from a user config file.
     pub loaded_from_file: bool,
     /// Daemon-wide cap on retained job metadata, after clamping. Lives here
@@ -21,7 +23,12 @@ pub struct UserConfig {
 
 impl Default for UserConfig {
     fn default() -> Self {
-        Self { keybinds: Keybinds::default(), loaded_from_file: false, max_job_history: DEFAULT_JOB_HISTORY }
+        Self {
+            keybinds: Keybinds::default(),
+            clipboard: ClipboardConfig::default(),
+            loaded_from_file: false,
+            max_job_history: DEFAULT_JOB_HISTORY,
+        }
     }
 }
 
@@ -70,6 +77,14 @@ pub fn default_user_config_toml() -> String {
 # # Cap on retained job metadata before history pruning fires. Range 128..=1000000,
 # # default 10000. When exceeded, the oldest 25% of terminal jobs are evicted.
 # max_job_history = 10000
+
+# [clipboard]
+# # mechanism = "auto" probes OSC 52 support and falls back to clipboard commands.
+# # Other values: "osc52", "command", "disabled".
+# mechanism = "auto"
+# # Used as the first fallback in auto mode, or required when mechanism = "command".
+# # The command is run through `sh -c` and receives copied text on stdin.
+# # command = "wl-copy"
 
 "#,
     );
@@ -309,17 +324,18 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
     })?;
 
     let mut keybinds = Keybinds::default();
+    let mut clipboard = ClipboardConfig::default();
     let mut max_job_history = DEFAULT_JOB_HISTORY;
 
     let root_table = toml.table();
 
     for (key, _value) in root_table {
-        if key.name != "bind" && key.name != "daemon" {
+        if key.name != "bind" && key.name != "daemon" && key.name != "clipboard" {
             let span: std::ops::Range<usize> = key.span.into();
             let diagnostic = Diagnostic::error()
                 .with_message(format!("unknown key '{}'", key.name))
                 .with_label(DiagnosticLabel::primary(span))
-                .with_note("supported root keys are 'bind' and 'daemon'");
+                .with_note("supported root keys are 'bind', 'daemon', and 'clipboard'");
             return Err(render_diagnostic(file_name, content, &diagnostic));
         }
     }
@@ -333,7 +349,7 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
         })?;
 
         for (key, value) in daemon_table {
-            match key.name.as_ref() {
+            match key.name {
                 "max_job_history" => {
                     let toml_spanner::Value::Integer(i) = value.value() else {
                         let span: std::ops::Range<usize> = value.span().into();
@@ -359,6 +375,60 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
                         .with_message(format!("unknown daemon key '{}'", key.name))
                         .with_label(DiagnosticLabel::primary(span))
                         .with_note("supported daemon keys: max_job_history");
+                    return Err(render_diagnostic(file_name, content, &diagnostic));
+                }
+            }
+        }
+    }
+
+    if let Some(clipboard_value) = root_table.get("clipboard") {
+        let clipboard_table = clipboard_value.as_table().ok_or_else(|| {
+            let span: std::ops::Range<usize> = clipboard_value.span().into();
+            let diagnostic = Diagnostic::error()
+                .with_message("'clipboard' must be a table")
+                .with_label(DiagnosticLabel::primary(span));
+            render_diagnostic(file_name, content, &diagnostic)
+        })?;
+
+        for (key, value) in clipboard_table {
+            match key.name {
+                "mechanism" => {
+                    let Some(raw) = value.as_str() else {
+                        let span: std::ops::Range<usize> = value.span().into();
+                        let diagnostic = Diagnostic::error()
+                            .with_message("'clipboard.mechanism' must be a string")
+                            .with_label(DiagnosticLabel::primary(span));
+                        return Err(render_diagnostic(file_name, content, &diagnostic));
+                    };
+                    clipboard.mechanism = raw.parse::<ClipboardMechanism>().map_err(|e| {
+                        let span: std::ops::Range<usize> = value.span().into();
+                        let diagnostic = Diagnostic::error().with_message(e).with_label(DiagnosticLabel::primary(span));
+                        render_diagnostic(file_name, content, &diagnostic)
+                    })?;
+                }
+                "command" => {
+                    let Some(command) = value.as_str() else {
+                        let span: std::ops::Range<usize> = value.span().into();
+                        let diagnostic = Diagnostic::error()
+                            .with_message("'clipboard.command' must be a string")
+                            .with_label(DiagnosticLabel::primary(span));
+                        return Err(render_diagnostic(file_name, content, &diagnostic));
+                    };
+                    if command.trim().is_empty() {
+                        let span: std::ops::Range<usize> = value.span().into();
+                        let diagnostic = Diagnostic::error()
+                            .with_message("'clipboard.command' must not be empty")
+                            .with_label(DiagnosticLabel::primary(span));
+                        return Err(render_diagnostic(file_name, content, &diagnostic));
+                    }
+                    clipboard.command = Some(command.into());
+                }
+                _ => {
+                    let span: std::ops::Range<usize> = key.span.into();
+                    let diagnostic = Diagnostic::error()
+                        .with_message(format!("unknown clipboard key '{}'", key.name))
+                        .with_label(DiagnosticLabel::primary(span))
+                        .with_note("supported clipboard keys: mechanism, command");
                     return Err(render_diagnostic(file_name, content, &diagnostic));
                 }
             }
@@ -492,7 +562,7 @@ fn parse_user_config_for_daemon(content: &str, file_name: &str) -> Result<UserCo
         }
     }
 
-    Ok(UserConfig { keybinds, loaded_from_file: false, max_job_history })
+    Ok(UserConfig { keybinds, clipboard, loaded_from_file: false, max_job_history })
 }
 
 #[cfg(test)]
@@ -537,7 +607,12 @@ fn parse_user_config(content: &str) -> Result<UserConfig, String> {
         }
     }
 
-    Ok(UserConfig { keybinds, loaded_from_file: false, max_job_history: DEFAULT_JOB_HISTORY })
+    Ok(UserConfig {
+        keybinds,
+        clipboard: ClipboardConfig::default(),
+        loaded_from_file: false,
+        max_job_history: DEFAULT_JOB_HISTORY,
+    })
 }
 
 #[cfg(test)]
@@ -647,6 +722,37 @@ mod tests {
             Err(err) => assert!(err.contains("unknown daemon key"), "unexpected error: {err}"),
             Ok(_) => panic!("expected error for unknown daemon key"),
         }
+    }
+
+    #[test]
+    fn parse_clipboard_config() {
+        let config = parse_user_config_for_daemon(
+            r#"
+            [clipboard]
+            mechanism = "command"
+            command = "wl-copy"
+            "#,
+            "test.toml",
+        )
+        .unwrap();
+
+        assert_eq!(config.clipboard.mechanism, ClipboardMechanism::Command);
+        assert_eq!(config.clipboard.command.as_deref(), Some("wl-copy"));
+    }
+
+    #[test]
+    fn clipboard_rejects_unknown_mechanism() {
+        let err = match parse_user_config_for_daemon(
+            r#"
+            [clipboard]
+            mechanism = "magic"
+            "#,
+            "test.toml",
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("expected error for unknown clipboard mechanism"),
+        };
+        assert!(err.contains("unknown clipboard mechanism"), "unexpected error: {err}");
     }
 
     #[test]

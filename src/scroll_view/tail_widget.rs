@@ -18,6 +18,8 @@ pub struct LogTailWidget {
     /// forces a full reset and hardware-scroll deltas are disabled while
     /// skip_rect is active so the overlay cells aren't shifted.
     pub(crate) last_skip_rect: Option<Rect>,
+    /// Last full-line log selection rendered by this widget.
+    pub(crate) last_selection: Option<LogSelection>,
 }
 
 impl Default for LogTailWidget {
@@ -27,15 +29,17 @@ impl Default for LogTailWidget {
             next_screen_offset: Default::default(),
             previous: Rect::EMPTY,
             last_skip_rect: None,
+            last_selection: None,
         }
     }
 }
 
 impl LogTailWidget {
     pub fn render(&mut self, buf: &mut Vec<u8>, rect: Rect, view: &LogView, style: &LogStyle) {
-        if rect != self.previous || self.last_skip_rect != style.skip_rect {
+        if rect != self.previous || self.last_skip_rect != style.skip_rect || self.last_selection != style.selection {
             self.previous = rect;
             self.last_skip_rect = style.skip_rect;
+            self.last_selection = style.selection.clone();
             self.next_screen_offset = render_buffer_tail_reset(buf, rect, view, style);
             self.tail = view.tail;
             return;
@@ -121,5 +125,49 @@ impl LogTailWidget {
         }
         self.next_screen_offset = offset as u16;
         self.tail = view.tail;
+    }
+
+    pub fn log_id_at_row(&self, view: &LogView, style: &LogStyle, rect: Rect, row: u16) -> Option<LogId> {
+        if rect.w == 0 || row >= rect.h {
+            return None;
+        }
+
+        let mut displayed: Vec<(LogId, LogEntry)> = Vec::new();
+        let mut remaining_v_space = rect.h as i32;
+
+        view.for_each_rev(view.logs.head(), &mut |log_id, entry| {
+            remaining_v_space -= get_entry_height(entry, style, rect.w as u32) as i32;
+            displayed.push((log_id, *entry));
+            if remaining_v_space <= 0 { std::ops::ControlFlow::Break(()) } else { std::ops::ControlFlow::Continue(()) }
+        });
+
+        let mut current_row = 0u16;
+        let mut entries = displayed.iter().rev();
+
+        if remaining_v_space < 0
+            && let Some((log_id, entry)) = entries.next()
+        {
+            let skip = (-remaining_v_space) as u16;
+            let visible = (get_entry_height(entry, style, rect.w as u32) as u16)
+                .saturating_sub(skip)
+                .min(rect.h.saturating_sub(current_row));
+            if row < current_row + visible {
+                return Some(*log_id);
+            }
+            current_row += visible;
+        }
+
+        for (log_id, entry) in entries {
+            if current_row >= rect.h {
+                return None;
+            }
+            let visible = (get_entry_height(entry, style, rect.w as u32) as u16).min(rect.h - current_row);
+            if row < current_row + visible {
+                return Some(*log_id);
+            }
+            current_row += visible;
+        }
+
+        None
     }
 }

@@ -220,7 +220,7 @@ pub fn apply_raw_display_mode_vt_to_style(style: &mut Style, escape: &str) {
             },
             39 => style.without_fg(),
             fg @ 90..=97 => style.with_fg(extui::AnsiColor(fg - 90 + 8)),
-            bg @ 40..=47 => style.with_fg(extui::AnsiColor(bg - 30)),
+            bg @ 40..=47 => style.with_bg(extui::AnsiColor(bg - 40)),
             bg @ 100..=107 => style.with_bg(extui::AnsiColor(bg - 100 + 8)),
             49 => style.without_bg(),
             48 => match next!() {
@@ -355,6 +355,14 @@ mod tests {
                 Segment::AnsiEscapes("0"),
             ]
         );
+    }
+
+    #[test]
+    fn test_standard_background_sgr_updates_background() {
+        let mut style = Style::DEFAULT;
+        apply_raw_display_mode_vt_to_style(&mut style, "41");
+        assert_eq!(style.fg(), None);
+        assert_eq!(style.bg().map(|color| color.to_ansi()), Some(AnsiColor(1)));
     }
 
     #[test]

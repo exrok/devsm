@@ -55,6 +55,8 @@ fn render_single_entry(
 
     let highlight_info = highlight.filter(|h| h.log_id == log_id);
     let highlight_style = AnsiColor::Grey[25].with_fg(AnsiColor::Black);
+    let selected = style.selection.as_ref().is_some_and(|selection| selection.contains(log_id, entry));
+    let selection_bg = selection_background();
 
     let prefix = style.prefix(entry.log_group);
     let prefix_width = prefix.map(|p| p.width).unwrap_or(0) as u16;
@@ -68,21 +70,33 @@ fn render_single_entry(
     let text = unsafe { entry.text(logs) };
 
     if skip_lines == 0 && max_lines >= total_height && total_height == 1 {
-        if !prefix_bytes.is_empty() {
-            buf.extend_from_slice(prefix_bytes);
-        }
-
-        if let Some(hl) = highlight_info {
-            render_text_with_highlight(buf, text, entry.style, hl.match_info, highlight_style);
+        if selected {
+            write_selection_style(buf, extui::Style::DEFAULT, selection_bg);
+            render_selected_bytes(buf, prefix_bytes, extui::Style::DEFAULT, selection_bg);
+            render_selected_text(buf, text, entry.style, selection_bg);
         } else {
-            entry.style.write_to_buffer(buf);
-            buf.extend_from_slice(text.as_bytes());
+            if !prefix_bytes.is_empty() {
+                buf.extend_from_slice(prefix_bytes);
+            }
+
+            if let Some(hl) = highlight_info {
+                render_text_with_highlight(buf, text, entry.style, hl.match_info, highlight_style);
+            } else {
+                entry.style.write_to_buffer(buf);
+                buf.extend_from_slice(text.as_bytes());
+            }
         }
 
-        buf.extend_from_slice(vt::CLEAR_STYLE);
-
-        if !style.assume_blank {
-            buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+        if selected {
+            if !style.assume_blank {
+                buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+            }
+            buf.extend_from_slice(vt::CLEAR_STYLE);
+        } else {
+            buf.extend_from_slice(vt::CLEAR_STYLE);
+            if !style.assume_blank {
+                buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+            }
         }
         buf.extend_from_slice(b"\r\n");
         return 1;
@@ -101,15 +115,21 @@ fn render_single_entry(
             first_line_len = line_text.len();
 
             if current_skip == 0 {
-                if !prefix_bytes.is_empty() {
-                    buf.extend_from_slice(prefix_bytes);
-                }
-
-                if let Some(hl) = highlight_info {
-                    render_text_with_highlight(buf, line_text, line_style, hl.match_info, highlight_style);
+                if selected {
+                    write_selection_style(buf, extui::Style::DEFAULT, selection_bg);
+                    render_selected_bytes(buf, prefix_bytes, extui::Style::DEFAULT, selection_bg);
+                    render_selected_text(buf, line_text, line_style, selection_bg);
                 } else {
-                    line_style.write_to_buffer(buf);
-                    buf.extend_from_slice(line_text.as_bytes());
+                    if !prefix_bytes.is_empty() {
+                        buf.extend_from_slice(prefix_bytes);
+                    }
+
+                    if let Some(hl) = highlight_info {
+                        render_text_with_highlight(buf, line_text, line_style, hl.match_info, highlight_style);
+                    } else {
+                        line_style.write_to_buffer(buf);
+                        buf.extend_from_slice(line_text.as_bytes());
+                    }
                 }
 
                 if !style.assume_blank {
@@ -127,12 +147,22 @@ fn render_single_entry(
             }
         }
     } else if current_skip == 0 {
-        if !prefix_bytes.is_empty() {
+        if selected {
+            write_selection_style(buf, extui::Style::DEFAULT, selection_bg);
+            render_selected_bytes(buf, prefix_bytes, extui::Style::DEFAULT, selection_bg);
+        } else if !prefix_bytes.is_empty() {
             buf.extend_from_slice(prefix_bytes);
         }
-        vt::CLEAR_STYLE.write_to_buffer(buf);
-        if !style.assume_blank {
-            buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+        if selected {
+            if !style.assume_blank {
+                buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+            }
+            vt::CLEAR_STYLE.write_to_buffer(buf);
+        } else {
+            vt::CLEAR_STYLE.write_to_buffer(buf);
+            if !style.assume_blank {
+                buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+            }
         }
         buf.extend_from_slice(b"\r\n");
         return 1;
@@ -151,7 +181,10 @@ fn render_single_entry(
         let mut current_stripped_offset = stripped_offset;
 
         for (line, line_style) in lines {
-            if let Some(hl) = highlight_info {
+            if selected {
+                write_selection_style(buf, line_style, selection_bg);
+                render_selected_text(buf, line, line_style, selection_bg);
+            } else if let Some(hl) = highlight_info {
                 let line_stripped_len = calculate_stripped_len(line);
                 let line_start = current_stripped_offset;
                 let line_end = current_stripped_offset + line_stripped_len;
@@ -184,6 +217,43 @@ fn render_single_entry(
     buf.extend_from_slice(vt::CLEAR_STYLE);
 
     lines_rendered
+}
+
+fn selection_style(base_style: extui::Style, selection_bg: extui::AnsiColor) -> extui::Style {
+    base_style.with_bg(selection_bg)
+}
+
+fn selection_background() -> extui::AnsiColor {
+    extui::AnsiColor::Grey[5]
+}
+
+fn write_selection_style(buf: &mut Vec<u8>, base_style: extui::Style, selection_bg: extui::AnsiColor) {
+    vt::CLEAR_STYLE.write_to_buffer(buf);
+    selection_style(base_style, selection_bg).write_to_buffer(buf);
+}
+
+fn render_selected_bytes(buf: &mut Vec<u8>, bytes: &[u8], base_style: extui::Style, selection_bg: extui::AnsiColor) {
+    if bytes.is_empty() {
+        return;
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        render_selected_text(buf, text, base_style, selection_bg);
+    }
+}
+
+fn render_selected_text(buf: &mut Vec<u8>, text: &str, base_style: extui::Style, selection_bg: extui::AnsiColor) {
+    let mut current_style = base_style;
+    write_selection_style(buf, current_style, selection_bg);
+
+    for segment in Segment::iterator(text) {
+        match segment {
+            Segment::Ascii(s) | Segment::Utf8(s) => buf.extend_from_slice(s.as_bytes()),
+            Segment::AnsiEscapes(escape) => {
+                line_width::apply_raw_display_mode_vt_to_style(&mut current_style, escape);
+                write_selection_style(buf, current_style, selection_bg);
+            }
+        }
+    }
 }
 
 fn calculate_stripped_len(text: &str) -> usize {
@@ -476,11 +546,36 @@ pub struct LogHighlight {
     pub match_info: MatchHighlight,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogSelection {
+    pub start: LogId,
+    pub end: LogId,
+    pub filter: crate::log_storage::LogFilter,
+    pub include_task_prefixes: bool,
+}
+
+impl LogSelection {
+    pub fn new(
+        anchor: LogId,
+        active: LogId,
+        filter: crate::log_storage::LogFilter,
+        include_task_prefixes: bool,
+    ) -> Self {
+        let (start, end) = if anchor <= active { (anchor, active) } else { (active, anchor) };
+        Self { start, end, filter, include_task_prefixes }
+    }
+
+    pub fn contains(&self, log_id: LogId, entry: &LogEntry) -> bool {
+        self.start <= log_id && log_id <= self.end && self.filter.matches_entry(entry)
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct LogStyle {
     pub prefixes: Vec<Prefix>,
     pub assume_blank: bool,
     pub highlight: Option<LogHighlight>,
+    pub selection: Option<LogSelection>,
     /// When set, rows inside this rectangle are not written by the log view —
     /// a log overlay (like the command palette) owns those cells. Enabling this
     /// disables hardware-scroll deltas so the overlay cells survive scrolling.
@@ -584,6 +679,7 @@ impl LogWidget {
                 previous: Rect { x: tail.previous.x, y: tail.previous.y, w: tail.previous.w, h: tail.previous.h },
                 last_highlight: None,
                 last_skip_rect: None,
+                last_selection: None,
             };
 
             *self = LogWidget::Scroll(scroll_view)
@@ -606,6 +702,13 @@ impl LogWidget {
         match self {
             LogWidget::Scroll(scroll_view) => scroll_view.render_reset_if_needed(buf, rect, view, style),
             LogWidget::Tail(tail_view) => tail_view.render(buf, rect, view, style),
+        }
+    }
+
+    pub fn log_id_at_row(&self, view: &LogView, style: &LogStyle, rect: Rect, row: u16) -> Option<LogId> {
+        match self {
+            LogWidget::Scroll(scroll_view) => scroll_view.log_id_at_row(view, style, rect, row),
+            LogWidget::Tail(tail_view) => tail_view.log_id_at_row(view, style, rect, row),
         }
     }
 
@@ -770,9 +873,16 @@ impl LogWidget {
             }
         }
 
+        // Hardware scroll deltas preserve already-rendered cells. That works
+        // for an unchanged selection, but a new/cleared selection needs a full
+        // repaint so the full-line styling moves to the selected log ids.
+        let reset_needed = scroll_view.previous != rect
+            || style.skip_rect != scroll_view.last_skip_rect
+            || style.selection != scroll_view.last_selection;
+
         if scrolled_lines > 0 {
             handle_scroll_render(scroll_view, buf, rect, view, scrolled_lines, ScrollDirection::Up, style);
-        } else if scroll_view.previous != rect {
+        } else if reset_needed {
             scroll_view.render_reset(buf, rect, view, style);
         } else if style.highlight != scroll_view.last_highlight {
             scroll_view.delta_highlight_only(buf, rect, view, style);
@@ -836,7 +946,13 @@ impl LogWidget {
 
             let is_at_bottom = check_at_bottom(scroll_view);
 
-            if is_at_bottom && style.highlight.is_some() && scroll_view.previous == rect {
+            // See the matching scroll-up branch: changed selection/cutout
+            // state cannot be applied by only scrolling existing cells.
+            let reset_needed = scroll_view.previous != rect
+                || style.skip_rect != scroll_view.last_skip_rect
+                || style.selection != scroll_view.last_selection;
+
+            if is_at_bottom && style.highlight.is_some() && !reset_needed {
                 let mut current_height = 0u32;
                 if let Some(&id) = scroll_view.ids.get(scroll_view.top_index) {
                     let entry = logs[id];
@@ -883,7 +999,7 @@ impl LogWidget {
             let stay_in_scroll = !is_at_bottom || style.highlight.is_some();
             if stay_in_scroll && scrolled_lines > 0 {
                 handle_scroll_render(scroll_view, buf, rect, view, scrolled_lines, ScrollDirection::Down, style);
-            } else if stay_in_scroll && scroll_view.previous != rect {
+            } else if stay_in_scroll && reset_needed {
                 scroll_view.render_reset(buf, rect, view, style);
             } else if stay_in_scroll && style.highlight != scroll_view.last_highlight {
                 scroll_view.delta_highlight_only(buf, rect, view, style);
@@ -916,6 +1032,12 @@ fn handle_scroll_render(
 ) {
     let scrolled_lines = scrolled_lines as u16;
     if scrolled_lines >= rect.h || scroll_view.previous != rect {
+        scroll_view.render_reset(buf, rect, view, style);
+        return;
+    }
+    // Delta scrolling is only valid when full-line selection and overlay
+    // cutout state match what is already on screen.
+    if style.skip_rect != scroll_view.last_skip_rect || style.selection != scroll_view.last_selection {
         scroll_view.render_reset(buf, rect, view, style);
         return;
     }
@@ -1071,6 +1193,7 @@ pub(crate) fn render_single_entry_bounded(
             logs,
             rect,
             entry,
+            log_id,
             style,
             line_offset_start,
             line_offset_end,
@@ -1102,6 +1225,7 @@ fn render_entry_middle_rows_clipped(
     logs: &Logs,
     rect: Rect,
     entry: &LogEntry,
+    log_id: LogId,
     style: &LogStyle,
     line_start: u16,
     line_end: u16,
@@ -1115,12 +1239,24 @@ fn render_entry_middle_rows_clipped(
     let prefix = style.prefix(entry.log_group);
     let prefix_width = prefix.map(|p| p.width as u16).unwrap_or(0);
     let prefix_bytes = prefix.map(|p| p.bytes.as_bytes()).unwrap_or(b"");
+    let selection_bg =
+        style.selection.as_ref().is_some_and(|selection| selection.contains(log_id, entry)).then(selection_background);
 
     let text = unsafe { entry.text(logs) };
 
     if entry.width == 0 {
         if line_start == 0 && line_end > 0 {
-            render_line_with_skip(buf, rect, first_row_y, prefix_bytes, prefix_width, "", entry.style, skip);
+            render_line_with_skip(
+                buf,
+                rect,
+                first_row_y,
+                prefix_bytes,
+                prefix_width,
+                "",
+                entry.style,
+                skip,
+                selection_bg,
+            );
         }
         return;
     }
@@ -1135,7 +1271,17 @@ fn render_entry_middle_rows_clipped(
 
     if let Some((line_text, line_style)) = first_line {
         if current_line_idx >= line_start && current_line_idx < line_end {
-            render_line_with_skip(buf, rect, current_row, prefix_bytes, prefix_width, line_text, line_style, skip);
+            render_line_with_skip(
+                buf,
+                rect,
+                current_row,
+                prefix_bytes,
+                prefix_width,
+                line_text,
+                line_style,
+                skip,
+                selection_bg,
+            );
             current_row += 1;
         }
         current_line_idx += 1;
@@ -1153,7 +1299,7 @@ fn render_entry_middle_rows_clipped(
                 break;
             }
             if current_line_idx >= line_start {
-                render_line_with_skip(buf, rect, current_row, b"", 0, line_text, line_style, skip);
+                render_line_with_skip(buf, rect, current_row, b"", 0, line_text, line_style, skip, selection_bg);
                 current_row += 1;
             }
             current_line_idx += 1;
@@ -1216,7 +1362,14 @@ fn clear_side_columns(buf: &mut Vec<u8>, rect: Rect, row: u16, skip: Rect) {
 /// Wide graphemes that would straddle `col_end` or `col_start` are dropped
 /// and the affected cells are padded with spaces so the visible slice is
 /// column-exact.
-fn render_line_at_cols(buf: &mut Vec<u8>, line_text: &str, base_style: extui::Style, col_start: u16, col_end: u16) {
+fn render_line_at_cols(
+    buf: &mut Vec<u8>,
+    line_text: &str,
+    base_style: extui::Style,
+    col_start: u16,
+    col_end: u16,
+    selection_bg: Option<extui::AnsiColor>,
+) {
     if col_start >= col_end {
         return;
     }
@@ -1225,11 +1378,20 @@ fn render_line_at_cols(buf: &mut Vec<u8>, line_text: &str, base_style: extui::St
     let mut current_style = base_style;
     let mut visible_started = false;
 
-    fn begin_visible(buf: &mut Vec<u8>, style: extui::Style, started: &mut bool) {
+    fn begin_visible(
+        buf: &mut Vec<u8>,
+        style: extui::Style,
+        selection_bg: Option<extui::AnsiColor>,
+        started: &mut bool,
+    ) {
         if !*started {
-            buf.extend_from_slice(vt::CLEAR_STYLE);
-            if style != extui::Style::DEFAULT {
-                style.write_to_buffer(buf);
+            if let Some(selection_bg) = selection_bg {
+                write_selection_style(buf, style, selection_bg);
+            } else {
+                buf.extend_from_slice(vt::CLEAR_STYLE);
+                if style != extui::Style::DEFAULT {
+                    style.write_to_buffer(buf);
+                }
             }
             *started = true;
         }
@@ -1245,7 +1407,7 @@ fn render_line_at_cols(buf: &mut Vec<u8>, line_text: &str, base_style: extui::St
                 let mut i = 0usize;
                 while i < bytes.len() && col < col_end {
                     if col >= col_start {
-                        begin_visible(buf, current_style, &mut visible_started);
+                        begin_visible(buf, current_style, selection_bg, &mut visible_started);
                         let start = i;
                         while i < bytes.len() && col < col_end {
                             i += 1;
@@ -1267,7 +1429,7 @@ fn render_line_at_cols(buf: &mut Vec<u8>, line_text: &str, base_style: extui::St
                     let col_after = col + w;
                     if col_after > col_end {
                         if col >= col_start {
-                            begin_visible(buf, current_style, &mut visible_started);
+                            begin_visible(buf, current_style, selection_bg, &mut visible_started);
                             for _ in col..col_end {
                                 buf.push(b' ');
                             }
@@ -1276,10 +1438,10 @@ fn render_line_at_cols(buf: &mut Vec<u8>, line_text: &str, base_style: extui::St
                         break;
                     }
                     if col >= col_start {
-                        begin_visible(buf, current_style, &mut visible_started);
+                        begin_visible(buf, current_style, selection_bg, &mut visible_started);
                         buf.extend_from_slice(cluster.as_bytes());
                     } else if col_after > col_start {
-                        begin_visible(buf, current_style, &mut visible_started);
+                        begin_visible(buf, current_style, selection_bg, &mut visible_started);
                         for _ in col_start..col_after {
                             buf.push(b' ');
                         }
@@ -1290,9 +1452,13 @@ fn render_line_at_cols(buf: &mut Vec<u8>, line_text: &str, base_style: extui::St
             line_width::Segment::AnsiEscapes(escape) => {
                 line_width::apply_raw_display_mode_vt_to_style(&mut current_style, escape);
                 if visible_started {
-                    buf.extend_from_slice(b"\x1b[");
-                    buf.extend_from_slice(escape.as_bytes());
-                    buf.push(b'm');
+                    if let Some(selection_bg) = selection_bg {
+                        write_selection_style(buf, current_style, selection_bg);
+                    } else {
+                        buf.extend_from_slice(b"\x1b[");
+                        buf.extend_from_slice(escape.as_bytes());
+                        buf.push(b'm');
+                    }
                 }
             }
         }
@@ -1300,7 +1466,11 @@ fn render_line_at_cols(buf: &mut Vec<u8>, line_text: &str, base_style: extui::St
 
     let pad_from = if visible_started { col } else { col_start };
     if pad_from < col_end {
-        buf.extend_from_slice(vt::CLEAR_STYLE);
+        if let Some(selection_bg) = selection_bg {
+            write_selection_style(buf, current_style, selection_bg);
+        } else {
+            buf.extend_from_slice(vt::CLEAR_STYLE);
+        }
         for _ in pad_from..col_end {
             buf.push(b' ');
         }
@@ -1326,6 +1496,7 @@ fn render_line_with_skip(
     line_text: &str,
     line_style: extui::Style,
     skip: Rect,
+    selection_bg: Option<extui::AnsiColor>,
 ) {
     let rect_end_col = rect.x + rect.w;
     let skip_left_col = skip.x.clamp(rect.x, rect_end_col);
@@ -1338,15 +1509,23 @@ fn render_line_with_skip(
     if left_end_local > 0 {
         vt::MoveCursor(rect.x, row).write_to_buffer(buf);
         if prefix_width == 0 {
-            render_line_at_cols(buf, line_text, line_style, 0, left_end_local);
+            render_line_at_cols(buf, line_text, line_style, 0, left_end_local, selection_bg);
         } else if prefix_width <= left_end_local {
-            buf.extend_from_slice(prefix_bytes);
+            if let Some(selection_bg) = selection_bg {
+                render_selected_bytes(buf, prefix_bytes, extui::Style::DEFAULT, selection_bg);
+            } else {
+                buf.extend_from_slice(prefix_bytes);
+            }
             let text_end = left_end_local - prefix_width;
             if text_end > 0 {
-                render_line_at_cols(buf, line_text, line_style, 0, text_end);
+                render_line_at_cols(buf, line_text, line_style, 0, text_end, selection_bg);
             }
         } else {
-            vt::CLEAR_STYLE.write_to_buffer(buf);
+            if let Some(selection_bg) = selection_bg {
+                write_selection_style(buf, extui::Style::DEFAULT, selection_bg);
+            } else {
+                vt::CLEAR_STYLE.write_to_buffer(buf);
+            }
             for _ in 0..left_end_local {
                 buf.push(b' ');
             }
@@ -1359,9 +1538,16 @@ fn render_line_with_skip(
         if prefix_width <= right_start_local {
             let line_col_start = right_start_local - prefix_width;
             let line_col_end = total_local - prefix_width;
-            render_line_at_cols(buf, line_text, line_style, line_col_start, line_col_end);
+            render_line_at_cols(buf, line_text, line_style, line_col_start, line_col_end, selection_bg);
+        } else if let Some(selection_bg) = selection_bg {
+            write_selection_style(buf, extui::Style::DEFAULT, selection_bg);
+            for _ in right_start_local..total_local {
+                buf.push(b' ');
+            }
         }
         vt::CLEAR_STYLE.write_to_buffer(buf);
-        buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+        if selection_bg.is_none() {
+            buf.extend_from_slice(vt::CLEAR_LINE_TO_RIGHT);
+        }
     }
 }

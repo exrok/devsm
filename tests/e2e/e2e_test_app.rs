@@ -724,3 +724,118 @@ allow_multiple = true
         assert!(r2.success(), "client 2: stdout={}, stderr={}", r2.stdout, r2.stderr);
     });
 }
+
+/// Submitting a service explicitly while it is already scheduled as a dependency
+/// of another submitted task must not orphan dependents already wired to that
+/// scheduled job. Models the production pattern from a config like:
+///
+/// ```toml
+/// [service.frontend]   require = ["init"]
+/// [service.portal]     require = ["init", "frontend"]
+/// [service.child]      require = ["init", "frontend", "portal"]
+/// ```
+///
+/// invoked as a group `["portal", "child", "frontend"]`. Before the fix the
+/// explicit `frontend` spawn cancelled the dependency-spawned `frontend` job,
+/// which left `portal`/`child` waiting on a now-`Cancelled` `Active` predicate
+/// and cascaded both into "will never be ready" cancellation.
+#[test]
+fn group_explicit_service_reuses_scheduled_dependency_job() {
+    let mut harness = TestHarness::new("group_reuses_scheduled_dep");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[action.init]
+cmd = ["test-app", "init"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+cache = {{}}
+
+[service.frontend]
+cmd = ["test-app", "frontend"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["init"]
+
+[service.portal]
+cmd = ["test-app", "portal"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["init", "frontend"]
+
+[service.child]
+cmd = ["test-app", "child"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["init", "frontend", "portal"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+
+    // Spawn the dependent first so `frontend` is scheduled as a dependency of `portal`.
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "portal",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "spawn portal rejected: {:?}", resp.body);
+
+    // Anchor `init` in `Running` state. Action `init` is now `Running`, so the
+    // dependency-spawned `frontend` job stays `Scheduled` until we tell `init`
+    // to exit. This is what reproduces the original bug: the explicit `frontend`
+    // submission below races a still-`Scheduled` dependency job.
+    let mut init = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(init.name(), "init");
+
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "child",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "spawn child rejected: {:?}", resp.body);
+
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "frontend",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "spawn frontend rejected: {:?}", resp.body);
+
+    init.exit(0);
+
+    let mut frontend = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(
+        frontend.name(),
+        "frontend",
+        "frontend must start after init exits; server_log={}",
+        harness.server_log()
+    );
+
+    let mut portal = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(
+        portal.name(),
+        "portal",
+        "portal must not be cancelled when frontend is re-submitted; server_log={}",
+        harness.server_log()
+    );
+
+    let mut child = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(
+        child.name(),
+        "child",
+        "child must not be cancelled when frontend is re-submitted; server_log={}",
+        harness.server_log()
+    );
+
+    child.exit(0);
+    portal.exit(0);
+    frontend.exit(0);
+}

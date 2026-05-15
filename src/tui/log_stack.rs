@@ -6,8 +6,8 @@ use crate::{
     keybinds::Keybinds,
     line_width::display_width,
     log_storage::{BaseTaskSet, LogFilter, LogId},
-    scroll_view::{LogHighlight, LogStyle, LogWidget, ScrollState},
-    tui::task_tree::{MetaGroupKind, SelectionState},
+    scroll_view::{LogHighlight, LogSelection, LogStyle, LogWidget, ScrollState},
+    tui::task_tree::SelectionState,
     welcome_message::render_welcome_message,
     workspace::{BaseTaskIndex, Workspace, WorkspaceState},
 };
@@ -16,6 +16,13 @@ use crate::{
 pub struct LogStackScrollState {
     pub top: ScrollState,
     pub bottom: Option<ScrollState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogSelectionPoint {
+    pub log_id: LogId,
+    pub filter: LogFilter,
+    pub include_task_prefixes: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -103,6 +110,7 @@ pub struct LogStack {
     /// Anchoring the top pane keeps the separator at a fixed screen y when the
     /// menu bar is resized, since the log area grows/shrinks from its bottom.
     hybrid_top_h: Option<u16>,
+    selection: Option<LogSelection>,
 }
 
 /// Minimum rows required for each pane in hybrid mode.
@@ -121,6 +129,7 @@ impl Default for LogStack {
             last_separator: None,
             welcome_shown: false,
             hybrid_top_h: None,
+            selection: None,
         }
     }
 }
@@ -154,6 +163,143 @@ impl LogStack {
 
     pub fn hybrid_top_h_pinned(&self) -> Option<u16> {
         self.hybrid_top_h
+    }
+
+    fn ensure_base_task_prefixes(&mut self, ws: &WorkspaceState) {
+        if self.base_task_log_style.prefixes.len() == ws.base_tasks.len() {
+            return;
+        }
+        self.base_task_log_style.prefixes.clear();
+        for (i, base_task) in ws.base_tasks.iter().enumerate() {
+            const SPAN_COLORS: &[&str] = &[
+                "\x1b[48;5;235;38;5;195m",
+                "\x1b[48;5;16;38;5;189m",
+                "\x1b[48;5;235;38;5;183m",
+                "\x1b[48;5;16;38;5;149m",
+                "\x1b[48;5;235;38;5;157m",
+                "\x1b[48;5;16;38;5;110m",
+                "\x1b[48;5;235;38;5;229m",
+                "\x1b[48;5;16;38;5;182m",
+                "\x1b[48;5;235;38;5;151m",
+            ];
+            let text = format!("{} {} \x1b[m ", SPAN_COLORS[i % SPAN_COLORS.len()], base_task.name);
+            self.base_task_log_style
+                .prefixes
+                .push(crate::scroll_view::Prefix { width: display_width(&text), bytes: text.into() });
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn selection_contains_point(&self, point: &LogSelectionPoint) -> bool {
+        let Some(selection) = &self.selection else {
+            return false;
+        };
+        selection.filter == point.filter
+            && selection.include_task_prefixes == point.include_task_prefixes
+            && selection.start <= point.log_id
+            && point.log_id <= selection.end
+    }
+
+    pub fn begin_selection(&mut self, point: LogSelectionPoint) {
+        self.selection = Some(LogSelection::new(point.log_id, point.log_id, point.filter, point.include_task_prefixes));
+    }
+
+    pub fn extend_selection(&mut self, anchor: &LogSelectionPoint, active: LogSelectionPoint) {
+        if anchor.filter != active.filter || anchor.include_task_prefixes != active.include_task_prefixes {
+            return;
+        }
+        self.selection =
+            Some(LogSelection::new(anchor.log_id, active.log_id, anchor.filter.clone(), anchor.include_task_prefixes));
+    }
+
+    pub fn selected_text(&self, ws: &Workspace) -> Option<(String, usize)> {
+        let selection = self.selection.as_ref()?;
+        let logs = ws.logs.read().unwrap();
+        let view = logs.view(selection.filter.clone());
+        let mut bytes = Vec::new();
+        let mut count = 0usize;
+
+        view.for_each_forward(selection.start, &mut |log_id, entry| {
+            if log_id > selection.end {
+                return std::ops::ControlFlow::Break(());
+            }
+            if !selection.filter.matches_entry(entry) {
+                return std::ops::ControlFlow::Continue(());
+            }
+            if count > 0 {
+                bytes.push(b'\n');
+            }
+            if selection.include_task_prefixes
+                && let Some(prefix) = self.base_task_log_style.prefix(entry.log_group)
+            {
+                crate::line_width::strip_ansi_to_buffer_preserve_case(&prefix.bytes, &mut bytes);
+            }
+            let text = unsafe { entry.text(&logs) };
+            crate::line_width::strip_ansi_to_buffer_preserve_case(text, &mut bytes);
+            count += 1;
+            std::ops::ControlFlow::Continue(())
+        });
+
+        if count == 0 {
+            return Some((String::new(), 0));
+        }
+
+        Some((String::from_utf8(bytes).unwrap_or_default(), count))
+    }
+
+    pub fn selection_point_at(&mut self, dest: Rect, x: u16, y: u16, ws: &Workspace) -> Option<LogSelectionPoint> {
+        if !dest.contains(x, y) {
+            return None;
+        }
+
+        let ws_state = ws.state();
+        self.ensure_base_task_prefixes(&ws_state);
+        let top_filter = self.mode.top_filter(&ws_state);
+        let bot_filter = self.mode.bottom_filter(&ws_state);
+        drop(ws_state);
+
+        let logs = ws.logs.read().unwrap();
+
+        if let Some(bot_filter) = bot_filter {
+            let top_view = logs.view(top_filter.clone());
+            if top_view.is_empty() {
+                let view = logs.view(bot_filter.clone());
+                let def = LogStyle::default();
+                let log_id = self.bottom.log_id_at_row(&view, &def, dest, y - dest.y)?;
+                return Some(LogSelectionPoint { log_id, filter: bot_filter, include_task_prefixes: false });
+            }
+
+            let top_h = self.effective_hybrid_top_h(dest.h);
+            let bot_h = dest.h.saturating_sub(top_h + 1);
+            let bot_rect = Rect { x: dest.x, y: dest.y + top_h + 1, w: dest.w, h: bot_h };
+            let sep_y = dest.y + top_h;
+            let top_rect = Rect { x: dest.x, y: dest.y, w: dest.w, h: top_h };
+
+            if y == sep_y {
+                return None;
+            }
+            if bot_rect.contains(x, y) {
+                let view = logs.view(bot_filter.clone());
+                let def = LogStyle::default();
+                let log_id = self.bottom.log_id_at_row(&view, &def, bot_rect, y - bot_rect.y)?;
+                return Some(LogSelectionPoint { log_id, filter: bot_filter, include_task_prefixes: false });
+            }
+            if top_rect.contains(x, y) {
+                let log_id = self.top.log_id_at_row(&top_view, &self.base_task_log_style, top_rect, y - top_rect.y)?;
+                return Some(LogSelectionPoint { log_id, filter: top_filter, include_task_prefixes: true });
+            }
+            return None;
+        }
+
+        let view = logs.view(top_filter.clone());
+        let include_task_prefixes = matches!(self.mode, Mode::All);
+        let def = LogStyle::default();
+        let style = if include_task_prefixes { &self.base_task_log_style } else { &def };
+        let log_id = self.top.log_id_at_row(&view, style, dest, y - dest.y)?;
+        Some(LogSelectionPoint { log_id, filter: top_filter, include_task_prefixes })
     }
 
     /// Returns the scroll state for both top and bottom panes.
@@ -227,6 +373,18 @@ impl LogStack {
         }
     }
 
+    pub fn select_log_id_for_current_mode(&mut self, target: LogId, ws: &Workspace) {
+        let ws_state = ws.state();
+        self.ensure_base_task_prefixes(&ws_state);
+
+        let (filter, include_task_prefixes) = match &self.mode {
+            Mode::All => (LogFilter::All, true),
+            Mode::OnlySelected(ss) | Mode::Hybrid(ss) => (selection_filter(ss, &ws_state), false),
+        };
+
+        self.selection = Some(LogSelection::new(target, target, filter, include_task_prefixes));
+    }
+
     pub fn set_mode(&mut self, mode: Mode) {
         if self.mode != mode {
             self.mode = mode;
@@ -294,33 +452,15 @@ impl LogStack {
             }
 
             self.welcome_shown = false;
-
-            if self.base_task_log_style.prefixes.len() != ws.base_tasks.len() {
-                self.base_task_log_style.prefixes.clear();
-                for (i, base_task) in ws.base_tasks.iter().enumerate() {
-                    const SPAN_COLORS: &[&str] = &[
-                        "\x1b[48;5;235;38;5;195m",
-                        "\x1b[48;5;16;38;5;189m",
-                        "\x1b[48;5;235;38;5;183m",
-                        "\x1b[48;5;16;38;5;149m",
-                        "\x1b[48;5;235;38;5;157m",
-                        "\x1b[48;5;16;38;5;110m",
-                        "\x1b[48;5;235;38;5;229m",
-                        "\x1b[48;5;16;38;5;182m",
-                        "\x1b[48;5;235;38;5;151m",
-                    ];
-                    let text = format!("{} {} \x1b[m ", SPAN_COLORS[i % SPAN_COLORS.len()], base_task.name);
-                    self.base_task_log_style
-                        .prefixes
-                        .push(crate::scroll_view::Prefix { width: display_width(&text), bytes: text.into() });
-                }
-            }
+            self.ensure_base_task_prefixes(&ws);
             (self.mode.top_filter(&ws), self.mode.bottom_filter(&ws))
         };
 
         self.base_task_log_style.highlight = self.highlight;
         self.base_task_log_style.skip_rect = skip_rect;
-        let def = LogStyle { highlight: self.highlight, skip_rect, ..LogStyle::default() };
+        self.base_task_log_style.selection = self.selection.clone();
+        let def =
+            LogStyle { highlight: self.highlight, selection: self.selection.clone(), skip_rect, ..LogStyle::default() };
 
         let logs = ws.logs.read().unwrap();
         if let Some(bot_filter) = bot_filter {

@@ -1318,6 +1318,32 @@ impl WorkspaceState {
         }
         .to_string();
         let params = params.to_owned();
+
+        // Reuse a compatible scheduled/starting service instead of cancelling it.
+        // `plan_conflicts` under `AllowMultiple::False` (the default) cancels every
+        // scheduled job for the base task, so an explicit spawn racing a
+        // dependency-driven spawn of the same service (e.g. a group submission that
+        // lists both a dependent and the service itself) would orphan the dependents
+        // wired to the original job via `JobPredicate::Active` — they'd cascade into
+        // "will never be ready" cancellations once the predicate sees the cancelled
+        // job. Running services keep their documented "explicit spawn restarts"
+        // semantic.
+        if !force_restart {
+            let bt = &self.base_tasks[base_task.idx()];
+            let cache_never = bt.config.cache.as_ref().is_some_and(|c| c.never);
+            if bt.config.kind == TaskKind::Service && !cache_never {
+                for &ji in bt.jobs.non_terminal() {
+                    let job = &self.jobs[ji];
+                    if matches!(job.process_status, JobStatus::Running { .. }) {
+                        continue;
+                    }
+                    if service_matches_require(job, &profile, &params) {
+                        return Ok(ji);
+                    }
+                }
+            }
+        }
+
         let bt = &mut self.base_tasks[base_task.idx()];
         bt.update_profile_tracking(&profile);
 

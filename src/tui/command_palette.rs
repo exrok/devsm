@@ -235,6 +235,7 @@ fn available_commands(keybinds: &Keybinds) -> Vec<CommandEntry> {
         Command::LogModeHybrid,
         Command::JumpToOldestLogs,
         Command::JumpToNewestLogs,
+        Command::CopyLogs,
         Command::ToggleHelp,
         Command::ToggleGroupExpand,
         Command::ToggleTaskTree,

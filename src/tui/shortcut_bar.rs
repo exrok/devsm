@@ -86,6 +86,7 @@ pub fn build_shortcut_entries(
                         (&Command::LogModeAll, "All"),
                         (&Command::LogModeSelected, "Sel"),
                         (&Command::LogModeHybrid, "Hyb"),
+                        (&Command::CopyLogs, "Copy"),
                         (&Command::Quit, "Quit"),
                         (&Command::ToggleHelp, "Help"),
                     ],
@@ -100,6 +101,7 @@ pub fn build_shortcut_entries(
                         (&Command::JumpToOldestLogs, "Oldest"),
                         (&Command::LogScrollUp, "Up"),
                         (&Command::LogScrollDown, "Down"),
+                        (&Command::CopyLogs, "Copy"),
                         (&Command::SearchLogs, "Search"),
                     ],
                 );
@@ -160,6 +162,7 @@ pub fn build_shortcut_entries(
                             (&Command::LogModeAll, "All"),
                             (&Command::LogModeSelected, "Sel"),
                             (&Command::LogModeHybrid, "Hyb"),
+                            (&Command::CopyLogs, "Copy"),
                         ],
                     );
                 }

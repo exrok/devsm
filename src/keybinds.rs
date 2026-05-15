@@ -183,6 +183,7 @@ pub enum Command {
     JumpToNewestLogs,
     LogScrollUp,
     LogScrollDown,
+    CopyLogs,
     ToggleHelp,
     HelpScrollUp,
     HelpScrollDown,
@@ -237,6 +238,7 @@ impl FromStr for Command {
             "JumpToNewestLogs" => Command::JumpToNewestLogs,
             "LogScrollUp" => Command::LogScrollUp,
             "LogScrollDown" => Command::LogScrollDown,
+            "CopyLogs" => Command::CopyLogs,
             "ToggleHelp" => Command::ToggleHelp,
             "HelpScrollUp" => Command::HelpScrollUp,
             "HelpScrollDown" => Command::HelpScrollDown,
@@ -483,6 +485,7 @@ impl Keybinds {
         self.bind(Mode::TaskTree, "ESC", Command::JumpToNewestLogs);
         self.bind(Mode::TaskTree, "C-k", Command::LogScrollUp);
         self.bind(Mode::TaskTree, "C-j", Command::LogScrollDown);
+        self.bind(Mode::TaskTree, "y", Command::CopyLogs);
         self.bind(Mode::TaskTree, "PGUP", Command::HelpScrollUp);
         self.bind(Mode::TaskTree, "PGDN", Command::HelpScrollDown);
         self.bind(Mode::TaskTree, "1", Command::LogModeAll);
@@ -683,6 +686,7 @@ impl Command {
             Command::JumpToNewestLogs => "Newest Logs",
             Command::LogScrollUp => "Scroll Up",
             Command::LogScrollDown => "Scroll Down",
+            Command::CopyLogs => "Copy Logs",
             Command::ToggleHelp => "Help",
             Command::HelpScrollUp => "Help Up",
             Command::HelpScrollDown => "Help Down",
@@ -729,6 +733,7 @@ impl Command {
             Command::JumpToNewestLogs => "JumpToNewestLogs",
             Command::LogScrollUp => "LogScrollUp",
             Command::LogScrollDown => "LogScrollDown",
+            Command::CopyLogs => "CopyLogs",
             Command::ToggleHelp => "ToggleHelp",
             Command::HelpScrollUp => "HelpScrollUp",
             Command::HelpScrollDown => "HelpScrollDown",

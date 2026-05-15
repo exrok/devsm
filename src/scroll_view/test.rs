@@ -2,8 +2,8 @@ use extui::{Rect, vt, vt::BufferWrite};
 
 use crate::{
     line_width::MatchHighlight,
-    log_storage::{LogId, LogWriter},
-    scroll_view::{LogHighlight, LogStyle, LogWidget, Prefix, get_entry_height},
+    log_storage::{LogFilter, LogId, LogWriter},
+    scroll_view::{LogHighlight, LogSelection, LogStyle, LogWidget, Prefix, get_entry_height},
 };
 
 #[track_caller]
@@ -212,8 +212,13 @@ fn prefix_wrapping() {
 
     // Setup style with a prefix for Job 0
     let prefix = Prefix { bytes: "P: ".into(), width: 3 };
-    let style =
-        LogStyle { prefixes: vec![prefix.clone(), prefix], assume_blank: false, highlight: None, skip_rect: None };
+    let style = LogStyle {
+        prefixes: vec![prefix.clone(), prefix],
+        assume_blank: false,
+        highlight: None,
+        selection: None,
+        skip_rect: None,
+    };
 
     writer.push("Short");
     view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
@@ -714,6 +719,98 @@ fn highlight_only_change_via_render() {
         "Delta highlight ({} bytes) should be more efficient than full reset ({} bytes)",
         delta_bytes,
         reset_bytes
+    );
+}
+
+#[test]
+fn scrollable_render_zero_updates_selection_in_scrolled_view() {
+    let mut parser = vt100::Parser::new(6, 10, 0);
+    let mut buf = Vec::new();
+    let rect = Rect { x: 0, y: 1, w: 10, h: 4 };
+
+    let mut writer = LogWriter::new();
+    let logs = writer.reader();
+    let mut view = LogWidget::default();
+
+    for i in 0..8 {
+        writer.push(&format!("Line {}", i));
+    }
+
+    let style = LogStyle::default();
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    parser.process(&buf);
+    buf.clear();
+
+    view.scroll_up(2, &mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    parser.process(&buf);
+    buf.clear();
+
+    let screen_content = parser.screen().contents();
+    assert!(screen_content.contains("Line 2"), "Should be scrolled before selecting: '{}'", screen_content);
+    assert!(screen_content.contains("Line 5"), "Should be scrolled before selecting: '{}'", screen_content);
+
+    let selection_style = LogStyle {
+        selection: Some(LogSelection::new(LogId(4), LogId(4), LogFilter::All, false)),
+        ..LogStyle::default()
+    };
+    view.scrollable_render(0, &mut buf, rect, &logs.read().unwrap().view_all(), &selection_style);
+    parser.process(&buf);
+
+    let screen_content = parser.screen().contents();
+    let selected_cell = parser.screen().cell(3, 0).unwrap();
+    assert!(
+        selected_cell.bgcolor() != vt100::Color::Default,
+        "Line 4 should be highlighted after zero-scroll render in scrolled mode: '{}'",
+        screen_content
+    );
+}
+
+#[test]
+fn selected_log_preserves_ansi_foreground() {
+    let mut parser = vt100::Parser::new(3, 40, 0);
+    let mut buf = Vec::new();
+    let rect = Rect { x: 0, y: 0, w: 40, h: 3 };
+
+    let mut writer = LogWriter::new();
+    let logs = writer.reader();
+    let mut view = LogWidget::default();
+
+    writer.push("\x1b[31mRED\x1b[0m plain");
+
+    let style = LogStyle {
+        selection: Some(LogSelection::new(LogId(0), LogId(0), LogFilter::All, false)),
+        ..LogStyle::default()
+    };
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    parser.process(&buf);
+
+    let screen = parser.screen();
+    let red_cell = screen.cell(0, 0).unwrap();
+    assert_eq!(red_cell.contents(), "R");
+    assert_eq!(
+        red_cell.fgcolor(),
+        vt100::Color::Idx(1),
+        "selected ANSI red text should keep its foreground, got {:?}",
+        red_cell.fgcolor()
+    );
+    assert_ne!(
+        red_cell.bgcolor(),
+        vt100::Color::Default,
+        "selected ANSI red text should still have a selection background"
+    );
+
+    let plain_cell = screen.cell(0, 4).unwrap();
+    assert_eq!(plain_cell.contents(), "p");
+    assert_eq!(
+        plain_cell.fgcolor(),
+        vt100::Color::Default,
+        "text after ANSI reset should return to the default foreground, got {:?}",
+        plain_cell.fgcolor()
+    );
+    assert_ne!(
+        plain_cell.bgcolor(),
+        vt100::Color::Default,
+        "text after ANSI reset should keep the selection background"
     );
 }
 
@@ -1308,6 +1405,55 @@ fn skip_rect_narrow_preserves_styles_across_cut() {
         vt100::Color::Idx(4),
         "right side col 16 should be blue (escape after the cut is honoured), got {:?}",
         right_blue.fgcolor()
+    );
+}
+
+#[test]
+fn selected_log_with_skip_rect_highlights_side_columns() {
+    let mut parser = vt100::Parser::new(8, 20, 0);
+    let mut buf = Vec::new();
+
+    let mut seed = Vec::new();
+    vt::MoveCursor(6, 0).write_to_buffer(&mut seed);
+    seed.extend_from_slice(b"<PALETTE");
+    parser.process(&seed);
+
+    let mut writer = LogWriter::new();
+    let logs = writer.reader();
+    let mut view = LogWidget::default();
+
+    writer.push("AA\x1b[31mRR\x1b[0mBB\x1b[32mGGGGGGGG\x1b[0mCC");
+
+    let rect = Rect { x: 0, y: 0, w: 20, h: 4 };
+    let style = LogStyle {
+        skip_rect: Some(Rect { x: 6, y: 0, w: 8, h: 1 }),
+        selection: Some(LogSelection::new(LogId(0), LogId(0), LogFilter::All, false)),
+        ..Default::default()
+    };
+
+    view.render(&mut buf, rect, &logs.read().unwrap().view_all(), &style);
+    parser.process(&buf);
+
+    let screen = parser.screen();
+
+    let left_red = screen.cell(0, 2).unwrap();
+    assert_eq!(left_red.contents(), "R");
+    assert_eq!(left_red.fgcolor(), vt100::Color::Idx(1), "selected clipped text should preserve foreground");
+    assert_ne!(
+        left_red.bgcolor(),
+        vt100::Color::Default,
+        "selected clipped text should keep a selection background on the left side"
+    );
+
+    let skipped = screen.cell(0, 6).unwrap();
+    assert_eq!(skipped.contents(), "<", "skip cells should remain owned by the overlay");
+    assert_eq!(skipped.bgcolor(), vt100::Color::Default, "skip cells should not receive selection styling");
+
+    let right_side = screen.cell(0, 14).unwrap();
+    assert_ne!(
+        right_side.bgcolor(),
+        vt100::Color::Default,
+        "selected clipped text should keep a selection background on the right side"
     );
 }
 

@@ -10,7 +10,8 @@ use jsony_value::ValueMap;
 
 use crate::config::TaskKind;
 use crate::event_loop::{
-    Action, ClientChannel, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_SERVICES, SELECTED_META_GROUP_TESTS,
+    Action, ClientChannel, ProcessRequest, SELECTED_META_GROUP_ACTIONS, SELECTED_META_GROUP_SERVICES,
+    SELECTED_META_GROUP_TESTS,
 };
 use crate::function::{FunctionAction, SetFunctionAction};
 use crate::keybinds::{BindingEntry, Command, InputEvent, Keybinds, Mode};
@@ -171,10 +172,10 @@ impl ChainState {
     }
 }
 
-#[derive(Clone, Copy)]
 enum DragKind {
     MenuSeparator,
     HybridSeparator,
+    LogSelection { anchor: Box<log_stack::LogSelectionPoint>, clear_on_click: bool, moved: bool },
 }
 
 struct TuiState {
@@ -613,6 +614,7 @@ enum ProcessKeyResult {
     Continue,
     Quit,
     ReloadConfig,
+    CopyLogs,
 }
 
 fn render_help_menu(
@@ -770,6 +772,7 @@ fn process_key(
                 }
                 SearchAction::Confirm(log_id) => {
                     tui.logs.scroll_to_log_id(log_id, workspace);
+                    tui.logs.select_log_id_for_current_mode(log_id, workspace);
                     tui.overlay = FocusOverlap::None;
                 }
                 SearchAction::None => {
@@ -1039,6 +1042,9 @@ fn dispatch_command(
         Command::LogScrollDown => {
             tui.logs.pending_top_scroll -= 5;
         }
+        Command::CopyLogs => {
+            return ProcessKeyResult::CopyLogs;
+        }
         Command::ToggleHelp => {
             tui.help.visible = !tui.help.visible;
         }
@@ -1077,6 +1083,65 @@ fn dispatch_command(
         }
     }
     ProcessKeyResult::Continue
+}
+
+fn copy_selected_logs(
+    tui: &mut TuiState,
+    workspace: &Workspace,
+    terminal: Option<&mut extui::Terminal>,
+    stdin: &File,
+    events: &mut extui::event::Events,
+    clipboard_features: &mut Option<extui::TerminalFeatures>,
+    clipboard_config: &crate::clipboard::ClipboardConfig,
+) {
+    let Some((text, line_count)) = tui.logs.selected_text(workspace) else {
+        tui.status_message = Some(StatusMessage::error("No logs selected"));
+        return;
+    };
+    if line_count == 0 {
+        tui.status_message = Some(StatusMessage::error("Selected logs are no longer available"));
+        return;
+    }
+    let Some(terminal) = terminal else {
+        tui.status_message = Some(StatusMessage::error("Clipboard unavailable in JSON output mode"));
+        return;
+    };
+
+    let process_channel = workspace.process_channel.clone();
+    match crate::clipboard::copy_text(
+        terminal,
+        stdin,
+        events,
+        clipboard_features,
+        clipboard_config,
+        &text,
+        |text, command| {
+            // Clipboard CLI fallbacks spawn helper processes. Keep that on the
+            // event loop thread, which owns process spawning/reaping invariants.
+            let (response, result) = std::sync::mpsc::sync_channel(1);
+            process_channel
+                .try_send(ProcessRequest::ClipboardCopy {
+                    text: text.into(),
+                    command: command.map(Into::into),
+                    response,
+                })
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+            result
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|err| std::io::Error::other(format!("clipboard command response timed out: {err}")))?
+        },
+    ) {
+        Ok(report) => {
+            let suffix = if line_count == 1 { "" } else { "s" };
+            tui.status_message =
+                Some(StatusMessage::info(format!("Copied {line_count} log line{suffix} via {}", report.backend)));
+            kvlog::info!("Copied logs to clipboard", lines = line_count, backend = %report.backend, note = %report.note);
+        }
+        Err(err) => {
+            kvlog::warn!("Failed to copy logs", ?err);
+            tui.status_message = Some(StatusMessage::error(format!("Copy failed: {err}")));
+        }
+    }
 }
 
 fn call_function(tui: &mut TuiState, workspace: &Workspace, fn_name: &str) {
@@ -1491,7 +1556,12 @@ pub enum OutputMode {
     JsonStateStream,
 }
 
-fn attempt_config_reload(tui: &mut TuiState, workspace: &Workspace, keybinds: &mut Arc<Keybinds>) {
+fn attempt_config_reload(
+    tui: &mut TuiState,
+    workspace: &Workspace,
+    keybinds: &mut Arc<Keybinds>,
+    clipboard_config: &mut Arc<crate::clipboard::ClipboardConfig>,
+) {
     let mut errors = Vec::new();
     let mut workspace_errored = false;
     let mut user_errored = false;
@@ -1514,8 +1584,10 @@ fn attempt_config_reload(tui: &mut TuiState, workspace: &Workspace, keybinds: &m
     match crate::user_config::reload_user_config() {
         Ok(config) => {
             crate::user_config::set_global_max_job_history(config.max_job_history);
+            crate::event_loop::update_global_clipboard_config(config.clipboard);
             crate::event_loop::update_global_keybinds(config.keybinds);
             *keybinds = crate::event_loop::global_keybinds();
+            *clipboard_config = crate::event_loop::global_clipboard_config();
         }
         Err(e) => {
             errors.push(e);
@@ -1549,6 +1621,7 @@ pub fn run(
     workspace: &Workspace,
     extui_channel: Arc<ClientChannel>,
     mut keybinds: Arc<Keybinds>,
+    mut clipboard_config: Arc<crate::clipboard::ClipboardConfig>,
     output_mode: OutputMode,
 ) -> anyhow::Result<()> {
     let mode = TerminalFlags::RAW_MODE
@@ -1589,6 +1662,7 @@ pub fn run(
     };
 
     let mut delta = Has(0);
+    let mut clipboard_features = None;
     loop {
         if delta.any(Has::RESIZED) {
             (w, h) = if let Some(terminal) = &terminal { terminal.size()? } else { (150, 80) };
@@ -1634,7 +1708,7 @@ pub fn run(
                 if let FocusOverlap::ConfigError { state } = &mut tui.overlay
                     && state.check_file_changed()
                 {
-                    attempt_config_reload(&mut tui, workspace, &mut keybinds);
+                    attempt_config_reload(&mut tui, workspace, &mut keybinds, &mut clipboard_config);
                 }
             }
         }
@@ -1653,7 +1727,18 @@ pub fn run(
                 Event::Key(key_event) => match process_key(&mut tui, workspace, key_event, &keybinds) {
                     ProcessKeyResult::Quit => return Ok(()),
                     ProcessKeyResult::ReloadConfig => {
-                        attempt_config_reload(&mut tui, workspace, &mut keybinds);
+                        attempt_config_reload(&mut tui, workspace, &mut keybinds, &mut clipboard_config);
+                    }
+                    ProcessKeyResult::CopyLogs => {
+                        copy_selected_logs(
+                            &mut tui,
+                            workspace,
+                            terminal.as_mut(),
+                            &stdin,
+                            &mut events,
+                            &mut clipboard_features,
+                            &clipboard_config,
+                        );
                     }
                     ProcessKeyResult::Continue => {}
                 },
@@ -1727,10 +1812,27 @@ pub fn run(
                                 tui.drag = Some(DragKind::MenuSeparator);
                             } else if is_left && Some(y) == hybrid_sep_y {
                                 tui.drag = Some(DragKind::HybridSeparator);
+                            } else if is_left && y < status_bar_y {
+                                let log_rect = Rect { x: 0, y: 0, w, h: log_area_h };
+                                if let Some(point) = tui.logs.selection_point_at(log_rect, x, y, workspace) {
+                                    let clear_on_click = tui.logs.selection_contains_point(&point);
+                                    tui.logs.begin_selection(point.clone());
+                                    tui.drag = Some(DragKind::LogSelection {
+                                        anchor: Box::new(point),
+                                        clear_on_click,
+                                        moved: false,
+                                    });
+                                } else {
+                                    tui.logs.clear_selection();
+                                    tui.drag = None;
+                                }
                             } else {
                                 tui.drag = None;
                                 match target {
                                     ScrollTarget::TaskList { row } => {
+                                        if is_left {
+                                            tui.logs.clear_selection();
+                                        }
                                         let toggle_group = is_left
                                             .then(|| tui.task_tree.selected_meta_group_at_row(row as usize))
                                             .flatten();
@@ -1747,6 +1849,9 @@ pub fn run(
                                         }
                                     }
                                     ScrollTarget::JobList { row } => {
+                                        if is_left {
+                                            tui.logs.clear_selection();
+                                        }
                                         tui.task_tree.select_job_by_row(row as usize, &workspace.state());
                                         if matches!(button, extui::event::MouseButton::Right) {
                                             restart_selected_task(&mut tui, workspace);
@@ -1756,26 +1861,40 @@ pub fn run(
                                 }
                             }
                         }
-                        extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left) => match tui.drag {
-                            Some(DragKind::MenuSeparator) => {
-                                let new_h = h.saturating_sub(shortcut_h).saturating_sub(y);
-                                tui.menu_height_override = Some(new_h);
-                                delta |= Has::RESIZED;
-                            }
-                            Some(DragKind::HybridSeparator)
-                                if in_hybrid && log_area_h >= log_stack::HYBRID_MIN_PANE * 2 + 1 =>
-                            {
-                                let max_top = log_area_h - log_stack::HYBRID_MIN_PANE - 1;
-                                let clamped = y.clamp(log_stack::HYBRID_MIN_PANE, max_top);
-                                if tui.logs.hybrid_top_h_pinned() != Some(clamped) {
-                                    tui.logs.set_hybrid_top_h(clamped);
+                        extui::event::MouseEventKind::Drag(extui::event::MouseButton::Left) => {
+                            match tui.drag.as_mut() {
+                                Some(DragKind::MenuSeparator) => {
+                                    let new_h = h.saturating_sub(shortcut_h).saturating_sub(y);
+                                    tui.menu_height_override = Some(new_h);
                                     delta |= Has::RESIZED;
                                 }
+                                Some(DragKind::HybridSeparator)
+                                    if in_hybrid && log_area_h > log_stack::HYBRID_MIN_PANE * 2 =>
+                                {
+                                    let max_top = log_area_h - log_stack::HYBRID_MIN_PANE - 1;
+                                    let clamped = y.clamp(log_stack::HYBRID_MIN_PANE, max_top);
+                                    if tui.logs.hybrid_top_h_pinned() != Some(clamped) {
+                                        tui.logs.set_hybrid_top_h(clamped);
+                                        delta |= Has::RESIZED;
+                                    }
+                                }
+                                Some(DragKind::LogSelection { anchor, moved, .. }) => {
+                                    *moved = true;
+                                    let anchor = anchor.as_ref().clone();
+                                    let log_rect = Rect { x: 0, y: 0, w, h: log_area_h };
+                                    if let Some(point) = tui.logs.selection_point_at(log_rect, x, y, workspace) {
+                                        tui.logs.extend_selection(&anchor, point);
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
-                        },
+                        }
                         extui::event::MouseEventKind::Up(_) => {
-                            tui.drag = None;
+                            if let Some(DragKind::LogSelection { clear_on_click: true, moved: false, .. }) =
+                                tui.drag.take()
+                            {
+                                tui.logs.clear_selection();
+                            }
                         }
                         _ => {}
                     }
@@ -1790,7 +1909,96 @@ pub fn run(
 
 #[cfg(test)]
 mod test {
-    use super::constrain_scroll_offset;
+    use std::sync::{Arc, Mutex, RwLock};
+
+    use extui::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::*;
+    use crate::{
+        event_loop::MioChannel,
+        log_storage::{LogId, LogWriter},
+        workspace::{Workspace, WorkspaceState},
+    };
+
+    fn test_tui_state(width: u16, height: u16) -> TuiState {
+        let frame_height = compute_menu_height(height) + 1;
+        TuiState {
+            frame: DoubleBuffer::new(width, frame_height),
+            frame_width: width,
+            frame_height,
+            logs: LogStack::default(),
+            task_tree: TaskTreeState::default(),
+            overlay: FocusOverlap::None,
+            help: HelpMenu { visible: false, scroll: 0 },
+            status_message: None,
+            task_tree_hidden: false,
+            shortcut_bar_visible: true,
+            chain: ChainState::default(),
+            menu_height_override: None,
+            drag: None,
+            log_overlay: None,
+            log_overlay_last_rect: None,
+        }
+    }
+
+    fn test_workspace_with_logs(lines: &[&str]) -> Workspace {
+        let mut writer = LogWriter::new();
+        for line in lines {
+            writer.push(line);
+        }
+
+        let poll = mio::Poll::new().unwrap();
+        let waker = Box::leak(Box::new(mio::Waker::new(poll.registry(), mio::Token(0)).unwrap()));
+        let config_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("schema/devsm.example-big.toml");
+
+        Workspace {
+            workspace_id: 0,
+            logs: writer.reader(),
+            state: RwLock::new(WorkspaceState::new(config_path).unwrap()),
+            process_channel: Arc::new(MioChannel { waker, events: Mutex::new(Vec::new()) }),
+        }
+    }
+
+    #[test]
+    fn confirming_log_search_selects_match_for_copy() {
+        let workspace = test_workspace_with_logs(&["alpha", "needle target", "omega"]);
+        let keybinds = Keybinds::default();
+        let mut tui = test_tui_state(80, 24);
+
+        {
+            let logs = workspace.logs.read().unwrap();
+            tui.logs.enter_scroll_mode(&workspace);
+            tui.overlay = FocusOverlap::LogSearch { state: LogSearchState::new(&logs, LogFilter::All, logs.tail()) };
+        }
+
+        for ch in "needle".chars() {
+            assert!(matches!(
+                process_key(&mut tui, &workspace, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()), &keybinds),
+                ProcessKeyResult::Continue
+            ));
+        }
+
+        assert!(matches!(
+            process_key(&mut tui, &workspace, KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()), &keybinds),
+            ProcessKeyResult::Continue
+        ));
+
+        let (text, count) = tui.logs.selected_text(&workspace).expect("confirmed search match should be selected");
+        assert_eq!(count, 1);
+        assert_eq!(text, "needle target");
+    }
+
+    #[test]
+    fn selected_blank_log_line_is_copyable() {
+        let workspace = test_workspace_with_logs(&[""]);
+        let mut tui = test_tui_state(80, 24);
+
+        tui.logs.select_log_id_for_current_mode(LogId(0), &workspace);
+
+        let (text, count) = tui.logs.selected_text(&workspace).expect("blank selected line should still be selected");
+        assert_eq!(count, 1);
+        assert_eq!(text, "");
+    }
 
     #[test]
     fn scroll_offset_edge_cases() {

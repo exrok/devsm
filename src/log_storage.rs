@@ -14,7 +14,7 @@ use crate::workspace::BaseTaskIndex;
 
 /// Bitset for filtering logs by a set of base task indices.
 /// Uses [u64; 64] to cover all possible BaseTaskIndex values (0..0xfff = 4096 bits).
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BaseTaskSet([u64; 64]);
 
 impl BaseTaskSet {
@@ -39,7 +39,7 @@ impl Default for BaseTaskSet {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogFilter {
     All,
     IsGroup(LogGroup),
@@ -50,6 +50,21 @@ pub enum LogFilter {
     IsInSet(BaseTaskSet),
 }
 impl LogFilter {
+    pub fn matches_group(&self, group: LogGroup) -> bool {
+        match self {
+            LogFilter::All => true,
+            LogFilter::IsGroup(log_group) => group == *log_group,
+            LogFilter::NotGroup(log_group) => group != *log_group,
+            LogFilter::IsBaseTask(base_task) => group.base_task_index() == *base_task,
+            LogFilter::NotBaseTask(base_task) => group.base_task_index() != *base_task,
+            LogFilter::IsInSet(set) => set.contains(group.base_task_index()),
+        }
+    }
+
+    pub fn matches_entry(&self, entry: &LogEntry) -> bool {
+        self.matches_group(entry.log_group)
+    }
+
     /// Guarantees that the pointer returned will (if some) will be the from the provided iterator
     #[inline]
     pub fn next<'b>(&self, iter: &mut impl Iterator<Item = &'b LogGroup>) -> Option<&'b LogGroup> {
@@ -75,14 +90,7 @@ impl<'a> LogView<'a> {
     }
 
     pub fn contains(&self, line: &LogEntry) -> bool {
-        match &self.filter {
-            LogFilter::All => true,
-            LogFilter::IsGroup(log_group) => line.log_group == *log_group,
-            LogFilter::NotGroup(log_group) => line.log_group != *log_group,
-            LogFilter::IsBaseTask(base_task) => line.log_group.base_task_index() == *base_task,
-            LogFilter::NotBaseTask(base_task) => line.log_group.base_task_index() != *base_task,
-            LogFilter::IsInSet(set) => set.contains(line.log_group.base_task_index()),
-        }
+        self.filter.matches_entry(line)
     }
 
     pub fn collect_forward(&self, from: LogId, ids: &mut Vec<LogId>) {
