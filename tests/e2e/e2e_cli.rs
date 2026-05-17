@@ -980,6 +980,72 @@ require = [["dep", {{ msg = "hello_from_params" }}]]
 }
 
 #[test]
+fn run_forwards_task_arguments() {
+    let mut harness = TestHarness::new("run_forward_args");
+    let output_file = harness.temp_dir.join("forwarded.txt");
+    harness.write_config(&format!(
+        r#"
+[action.capture]
+cmd = ["sh", "-c", '''printf '%s\n' "$@" > {output}''', "capture", {{ var = "args" }}]
+cli.forward-arguments = true
+"#,
+        output = output_file.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "capture", "-al", "/tmp", "--color=auto"]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+
+    let content = fs::read_to_string(&output_file).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines, vec!["-al", "/tmp", "--color=auto"], "forwarded args mismatch: {:?}", lines);
+}
+
+#[test]
+fn exec_forwards_task_arguments() {
+    let harness = TestHarness::new("exec_forward_args");
+    let output_file = harness.temp_dir.join("forwarded.txt");
+    harness.write_config(&format!(
+        r#"
+[action.capture]
+cmd = ["sh", "-c", '''printf '%s\n' "$@" > {output}''', "capture", {{ var = "args" }}]
+cli.forward-arguments = true
+"#,
+        output = output_file.display()
+    ));
+
+    let result = harness.run_client(&["exec", "capture", "-al", "/tmp", "--color=auto"]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+
+    let content = fs::read_to_string(&output_file).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines, vec!["-al", "/tmp", "--color=auto"], "forwarded args mismatch: {:?}", lines);
+}
+
+#[test]
+fn run_non_forward_task_still_parses_vars_after_task_name() {
+    let mut harness = TestHarness::new("run_legacy_vars");
+    let output_file = harness.temp_dir.join("value.txt");
+    harness.write_config(&format!(
+        r#"
+[action.capture]
+sh = "printf '%s' \"$VALUE\" > {output}"
+env.VALUE = {{ var = "value" }}
+"#,
+        output = output_file.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "capture", "--value=hello"]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+
+    let content = fs::read_to_string(&output_file).unwrap_or_default();
+    assert_eq!(content, "hello");
+}
+
+#[test]
 fn require_cache_per_profile() {
     let mut harness = TestHarness::new("cache_per_profile");
     let counter = harness.temp_dir.join("counter.txt");

@@ -34,6 +34,11 @@ managed = false
 cmd = ["ls", { var = "dir" }]
 managed = true
 
+# Action forwarding CLI tokens into a list variable
+[action.with_forwarded_args]
+cmd = ["ls", { var = "args" }]
+cli.forward-arguments = true
+
 # Action with variable metadata - description only
 [action.var_with_description]
 cmd = ["curl", { var = "url" }]

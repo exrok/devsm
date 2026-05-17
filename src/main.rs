@@ -112,15 +112,15 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Exec { job, value_map } => {
-            if let Err(err) = exec_task(job, value_map) {
+        cli::Command::Exec { job, value_map, trailing_args } => {
+            if let Err(err) = exec_task(job, value_map, trailing_args) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
         }
-        cli::Command::Run { job, value_map, as_test, derive_cache_key } => {
+        cli::Command::Run { job, value_map, trailing_args, as_test, derive_cache_key } => {
             let _log_guard = self_log::init_client_logging();
-            if let Err(err) = run_client(job, value_map, as_test, derive_cache_key) {
+            if let Err(err) = run_client(job, value_map, trailing_args, as_test, derive_cache_key) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -336,6 +336,32 @@ fn setup_signal_handler(sig: i32, handler: unsafe extern "C" fn(i32)) -> anyhow:
         }
     }
     Ok(())
+}
+
+fn build_task_params<'a>(
+    task_expr: &config::TaskConfigExpr<'static>,
+    mut params: jsony_value::ValueMap<'a>,
+    trailing_args: &'a [String],
+    run_flags: Option<(&mut bool, &mut bool)>,
+) -> anyhow::Result<jsony_value::ValueMap<'a>> {
+    if task_expr.cli.forward_arguments {
+        if params.get("args").is_some() {
+            bail!("Task uses cli.forward-arguments, so --args cannot be provided explicitly");
+        }
+        let args_value: jsony_value::Value<'a> = trailing_args.iter().map(|arg| arg.as_str()).collect();
+        params.insert("args".into(), args_value);
+        return Ok(params);
+    }
+
+    let trailing_params = if let Some((as_test, derive_cache_key)) = run_flags {
+        cli::parse_run_trailing_params(trailing_args, as_test, derive_cache_key)?
+    } else {
+        cli::parse_task_params(trailing_args)?
+    };
+    for (key, value) in trailing_params.entries() {
+        params.insert(key.clone(), value.clone());
+    }
+    Ok(params)
 }
 
 fn default_connect_timeout_ms() -> u64 {
@@ -648,7 +674,13 @@ fn reset_terminal_to_canonical() {
     }
 }
 
-fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool, derive_cache_key: bool) -> anyhow::Result<()> {
+fn run_client(
+    job: &str,
+    params: jsony_value::ValueMap,
+    trailing_args: &[String],
+    mut as_test: bool,
+    mut derive_cache_key: bool,
+) -> anyhow::Result<()> {
     reset_terminal_to_canonical();
 
     let cwd = std::env::current_dir()?;
@@ -660,14 +692,15 @@ fn run_client(job: &str, params: jsony_value::ValueMap, as_test: bool, derive_ca
     let bare_task_name = name.split_once('.').map_or(name, |(_, rest)| rest).to_string();
 
     let resolved = resolve_name_in_config(&workspace_config, name);
+    let task_expr = match resolved {
+        Some((_, expr)) => expr,
+        None if name == "~cargo" => &config::CARGO_AUTO_EXPR,
+        None => bail!("Task not found: {}", name),
+    };
+    let params = build_task_params(task_expr, params, trailing_args, Some((&mut as_test, &mut derive_cache_key)))?;
     let as_test = match resolved {
         Some((kind, _)) => as_test || kind == config::TaskKind::Test,
-        None => {
-            if name != "~cargo" {
-                bail!("Task not found: {}", name);
-            }
-            as_test
-        }
+        None => as_test,
     };
     let job = job.to_owned();
 
@@ -882,7 +915,7 @@ fn resolve_name_in_config(
 }
 
 /// Executes a task directly, bypassing the daemon and ignoring dependencies.
-fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
+fn exec_task(job: &str, params: jsony_value::ValueMap, trailing_args: &[String]) -> anyhow::Result<()> {
     let workspace_config = config::load_from_env()?;
     let (name, profile) = job.rsplit_once(':').unwrap_or((job, ""));
 
@@ -904,6 +937,7 @@ fn exec_task(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<()> {
         );
     }
 
+    let params = build_task_params(task_expr, params, trailing_args, None)?;
     let profile = if profile.is_empty() { task_expr.profiles.first().copied().unwrap_or("") } else { profile };
     let env = config::Environment { profile, param: params, vars: task_expr.vars };
     let task = task_expr.eval(&env).map_err(|e| anyhow::anyhow!("Failed to evaluate task: {:?}", e))?;

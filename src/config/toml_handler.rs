@@ -3,9 +3,10 @@ use std::time::Duration;
 use toml_spanner::{Context, Document, Failed, Item, Table, Value};
 
 use crate::config::{
-    Alias, AllowMultiple, CacheConfig, CacheKeyInput, CommandExpr, FunctionDef, FunctionDefAction, If, Predicate,
-    ReadyConfig, ReadyPredicate, Requirement, ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr,
-    TaskKind, TestConfigExpr, TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
+    Alias, AllowMultiple, CacheConfig, CacheKeyInput, CliConfig, CommandExpr, FunctionDef, FunctionDefAction, If,
+    Predicate, ReadyConfig, ReadyPredicate, Requirement, ServiceHidden, StringExpr, StringListExpr, TaskCall,
+    TaskConfigExpr, TaskKind, TestConfigExpr, TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig,
+    parse_duration,
 };
 
 fn parse_predicate<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Predicate<'a>, Failed> {
@@ -80,6 +81,25 @@ fn parse_var_meta<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<VarMeta
     }
 
     Ok(VarMeta { description, default })
+}
+
+fn parse_cli_config<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<CliConfig, Failed> {
+    let table = value.require_table(ctx)?;
+    let mut cli = CliConfig::DEFAULT;
+
+    for (key, val) in table {
+        match key.name {
+            "forward-arguments" | "forward_arguments" => match val.value() {
+                Value::Boolean(&b) => cli.forward_arguments = b,
+                _ => return Err(ctx.report_expected_but_found(&"a boolean", val)),
+            },
+            _ => {
+                return Err(ctx.report_unexpected_key(0, val, key.span));
+            }
+        }
+    }
+
+    Ok(cli)
 }
 
 fn parse_duration_value<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<f64, Failed> {
@@ -304,6 +324,7 @@ fn parse_task<'a>(
     let mut managed: Option<bool> = None;
     let mut hidden = ServiceHidden::Never;
     let mut allow_multiple = AllowMultiple::False;
+    let mut cli = CliConfig::DEFAULT;
     let mut vars_vec = bumpalo::collections::Vec::new_in(alloc);
 
     for (key, value) in task_table {
@@ -385,6 +406,7 @@ fn parse_task<'a>(
                 }
                 _ => return Err(ctx.report_expected_but_found(&"a boolean or string", value)),
             },
+            "cli" => cli = parse_cli_config(value, ctx)?,
             "var" => {
                 let var_table = value.require_table(ctx)?;
                 for (var_key, var_value) in var_table {
@@ -424,6 +446,7 @@ fn parse_task<'a>(
         managed,
         hidden,
         allow_multiple,
+        cli,
         vars: vars_vec.into_bump_slice(),
     })
 }
@@ -521,6 +544,7 @@ fn parse_test<'a>(
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
+    let mut cli = CliConfig::DEFAULT;
     let mut vars_vec = bumpalo::collections::Vec::new_in(alloc);
 
     for (key, value) in test_table {
@@ -560,6 +584,7 @@ fn parse_test<'a>(
             }
             "info" => info = value.require_string(ctx)?,
             "timeout" => timeout = Some(parse_timeout_config(value, ctx)?),
+            "cli" => cli = parse_cli_config(value, ctx)?,
             "var" => {
                 let var_table = value.require_table(ctx)?;
                 for (var_key, var_value) in var_table {
@@ -593,6 +618,7 @@ fn parse_test<'a>(
         tags: tags_vec.into_bump_slice(),
         cache,
         timeout,
+        cli,
         vars: vars_vec.into_bump_slice(),
     })
 }
@@ -1038,6 +1064,29 @@ mod test {
         let cache = task.cache.as_ref().expect("cache should be present");
         assert!(cache.never);
         assert!(cache.key.is_empty());
+    }
+
+    #[test]
+    fn test_cli_forward_arguments_valid_for_action() {
+        let text = "[action.list]\ncmd = [\"ls\", { var = \"args\" }]\ncli.forward-arguments = true\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "Expected successful parse: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let (_, task) = &config.tasks[0];
+        assert!(task.cli.forward_arguments);
+    }
+
+    #[test]
+    fn test_cli_unknown_key_errors() {
+        let text = "[action.list]\ncmd = [\"ls\"]\ncli.unknown = true\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err(), "Expected error for unknown cli key");
+        let messages = collect_messages(&doc);
+        assert!(messages.iter().any(|m| m.contains("unexpected key")), "messages: {:?}", messages);
     }
 
     #[test]

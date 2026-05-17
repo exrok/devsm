@@ -390,6 +390,18 @@
         }
       }
     },
+    "cliConfig": {
+      "type": "object",
+      "description": "Task command-line behavior",
+      "additionalProperties": false,
+      "properties": {
+        "forward-arguments": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, tokens after the task name in 'devsm run' or 'devsm exec' are forwarded as the 'args' variable."
+        }
+      }
+    },
     "action": {
       "type": "object",
       "description": "Action configuration - a one-time task",
@@ -458,6 +470,9 @@
           "additionalProperties": {
             "$ref": "#/definitions/varMeta"
           }
+        },
+        "cli": {
+          "$ref": "#/definitions/cliConfig"
         }
       },
       "x-taplo": {
@@ -542,6 +557,9 @@
           "additionalProperties": {
             "$ref": "#/definitions/varMeta"
           }
+        },
+        "cli": {
+          "$ref": "#/definitions/cliConfig"
         }
       },
       "x-taplo": {
@@ -620,6 +638,9 @@
           "additionalProperties": {
             "$ref": "#/definitions/varMeta"
           }
+        },
+        "cli": {
+          "$ref": "#/definitions/cliConfig"
         }
       },
       "x-taplo": {

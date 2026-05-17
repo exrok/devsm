@@ -41,6 +41,11 @@ impl<'a> ArgParser<'a> {
         ArgParser { args: args.iter(), value: None }
     }
 
+    fn rest(&self) -> &'a [String] {
+        debug_assert!(self.value.is_none());
+        self.args.as_slice()
+    }
+
     fn next_value(&mut self) -> Option<&'a str> {
         match self.next()? {
             Component::Value(v) | Component::Term(v) => Some(v),
@@ -85,8 +90,8 @@ pub enum Command<'a> {
     Server,
     RestartSelected,
     Spawn { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
-    Exec { job: &'a str, value_map: ValueMap<'a> },
-    Run { job: &'a str, value_map: ValueMap<'a>, as_test: bool, derive_cache_key: bool },
+    Exec { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String] },
+    Run { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String], as_test: bool, derive_cache_key: bool },
     Kill { job: &'a str },
     Test { filters: Vec<TestFilter<'a>>, force: bool },
     RerunTests { only_failed: bool },
@@ -156,17 +161,7 @@ pub enum TestFilter<'a> {
     IncludeName(Cow<'a, str>),
 }
 
-/// Parses a job name and parameters from remaining arguments.
-///
-/// Accepts either `--key=value` flags or a single JSON object literal.
-/// Flags are parsed as JSON literals, falling back to strings.
-fn parse_job_args<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<(&'a str, ValueMap<'a>)> {
-    let job = match parser.next() {
-        Some(Component::Term(name)) => name,
-        Some(f) => bail!("Expected name of job, found {:?}", f),
-        None => bail!("Missing name of job"),
-    };
-
+fn parse_param_components<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<ValueMap<'a>> {
     let mut value_map = ValueMap::new();
     while let Some(component) = parser.next() {
         match component {
@@ -193,7 +188,53 @@ fn parse_job_args<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<(&'a str, Va
         }
     }
 
-    Ok((job, value_map))
+    Ok(value_map)
+}
+
+pub fn parse_task_params<'a>(args: &'a [String]) -> anyhow::Result<ValueMap<'a>> {
+    let mut parser = ArgParser::new(args);
+    parse_param_components(&mut parser)
+}
+
+pub fn parse_run_trailing_params<'a>(
+    args: &'a [String],
+    as_test: &mut bool,
+    derive_cache_key: &mut bool,
+) -> anyhow::Result<ValueMap<'a>> {
+    let mut parser = ArgParser::new(args);
+    let mut value_map = ValueMap::new();
+    while let Some(component) = parser.next() {
+        match component {
+            Component::Long("as-test") => {
+                *as_test = true;
+            }
+            Component::Long("derive-cache-key") => {
+                *derive_cache_key = true;
+            }
+            Component::Long(key) => {
+                let Some(val) = parser.next_value() else {
+                    bail!("Flag --{} requires a value (use --{}=value)", key, key);
+                };
+                value_map.insert(key.into(), parse_flag_value(val));
+            }
+            Component::Term(json) => {
+                let parsed: ValueMap = jsony::from_json(json).context("Parsing job parameters")?;
+                for (k, v) in parsed.entries() {
+                    value_map.insert(k.clone(), v.clone());
+                }
+            }
+            Component::Flags(flags) => {
+                if let Some(flag) = flags.chars().next() {
+                    bail!("Unknown flag -{}", flag);
+                }
+            }
+            Component::Value(val) => {
+                bail!("Unexpected value: {:?}", val);
+            }
+        }
+    }
+
+    Ok(value_map)
 }
 
 fn parse_spawn<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
@@ -241,8 +282,12 @@ fn parse_spawn<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
 }
 
 fn parse_exec<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
-    let (job, value_map) = parse_job_args(parser)?;
-    Ok(Command::Exec { job, value_map })
+    let job = match parser.next() {
+        Some(Component::Term(name)) => name,
+        Some(f) => bail!("Expected name of job, found {:?}", f),
+        None => bail!("Missing name of job"),
+    };
+    Ok(Command::Exec { job, value_map: ValueMap::new(), trailing_args: parser.rest() })
 }
 
 fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
@@ -268,6 +313,7 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
             Component::Term(arg) => {
                 if job.is_none() {
                     job = Some(arg);
+                    break;
                 } else {
                     let parsed: ValueMap = jsony::from_json(arg).context("Parsing job parameters")?;
                     for (k, v) in parsed.entries() {
@@ -290,7 +336,7 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
         bail!("Missing name of job");
     };
 
-    Ok(Command::Run { job, value_map, as_test, derive_cache_key })
+    Ok(Command::Run { job, value_map, trailing_args: parser.rest(), as_test, derive_cache_key })
 }
 
 /// Parse validate command arguments.
@@ -736,5 +782,69 @@ mod tests {
             };
             assert_eq!(&**s, expected, "input: '{input}'");
         }
+    }
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn parse_run_captures_trailing_args_raw() {
+        let args = args(&["run", "list", "-al", "/tmp", "--color=auto"]);
+        let (_, command) = parse(&args).unwrap();
+        let Command::Run { job, value_map, trailing_args, as_test, derive_cache_key } = command else {
+            panic!("expected run command");
+        };
+        assert_eq!(job, "list");
+        assert!(value_map.entries().is_empty());
+        assert_eq!(trailing_args, &args[2..]);
+        assert!(!as_test);
+        assert!(!derive_cache_key);
+    }
+
+    #[test]
+    fn parse_run_keeps_prefix_options_and_vars() {
+        let args = args(&["run", "--derive-cache-key", "--limit=5", "build", "--release"]);
+        let (_, command) = parse(&args).unwrap();
+        let Command::Run { job, value_map, trailing_args, as_test, derive_cache_key } = command else {
+            panic!("expected run command");
+        };
+        assert_eq!(job, "build");
+        assert_eq!(value_map["limit"].as_i64(), Some(5));
+        assert_eq!(trailing_args, &args[4..]);
+        assert!(!as_test);
+        assert!(derive_cache_key);
+    }
+
+    #[test]
+    fn parse_task_params_preserves_legacy_var_parsing() {
+        let args = args(&["--msg=hello", r#"{"count":2}"#]);
+        let params = parse_task_params(&args).unwrap();
+        let ValueRef::String(msg) = params["msg"].as_ref() else {
+            panic!("expected msg string");
+        };
+        assert_eq!(&**msg, "hello");
+        assert_eq!(params["count"].as_i64(), Some(2));
+    }
+
+    #[test]
+    fn parse_task_params_rejects_unknown_short_flags() {
+        let args = args(&["-al"]);
+        let err = parse_task_params(&args).unwrap_err();
+        assert!(err.to_string().contains("Unknown flag -a"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_run_trailing_params_preserves_post_task_run_options_for_legacy_tasks() {
+        let args = args(&["--as-test", "--derive-cache-key", "--msg=hello"]);
+        let mut as_test = false;
+        let mut derive_cache_key = false;
+        let params = parse_run_trailing_params(&args, &mut as_test, &mut derive_cache_key).unwrap();
+        assert!(as_test);
+        assert!(derive_cache_key);
+        let ValueRef::String(msg) = params["msg"].as_ref() else {
+            panic!("expected msg string");
+        };
+        assert_eq!(&**msg, "hello");
     }
 }

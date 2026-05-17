@@ -113,6 +113,16 @@ pub enum AllowMultiple {
     True,
 }
 
+/// Per-task command-line behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CliConfig {
+    pub forward_arguments: bool,
+}
+
+impl CliConfig {
+    pub const DEFAULT: Self = Self { forward_arguments: false };
+}
+
 /// A single cache key input that contributes to cache invalidation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheKeyInput<'a> {
@@ -429,6 +439,8 @@ pub struct TaskConfigExpr<'a> {
     pub hidden: ServiceHidden,
     /// Controls whether multiple instances of this task can run concurrently.
     pub allow_multiple: AllowMultiple,
+    /// Per-task command-line behavior.
+    pub cli: CliConfig,
     /// Variable metadata (description, default) for variables used in this task.
     pub vars: &'a [(&'a str, VarMeta<'a>)],
 }
@@ -445,6 +457,8 @@ pub struct TestConfigExpr<'a> {
     pub cache: Option<CacheConfig<'a>>,
     /// Timeout configuration for the test.
     pub timeout: Option<TimeoutConfig<'a>>,
+    /// Per-test command-line behavior.
+    pub cli: CliConfig,
     /// Variable metadata (description, default) for variables used in this test.
     pub vars: &'a [(&'a str, VarMeta<'a>)],
 }
@@ -469,6 +483,7 @@ impl TestConfigExpr<'static> {
             managed: None,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
+            cli: self.cli,
             vars: self.vars,
         }))
     }
@@ -493,6 +508,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         managed: None,
         hidden: ServiceHidden::Never,
         allow_multiple: AllowMultiple::False,
+        cli: CliConfig::DEFAULT,
         vars: &[],
     }
 };
@@ -544,6 +560,7 @@ impl ConfigGeneration {
                     managed: None,
                     hidden: ServiceHidden::Never,
                     allow_multiple: AllowMultiple::False,
+                    cli: config.cli,
                     vars: config.vars,
                 },
             });
@@ -1047,6 +1064,7 @@ mod tests {
             managed: None,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
+            cli: CliConfig::DEFAULT,
             vars: &[],
         };
         let vars = TEST_EXPR.collect_variables();
@@ -1076,6 +1094,7 @@ mod tests {
             managed: None,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
+            cli: CliConfig::DEFAULT,
             vars: &[],
         };
         let vars = TEST_EXPR.collect_variables();
@@ -1122,6 +1141,7 @@ mod tests {
             managed: None,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
+            cli: CliConfig::DEFAULT,
             vars: &[],
         };
         let vars = TEST_EXPR.collect_variables();
@@ -1153,6 +1173,7 @@ mod tests {
             managed: None,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
+            cli: CliConfig::DEFAULT,
             vars: &[],
         };
 
@@ -1181,6 +1202,7 @@ mod tests {
             managed: None,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
+            cli: CliConfig::DEFAULT,
             vars: &[],
         };
 
