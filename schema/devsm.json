@@ -399,6 +399,11 @@
           "type": "boolean",
           "default": false,
           "description": "When true, tokens after the task name in 'devsm run' or 'devsm exec' are forwarded as the 'args' variable."
+        },
+        "autocomplete": {
+          "type": "string",
+          "enum": ["forward"],
+          "description": "When set to 'forward', fish completions after the task name are forwarded to the static command prefix before the forwarded arguments."
         }
       }
     },

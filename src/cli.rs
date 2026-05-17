@@ -109,6 +109,8 @@ pub enum CompleteContext<'a> {
     Tests,
     Profiles { task: &'a str },
     Vars { task: &'a str, exclude: Vec<&'a str> },
+    ForwardPrefix { task: &'a str },
+    TaskArgs { task: &'a str, exclude: Vec<&'a str> },
     Groups,
     Functions,
     Tags,
@@ -481,7 +483,7 @@ fn parse_complete<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
 
     let Some(context_str) = context_str else {
         bail!(
-            "complete requires a context (commands, tasks, tests, profiles, vars, groups, functions, tags, get-resources, kinds)"
+            "complete requires a context (commands, tasks, tests, profiles, vars, forward-prefix, task-args, groups, functions, tags, get-resources, kinds)"
         );
     };
 
@@ -500,6 +502,18 @@ fn parse_complete<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
                 bail!("complete vars requires --task=NAME");
             };
             CompleteContext::Vars { task, exclude }
+        }
+        "forward-prefix" => {
+            let Some(task) = task else {
+                bail!("complete forward-prefix requires --task=NAME");
+            };
+            CompleteContext::ForwardPrefix { task }
+        }
+        "task-args" => {
+            let Some(task) = task else {
+                bail!("complete task-args requires --task=NAME");
+            };
+            CompleteContext::TaskArgs { task, exclude }
         }
         "groups" => CompleteContext::Groups,
         "functions" => CompleteContext::Functions,
@@ -846,5 +860,30 @@ mod tests {
             panic!("expected msg string");
         };
         assert_eq!(&**msg, "hello");
+    }
+
+    #[test]
+    fn parse_complete_forward_prefix_requires_task() {
+        let cli_args = args(&["complete", "forward-prefix", "--task=ls"]);
+        let (_, command) = parse(&cli_args).unwrap();
+        let Command::Complete { context: CompleteContext::ForwardPrefix { task } } = command else {
+            panic!("expected forward-prefix completion context");
+        };
+        assert_eq!(task, "ls");
+
+        let cli_args = args(&["complete", "forward-prefix"]);
+        let err = parse(&cli_args).err().unwrap();
+        assert!(err.to_string().contains("complete forward-prefix requires --task=NAME"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn parse_complete_task_args_accepts_task_and_exclude() {
+        let cli_args = args(&["complete", "task-args", "--task=ls", "--exclude=args,other"]);
+        let (_, command) = parse(&cli_args).unwrap();
+        let Command::Complete { context: CompleteContext::TaskArgs { task, exclude } } = command else {
+            panic!("expected task-args completion context");
+        };
+        assert_eq!(task, "ls");
+        assert_eq!(exclude, vec!["args", "other"]);
     }
 }

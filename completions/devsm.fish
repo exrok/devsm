@@ -164,6 +164,97 @@ function __fish_devsm_vars
     end
 end
 
+function __fish_devsm_forwarded_args
+    set -l cmd (commandline -opc)
+    set -l found_subcommand 0
+    set -l found_task 0
+    set -l args
+
+    for arg in $cmd[2..]
+        if test $found_subcommand -eq 0
+            if not string match -q -- '-*' $arg
+                set found_subcommand 1
+            end
+            continue
+        end
+
+        if test $found_task -eq 0
+            if not string match -q -- '-*' $arg
+                set found_task 1
+            end
+            continue
+        end
+
+        set -a args $arg
+    end
+
+    printf '%s\n' $args
+end
+
+function __fish_devsm_task_arg_completions
+    set -l task (__fish_devsm_current_task)
+    if test -z "$task"
+        return 0
+    end
+
+    set -l cmd (commandline -opc)
+    set -l used_vars
+    for arg in $cmd
+        if string match -q -- '--*=*' "$arg"
+            set -l var_name (string match -r -- '^--([^=]+)=' "$arg")[2]
+            if test -n "$var_name"
+                set -a used_vars $var_name
+            end
+        end
+    end
+
+    set -l exclude_flag
+    if test (count $used_vars) -gt 0
+        set exclude_flag "--exclude="(string join ',' $used_vars)
+    end
+
+    set -l completion_data (devsm complete task-args --task=$task $exclude_flag 2>/dev/null)
+    if test (count $completion_data) -eq 0
+        return 0
+    end
+
+    switch $completion_data[1]
+        case forward
+            if test (count $completion_data) -lt 3
+                return 0
+            end
+
+            set -l cwd $completion_data[2]
+            set -l prefix $completion_data[3..]
+            set -l forwarded_args (__fish_devsm_forwarded_args)
+            set -l completion_line (string join ' ' (string escape -- $prefix $forwarded_args))
+            if string match -qr '\s$' -- (commandline -b)
+                set completion_line "$completion_line "
+            end
+
+            if pushd "$cwd" >/dev/null 2>/dev/null
+                complete -C "$completion_line"
+                set -l complete_status $status
+                popd >/dev/null 2>/dev/null
+                return $complete_status
+            end
+
+            complete -C "$completion_line"
+
+        case vars
+            for line in $completion_data[2..]
+                set -l parts (string split \t $line)
+                set -l name $parts[1]
+                set -l desc $parts[2]
+                if test -n "$desc"
+                    printf '%s\t%s\n' "--$name=" "$desc"
+                else
+                    echo "--$name="
+                end
+            end
+    end
+end
+
 # Disable file completions by default
 complete -c devsm -f
 
@@ -197,9 +288,9 @@ complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_completin
 complete -c devsm -n '__fish_devsm_using_command exec; and __fish_devsm_completing_profile' -xa '(__fish_devsm_profiles_for_token)'
 complete -c devsm -n '__fish_devsm_using_command spawn; and __fish_devsm_completing_profile' -xa '(__fish_devsm_profiles_for_token)'
 
-# Task variables (--var=value) - only after task is entered
-complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_needs_vars' -xa '(__fish_devsm_vars)'
-complete -c devsm -n '__fish_devsm_using_command exec; and __fish_devsm_needs_vars' -xa '(__fish_devsm_vars)'
+# Task variables or forwarded argument completions - only after task is entered
+complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_needs_vars' -xa '(__fish_devsm_task_arg_completions)'
+complete -c devsm -n '__fish_devsm_using_command exec; and __fish_devsm_needs_vars' -xa '(__fish_devsm_task_arg_completions)'
 complete -c devsm -n '__fish_devsm_using_command spawn; and __fish_devsm_needs_vars' -xa '(__fish_devsm_vars)'
 
 # Spawn command options
@@ -330,6 +421,8 @@ complete -c devsm -n '__fish_devsm_using_command complete; and __fish_devsm_comp
 complete -c devsm -n '__fish_devsm_using_command complete; and __fish_devsm_complete_needs_context' -xa 'tests' -d 'List tests'
 complete -c devsm -n '__fish_devsm_using_command complete; and __fish_devsm_complete_needs_context' -xa 'profiles' -d 'List profiles for task'
 complete -c devsm -n '__fish_devsm_using_command complete; and __fish_devsm_complete_needs_context' -xa 'vars' -d 'List variables for task'
+complete -c devsm -n '__fish_devsm_using_command complete; and __fish_devsm_complete_needs_context' -xa 'forward-prefix' -d 'List forwarded autocomplete command prefix'
+complete -c devsm -n '__fish_devsm_using_command complete; and __fish_devsm_complete_needs_context' -xa 'task-args' -d 'List task argument completion mode and data'
 complete -c devsm -n '__fish_devsm_using_command complete; and __fish_devsm_complete_needs_context' -xa 'groups' -d 'List groups'
 complete -c devsm -n '__fish_devsm_using_command complete; and __fish_devsm_complete_needs_context' -xa 'functions' -d 'List functions'
 complete -c devsm -n '__fish_devsm_using_command complete; and __fish_devsm_complete_needs_context' -xa 'tags' -d 'List tags'

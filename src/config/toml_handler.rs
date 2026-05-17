@@ -3,10 +3,10 @@ use std::time::Duration;
 use toml_spanner::{Context, Document, Failed, Item, Table, Value};
 
 use crate::config::{
-    Alias, AllowMultiple, CacheConfig, CacheKeyInput, CliConfig, CommandExpr, FunctionDef, FunctionDefAction, If,
-    Predicate, ReadyConfig, ReadyPredicate, Requirement, ServiceHidden, StringExpr, StringListExpr, TaskCall,
-    TaskConfigExpr, TaskKind, TestConfigExpr, TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig,
-    parse_duration,
+    Alias, AllowMultiple, CacheConfig, CacheKeyInput, CliAutocomplete, CliConfig, CommandExpr, FunctionDef,
+    FunctionDefAction, If, Predicate, ReadyConfig, ReadyPredicate, Requirement, ServiceHidden, StringExpr,
+    StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, TimeoutConfig, TimeoutPredicate, VarMeta,
+    WorkspaceConfig, parse_duration,
 };
 
 fn parse_predicate<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Predicate<'a>, Failed> {
@@ -92,6 +92,13 @@ fn parse_cli_config<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<CliCo
             "forward-arguments" | "forward_arguments" => match val.value() {
                 Value::Boolean(&b) => cli.forward_arguments = b,
                 _ => return Err(ctx.report_expected_but_found(&"a boolean", val)),
+            },
+            "autocomplete" => match val.value() {
+                Value::String(&s) if s == "forward" => cli.autocomplete = CliAutocomplete::Forward,
+                Value::String(_) => {
+                    return Err(ctx.report_expected_but_found(&"`forward`", val));
+                }
+                _ => return Err(ctx.report_expected_but_found(&"a string", val)),
             },
             _ => {
                 return Err(ctx.report_unexpected_key(0, val, key.span));
@@ -1068,7 +1075,7 @@ mod test {
 
     #[test]
     fn test_cli_forward_arguments_valid_for_action() {
-        let text = "[action.list]\ncmd = [\"ls\", { var = \"args\" }]\ncli.forward-arguments = true\n";
+        let text = "[action.list]\ncmd = [\"ls\", { var = \"args\" }]\ncli.forward-arguments = true\ncli.autocomplete = \"forward\"\n";
         let arena = toml_spanner::Arena::new();
         let bump = Bump::new();
         let (doc, result) = parse_text(text, &arena, &bump);
@@ -1076,6 +1083,18 @@ mod test {
         let config = result.unwrap();
         let (_, task) = &config.tasks[0];
         assert!(task.cli.forward_arguments);
+        assert_eq!(task.cli.autocomplete, CliAutocomplete::Forward);
+    }
+
+    #[test]
+    fn test_cli_autocomplete_invalid_value_errors() {
+        let text = "[action.list]\ncmd = [\"ls\"]\ncli.autocomplete = \"shell\"\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err(), "Expected error for invalid cli autocomplete value");
+        let messages = collect_messages(&doc);
+        assert!(messages.iter().any(|m| m.contains("expected `forward`")), "messages: {:?}", messages);
     }
 
     #[test]

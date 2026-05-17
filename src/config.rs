@@ -117,10 +117,19 @@ pub enum AllowMultiple {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CliConfig {
     pub forward_arguments: bool,
+    pub autocomplete: CliAutocomplete,
 }
 
 impl CliConfig {
-    pub const DEFAULT: Self = Self { forward_arguments: false };
+    pub const DEFAULT: Self = Self { forward_arguments: false, autocomplete: CliAutocomplete::None };
+}
+
+/// Per-task command-line autocomplete behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CliAutocomplete {
+    #[default]
+    None,
+    Forward,
 }
 
 /// A single cache key input that contributes to cache invalidation.
@@ -999,6 +1008,48 @@ impl TaskConfigExpr<'static> {
             CommandExpr::Sh(str_expr) => first_literal_from_string(str_expr).unwrap_or(""),
         }
     }
+
+    /// Returns the literal command prefix used when forwarding shell completions.
+    ///
+    /// The prefix stops at the first dynamic command component. For example,
+    /// `["git", "checkout", { var = "args" }]` returns `["git", "checkout"]`.
+    pub fn autocomplete_forward_prefix(&self) -> Option<Vec<&'static str>> {
+        if self.cli.autocomplete != CliAutocomplete::Forward {
+            return None;
+        }
+
+        let CommandExpr::Cmd(list_expr) = &self.command else {
+            return None;
+        };
+
+        let mut prefix = Vec::new();
+        collect_literal_prefix_from_list(list_expr, &mut prefix);
+        if prefix.is_empty() { None } else { Some(prefix) }
+    }
+
+    /// Evaluates only the task working directory for completion-time behavior.
+    pub fn eval_pwd(&self, env: &Environment) -> Result<String, EvalError> {
+        let bump = Bump::new();
+        Ok(self.pwd.bump_eval(env, &bump)?.to_string())
+    }
+}
+
+fn collect_literal_prefix_from_list(expr: &StringListExpr<'static>, out: &mut Vec<&'static str>) -> bool {
+    match expr {
+        StringListExpr::Literal(s) => {
+            out.push(s);
+            true
+        }
+        StringListExpr::List(items) => {
+            for item in *items {
+                if !collect_literal_prefix_from_list(item, out) {
+                    return false;
+                }
+            }
+            true
+        }
+        StringListExpr::Var(_) | StringListExpr::If(_) => false,
+    }
 }
 
 fn first_literal_from_list(expr: &StringListExpr<'static>) -> Option<&'static str> {
@@ -1148,6 +1199,81 @@ mod tests {
         assert!(!vars.contains(&"$profile"), "should exclude $profile: {:?}", vars);
         assert!(vars.contains(&"user_var"), "should include user_var: {:?}", vars);
         assert_eq!(vars.len(), 1);
+    }
+
+    #[test]
+    fn autocomplete_forward_prefix_returns_static_command_prefix() {
+        static TEST_EXPR: TaskConfigExpr<'static> = TaskConfigExpr {
+            kind: TaskKind::Action,
+            info: "",
+            pwd: StringExpr::Literal("./"),
+            command: CommandExpr::Cmd(StringListExpr::List(&[
+                StringListExpr::Literal("git"),
+                StringListExpr::Literal("checkout"),
+                StringListExpr::Var("args"),
+                StringListExpr::Literal("--ignored-after-args"),
+            ])),
+            profiles: &[],
+            envvar: &[],
+            require: EMPTY_REQUIREMENTS,
+            cache: None,
+            ready: None,
+            timeout: None,
+            tags: &[],
+            managed: None,
+            hidden: ServiceHidden::Never,
+            allow_multiple: AllowMultiple::False,
+            cli: CliConfig { forward_arguments: true, autocomplete: CliAutocomplete::Forward },
+            vars: &[],
+        };
+
+        assert_eq!(TEST_EXPR.autocomplete_forward_prefix(), Some(vec!["git", "checkout"]));
+    }
+
+    #[test]
+    fn autocomplete_forward_prefix_requires_forward_mode_and_cmd() {
+        static DEFAULT_CLI_EXPR: TaskConfigExpr<'static> = TaskConfigExpr {
+            kind: TaskKind::Action,
+            info: "",
+            pwd: StringExpr::Literal("./"),
+            command: CommandExpr::Cmd(StringListExpr::List(&[
+                StringListExpr::Literal("git"),
+                StringListExpr::Var("args"),
+            ])),
+            profiles: &[],
+            envvar: &[],
+            require: EMPTY_REQUIREMENTS,
+            cache: None,
+            ready: None,
+            timeout: None,
+            tags: &[],
+            managed: None,
+            hidden: ServiceHidden::Never,
+            allow_multiple: AllowMultiple::False,
+            cli: CliConfig::DEFAULT,
+            vars: &[],
+        };
+        static SHELL_EXPR: TaskConfigExpr<'static> = TaskConfigExpr {
+            kind: TaskKind::Action,
+            info: "",
+            pwd: StringExpr::Literal("./"),
+            command: CommandExpr::Sh(StringExpr::Literal("git checkout \"$@\"")),
+            profiles: &[],
+            envvar: &[],
+            require: EMPTY_REQUIREMENTS,
+            cache: None,
+            ready: None,
+            timeout: None,
+            tags: &[],
+            managed: None,
+            hidden: ServiceHidden::Never,
+            allow_multiple: AllowMultiple::False,
+            cli: CliConfig { forward_arguments: true, autocomplete: CliAutocomplete::Forward },
+            vars: &[],
+        };
+
+        assert_eq!(DEFAULT_CLI_EXPR.autocomplete_forward_prefix(), None);
+        assert_eq!(SHELL_EXPR.autocomplete_forward_prefix(), None);
     }
 
     #[test]

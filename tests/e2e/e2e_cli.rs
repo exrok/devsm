@@ -1024,6 +1024,68 @@ cli.forward-arguments = true
 }
 
 #[test]
+fn complete_forward_prefix_returns_static_command_prefix() {
+    let harness = TestHarness::new("complete_forward_prefix");
+    harness.write_config(
+        r#"
+[action.git_checkout]
+cmd = ["git", "checkout", { var = "args" }]
+cli.forward-arguments = true
+cli.autocomplete = "forward"
+
+[action.no_forward_completion]
+cmd = ["git", "status", { var = "args" }]
+cli.forward-arguments = true
+"#,
+    );
+
+    let result = harness.run_client(&["complete", "forward-prefix", "--task=git_checkout"]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+    let lines: Vec<&str> = result.stdout.lines().collect();
+    assert_eq!(lines, vec!["git", "checkout"]);
+
+    let result = harness.run_client(&["complete", "forward-prefix", "--task=git_checkout:debug"]);
+    assert!(result.success(), "Expected success for task profile, got stderr: {}", result.stderr);
+    let lines: Vec<&str> = result.stdout.lines().collect();
+    assert_eq!(lines, vec!["git", "checkout"]);
+
+    let result = harness.run_client(&["complete", "forward-prefix", "--task=no_forward_completion"]);
+    assert!(result.success(), "Expected success with empty output, got stderr: {}", result.stderr);
+    assert!(result.stdout.is_empty(), "Expected no prefix, got stdout: {:?}", result.stdout);
+}
+
+#[test]
+fn complete_task_args_returns_forward_pwd_and_legacy_vars() {
+    let harness = TestHarness::new("complete_task_args");
+    let work_dir = harness.temp_dir.join("work dir");
+    fs::create_dir_all(&work_dir).expect("create task pwd");
+    harness.write_config(&format!(
+        r#"
+[action.list]
+pwd = "{work_dir}"
+cmd = ["ls", {{ var = "args" }}]
+cli.forward-arguments = true
+cli.autocomplete = "forward"
+
+[action.echo]
+cmd = ["echo", {{ var = "name" }}]
+var.name = {{ description = "Name to print" }}
+"#,
+        work_dir = work_dir.display()
+    ));
+
+    let result = harness.run_client(&["complete", "task-args", "--task=list"]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+    let lines: Vec<&str> = result.stdout.lines().collect();
+    assert_eq!(lines, vec!["forward", work_dir.to_str().unwrap(), "ls"]);
+
+    let result = harness.run_client(&["complete", "task-args", "--task=echo"]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+    let lines: Vec<&str> = result.stdout.lines().collect();
+    assert_eq!(lines, vec!["vars", "name\tName to print"]);
+}
+
+#[test]
 fn run_non_forward_task_still_parses_vars_after_task_name() {
     let mut harness = TestHarness::new("run_legacy_vars");
     let output_file = harness.temp_dir.join("value.txt");

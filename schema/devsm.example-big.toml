@@ -38,6 +38,7 @@ managed = true
 [action.with_forwarded_args]
 cmd = ["ls", { var = "args" }]
 cli.forward-arguments = true
+cli.autocomplete = "forward"
 
 # Action with variable metadata - description only
 [action.var_with_description]

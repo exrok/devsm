@@ -1152,6 +1152,48 @@ mod completion_tests {
     }
 }
 
+fn print_task_var_completions(expr: &config::TaskConfigExpr<'static>, exclude: &[&str]) {
+    for (name, meta) in expr.vars {
+        if exclude.contains(name) {
+            continue;
+        }
+        print_completion(name, meta.description);
+    }
+    for var in expr.collect_variables() {
+        if exclude.contains(&var) {
+            continue;
+        }
+        if !expr.vars.iter().any(|(n, _)| *n == var) {
+            println!("{var}");
+        }
+    }
+}
+
+fn resolve_completion_task_expr<'a>(
+    workspace: &config::WorkspaceConfig<'static>,
+    task: &'a str,
+) -> Option<(&'static config::TaskConfigExpr<'static>, &'a str)> {
+    let (name, profile) = task.rsplit_once(':').unwrap_or((task, ""));
+    let expr = if name == "~cargo" {
+        &config::CARGO_AUTO_EXPR
+    } else {
+        resolve_name_in_config(workspace, name).map(|(_, expr)| expr)?
+    };
+    Some((expr, profile))
+}
+
+fn forward_completion_spec(
+    workspace: &config::WorkspaceConfig<'static>,
+    task: &str,
+) -> Option<(std::path::PathBuf, Vec<&'static str>)> {
+    let (expr, profile) = resolve_completion_task_expr(workspace, task)?;
+    let prefix = expr.autocomplete_forward_prefix()?;
+    let profile = if profile.is_empty() { expr.profiles.first().copied().unwrap_or("") } else { profile };
+    let env = config::Environment { profile, param: jsony_value::ValueMap::new(), vars: expr.vars };
+    let pwd = expr.eval_pwd(&env).ok()?;
+    Some((workspace.base_path.join(pwd), prefix))
+}
+
 fn print_completions(context: cli::CompleteContext) -> bool {
     match context {
         cli::CompleteContext::Commands => {
@@ -1214,20 +1256,44 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             let Some((_, expr)) = workspace.tasks.iter().find(|(n, _)| *n == task) else {
                 return false;
             };
-            for (name, meta) in expr.vars {
-                if exclude.contains(name) {
-                    continue;
+            print_task_var_completions(expr, &exclude);
+            true
+        }
+        cli::CompleteContext::ForwardPrefix { task } => {
+            let Ok(workspace) = config::load_from_env() else {
+                return false;
+            };
+            let Some((expr, _)) = resolve_completion_task_expr(&workspace, task) else {
+                return false;
+            };
+            if let Some(prefix) = expr.autocomplete_forward_prefix() {
+                for arg in prefix {
+                    println!("{arg}");
                 }
-                print_completion(name, meta.description);
             }
-            for var in expr.collect_variables() {
-                if exclude.contains(&var) {
-                    continue;
+            true
+        }
+        cli::CompleteContext::TaskArgs { task, exclude } => {
+            let Ok(workspace) = config::load_from_env() else {
+                return false;
+            };
+            if let Some((cwd, prefix)) = forward_completion_spec(&workspace, task) {
+                println!("forward");
+                println!("{}", cwd.display());
+                for arg in prefix {
+                    println!("{arg}");
                 }
-                if !expr.vars.iter().any(|(n, _)| *n == var) {
-                    println!("{var}");
-                }
+                return true;
             }
+
+            let Some((expr, _)) = resolve_completion_task_expr(&workspace, task) else {
+                return false;
+            };
+            if expr.cli.autocomplete == config::CliAutocomplete::Forward {
+                return true;
+            }
+            println!("vars");
+            print_task_var_completions(expr, &exclude);
             true
         }
         cli::CompleteContext::Groups => {
