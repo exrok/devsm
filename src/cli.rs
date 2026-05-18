@@ -110,7 +110,7 @@ pub enum CompleteContext<'a> {
     Profiles { task: &'a str },
     Vars { task: &'a str, exclude: Vec<&'a str> },
     ForwardPrefix { task: &'a str },
-    TaskArgs { task: &'a str, exclude: Vec<&'a str> },
+    TaskArgs { task: &'a str, exclude: Vec<&'a str>, args: &'a [String] },
     Groups,
     Functions,
     Tags,
@@ -446,6 +446,7 @@ fn parse_complete<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
     let mut task: Option<&'a str> = None;
     let mut context_str: Option<&'a str> = None;
     let mut exclude: Vec<&'a str> = Vec::new();
+    let mut args: &'a [String] = &[];
 
     while let Some(component) = parser.next() {
         match component {
@@ -467,6 +468,10 @@ fn parse_complete<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
                         bail!("Flag --exclude requires a value (use --exclude=var1,var2)");
                     };
                     exclude.extend(val.split(',').filter(|s| !s.is_empty()));
+                }
+                "" => {
+                    args = parser.rest();
+                    break;
                 }
                 _ => bail!("Unknown flag --{} in complete command", long),
             },
@@ -513,7 +518,7 @@ fn parse_complete<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
             let Some(task) = task else {
                 bail!("complete task-args requires --task=NAME");
             };
-            CompleteContext::TaskArgs { task, exclude }
+            CompleteContext::TaskArgs { task, exclude, args }
         }
         "groups" => CompleteContext::Groups,
         "functions" => CompleteContext::Functions,
@@ -878,12 +883,13 @@ mod tests {
 
     #[test]
     fn parse_complete_task_args_accepts_task_and_exclude() {
-        let cli_args = args(&["complete", "task-args", "--task=ls", "--exclude=args,other"]);
+        let cli_args = args(&["complete", "task-args", "--task=ls", "--exclude=args,other", "--", "--env", "x"]);
         let (_, command) = parse(&cli_args).unwrap();
-        let Command::Complete { context: CompleteContext::TaskArgs { task, exclude } } = command else {
+        let Command::Complete { context: CompleteContext::TaskArgs { task, exclude, args } } = command else {
             panic!("expected task-args completion context");
         };
         assert_eq!(task, "ls");
         assert_eq!(exclude, vec!["args", "other"]);
+        assert_eq!(args, &["--env".to_string(), "x".to_string()]);
     }
 }

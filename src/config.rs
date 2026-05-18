@@ -115,21 +115,24 @@ pub enum AllowMultiple {
 
 /// Per-task command-line behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CliConfig {
+pub struct CliConfig<'a> {
     pub forward_arguments: bool,
-    pub autocomplete: CliAutocomplete,
+    pub autocomplete: CliAutocomplete<'a>,
 }
 
-impl CliConfig {
+impl<'a> CliConfig<'a> {
     pub const DEFAULT: Self = Self { forward_arguments: false, autocomplete: CliAutocomplete::None };
 }
 
 /// Per-task command-line autocomplete behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CliAutocomplete {
+pub enum CliAutocomplete<'a> {
     #[default]
     None,
     Forward,
+    Schema {
+        command: &'a [&'a str],
+    },
 }
 
 /// A single cache key input that contributes to cache invalidation.
@@ -449,7 +452,7 @@ pub struct TaskConfigExpr<'a> {
     /// Controls whether multiple instances of this task can run concurrently.
     pub allow_multiple: AllowMultiple,
     /// Per-task command-line behavior.
-    pub cli: CliConfig,
+    pub cli: CliConfig<'a>,
     /// Variable metadata (description, default) for variables used in this task.
     pub vars: &'a [(&'a str, VarMeta<'a>)],
 }
@@ -467,7 +470,7 @@ pub struct TestConfigExpr<'a> {
     /// Timeout configuration for the test.
     pub timeout: Option<TimeoutConfig<'a>>,
     /// Per-test command-line behavior.
-    pub cli: CliConfig,
+    pub cli: CliConfig<'a>,
     /// Variable metadata (description, default) for variables used in this test.
     pub vars: &'a [(&'a str, VarMeta<'a>)],
 }
@@ -1014,7 +1017,7 @@ impl TaskConfigExpr<'static> {
     /// The prefix stops at the first dynamic command component. For example,
     /// `["git", "checkout", { var = "args" }]` returns `["git", "checkout"]`.
     pub fn autocomplete_forward_prefix(&self) -> Option<Vec<&'static str>> {
-        if self.cli.autocomplete != CliAutocomplete::Forward {
+        if !matches!(self.cli.autocomplete, CliAutocomplete::Forward) {
             return None;
         }
 

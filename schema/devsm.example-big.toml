@@ -40,6 +40,12 @@ cmd = ["ls", { var = "args" }]
 cli.forward-arguments = true
 cli.autocomplete = "forward"
 
+# Action forwarding CLI tokens with a script-emitted devsm autocomplete schema
+[action.with_schema_autocomplete]
+cmd = ["./cmd/dist/make.ts", { var = "args" }]
+cli.forward-arguments = true
+cli.autocomplete = { command = ["./cmd/dist/make.ts", "autocomplete-schema"] }
+
 # Action with variable metadata - description only
 [action.var_with_description]
 cmd = ["curl", { var = "url" }]

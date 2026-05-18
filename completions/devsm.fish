@@ -213,7 +213,13 @@ function __fish_devsm_task_arg_completions
         set exclude_flag "--exclude="(string join ',' $used_vars)
     end
 
-    set -l completion_data (devsm complete task-args --task=$task $exclude_flag 2>/dev/null)
+    set -l forwarded_args (__fish_devsm_forwarded_args)
+    set -l request_args $forwarded_args
+    if string match -qr '\s$' -- (commandline -b)
+        set -a request_args ""
+    end
+
+    set -l completion_data (devsm complete task-args --task=$task $exclude_flag -- $request_args 2>/dev/null)
     if test (count $completion_data) -eq 0
         return 0
     end
@@ -226,7 +232,6 @@ function __fish_devsm_task_arg_completions
 
             set -l cwd $completion_data[2]
             set -l prefix $completion_data[3..]
-            set -l forwarded_args (__fish_devsm_forwarded_args)
             set -l completion_line (string join ' ' (string escape -- $prefix $forwarded_args))
             if string match -qr '\s$' -- (commandline -b)
                 set completion_line "$completion_line "
@@ -251,6 +256,11 @@ function __fish_devsm_task_arg_completions
                 else
                     echo "--$name="
                 end
+            end
+
+        case items
+            for line in $completion_data[2..]
+                printf '%s\n' $line
             end
     end
 end

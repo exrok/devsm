@@ -83,7 +83,7 @@ fn parse_var_meta<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<VarMeta
     Ok(VarMeta { description, default })
 }
 
-fn parse_cli_config<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<CliConfig, Failed> {
+fn parse_cli_config<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<CliConfig<'a>, Failed> {
     let table = value.require_table(ctx)?;
     let mut cli = CliConfig::DEFAULT;
 
@@ -96,9 +96,25 @@ fn parse_cli_config<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<CliCo
             "autocomplete" => match val.value() {
                 Value::String(&s) if s == "forward" => cli.autocomplete = CliAutocomplete::Forward,
                 Value::String(_) => {
-                    return Err(ctx.report_expected_but_found(&"`forward`", val));
+                    return Err(ctx.report_expected_but_found(&"`forward` or a table with `command`", val));
                 }
-                _ => return Err(ctx.report_expected_but_found(&"a string", val)),
+                Value::Table(autocomplete_table) => {
+                    let mut command = None;
+                    for (autocomplete_key, autocomplete_value) in autocomplete_table {
+                        match autocomplete_key.name {
+                            "command" => command = Some(parse_string_or_array(alloc, autocomplete_value, ctx)?),
+                            _ => return Err(ctx.report_unexpected_key(0, autocomplete_value, autocomplete_key.span)),
+                        }
+                    }
+                    let Some(command) = command else {
+                        return Err(ctx.report_missing_field("command", val));
+                    };
+                    if command.is_empty() {
+                        return Err(ctx.report_custom_error("`cli.autocomplete.command` must not be empty", val));
+                    }
+                    cli.autocomplete = CliAutocomplete::Schema { command };
+                }
+                _ => return Err(ctx.report_expected_but_found(&"a string or table", val)),
             },
             _ => {
                 return Err(ctx.report_unexpected_key(0, val, key.span));
@@ -413,7 +429,7 @@ fn parse_task<'a>(
                 }
                 _ => return Err(ctx.report_expected_but_found(&"a boolean or string", value)),
             },
-            "cli" => cli = parse_cli_config(value, ctx)?,
+            "cli" => cli = parse_cli_config(alloc, value, ctx)?,
             "var" => {
                 let var_table = value.require_table(ctx)?;
                 for (var_key, var_value) in var_table {
@@ -591,7 +607,7 @@ fn parse_test<'a>(
             }
             "info" => info = value.require_string(ctx)?,
             "timeout" => timeout = Some(parse_timeout_config(value, ctx)?),
-            "cli" => cli = parse_cli_config(value, ctx)?,
+            "cli" => cli = parse_cli_config(alloc, value, ctx)?,
             "var" => {
                 let var_table = value.require_table(ctx)?;
                 for (var_key, var_value) in var_table {
@@ -1087,6 +1103,21 @@ mod test {
     }
 
     #[test]
+    fn test_cli_schema_autocomplete_valid_for_action() {
+        let text = "[action.make]\ncmd = [\"./make\", { var = \"args\" }]\ncli.forward-arguments = true\ncli.autocomplete = { command = [\"./make\", \"autocomplete-schema\"] }\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "Expected successful parse: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let (_, task) = &config.tasks[0];
+        let CliAutocomplete::Schema { command } = task.cli.autocomplete else {
+            panic!("expected schema autocomplete");
+        };
+        assert_eq!(command, &["./make", "autocomplete-schema"]);
+    }
+
+    #[test]
     fn test_cli_autocomplete_invalid_value_errors() {
         let text = "[action.list]\ncmd = [\"ls\"]\ncli.autocomplete = \"shell\"\n";
         let arena = toml_spanner::Arena::new();
@@ -1094,7 +1125,7 @@ mod test {
         let (doc, result) = parse_text(text, &arena, &bump);
         assert!(result.is_err(), "Expected error for invalid cli autocomplete value");
         let messages = collect_messages(&doc);
-        assert!(messages.iter().any(|m| m.contains("expected `forward`")), "messages: {:?}", messages);
+        assert!(messages.iter().any(|m| m.contains("expected `forward` or a table")), "messages: {:?}", messages);
     }
 
     #[test]

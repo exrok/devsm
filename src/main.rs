@@ -25,6 +25,7 @@ mod cli;
 mod clipboard;
 mod clock;
 mod collection;
+mod completion;
 mod config;
 mod daemon;
 mod db;
@@ -1273,7 +1274,7 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             }
             true
         }
-        cli::CompleteContext::TaskArgs { task, exclude } => {
+        cli::CompleteContext::TaskArgs { task, exclude, args } => {
             let Ok(workspace) = config::load_from_env() else {
                 return false;
             };
@@ -1289,7 +1290,15 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             let Some((expr, _)) = resolve_completion_task_expr(&workspace, task) else {
                 return false;
             };
-            if expr.cli.autocomplete == config::CliAutocomplete::Forward {
+            let (_, profile) = task.rsplit_once(':').unwrap_or((task, ""));
+            if let Some(items) = completion::complete_schema_task(&workspace, expr, task, profile, args) {
+                println!("items");
+                for item in items {
+                    print_completion(&item.value, item.description.as_deref());
+                }
+                return true;
+            }
+            if matches!(expr.cli.autocomplete, config::CliAutocomplete::Forward) {
                 return true;
             }
             println!("vars");

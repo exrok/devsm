@@ -4,6 +4,7 @@ use crate::harness;
 
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -1083,6 +1084,61 @@ var.name = {{ description = "Name to print" }}
     assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
     let lines: Vec<&str> = result.stdout.lines().collect();
     assert_eq!(lines, vec!["vars", "name\tName to print"]);
+}
+
+#[test]
+fn complete_task_args_returns_schema_items() {
+    let harness = TestHarness::new("complete_schema_items");
+    let work_dir = harness.temp_dir.join("work");
+    fs::create_dir_all(&work_dir).expect("create task pwd");
+    let schema_script = harness.temp_dir.join("schema.sh");
+    fs::write(
+        &schema_script,
+        format!(
+            r#"#!/bin/sh
+if [ "$SCHEMA_ENV" != "schema-env" ]; then
+    exit 2
+fi
+if [ "$PWD" != "{}" ]; then
+    exit 3
+fi
+printf '%s\n' '{{"version":1,"options":[{{"name":"env","short":"e","description":"Target environment","value":{{"name":"ENV","candidates":["xo",{{"value":"demo","description":"Demo env"}}]}}}},{{"name":"deploy","description":"Deploy build"}},{{"name":"component","repeatable":true,"value":{{"candidates":["libra_webserver"]}}}}]}}'
+"#,
+            work_dir.display()
+        ),
+    )
+    .expect("write schema script");
+    let mut permissions = fs::metadata(&schema_script).expect("schema metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&schema_script, permissions).expect("chmod schema script");
+
+    harness.write_config(&format!(
+        r#"
+[action.make]
+pwd = "{work_dir}"
+cmd = ["true", {{ var = "args" }}]
+env.SCHEMA_ENV = "schema-env"
+cli.forward-arguments = true
+cli.autocomplete = {{ command = ["{schema_script}"] }}
+"#,
+        work_dir = work_dir.display(),
+        schema_script = schema_script.display()
+    ));
+
+    let result = harness.run_client(&["complete", "task-args", "--task=make", "--", ""]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+    let lines: Vec<&str> = result.stdout.lines().collect();
+    assert_eq!(lines, vec!["items", "--env\tTarget environment", "--deploy\tDeploy build", "--component"]);
+
+    let result = harness.run_client(&["complete", "task-args", "--task=make", "--", "--env", "d"]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+    let lines: Vec<&str> = result.stdout.lines().collect();
+    assert_eq!(lines, vec!["items", "demo\tDemo env"]);
+
+    let result = harness.run_client(&["complete", "task-args", "--task=make", "--", "--deploy", ""]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+    let lines: Vec<&str> = result.stdout.lines().collect();
+    assert_eq!(lines, vec!["items", "--env\tTarget environment", "--component"]);
 }
 
 #[test]

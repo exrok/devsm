@@ -401,9 +401,26 @@
           "description": "When true, tokens after the task name in 'devsm run' or 'devsm exec' are forwarded as the 'args' variable."
         },
         "autocomplete": {
-          "type": "string",
-          "enum": ["forward"],
-          "description": "When set to 'forward', fish completions after the task name are forwarded to the static command prefix before the forwarded arguments."
+          "description": "Task argument autocomplete behavior. Use 'forward' to delegate to the underlying command, or a command table to emit a devsm completion schema.",
+          "oneOf": [
+            {
+              "type": "string",
+              "enum": ["forward"]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["command"],
+              "properties": {
+                "command": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string" },
+                  "description": "Command run in the task pwd/env to print a version 1 devsm autocomplete schema as JSON."
+                }
+              }
+            }
+          ]
         }
       }
     },
