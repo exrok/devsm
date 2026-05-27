@@ -455,6 +455,182 @@ fn send_termination(encoder: &mut Encoder, socket: &mut Option<UnixStream>) {
     encoder.clear();
 }
 
+fn write_run_group_log_entry(
+    file: &mut File,
+    entry: &LogEntry,
+    logs: &Logs,
+    task_names: &[String],
+    with_taskname: bool,
+) -> std::io::Result<()> {
+    if with_taskname {
+        let bti = entry.log_group.base_task_index();
+        let task_name = task_names.get(bti.idx()).map(|s| s.as_str()).unwrap_or("?");
+        let color = SPAN_COLORS[bti.idx() % SPAN_COLORS.len()];
+        write!(file, "{} {} \x1b[m ", color, task_name)?;
+    }
+
+    let text = unsafe { entry.text(logs) };
+    file.write_all(text.as_bytes())?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+fn run_group_log_metadata(workspace: &Workspace, log_groups: &[LogGroup]) -> (Vec<String>, bool) {
+    let state = workspace.state.read().unwrap();
+    let mut task_names = Vec::new();
+    let mut base_tasks = Vec::new();
+    for log_group in log_groups {
+        let bti = log_group.base_task_index();
+        if !base_tasks.contains(&bti) {
+            base_tasks.push(bti);
+        }
+        while task_names.len() <= bti.idx() {
+            task_names.push(String::new());
+        }
+        task_names[bti.idx()] =
+            state.base_tasks.get(bti.idx()).map(|bt| bt.name.to_string()).unwrap_or_else(|| "?".to_string());
+    }
+    (task_names, base_tasks.len() > 1)
+}
+
+fn forward_new_group_logs(
+    file: &mut File,
+    workspace: &Workspace,
+    log_groups: &[LogGroup],
+    task_names: &[String],
+    with_taskname: bool,
+    last_log_id: &mut LogId,
+) -> anyhow::Result<()> {
+    let logs = workspace.logs.read().unwrap();
+    let current_tail = logs.tail();
+
+    if *last_log_id >= current_tail {
+        return Ok(());
+    }
+
+    let (a, b) = logs.slices_range(*last_log_id, LogId(current_tail.0.saturating_sub(1)));
+    for slice in [a, b] {
+        for entry in slice {
+            if !log_groups.contains(&entry.log_group) {
+                continue;
+            }
+            let _ = write_run_group_log_entry(file, entry, &logs, task_names, with_taskname);
+        }
+    }
+    let _ = file.flush();
+
+    *last_log_id = current_tail;
+    Ok(())
+}
+
+fn group_exit_state(workspace: &Workspace, jobs: &[JobIndex]) -> (bool, Option<i32>, Option<RpcExitCause>) {
+    let state = workspace.state.read().unwrap();
+    let mut all_terminal = true;
+    let mut aggregate_code = Some(0);
+    let mut aggregate_cause = Some(RpcExitCause::Unknown);
+
+    for &job_index in jobs {
+        let Some(job) = state.jobs.get(job_index) else {
+            continue;
+        };
+        match &job.process_status {
+            JobStatus::Scheduled { .. } | JobStatus::Starting | JobStatus::Running { .. } => {
+                all_terminal = false;
+            }
+            JobStatus::Exited { status, cause, .. } => {
+                let (code, rpc_cause) = match cause {
+                    ExitCause::Killed => (-1, RpcExitCause::Killed),
+                    ExitCause::Restarted => (-1, RpcExitCause::Restarted),
+                    ExitCause::Unknown => (*status as i32, RpcExitCause::Unknown),
+                    ExitCause::SpawnFailed => (*status as i32, RpcExitCause::SpawnFailed),
+                    ExitCause::ProfileConflict => (-1, RpcExitCause::ProfileConflict),
+                    ExitCause::Timeout => (-1, RpcExitCause::Timeout),
+                };
+                if aggregate_code == Some(0) && code != 0 {
+                    aggregate_code = Some(code);
+                    aggregate_cause = Some(rpc_cause);
+                }
+            }
+            JobStatus::Cancelled => {
+                if aggregate_code == Some(0) {
+                    aggregate_code = Some(-1);
+                    aggregate_cause = Some(RpcExitCause::Killed);
+                }
+            }
+        }
+    }
+
+    (all_terminal, aggregate_code, aggregate_cause)
+}
+
+pub fn run_many(
+    stdin: File,
+    mut stdout: File,
+    mut socket: Option<UnixStream>,
+    workspace: &Workspace,
+    jobs: Vec<JobIndex>,
+    log_groups: Vec<LogGroup>,
+    channel: Arc<ClientChannel>,
+) -> anyhow::Result<()> {
+    let mut last_log_id = workspace.logs.read().unwrap().head();
+    let mut encoder = Encoder::new();
+    let stdin_is_tty = unsafe { libc::isatty(stdin.as_raw_fd()) == 1 };
+    let mut stdin_closed = !stdin_is_tty;
+    let (task_names, with_taskname) = run_group_log_metadata(workspace, &log_groups);
+
+    loop {
+        if channel.is_terminated() {
+            forward_new_group_logs(&mut stdout, workspace, &log_groups, &task_names, with_taskname, &mut last_log_id)?;
+            send_termination(&mut encoder, &mut socket);
+            break;
+        }
+
+        forward_new_group_logs(&mut stdout, workspace, &log_groups, &task_names, with_taskname, &mut last_log_id)?;
+        let (group_exited, exit_code, cause) = group_exit_state(workspace, &jobs);
+        if group_exited {
+            send_exit_status(
+                &mut encoder,
+                &mut socket,
+                exit_code.unwrap_or(0),
+                0,
+                cause.unwrap_or(RpcExitCause::Unknown),
+            );
+            send_termination(&mut encoder, &mut socket);
+            break;
+        }
+
+        if stdin_closed {
+            let _ = channel.waker.wait();
+        } else {
+            match extui::event::poll_with_custom_waker(&stdin, Some(&channel.waker), None) {
+                Ok(extui::event::Polled::ReadReady) => {
+                    let mut buf = [0u8; 64];
+                    let n = unsafe { libc::read(stdin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n == 0 {
+                        if stdin_is_tty {
+                            forward_new_group_logs(
+                                &mut stdout,
+                                workspace,
+                                &log_groups,
+                                &task_names,
+                                with_taskname,
+                                &mut last_log_id,
+                            )?;
+                            let _ = stdout.write_all(b"Detached. Group will continue running in background.\n");
+                            send_termination(&mut encoder, &mut socket);
+                            break;
+                        }
+                        stdin_closed = true;
+                    }
+                }
+                Ok(extui::event::Polled::Woken) | Ok(extui::event::Polled::TimedOut) | Err(_) => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Forwards log output for a specific job to the client's stdout.
 ///
 /// Runs in a loop, blocking on the waker until new logs arrive or termination

@@ -720,16 +720,38 @@ fn run_client(
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
     let workspace_config = config::load_from_env()?;
-    let (name, _profile) = job.rsplit_once(':').unwrap_or((job, ""));
+    let (name, profile) = job.rsplit_once(':').unwrap_or((job, ""));
     let bare_task_name = name.split_once('.').map_or(name, |(_, rest)| rest).to_string();
 
-    let resolved = resolve_name_in_config(&workspace_config, name);
+    let resolved =
+        if is_explicit_group_reference(name) { None } else { resolve_name_in_config(&workspace_config, name) };
+    let group = if resolved.is_none() { resolve_group_in_config(&workspace_config, name) } else { None };
+    if let Some(group_name) = group {
+        if !profile.is_empty() || !params.entries().is_empty() || !trailing_args.is_empty() {
+            bail!("Group '{}' does not support profiles, parameters, or trailing arguments", group_name);
+        }
+        if as_test {
+            bail!("Group '{}' cannot be run with --as-test", group_name);
+        }
+        if derive_cache_key {
+            bail!("Group '{}' cannot be run with --derive-cache-key", group_name);
+        }
+    }
+
     let task_expr = match resolved {
         Some((_, expr)) => expr,
         None if name == "~cargo" => &config::CARGO_AUTO_EXPR,
+        None if group.is_some() => &config::CARGO_AUTO_EXPR,
+        None if is_explicit_group_reference(name) => {
+            bail!("Group not found: {}", name.strip_prefix("group.").unwrap_or(name))
+        }
         None => bail!("Task not found: {}", name),
     };
-    let params = build_task_params(task_expr, params, trailing_args, Some((&mut as_test, &mut derive_cache_key)))?;
+    let params = if group.is_some() {
+        params
+    } else {
+        build_task_params(task_expr, params, trailing_args, Some((&mut as_test, &mut derive_cache_key)))?
+    };
     let as_test = match resolved {
         Some((kind, _)) => as_test || kind == config::TaskKind::Test,
         None => as_test,
@@ -855,6 +877,7 @@ fn auto_task_command(job: &str, params: jsony_value::ValueMap, trailing_args: &[
     let (name, _) = job.rsplit_once(':').unwrap_or((job, ""));
 
     if name != "~cargo"
+        && !is_explicit_group_reference(name)
         && let Some((_, expr)) = resolve_name_in_config(&workspace_config, name)
         && expr.managed == Some(false)
     {
@@ -937,6 +960,7 @@ fn resolve_name_in_config(
         Some(("service", rest)) => (Some(TaskKind::Service), rest),
         Some(("action", rest)) => (Some(TaskKind::Action), rest),
         Some(("test", rest)) => (Some(TaskKind::Test), rest),
+        Some(("group", _)) => return None,
         _ => (None, name),
     };
 
@@ -960,6 +984,23 @@ fn resolve_name_in_config(
     None
 }
 
+fn group_lookup_short_name(name: &str) -> Option<&str> {
+    match name.split_once('.') {
+        Some(("group", rest)) => Some(rest),
+        Some(("service" | "action" | "test", _)) => None,
+        _ => Some(name),
+    }
+}
+
+fn is_explicit_group_reference(name: &str) -> bool {
+    name.split_once('.').is_some_and(|(namespace, _)| namespace == "group")
+}
+
+fn resolve_group_in_config(config: &config::WorkspaceConfig<'static>, name: &str) -> Option<&'static str> {
+    let short = group_lookup_short_name(name)?;
+    config.groups.iter().find(|(group, _)| *group == short).map(|(group, _)| *group)
+}
+
 /// Executes a task directly, bypassing the daemon and ignoring dependencies.
 fn exec_task(job: &str, params: jsony_value::ValueMap, trailing_args: &[String]) -> anyhow::Result<()> {
     let workspace_config = config::load_from_env()?;
@@ -968,10 +1009,18 @@ fn exec_task(job: &str, params: jsony_value::ValueMap, trailing_args: &[String])
     let task_expr = if name == "~cargo" {
         &config::CARGO_AUTO_EXPR
     } else {
-        let Some((_, expr)) = resolve_name_in_config(&workspace_config, name) else {
-            bail!("Task not found: {}", name);
-        };
-        expr
+        let resolved =
+            if is_explicit_group_reference(name) { None } else { resolve_name_in_config(&workspace_config, name) };
+        match resolved {
+            Some((_, expr)) => expr,
+            None if resolve_group_in_config(&workspace_config, name).is_some() => {
+                bail!("exec is not supported for groups");
+            }
+            None if is_explicit_group_reference(name) => {
+                bail!("Group not found: {}", name.strip_prefix("group.").unwrap_or(name));
+            }
+            None => bail!("Task not found: {}", name),
+        }
     };
 
     if task_expr.managed == Some(true) {

@@ -935,6 +935,11 @@ pub struct WorkspaceState {
     pub session_functions: hashbrown::HashMap<String, FunctionAction>,
     /// The most recent test group (persists across runs for rerun functionality).
     pub last_test_group: Option<TestGroup>,
+    /// Jobs returned by group invocations, keyed by configured group name.
+    /// This lets `devsm stop <group>` stop the work that was launched through
+    /// that group without blindly killing every task that happens to share a
+    /// base task with the group.
+    pub group_jobs: hashbrown::HashMap<Box<str>, Vec<JobIndex>>,
     /// Daemon-lifetime intern table for `{ resource = "..." }` requirements,
     /// plus the current holder of each resource.
     pub resources: ResourceSlab,
@@ -1063,6 +1068,7 @@ impl WorkspaceState {
             Some(("service", rest)) => (Some(TaskKind::Service), rest),
             Some(("action", rest)) => (Some(TaskKind::Action), rest),
             Some(("test", rest)) => (Some(TaskKind::Test), rest),
+            Some(("group", _)) => return None,
             _ => (None, name),
         };
         let entry = self.name_map.get(short)?;
@@ -1102,6 +1108,54 @@ impl WorkspaceState {
             return Some(index);
         }
         self.lookup_name(name)
+    }
+
+    pub fn is_explicit_group_reference(name: &str) -> bool {
+        name.split_once('.').is_some_and(|(namespace, _)| namespace == "group")
+    }
+
+    fn group_lookup_short_name(name: &str) -> Option<&str> {
+        match name.split_once('.') {
+            Some(("group", rest)) => Some(rest),
+            Some(("service" | "action" | "test", _)) => None,
+            _ => Some(name),
+        }
+    }
+
+    fn group_task_specs(&self, name: &str, force_restart: bool) -> Option<(String, Vec<TaskSpec>)> {
+        let short = Self::group_lookup_short_name(name)?;
+        let (group_name, tasks) = self.config.current.workspace().groups.iter().find(|(group, _)| *group == short)?;
+        let specs = tasks
+            .iter()
+            .map(|task| TaskSpec {
+                name: task.name.to_string(),
+                profile: task.profile.unwrap_or_default().to_string(),
+                params: task.vars.clone().to_owned(),
+                force_restart,
+                trace: false,
+            })
+            .collect();
+        Some(((*group_name).to_string(), specs))
+    }
+
+    fn lookup_group_name(&self, name: &str) -> Option<String> {
+        let short = Self::group_lookup_short_name(name)?;
+        self.config
+            .current
+            .workspace()
+            .groups
+            .iter()
+            .find(|(group, _)| *group == short)
+            .map(|(group, _)| (*group).to_string())
+    }
+
+    fn record_group_jobs(&mut self, group_name: &str, jobs: &[JobIndex]) {
+        let entry = self.group_jobs.entry(group_name.into()).or_default();
+        for &job in jobs {
+            if !entry.contains(&job) {
+                entry.push(job);
+            }
+        }
     }
 
     fn refresh_config(&mut self) {
@@ -1858,6 +1912,62 @@ impl WorkspaceState {
         None
     }
 
+    fn terminate_job_indices(
+        &mut self,
+        channel: &MioChannel,
+        label: &str,
+        name: &str,
+        job_indices: Vec<JobIndex>,
+    ) -> String {
+        self.change_number = self.change_number.wrapping_add(1);
+
+        let mut seen = hashbrown::HashSet::new();
+        let mut jobs_to_cancel = Vec::new();
+        let mut killed_count = 0u32;
+        let mut cancelled_count = 0u32;
+
+        for job_index in job_indices {
+            if !seen.insert(job_index) {
+                continue;
+            }
+            if self.jobs.get(job_index).is_none() {
+                continue;
+            }
+            let job = &self.jobs[job_index];
+            match &job.process_status {
+                JobStatus::Running { process_index, .. } => {
+                    kvlog::info!("Terminating running job", label, name, job_index, process_index);
+                    channel.send(crate::event_loop::ProcessRequest::TerminateJob {
+                        job_id: job.log_group,
+                        process_index: *process_index,
+                        exit_cause: ExitCause::Killed,
+                    });
+                    killed_count += 1;
+                }
+                JobStatus::Starting => {
+                    kvlog::warn!("Job is in Starting state during termination", label, name, job_index);
+                }
+                JobStatus::Scheduled { .. } => {
+                    kvlog::info!("Cancelling scheduled job", label, name, job_index);
+                    jobs_to_cancel.push(job_index);
+                    cancelled_count += 1;
+                }
+                JobStatus::Exited { .. } | JobStatus::Cancelled => {}
+            }
+        }
+
+        for job_index in jobs_to_cancel {
+            self.update_job_status(job_index, JobStatus::Cancelled);
+        }
+
+        match (killed_count, cancelled_count) {
+            (0, 0) => format!("{} '{}' was already finished", label, name),
+            (k, 0) => format!("{} '{}' terminated ({} killed)", label, name, k),
+            (0, c) => format!("{} '{}' cancelled ({} scheduled)", label, name, c),
+            (k, c) => format!("{} '{}' terminated ({} killed, {} cancelled)", label, name, k, c),
+        }
+    }
+
     /// Layer 2: Find task by name and terminate all running instances.
     ///
     /// Accepts task name or numeric index. Returns a message describing the result.
@@ -1874,56 +1984,19 @@ impl WorkspaceState {
         };
 
         let bt = &self.base_tasks[index.idx()];
-
-        let has_non_terminal = !bt.jobs.non_terminal().is_empty();
-
-        if !has_non_terminal {
-            return Ok(format!("Task '{}' was already finished", bt.name));
-        }
-
         let task_name = bt.name.to_string();
-        self.change_number = self.change_number.wrapping_add(1);
+        let job_indices = bt.jobs.non_terminal().to_vec();
 
-        let mut jobs_to_cancel = Vec::new();
-        let mut killed_count = 0u32;
-        let mut cancelled_count = 0u32;
+        Ok(self.terminate_job_indices(channel, "Task", &task_name, job_indices))
+    }
 
-        for &job_index in bt.jobs.non_terminal() {
-            let job = &self.jobs[job_index];
-            match &job.process_status {
-                JobStatus::Running { process_index, .. } => {
-                    kvlog::info!("Terminating running job", task_name, job_index, process_index);
-                    channel.send(crate::event_loop::ProcessRequest::TerminateJob {
-                        job_id: job.log_group,
-                        process_index: *process_index,
-                        exit_cause: ExitCause::Killed,
-                    });
-                    killed_count += 1;
-                }
-                JobStatus::Starting => {
-                    kvlog::warn!("Job is in Starting state during termination", task_name, job_index);
-                }
-                JobStatus::Scheduled { .. } => {
-                    kvlog::info!("Cancelling scheduled job", task_name, job_index);
-                    jobs_to_cancel.push(job_index);
-                    cancelled_count += 1;
-                }
-                JobStatus::Exited { .. } | JobStatus::Cancelled => {}
-            }
-        }
-
-        for job_index in jobs_to_cancel {
-            self.update_job_status(job_index, JobStatus::Cancelled);
-        }
-
-        let msg = match (killed_count, cancelled_count) {
-            (0, 0) => format!("Task '{}' was already finished", task_name),
-            (k, 0) => format!("Task '{}' terminated ({} killed)", task_name, k),
-            (0, c) => format!("Task '{}' cancelled ({} scheduled)", task_name, c),
-            (k, c) => format!("Task '{}' terminated ({} killed, {} cancelled)", task_name, k, c),
+    pub fn lookup_and_terminate_group(&mut self, channel: &MioChannel, name: &str) -> Result<String, String> {
+        let Some(group_name) = self.lookup_group_name(name) else {
+            let short = Self::group_lookup_short_name(name).unwrap_or(name);
+            return Err(format!("Group '{}' not found", short));
         };
-
-        Ok(msg)
+        let job_indices = self.group_jobs.get(group_name.as_str()).cloned().unwrap_or_default();
+        Ok(self.terminate_job_indices(channel, "Group", &group_name, job_indices))
     }
 }
 impl std::ops::IndexMut<JobIndex> for WorkspaceState {
@@ -2193,6 +2266,11 @@ impl WorkspaceState {
         self.test_jobs.retain_live(still_live);
         self.service_jobs.retain_live(still_live);
 
+        for jobs in self.group_jobs.values_mut() {
+            jobs.retain(|ji| still_live(*ji));
+        }
+        self.group_jobs.retain(|_, jobs| !jobs.is_empty());
+
         if let Some(tg) = &mut self.last_test_group {
             // `base_tasks` and `job_indices` are parallel arrays. Filter both
             // in lockstep so positions stay aligned for rerun and narrow.
@@ -2236,6 +2314,7 @@ impl WorkspaceState {
             service_dependents: ServiceDependents::default(),
             session_functions: hashbrown::HashMap::new(),
             last_test_group: None,
+            group_jobs: hashbrown::HashMap::new(),
             resources: ResourceSlab::default(),
             require_analysis,
             cache_key_hasher: CacheKeyHasher::new(),
@@ -2863,26 +2942,85 @@ impl SpawnSpec {
 
 pub struct SubmitResult {
     pub jobs: Vec<(BaseTaskIndex, JobIndex)>,
+    pub group_names: Vec<String>,
 }
 
 impl Workspace {
-    pub fn submit(&self, spec: SpawnSpec) -> Result<SubmitResult, String> {
+    fn submit_impl(&self, spec: SpawnSpec, start: bool) -> Result<SubmitResult, String> {
         let state = &mut *self.state.write().unwrap();
         state.refresh_config();
         state.change_number = state.change_number.wrapping_add(1);
 
         let mut jobs = Vec::new();
+        let mut group_names = Vec::new();
         for task in &spec.tasks {
-            let (bti, ji) = state.lookup_and_spawn_task_with_trace(
-                self.workspace_id,
-                &self.process_channel,
-                &task.name,
-                task.params.clone(),
-                &task.profile,
-                task.force_restart,
-                task.trace,
-            )?;
-            jobs.push((bti, ji));
+            let explicit_group = WorkspaceState::is_explicit_group_reference(&task.name);
+            if !explicit_group && state.base_index_by_name(&task.name).is_some() {
+                let (bti, ji) = if start {
+                    state.lookup_and_start_task_with_trace(
+                        self.workspace_id,
+                        &self.process_channel,
+                        &task.name,
+                        task.params.clone(),
+                        &task.profile,
+                        task.trace,
+                    )?
+                } else {
+                    state.lookup_and_spawn_task_with_trace(
+                        self.workspace_id,
+                        &self.process_channel,
+                        &task.name,
+                        task.params.clone(),
+                        &task.profile,
+                        task.force_restart,
+                        task.trace,
+                    )?
+                };
+                jobs.push((bti, ji));
+                continue;
+            }
+
+            let Some((group_name, group_tasks)) = state.group_task_specs(&task.name, task.force_restart) else {
+                if explicit_group {
+                    let short = task.name.split_once('.').map_or(task.name.as_str(), |(_, rest)| rest);
+                    return Err(format!("Group '{}' not found", short));
+                }
+                return Err(format!("Task '{}' not found", task.name));
+            };
+
+            if !task.profile.is_empty() || !task.params.entries().is_empty() {
+                return Err(format!("Group '{}' does not support profiles or parameters", group_name));
+            }
+
+            let mut group_job_indices = Vec::new();
+            for group_task in group_tasks {
+                let (bti, ji) = if start {
+                    state.lookup_and_start_task_with_trace(
+                        self.workspace_id,
+                        &self.process_channel,
+                        &group_task.name,
+                        group_task.params,
+                        &group_task.profile,
+                        false,
+                    )?
+                } else {
+                    state.lookup_and_spawn_task_with_trace(
+                        self.workspace_id,
+                        &self.process_channel,
+                        &group_task.name,
+                        group_task.params,
+                        &group_task.profile,
+                        group_task.force_restart,
+                        false,
+                    )?
+                };
+                group_job_indices.push(ji);
+                jobs.push((bti, ji));
+            }
+            state.record_group_jobs(&group_name, &group_job_indices);
+            if !group_names.contains(&group_name) {
+                group_names.push(group_name);
+            }
         }
 
         if spec.test_group && !jobs.is_empty() {
@@ -2894,37 +3032,15 @@ impl Workspace {
             });
         }
 
-        Ok(SubmitResult { jobs })
+        Ok(SubmitResult { jobs, group_names })
+    }
+
+    pub fn submit(&self, spec: SpawnSpec) -> Result<SubmitResult, String> {
+        self.submit_impl(spec, false)
     }
 
     pub fn submit_start(&self, spec: SpawnSpec) -> Result<SubmitResult, String> {
-        let state = &mut *self.state.write().unwrap();
-        state.refresh_config();
-        state.change_number = state.change_number.wrapping_add(1);
-
-        let mut jobs = Vec::new();
-        for task in &spec.tasks {
-            let (bti, ji) = state.lookup_and_start_task_with_trace(
-                self.workspace_id,
-                &self.process_channel,
-                &task.name,
-                task.params.clone(),
-                &task.profile,
-                task.trace,
-            )?;
-            jobs.push((bti, ji));
-        }
-
-        if spec.test_group && !jobs.is_empty() {
-            let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
-            state.last_test_group = Some(TestGroup {
-                group_id,
-                base_tasks: jobs.iter().map(|(bti, _)| *bti).collect(),
-                job_indices: jobs.iter().map(|(_, ji)| *ji).collect(),
-            });
-        }
-
-        Ok(SubmitResult { jobs })
+        self.submit_impl(spec, true)
     }
 
     pub fn call_function(&self, name: &str) -> Result<Option<FunctionGlobalAction>, String> {
@@ -3184,8 +3300,23 @@ impl Workspace {
         cached: bool,
         force_restart: bool,
     ) -> Result<Option<String>, String> {
+        self.refresh_config_if_changed();
+        {
+            let state = self.state.read().unwrap();
+            let resolves_as_group = WorkspaceState::is_explicit_group_reference(name)
+                || (state.lookup_name(name).is_none() && state.lookup_group_name(name).is_some());
+            if resolves_as_group {
+                if !profile.is_empty() || !params.entries().is_empty() {
+                    let group_name = state.lookup_group_name(name).unwrap_or_else(|| name.to_string());
+                    return Err(format!("Group '{}' does not support profiles or parameters", group_name));
+                }
+                drop(state);
+                self.submit(SpawnSpec::task(name, "", ValueMap::new(), force_restart))?;
+                return Ok(None);
+            }
+        }
+
         if cached {
-            self.refresh_config_if_changed();
             // Phase 1: Gather info needed for cache key computation (hold lock briefly)
             let (cache_info, profile) = {
                 let state = self.state.read().unwrap();
@@ -3306,6 +3437,18 @@ impl Workspace {
         self.refresh_config_if_changed();
         {
             let state = self.state.read().unwrap();
+            let resolves_as_group = WorkspaceState::is_explicit_group_reference(name)
+                || (state.lookup_name(name).is_none() && state.lookup_group_name(name).is_some());
+            if resolves_as_group {
+                if !profile.is_empty() || !params.entries().is_empty() {
+                    let group_name = state.lookup_group_name(name).unwrap_or_else(|| name.to_string());
+                    return Err(format!("Group '{}' does not support profiles or parameters", group_name));
+                }
+                drop(state);
+                self.submit_start(SpawnSpec::task(name, "", ValueMap::new(), false))?;
+                return Ok(None);
+            }
+
             let Some(base_index) = state.lookup_name(name) else {
                 return Err(format!("Task '{}' not found", name));
             };
@@ -3339,6 +3482,11 @@ impl Workspace {
     pub fn terminate_task_by_name(&self, name: &str) -> Result<String, String> {
         let state = &mut *self.state.write().unwrap();
         state.refresh_config();
+        if WorkspaceState::is_explicit_group_reference(name)
+            || (state.lookup_name(name).is_none() && state.lookup_group_name(name).is_some())
+        {
+            return state.lookup_and_terminate_group(&self.process_channel, name);
+        }
         state.lookup_and_terminate_task(&self.process_channel, name)
     }
 

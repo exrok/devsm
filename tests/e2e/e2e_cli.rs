@@ -64,6 +64,124 @@ sh = "exit 42"
 }
 
 #[test]
+fn run_group_bare_and_explicit_namespace() {
+    let mut harness = TestHarness::new("run_group_cli");
+    harness.write_config(
+        r#"
+[action.alpha]
+sh = "echo alpha-run"
+
+[action.beta]
+sh = "echo beta-run"
+
+[group]
+combo = ["alpha", "beta"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["combo"]);
+    assert!(result.success(), "bare group failed: {}", result.stderr);
+    assert!(result.stdout.contains("alpha-run"), "missing alpha output: {}", result.stdout);
+    assert!(result.stdout.contains("beta-run"), "missing beta output: {}", result.stdout);
+    assert!(result.stderr.contains("Task exited (code 0)"), "missing exit status: {}", result.stderr);
+
+    let result = harness.run_client(&["run", "group.combo"]);
+    assert!(result.success(), "explicit group failed: {}", result.stderr);
+    assert!(result.stdout.contains("alpha-run"), "missing alpha output: {}", result.stdout);
+    assert!(result.stdout.contains("beta-run"), "missing beta output: {}", result.stdout);
+}
+
+#[test]
+fn group_is_lowest_priority_for_bare_names() {
+    let mut harness = TestHarness::new("group_lowest_priority");
+    harness.write_config(
+        r#"
+[action.combo]
+sh = "echo task-wins"
+
+[action.alpha]
+sh = "echo group-ran"
+
+[group]
+combo = ["alpha"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "combo"]);
+    assert!(result.success(), "task run failed: {}", result.stderr);
+    assert!(result.stdout.contains("task-wins"), "bare name should run task: {}", result.stdout);
+    assert!(!result.stdout.contains("group-ran"), "bare name should not fall through to group: {}", result.stdout);
+
+    let result = harness.run_client(&["run", "group.combo"]);
+    assert!(result.success(), "group run failed: {}", result.stderr);
+    assert!(result.stdout.contains("group-ran"), "explicit group should run group: {}", result.stdout);
+}
+
+#[test]
+fn exec_group_errors() {
+    let mut harness = TestHarness::new("exec_group_errors");
+    harness.write_config(
+        r#"
+[action.alpha]
+sh = "echo alpha"
+
+[group]
+combo = ["alpha"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["exec", "combo"]);
+    assert!(!result.success(), "exec group should fail");
+    assert!(result.stderr.contains("exec is not supported for groups"), "unexpected stderr: {}", result.stderr);
+}
+
+#[test]
+fn start_restart_stop_group_services() {
+    let mut harness = TestHarness::new("group_state_actions");
+    let starts = harness.temp_dir.join("starts.txt");
+    let stopped_a = harness.temp_dir.join("a.stopped");
+    let stopped_b = harness.temp_dir.join("b.stopped");
+    harness.write_config(&format!(
+        r#"
+[service.a]
+sh = "echo a >> {starts}; trap 'echo a > {stopped_a}; exit 0' INT; while true; do sleep 0.1; done"
+
+[service.b]
+sh = "echo b >> {starts}; trap 'echo b > {stopped_b}; exit 0' INT; while true; do sleep 0.1; done"
+
+[group]
+dev = ["a", "b"]
+"#,
+        starts = starts.display(),
+        stopped_a = stopped_a.display(),
+        stopped_b = stopped_b.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "dev"]);
+    assert!(result.success(), "start group failed: {}", result.stderr);
+    assert!(wait_for_line_count(&starts, "a", 1, Duration::from_secs(3)), "service a did not start");
+    assert!(wait_for_line_count(&starts, "b", 1, Duration::from_secs(3)), "service b did not start");
+
+    let result = harness.run_client(&["restart", "group.dev"]);
+    assert!(result.success(), "restart group failed: {}", result.stderr);
+    assert!(wait_for_line_count(&starts, "a", 2, Duration::from_secs(3)), "service a did not restart");
+    assert!(wait_for_line_count(&starts, "b", 2, Duration::from_secs(3)), "service b did not restart");
+
+    let result = harness.run_client(&["stop", "dev"]);
+    assert!(result.success(), "stop group failed: {}", result.stderr);
+    assert!(harness.wait_for_file(&stopped_a, Duration::from_secs(3)), "service a was not stopped");
+    assert!(harness.wait_for_file(&stopped_b, Duration::from_secs(3)), "service b was not stopped");
+}
+
+#[test]
 fn test_command_passes() {
     let mut harness = TestHarness::new("test_passes");
     harness.write_config(
@@ -1097,6 +1215,36 @@ var.name = {{ description = "Name to print" }}
     assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
     let lines: Vec<&str> = result.stdout.lines().collect();
     assert_eq!(lines, vec!["vars", "name\tName to print"]);
+}
+
+#[test]
+fn fish_runnable_completions_do_not_duplicate_group_namespace() {
+    let completion_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("completions/devsm.fish");
+    let script = format!(
+        r#"
+function devsm
+    set -l joined (string join ' ' -- $argv)
+    switch $joined
+        case 'self complete tasks'
+            printf '%s\n' build serve
+        case 'self complete groups'
+            printf '%s\n' dev ci
+    end
+end
+
+source {}
+__fish_devsm_runnables
+"#,
+        completion_path.display()
+    );
+
+    let Ok(output) = Command::new("fish").arg("-c").arg(script).output() else {
+        return;
+    };
+    assert!(output.status.success(), "fish failed: {}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines, vec!["build", "serve", "dev", "ci"]);
 }
 
 #[test]

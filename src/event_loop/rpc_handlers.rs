@@ -144,7 +144,7 @@ fn handle_tui_client_read(rpc_reader: &mut RpcClientStream, client: &mut ClientE
     }
 }
 
-fn handle_run_client_read(rpc_reader: &mut RpcClientStream, log_group: LogGroup, state: &mut State) {
+fn handle_run_client_read(rpc_reader: &mut RpcClientStream, log_groups: &[LogGroup], state: &mut State) {
     let mut kill_task = false;
     while let Some(message) = rpc_reader.next() {
         match message.kind {
@@ -158,9 +158,8 @@ fn handle_run_client_read(rpc_reader: &mut RpcClientStream, log_group: LogGroup,
 
     if kill_task {
         for (_, process) in &mut state.processes {
-            if process.log_group == log_group {
+            if log_groups.contains(&process.log_group) {
                 process.request_termination(ExitCause::Killed);
-                break;
             }
         }
     }
@@ -466,7 +465,7 @@ impl EventLoop {
                 return;
             }
             ClientKind::Tui => handle_tui_client_read(&mut rpc_stream, client),
-            ClientKind::Run { log_group } => handle_run_client_read(&mut rpc_stream, *log_group, &mut self.state),
+            ClientKind::Run { log_groups } => handle_run_client_read(&mut rpc_stream, log_groups, &mut self.state),
             ClientKind::TestRun => handle_test_run_client_read(&mut rpc_stream),
             ClientKind::SelfLogs => handle_self_logs_client_read(&mut rpc_stream),
             ClientKind::Logs => handle_logs_client_read(&mut rpc_stream),

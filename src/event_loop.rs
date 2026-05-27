@@ -222,7 +222,7 @@ struct RpcSubscriptions {
 
 enum ClientKind {
     Tui,
-    Run { log_group: LogGroup },
+    Run { log_groups: Vec<LogGroup> },
     TestRun,
     Rpc { subscriptions: RpcSubscriptions },
     SelfLogs,
@@ -1566,22 +1566,40 @@ impl EventLoop {
                 return;
             }
         };
-        let Some(&(_, job_index)) = result.jobs.first() else {
+        let Some(_) = result.jobs.first() else {
             let _ = std::io::Write::write_all(&mut stdout, b"No job created\n");
             return;
         };
-        let job_id = {
+        let (job_indices, log_groups) = {
             let state = ws.handle.state.read().unwrap();
-            state[job_index].log_group
+            let job_indices = result.jobs.iter().map(|(_, ji)| *ji).collect::<Vec<_>>();
+            let log_groups = job_indices.iter().map(|ji| state[*ji].log_group).collect::<Vec<_>>();
+            (job_indices, log_groups)
         };
         let forwarder_socket = socket.try_clone().ok();
-        let (index, channel) = self.register_client(socket, ws_index, ClientKind::Run { log_group: job_id }, None);
+        let (index, channel) =
+            self.register_client(socket, ws_index, ClientKind::Run { log_groups: log_groups.clone() }, None);
         let ws = &self.state.workspaces[ws_index as usize]; // require ws to allow register_client to run
 
         let ws_handle = ws.handle.clone();
-        self.spawn_client_channel("run", index, move || {
-            crate::log_fowarder_ui::run(stdin, stdout, forwarder_socket, &ws_handle, job_id, channel)
-        });
+        if result.group_names.is_empty() && job_indices.len() == 1 {
+            let job_id = log_groups[0];
+            self.spawn_client_channel("run", index, move || {
+                crate::log_fowarder_ui::run(stdin, stdout, forwarder_socket, &ws_handle, job_id, channel)
+            });
+        } else {
+            self.spawn_client_channel("run", index, move || {
+                crate::log_fowarder_ui::run_many(
+                    stdin,
+                    stdout,
+                    forwarder_socket,
+                    &ws_handle,
+                    job_indices,
+                    log_groups,
+                    channel,
+                )
+            });
+        }
     }
 
     fn attach_test_run_client(

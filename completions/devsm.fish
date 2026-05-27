@@ -210,6 +210,11 @@ function __fish_devsm_groups
     devsm self complete groups 2>/dev/null
 end
 
+function __fish_devsm_runnables
+    __fish_devsm_tasks
+    __fish_devsm_groups
+end
+
 # Helper: get functions from config
 function __fish_devsm_functions
     devsm self complete functions 2>/dev/null
@@ -418,14 +423,14 @@ complete -c devsm -n __fish_devsm_needs_command -a 'logs' -d 'View and stream lo
 complete -c devsm -n __fish_devsm_needs_command -a 'get' -d 'Get information from daemon'
 complete -c devsm -n __fish_devsm_needs_command -a 'function' -d 'Call a saved function'
 complete -c devsm -n __fish_devsm_needs_command -a 'self' -d 'Run devsm self-management commands'
-complete -c devsm -n __fish_devsm_needs_command -xa '(__fish_devsm_tasks)'
+complete -c devsm -n __fish_devsm_needs_command -xa '(__fish_devsm_runnables)'
 
 # Task commands: run, exec, start, restart, stop - only show tasks when we need one
-complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_needs_task' -xa '(__fish_devsm_tasks)'
+complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_needs_task' -xa '(__fish_devsm_runnables)'
 complete -c devsm -n '__fish_devsm_using_command exec; and __fish_devsm_needs_task' -xa '(__fish_devsm_tasks)'
-complete -c devsm -n '__fish_devsm_using_command start; and __fish_devsm_needs_task' -xa '(__fish_devsm_tasks)'
-complete -c devsm -n '__fish_devsm_using_command restart; and __fish_devsm_needs_task' -xa '(__fish_devsm_tasks)'
-complete -c devsm -n '__fish_devsm_using_command stop; and __fish_devsm_needs_task' -xa '(__fish_devsm_tasks)'
+complete -c devsm -n '__fish_devsm_using_command start; and __fish_devsm_needs_task' -xa '(__fish_devsm_runnables)'
+complete -c devsm -n '__fish_devsm_using_command restart; and __fish_devsm_needs_task' -xa '(__fish_devsm_runnables)'
+complete -c devsm -n '__fish_devsm_using_command stop; and __fish_devsm_needs_task' -xa '(__fish_devsm_runnables)'
 
 # Task profiles (task:profile syntax) - when current token contains ':'
 complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_completing_profile' -xa '(__fish_devsm_profiles_for_token)'
