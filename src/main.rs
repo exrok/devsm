@@ -238,7 +238,24 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::Completions { shell } => {
+            print_completion_script(shell);
+        }
     }
+}
+
+const BASH_SCRIPT: &str = include_str!("../completions/devsm.bash");
+const FISH_SCRIPT: &str = include_str!("../completions/devsm.fish");
+const ZSH_SCRIPT: &str = include_str!("../completions/devsm.zsh");
+
+fn print_completion_script(shell: cli::CompletionShell) {
+    let script = match shell {
+        cli::CompletionShell::Bash => BASH_SCRIPT,
+        cli::CompletionShell::Fish => FISH_SCRIPT,
+        cli::CompletionShell::Zsh => ZSH_SCRIPT,
+    };
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(script.as_bytes());
 }
 
 fn test_client(filters: Vec<cli::TestFilter>, force: bool) -> anyhow::Result<()> {
@@ -1247,6 +1264,77 @@ mod completion_tests {
     }
 }
 
+fn is_builtin_command_name(name: &str) -> bool {
+    matches!(
+        name,
+        "global"
+            | "run"
+            | "exec"
+            | "start"
+            | "restart"
+            | "restart-selected"
+            | "stop"
+            | "test"
+            | "rerun-tests"
+            | "logs"
+            | "get"
+            | "function"
+            | "self"
+            | "completions"
+    )
+}
+
+fn print_task_completions(workspace: &config::WorkspaceConfig<'static>) {
+    for (name, expr) in workspace.tasks {
+        let preview = expr.command_preview();
+        let kind = expr.kind.as_str();
+        let bare_visible = !is_builtin_command_name(name);
+        if bare_visible {
+            print_completion(name, Some(preview));
+        }
+        print_completion(&format!("{kind}.{name}"), Some(preview));
+        if expr.profiles.len() > 1 {
+            for profile in expr.profiles {
+                if bare_visible {
+                    print_completion(&format!("{name}:{profile}"), Some(preview));
+                }
+                print_completion(&format!("{kind}.{name}:{profile}"), Some(preview));
+            }
+        }
+    }
+}
+
+fn group_description(calls: &[config::TaskCall<'_>]) -> String {
+    let n = calls.len();
+    let suffix = if n == 1 { "" } else { "s" };
+    let mut shown: Vec<&str> = calls.iter().take(3).map(|c| &*c.name).collect();
+    if n > 3 {
+        shown.push("…");
+    }
+    format!("group: {n} runnable{suffix} ({})", shown.join(", "))
+}
+
+fn function_description(action: &config::FunctionDefAction<'_>) -> String {
+    match action {
+        config::FunctionDefAction::Restart { task } => format!("restart {task}"),
+        config::FunctionDefAction::Kill { task } => format!("kill {task}"),
+        config::FunctionDefAction::RestartSelected => "restart-selected".to_string(),
+        config::FunctionDefAction::Spawn { tasks } => match tasks.len() {
+            0 => "spawn (empty)".to_string(),
+            1 => format!("spawn {}", &*tasks[0].name),
+            n => format!("spawn {n} tasks"),
+        },
+    }
+}
+
+fn tag_description(tasks: u32, tests: u32) -> String {
+    match (tasks, tests) {
+        (0, n) => format!("{n} test{}", if n == 1 { "" } else { "s" }),
+        (n, 0) => format!("{n} task{}", if n == 1 { "" } else { "s" }),
+        (a, b) => format!("{a} task{}, {b} test{}", if a == 1 { "" } else { "s" }, if b == 1 { "" } else { "s" }),
+    }
+}
+
 fn print_task_var_completions(expr: &config::TaskConfigExpr<'static>, exclude: &[&str]) {
     for (name, meta) in expr.vars {
         if exclude.contains(name) {
@@ -1304,20 +1392,29 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             println!("self\tRun devsm self-management commands");
             println!("get\tGet information from daemon");
             println!("function\tCall a saved function");
+            println!("completions\tPrint shell completion script");
             true
         }
         cli::CompleteContext::Tasks => {
             let Ok(workspace) = config::load_from_env() else {
                 return false;
             };
-            for (name, expr) in workspace.tasks {
-                let preview = expr.command_preview();
-                print_completion(name, Some(preview));
-                if expr.profiles.len() > 1 {
-                    for profile in expr.profiles {
-                        print_completion(&format!("{name}:{profile}"), Some(preview));
-                    }
+            print_task_completions(&workspace);
+            true
+        }
+        cli::CompleteContext::Runnables => {
+            let Ok(workspace) = config::load_from_env() else {
+                return false;
+            };
+            print_task_completions(&workspace);
+            for (name, calls) in workspace.groups {
+                let desc = group_description(calls);
+                let task_with_same_name = workspace.tasks.iter().any(|(n, _)| n == name);
+                let bare_visible = !is_builtin_command_name(name) && !task_with_same_name;
+                if bare_visible {
+                    print_completion(name, Some(&desc));
                 }
+                print_completion(&format!("group.{name}"), Some(&desc));
             }
             true
         }
@@ -1335,11 +1432,16 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             let Ok(workspace) = config::load_from_env() else {
                 return false;
             };
-            let Some((_, expr)) = workspace.tasks.iter().find(|(n, _)| *n == task) else {
+            let short = match task.split_once('.') {
+                Some(("service" | "action" | "test", rest)) => rest,
+                _ => task,
+            };
+            let Some((_, expr)) = workspace.tasks.iter().find(|(n, _)| *n == short) else {
                 return false;
             };
+            let preview = expr.command_preview();
             for profile in expr.profiles {
-                println!("{task}:{profile}");
+                print_completion(&format!("{task}:{profile}"), Some(preview));
             }
             true
         }
@@ -1347,7 +1449,11 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             let Ok(workspace) = config::load_from_env() else {
                 return false;
             };
-            let Some((_, expr)) = workspace.tasks.iter().find(|(n, _)| *n == task) else {
+            let short = match task.split_once('.') {
+                Some(("service" | "action" | "test", rest)) => rest,
+                _ => task,
+            };
+            let Some((_, expr)) = workspace.tasks.iter().find(|(n, _)| *n == short) else {
                 return false;
             };
             print_task_var_completions(expr, &exclude);
@@ -1402,8 +1508,13 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             let Ok(workspace) = config::load_from_env() else {
                 return false;
             };
-            for (name, _) in workspace.groups {
-                println!("{name}");
+            for (name, calls) in workspace.groups {
+                let desc = group_description(calls);
+                let task_with_same_name = workspace.tasks.iter().any(|(n, _)| n == name);
+                if !task_with_same_name && !is_builtin_command_name(name) {
+                    print_completion(name, Some(&desc));
+                }
+                print_completion(&format!("group.{name}"), Some(&desc));
             }
             true
         }
@@ -1412,7 +1523,7 @@ fn print_completions(context: cli::CompleteContext) -> bool {
                 return false;
             };
             for func in workspace.functions {
-                println!("{}", func.name);
+                print_completion(func.name, Some(&function_description(&func.action)));
             }
             true
         }
@@ -1420,19 +1531,19 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             let Ok(workspace) = config::load_from_env() else {
                 return false;
             };
-            let mut tags = std::collections::HashSet::new();
+            let mut counts: hashbrown::HashMap<&str, (u32, u32)> = hashbrown::HashMap::default();
             for (_, expr) in workspace.tasks {
                 for tag in expr.tags {
-                    tags.insert(*tag);
+                    counts.entry(tag).or_default().0 += 1;
                 }
             }
             for (_, test) in workspace.tests {
                 for tag in test.tags {
-                    tags.insert(*tag);
+                    counts.entry(tag).or_default().1 += 1;
                 }
             }
-            for tag in tags {
-                println!("{tag}");
+            for (tag, (tasks, tests)) in counts {
+                print_completion(tag, Some(&tag_description(tasks, tests)));
             }
             true
         }
@@ -1475,6 +1586,7 @@ Commands:
   logs [options]     View and stream logs from tasks
   get <resource>     Get information from the daemon
   function call <n>  Call a function defined in config
+  completions <shell> Print shell completion script (bash | fish | zsh)
   self <command>     Run devsm self-management commands
 
 Options:

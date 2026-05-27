@@ -68,4 +68,17 @@ require = [{ resource = "cargo-bin" }]
 [test.cargo-build]
 cmd = ["cargo", "build"]
 
+[test.completion-bash]
+sh = "./tests/completions/bash.test.sh"
+require = [{ resource = "cargo-bin" }]
+tag = ["completion"]
 
+[test.completion-fish]
+sh = "./tests/completions/fish.test.fish"
+require = [{ resource = "cargo-bin" }]
+tag = ["completion"]
+
+[test.completion-zsh]
+sh = "./tests/completions/zsh.test.zsh"
+require = [{ resource = "cargo-bin" }]
+tag = ["completion"]

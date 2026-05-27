@@ -47,7 +47,7 @@ end
 
 function __fish_devsm_is_builtin_command
     switch $argv[1]
-        case global run exec start restart restart-selected stop test rerun-tests logs get function self
+        case global run exec start restart restart-selected stop test rerun-tests logs get function self completions
             return 0
     end
     return 1
@@ -211,8 +211,7 @@ function __fish_devsm_groups
 end
 
 function __fish_devsm_runnables
-    __fish_devsm_tasks
-    __fish_devsm_groups
+    devsm self complete runnables 2>/dev/null
 end
 
 # Helper: get functions from config
@@ -397,11 +396,13 @@ function __fish_devsm_emit_task_arg_completions
 end
 
 # Fish can skip reused dynamic completion actions in some command positions, so
-# register copied functions for the explicit and direct task forms.
-functions -c __fish_devsm_emit_task_arg_completions __fish_devsm_task_arg_completions
-functions -c __fish_devsm_emit_task_arg_completions __fish_devsm_run_task_arg_completions
-functions -c __fish_devsm_emit_task_arg_completions __fish_devsm_exec_task_arg_completions
-functions -c __fish_devsm_emit_task_arg_completions __fish_devsm_direct_task_arg_completions
+# register copied functions for the explicit and direct task forms. Erase any
+# stale copy first so re-sourcing this file (e.g. from a test harness) works.
+for __fish_devsm_copy in __fish_devsm_task_arg_completions __fish_devsm_run_task_arg_completions __fish_devsm_exec_task_arg_completions __fish_devsm_direct_task_arg_completions
+    functions -e $__fish_devsm_copy
+    functions -c __fish_devsm_emit_task_arg_completions $__fish_devsm_copy
+end
+set -e __fish_devsm_copy
 
 # Disable file completions by default
 complete -c devsm -f
@@ -423,7 +424,13 @@ complete -c devsm -n __fish_devsm_needs_command -a 'logs' -d 'View and stream lo
 complete -c devsm -n __fish_devsm_needs_command -a 'get' -d 'Get information from daemon'
 complete -c devsm -n __fish_devsm_needs_command -a 'function' -d 'Call a saved function'
 complete -c devsm -n __fish_devsm_needs_command -a 'self' -d 'Run devsm self-management commands'
+complete -c devsm -n __fish_devsm_needs_command -a 'completions' -d 'Print shell completion script'
 complete -c devsm -n __fish_devsm_needs_command -xa '(__fish_devsm_runnables)'
+
+# Completions command
+complete -c devsm -n '__fish_devsm_using_command completions' -xa 'bash' -d 'Bash completion script'
+complete -c devsm -n '__fish_devsm_using_command completions' -xa 'fish' -d 'Fish completion script'
+complete -c devsm -n '__fish_devsm_using_command completions' -xa 'zsh' -d 'Zsh completion script'
 
 # Task commands: run, exec, start, restart, stop - only show tasks when we need one
 complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_needs_task' -xa '(__fish_devsm_runnables)'
@@ -444,9 +451,16 @@ complete -c devsm -n '__fish_devsm_using_command start' -l cached -d 'Only start
 complete -c devsm -n '__fish_devsm_using_command restart' -l cached -d 'Only restart if not cached'
 
 # Test command
+function __fish_devsm_test_tag_filters
+    for line in (__fish_devsm_tags)
+        set -l tag (string split -f 1 \t -- $line)
+        test -n "$tag"; or continue
+        printf '%s\tInclude tag\n' "+$tag"
+        printf '%s\tExclude tag\n' "-$tag"
+    end
+end
 complete -c devsm -n '__fish_devsm_using_command test' -xa '(__fish_devsm_tests)'
-complete -c devsm -n '__fish_devsm_using_command test' -xa '(for tag in (__fish_devsm_tags); printf "+%s\tInclude tag\n" $tag; end)'
-complete -c devsm -n '__fish_devsm_using_command test' -xa '(for tag in (__fish_devsm_tags); printf "-%s\tExclude tag\n" $tag; end)'
+complete -c devsm -n '__fish_devsm_using_command test' -xa '(__fish_devsm_test_tag_filters)'
 complete -c devsm -n '__fish_devsm_using_command test' -l force -d 'Run tests even when cache would skip them'
 complete -c devsm -n '__fish_devsm_using_command test' -l no-cache -d 'Run tests even when cache would skip them'
 

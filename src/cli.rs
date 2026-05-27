@@ -102,6 +102,14 @@ pub enum Command<'a> {
     FunctionCall { name: &'a str },
     Logs { options: LogsOptions<'a> },
     Complete { context: CompleteContext<'a> },
+    Completions { shell: CompletionShell },
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum CompletionShell {
+    Bash,
+    Fish,
+    Zsh,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +126,7 @@ pub enum CompleteContext<'a> {
     Tags,
     GetResources,
     Kinds,
+    Runnables,
 }
 
 #[derive(Debug, Default)]
@@ -494,13 +503,14 @@ fn parse_complete<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
 
     let Some(context_str) = context_str else {
         bail!(
-            "complete requires a context (commands, tasks, tests, profiles, vars, forward-prefix, task-args, groups, functions, tags, get-resources, kinds)"
+            "complete requires a context (commands, tasks, runnables, tests, profiles, vars, forward-prefix, task-args, groups, functions, tags, get-resources, kinds)"
         );
     };
 
     let context = match context_str {
         "commands" => CompleteContext::Commands,
         "tasks" => CompleteContext::Tasks,
+        "runnables" => CompleteContext::Runnables,
         "tests" => CompleteContext::Tests,
         "profiles" => {
             let Some(task) = task else {
@@ -630,6 +640,22 @@ fn parse_self_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>
     Ok(Command::Get { resource: GetResource::SelfLogs { follow } })
 }
 
+fn parse_completions<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let Some(Component::Term(shell)) = parser.next() else {
+        bail!("completions requires a shell name (bash, fish, zsh)");
+    };
+    let shell = match shell {
+        "bash" => CompletionShell::Bash,
+        "fish" => CompletionShell::Fish,
+        "zsh" => CompletionShell::Zsh,
+        _ => bail!("Unknown shell: {} (expected bash, fish, or zsh)", shell),
+    };
+    if let Some(extra) = parser.next() {
+        bail!("Unexpected argument after shell: {:?}", extra);
+    }
+    Ok(Command::Completions { shell })
+}
+
 fn parse_self<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     let Some(Component::Term(subcommand)) = parser.next() else {
         bail!("self requires a subcommand (server, validate, logs, complete)");
@@ -683,6 +709,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
             Component::Term(command) => match command {
                 "global" => break 'command Command::Global,
                 "self" => break 'command parse_self(&mut parser)?,
+                "completions" => break 'command parse_completions(&mut parser)?,
                 "restart-selected" => break 'command Command::RestartSelected,
                 "start" => break 'command parse_daemon_task(&mut parser, false)?,
                 "restart" => break 'command parse_daemon_task(&mut parser, true)?,

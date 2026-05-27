@@ -1225,10 +1225,8 @@ fn fish_runnable_completions_do_not_duplicate_group_namespace() {
 function devsm
     set -l joined (string join ' ' -- $argv)
     switch $joined
-        case 'self complete tasks'
-            printf '%s\n' build serve
-        case 'self complete groups'
-            printf '%s\n' dev ci
+        case 'self complete runnables'
+            printf '%s\n' build serve dev ci
     end
 end
 

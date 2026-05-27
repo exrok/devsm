@@ -1,0 +1,48 @@
+# Fixture used by tests/completions/*.test.* to exercise every completion path:
+# - plain task (build)
+# - task with multiple profiles (api:dev, api:release)
+# - task with declared vars (deploy --host=, --port=)
+# - task with forward autocomplete (passthrough)
+# - test entries with a tag
+# - a group
+# - a function
+
+[action.build]
+cmd = ["echo", "build"]
+
+[action.api]
+cmd = ["echo", "api", { if.profile = "release", then = "--release" }]
+profiles = ["dev", "release"]
+info = "API server"
+
+[action.deploy]
+cmd = ["echo", "deploy", { var = "host" }, { var = "port" }]
+var.host = { description = "Target hostname", default = "localhost" }
+var.port = { description = "Target port", default = "8080" }
+
+[action.passthrough]
+cmd = ["echo", { var = "args" }]
+cli.forward-arguments = true
+cli.autocomplete = "forward"
+
+# Shadowing: 'run' is also a builtin command. Bare 'run' should be omitted from
+# runnable completions; only 'action.run' should appear.
+[action.run]
+sh = "echo collide-with-builtin"
+
+[test.unit]
+cmd = ["echo", "unit"]
+tag = ["fast"]
+
+[test.integration]
+cmd = ["echo", "integration"]
+tag = ["slow"]
+
+[group]
+all = ["build", "api"]
+# Shadowing: group 'logs' collides with builtin command 'logs'. Bare omitted,
+# 'group.logs' kept.
+logs = ["build"]
+
+[function]
+restart_api = { restart = "api" }
