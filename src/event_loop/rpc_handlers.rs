@@ -268,7 +268,9 @@ fn handle_rpc_message(
     let ws_index = resolve_workspace_from_header_result(state, ws_data)?;
     let ws = &mut state.workspaces[ws_index as usize];
     let body = match kind {
-        RpcMessageKind::SpawnTask => handle_rpc_restart_task(ws, payload),
+        RpcMessageKind::SpawnTask => handle_rpc_legacy_spawn_task(ws, payload),
+        RpcMessageKind::StartTask => handle_rpc_start_task(ws, payload),
+        RpcMessageKind::RestartTask => handle_rpc_restart_task(ws, payload),
         RpcMessageKind::KillTask => handle_rpc_kill_task(ws, payload),
         RpcMessageKind::RerunTests => handle_rpc_rerun_tests(ws, payload),
         RpcMessageKind::CallFunction => handle_rpc_call_function(clients, ws, payload),
@@ -281,12 +283,68 @@ fn handle_rpc_message(
     Ok(token.respond(RpcMessageKind::CommandAck, &crate::rpc::CommandResponse { workspace_id: ws_index, body }))
 }
 
-fn handle_rpc_restart_task(ws: &mut WorkspaceEntry, payload: &[u8]) -> CommandBody {
+fn decode_spawn_request(payload: &[u8]) -> Result<(rpc::SpawnTaskRequest<'_>, ValueMap<'static>), CommandBody> {
     let Ok(req) = jsony::from_binary::<rpc::SpawnTaskRequest>(payload) else {
-        return CommandBody::Error("Invalid request payload".into());
+        return Err(CommandBody::Error("Invalid request payload".into()));
+    };
+    let params = jsony::from_binary::<ValueMap>(req.params).unwrap_or_else(|_| ValueMap::new()).to_owned();
+    Ok((req, params))
+}
+
+fn handle_rpc_start_task(ws: &mut WorkspaceEntry, payload: &[u8]) -> CommandBody {
+    let (req, params) = match decode_spawn_request(payload) {
+        Ok(decoded) => decoded,
+        Err(body) => return body,
     };
 
-    let params = jsony::from_binary::<ValueMap>(req.params).unwrap_or_else(|_| ValueMap::new()).to_owned();
+    if req.as_test {
+        let mut spec = SpawnSpec::task(req.task_name, req.profile, params, false);
+        spec.test_group = true;
+        match ws.handle.submit_start(spec) {
+            Ok(_) => CommandBody::Empty,
+            Err(e) => CommandBody::Error(e.into()),
+        }
+    } else {
+        match ws.handle.start_task_by_name_cached(req.task_name, params, req.profile, req.cached) {
+            Ok(None) => CommandBody::Empty,
+            Ok(Some(msg)) => CommandBody::Message(msg.into()),
+            Err(e) => CommandBody::Error(e.into()),
+        }
+    }
+}
+
+fn handle_rpc_restart_task(ws: &mut WorkspaceEntry, payload: &[u8]) -> CommandBody {
+    let (req, params) = match decode_spawn_request(payload) {
+        Ok(decoded) => decoded,
+        Err(body) => return body,
+    };
+
+    if req.as_test {
+        let mut spec = SpawnSpec::task(req.task_name, req.profile, params, true);
+        spec.test_group = true;
+        match ws.handle.submit(spec) {
+            Ok(_) => CommandBody::Empty,
+            Err(e) => CommandBody::Error(e.into()),
+        }
+    } else if req.cached {
+        match ws.handle.spawn_task_by_name_cached(req.task_name, params, req.profile, true, true) {
+            Ok(None) => CommandBody::Empty,
+            Ok(Some(msg)) => CommandBody::Message(msg.into()),
+            Err(e) => CommandBody::Error(e.into()),
+        }
+    } else {
+        match ws.handle.submit(SpawnSpec::task(req.task_name, req.profile, params, true)) {
+            Ok(_) => CommandBody::Empty,
+            Err(e) => CommandBody::Error(e.into()),
+        }
+    }
+}
+
+fn handle_rpc_legacy_spawn_task(ws: &mut WorkspaceEntry, payload: &[u8]) -> CommandBody {
+    let (req, params) = match decode_spawn_request(payload) {
+        Ok(decoded) => decoded,
+        Err(body) => return body,
+    };
 
     if req.as_test {
         let mut spec = SpawnSpec::task(req.task_name, req.profile, params, false);
@@ -296,7 +354,7 @@ fn handle_rpc_restart_task(ws: &mut WorkspaceEntry, payload: &[u8]) -> CommandBo
             Err(e) => CommandBody::Error(e.into()),
         }
     } else if req.cached {
-        match ws.handle.spawn_task_by_name_cached(req.task_name, params, req.profile, true) {
+        match ws.handle.spawn_task_by_name_cached(req.task_name, params, req.profile, true, false) {
             Ok(None) => CommandBody::Empty,
             Ok(Some(msg)) => CommandBody::Message(msg.into()),
             Err(e) => CommandBody::Error(e.into()),
@@ -645,7 +703,9 @@ fn handle_rpc_request_command(
     payload: &[u8],
 ) -> Result<rpc::ResponseSent, rpc::HandlerError> {
     let body = match kind {
-        RpcMessageKind::SpawnTask => handle_rpc_restart_task(ws, payload),
+        RpcMessageKind::SpawnTask => handle_rpc_legacy_spawn_task(ws, payload),
+        RpcMessageKind::StartTask => handle_rpc_start_task(ws, payload),
+        RpcMessageKind::RestartTask => handle_rpc_restart_task(ws, payload),
         RpcMessageKind::KillTask => handle_rpc_kill_task(ws, payload),
         RpcMessageKind::RerunTests => handle_rpc_rerun_tests(ws, payload),
         RpcMessageKind::CallFunction => handle_rpc_call_function(clients, ws, payload),

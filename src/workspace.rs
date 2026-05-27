@@ -1756,6 +1756,51 @@ impl WorkspaceState {
         Ok((base_index, job_index))
     }
 
+    fn active_matching_job(
+        &self,
+        base_task: BaseTaskIndex,
+        profile: &str,
+        params: &ValueMap<'static>,
+    ) -> Option<JobIndex> {
+        self.base_tasks[base_task.idx()].jobs.non_terminal().iter().rev().copied().find(|&job_index| {
+            let job = &self.jobs[job_index];
+            job.spawn_profile() == profile && job.spawn_params() == params
+        })
+    }
+
+    pub fn lookup_and_start_task_with_trace(
+        &mut self,
+        workspace_id: u32,
+        channel: &MioChannel,
+        name: &str,
+        params: ValueMap,
+        profile: &str,
+        trace: bool,
+    ) -> Result<(BaseTaskIndex, JobIndex), String> {
+        let Some(base_index) = self.base_index_by_name(name) else {
+            return Err(format!("Task '{}' not found", name));
+        };
+        let profile = self.effective_profile_for_task(base_index, profile);
+        let params = params.to_owned();
+
+        if let Some(job_index) = self.active_matching_job(base_index, &profile, &params) {
+            return Ok((base_index, job_index));
+        }
+
+        self.change_number = self.change_number.wrapping_add(1);
+        let job_index = self.spawn_task(
+            workspace_id,
+            channel,
+            base_index,
+            params,
+            &profile,
+            ScheduleReason::Requested,
+            false,
+            trace,
+        )?;
+        Ok((base_index, job_index))
+    }
+
     /// Check if a task has a cache hit using a pre-computed cache key.
     ///
     /// Returns `Some(message)` if cache hit, `None` otherwise.
@@ -2852,6 +2897,36 @@ impl Workspace {
         Ok(SubmitResult { jobs })
     }
 
+    pub fn submit_start(&self, spec: SpawnSpec) -> Result<SubmitResult, String> {
+        let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
+        state.change_number = state.change_number.wrapping_add(1);
+
+        let mut jobs = Vec::new();
+        for task in &spec.tasks {
+            let (bti, ji) = state.lookup_and_start_task_with_trace(
+                self.workspace_id,
+                &self.process_channel,
+                &task.name,
+                task.params.clone(),
+                &task.profile,
+                task.trace,
+            )?;
+            jobs.push((bti, ji));
+        }
+
+        if spec.test_group && !jobs.is_empty() {
+            let group_id = state.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
+            state.last_test_group = Some(TestGroup {
+                group_id,
+                base_tasks: jobs.iter().map(|(bti, _)| *bti).collect(),
+                job_indices: jobs.iter().map(|(_, ji)| *ji).collect(),
+            });
+        }
+
+        Ok(SubmitResult { jobs })
+    }
+
     pub fn call_function(&self, name: &str) -> Result<Option<FunctionGlobalAction>, String> {
         use crate::config::FunctionDefAction;
         use crate::function::FunctionAction;
@@ -3107,6 +3182,7 @@ impl Workspace {
         params: ValueMap,
         profile: &str,
         cached: bool,
+        force_restart: bool,
     ) -> Result<Option<String>, String> {
         if cached {
             self.refresh_config_if_changed();
@@ -3128,7 +3204,7 @@ impl Workspace {
                         name,
                         params,
                         profile,
-                        false,
+                        force_restart,
                     )?;
                     return Ok(None);
                 };
@@ -3141,7 +3217,7 @@ impl Workspace {
                         name,
                         params,
                         profile,
-                        false,
+                        force_restart,
                     )?;
                     return Ok(None);
                 };
@@ -3196,14 +3272,63 @@ impl Workspace {
                 return Ok(Some(msg));
             }
 
-            let (_, _job_index) =
-                state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
+            let (_, _job_index) = state.lookup_and_spawn_task(
+                self.workspace_id,
+                &self.process_channel,
+                name,
+                params,
+                profile,
+                force_restart,
+            )?;
             Ok(None)
         } else {
             let state = &mut *self.state.write().unwrap();
             state.refresh_config();
-            let (_, _job_index) =
-                state.lookup_and_spawn_task(self.workspace_id, &self.process_channel, name, params, profile, false)?;
+            let (_, _job_index) = state.lookup_and_spawn_task(
+                self.workspace_id,
+                &self.process_channel,
+                name,
+                params,
+                profile,
+                force_restart,
+            )?;
+            Ok(None)
+        }
+    }
+
+    pub fn start_task_by_name_cached(
+        &self,
+        name: &str,
+        params: ValueMap,
+        profile: &str,
+        cached: bool,
+    ) -> Result<Option<String>, String> {
+        self.refresh_config_if_changed();
+        {
+            let state = self.state.read().unwrap();
+            let Some(base_index) = state.lookup_name(name) else {
+                return Err(format!("Task '{}' not found", name));
+            };
+            let profile = state.effective_profile_for_task(base_index, profile);
+            let active_params = params.clone().to_owned();
+            if state.active_matching_job(base_index, &profile, &active_params).is_some() {
+                return Ok(None);
+            }
+        }
+
+        if cached {
+            self.spawn_task_by_name_cached(name, params, profile, true, false)
+        } else {
+            let state = &mut *self.state.write().unwrap();
+            state.refresh_config();
+            let (_, _) = state.lookup_and_start_task_with_trace(
+                self.workspace_id,
+                &self.process_channel,
+                name,
+                params,
+                profile,
+                false,
+            )?;
             Ok(None)
         }
     }

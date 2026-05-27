@@ -44,7 +44,7 @@ impl BenchHarness {
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
         let server = Command::new(cargo_bin_path())
-            .arg("server")
+            .args(["self", "server"])
             .env("DEVSM_SOCKET", &harness.socket_path)
             .env("DEVSM_LOG_STDOUT", "1")
             .env("DEVSM_JSON_STATE_STREAM", "1")

@@ -30,7 +30,7 @@ use crate::config::{Requirement, TaskKind};
 use crate::workspace::{BaseTaskIndex, NameEntry, TaskEntry};
 
 /// Static view of a single task as input to the analyzer. Both
-/// [`crate::workspace::WorkspaceState`] and `devsm validate` materialize a
+/// [`crate::workspace::WorkspaceState`] and `devsm self validate` materialize a
 /// `Vec<TaskInput>` from their respective sources.
 pub struct TaskInput<'a> {
     pub name: &'a str,

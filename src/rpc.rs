@@ -134,6 +134,8 @@ pub enum RpcMessageKind {
     Terminate = 0x0121,
 
     // Commands (0x01xx) - new unified protocol
+    // TODO: SpawnTask is kept only for legacy tests during the CLI/RPC migration.
+    // Remove it once those tests use StartTask or RestartTask.
     SpawnTask = 0x0110,
     KillTask = 0x0111,
     RerunTests = 0x0112,
@@ -146,6 +148,8 @@ pub enum RpcMessageKind {
     RestartSelected = 0x0119,
     GetLoggedRustPanics = 0x011A,
     GetWorkspaces = 0x011B,
+    StartTask = 0x011C,
+    RestartTask = 0x011D,
 
     // Legacy responses
     OpenWorkspaceAck = 0x0200,
@@ -188,6 +192,8 @@ impl RpcMessageKind {
             0x0119 => Some(Self::RestartSelected),
             0x011A => Some(Self::GetLoggedRustPanics),
             0x011B => Some(Self::GetWorkspaces),
+            0x011C => Some(Self::StartTask),
+            0x011D => Some(Self::RestartTask),
             0x0200 => Some(Self::OpenWorkspaceAck),
             0x0201 => Some(Self::SubscribeAck),
             0x0203 => Some(Self::RunTaskAck),
@@ -208,6 +214,8 @@ impl RpcMessageKind {
         matches!(
             self,
             Self::SpawnTask
+                | Self::StartTask
+                | Self::RestartTask
                 | Self::KillTask
                 | Self::RerunTests
                 | Self::CallFunction
@@ -1111,7 +1119,10 @@ pub enum WorkspaceRef<'a> {
     },
 }
 
-/// Request to restart a task.
+/// Shared request payload for start/restart task commands.
+///
+/// The type name is legacy and follows the temporary `SpawnTask` RPC kept for
+/// tests during the CLI/RPC migration.
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub struct SpawnTaskRequest<'a> {

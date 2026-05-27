@@ -5,14 +5,27 @@ use crate::harness;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::rpc::{
     CommandBody, ExitCause, JobStatusKind, KillTaskRequest, SpawnTaskRequest, SubscribeAck, SubscriptionFilter,
     WorkspaceClient,
 };
 use harness::{RpcEvent, RpcSubscriber, TestHarness, cargo_bin_path};
+
+fn wait_for_line_count(path: &Path, needle: &str, expected: usize, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let count = fs::read_to_string(path).unwrap_or_default().lines().filter(|line| line.contains(needle)).count();
+        if count >= expected {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
 
 #[test]
 fn run_simple_action() {
@@ -1040,17 +1053,17 @@ cli.forward-arguments = true
 "#,
     );
 
-    let result = harness.run_client(&["complete", "forward-prefix", "--task=git_checkout"]);
+    let result = harness.run_client(&["self", "complete", "forward-prefix", "--task=git_checkout"]);
     assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
     let lines: Vec<&str> = result.stdout.lines().collect();
     assert_eq!(lines, vec!["git", "checkout"]);
 
-    let result = harness.run_client(&["complete", "forward-prefix", "--task=git_checkout:debug"]);
+    let result = harness.run_client(&["self", "complete", "forward-prefix", "--task=git_checkout:debug"]);
     assert!(result.success(), "Expected success for task profile, got stderr: {}", result.stderr);
     let lines: Vec<&str> = result.stdout.lines().collect();
     assert_eq!(lines, vec!["git", "checkout"]);
 
-    let result = harness.run_client(&["complete", "forward-prefix", "--task=no_forward_completion"]);
+    let result = harness.run_client(&["self", "complete", "forward-prefix", "--task=no_forward_completion"]);
     assert!(result.success(), "Expected success with empty output, got stderr: {}", result.stderr);
     assert!(result.stdout.is_empty(), "Expected no prefix, got stdout: {:?}", result.stdout);
 }
@@ -1075,12 +1088,12 @@ var.name = {{ description = "Name to print" }}
         work_dir = work_dir.display()
     ));
 
-    let result = harness.run_client(&["complete", "task-args", "--task=list"]);
+    let result = harness.run_client(&["self", "complete", "task-args", "--task=list"]);
     assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
     let lines: Vec<&str> = result.stdout.lines().collect();
     assert_eq!(lines, vec!["forward", work_dir.to_str().unwrap(), "ls"]);
 
-    let result = harness.run_client(&["complete", "task-args", "--task=echo"]);
+    let result = harness.run_client(&["self", "complete", "task-args", "--task=echo"]);
     assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
     let lines: Vec<&str> = result.stdout.lines().collect();
     assert_eq!(lines, vec!["vars", "name\tName to print"]);
@@ -1125,17 +1138,17 @@ cli.autocomplete = {{ command = ["{schema_script}"] }}
         schema_script = schema_script.display()
     ));
 
-    let result = harness.run_client(&["complete", "task-args", "--task=make", "--", ""]);
+    let result = harness.run_client(&["self", "complete", "task-args", "--task=make", "--", ""]);
     assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
     let lines: Vec<&str> = result.stdout.lines().collect();
     assert_eq!(lines, vec!["items", "--env\tTarget environment", "--deploy\tDeploy build", "--component"]);
 
-    let result = harness.run_client(&["complete", "task-args", "--task=make", "--", "--env", "d"]);
+    let result = harness.run_client(&["self", "complete", "task-args", "--task=make", "--", "--env", "d"]);
     assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
     let lines: Vec<&str> = result.stdout.lines().collect();
     assert_eq!(lines, vec!["items", "demo\tDemo env"]);
 
-    let result = harness.run_client(&["complete", "task-args", "--task=make", "--", "--deploy", ""]);
+    let result = harness.run_client(&["self", "complete", "task-args", "--task=make", "--", "--deploy", ""]);
     assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
     let lines: Vec<&str> = result.stdout.lines().collect();
     assert_eq!(lines, vec!["items", "--env\tTarget environment", "--component"]);
@@ -1386,6 +1399,50 @@ require = [["backend", {{ mode = "same" }}]]
     let log = fs::read_to_string(&service_log).unwrap_or_default();
     let start_count = log.lines().filter(|l| l.contains("started")).count();
     assert_eq!(start_count, 1, "Service should start only once with matching params, log: {}", log);
+}
+
+#[test]
+fn start_does_not_restart_running_service() {
+    let mut harness = TestHarness::new("start_no_restart");
+    let service_log = harness.temp_dir.join("service.log");
+
+    harness.write_config(&format!(
+        r#"
+[service.web]
+sh = '''
+echo "started" >> {service_log}
+while true; do sleep 1; done
+'''
+"#,
+        service_log = service_log.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "web"]);
+    assert!(result.success(), "start web failed: stderr={}, server_log={}", result.stderr, harness.server_log());
+    assert!(
+        wait_for_line_count(&service_log, "started", 1, Duration::from_secs(2)),
+        "web should start once; log={}, server_log={}",
+        fs::read_to_string(&service_log).unwrap_or_default(),
+        harness.server_log()
+    );
+
+    let result = harness.run_client(&["start", "web"]);
+    assert!(result.success(), "second start web failed: stderr={}, server_log={}", result.stderr, harness.server_log());
+    std::thread::sleep(Duration::from_millis(100));
+    let log = fs::read_to_string(&service_log).unwrap_or_default();
+    let start_count = log.lines().filter(|line| line.contains("started")).count();
+    assert_eq!(start_count, 1, "second start should not restart service, log: {}", log);
+
+    let result = harness.run_client(&["restart", "web"]);
+    assert!(result.success(), "restart web failed: stderr={}, server_log={}", result.stderr, harness.server_log());
+    assert!(
+        wait_for_line_count(&service_log, "started", 2, Duration::from_secs(2)),
+        "restart should start a second process; log={}, server_log={}",
+        fs::read_to_string(&service_log).unwrap_or_default(),
+        harness.server_log()
+    );
 }
 
 #[test]
@@ -3298,7 +3355,7 @@ require = ["dep", {{ resource = "R" }}]
     assert!(harness.wait_for_file(&marker, Duration::from_secs(5)), "user task should complete");
 }
 
-/// `devsm validate` must accept the `action.`, `service.`, and `test.`
+/// `devsm self validate` must accept the `action.`, `service.`, and `test.`
 /// kind-qualified require prefixes that the daemon's lookup already supports.
 #[test]
 fn validate_accepts_kind_qualified_require_names() {
@@ -3322,7 +3379,7 @@ require = ["action.dep", "service.svc"]
 
     let config_path = harness.temp_dir.join("devsm.toml");
     let result = Command::new(cargo_bin_path())
-        .arg("validate")
+        .args(["self", "validate"])
         .arg(&config_path)
         .arg("--skip-path-checks")
         .stdout(Stdio::piped())

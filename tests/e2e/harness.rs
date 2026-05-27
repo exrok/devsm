@@ -97,7 +97,7 @@ impl TestHarness {
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
         let server = Command::new(cargo_bin_path())
-            .arg("server")
+            .args(["self", "server"])
             .current_dir(&self.temp_dir)
             .env("DEVSM_SOCKET", &self.socket_path)
             .env("DEVSM_DB", db_path)
@@ -124,7 +124,7 @@ impl TestHarness {
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
         let server = Command::new(cargo_bin_path())
-            .arg("server")
+            .args(["self", "server"])
             .current_dir(cwd)
             .env("DEVSM_SOCKET", &self.socket_path)
             .env("DEVSM_DB", "/dev/null")
@@ -149,7 +149,7 @@ impl TestHarness {
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
         let server = Command::new(cargo_bin_path())
-            .arg("server")
+            .args(["self", "server"])
             .current_dir(&self.temp_dir)
             .env("DEVSM_SOCKET", &self.socket_path)
             .env("DEVSM_DB", "/dev/null")

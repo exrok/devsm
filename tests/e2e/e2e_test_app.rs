@@ -315,8 +315,8 @@ require = [{{ resource = "shared" }}]
     harness.spawn_server();
     assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
 
-    let result = harness.run_client(&["spawn", "svc:alpha"]);
-    assert!(result.success(), "spawn svc:alpha: stdout={}, stderr={}", result.stdout, result.stderr);
+    let result = harness.run_client(&["restart", "svc:alpha"]);
+    assert!(result.success(), "restart svc:alpha: stdout={}, stderr={}", result.stdout, result.stderr);
     let mut alpha = ctrl.accept(Duration::from_secs(10));
     assert_eq!(alpha.name(), "svc");
 
@@ -391,13 +391,13 @@ require = ["svc:beta"]
     harness.spawn_server();
     assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
 
-    let result = harness.run_client(&["spawn", "svc:alpha", "--id=one"]);
-    assert!(result.success(), "spawn alpha one: stdout={}, stderr={}", result.stdout, result.stderr);
+    let result = harness.run_client(&["restart", "svc:alpha", "--id=one"]);
+    assert!(result.success(), "restart alpha one: stdout={}, stderr={}", result.stdout, result.stderr);
     let mut alpha_one = ctrl.accept(Duration::from_secs(10));
     assert_eq!(alpha_one.name(), "svc");
 
-    let result = harness.run_client(&["spawn", "svc:alpha", "--id=two"]);
-    assert!(result.success(), "spawn alpha two: stdout={}, stderr={}", result.stdout, result.stderr);
+    let result = harness.run_client(&["restart", "svc:alpha", "--id=two"]);
+    assert!(result.success(), "restart alpha two: stdout={}, stderr={}", result.stdout, result.stderr);
     let mut alpha_two = ctrl.accept(Duration::from_secs(10));
     assert_eq!(alpha_two.name(), "svc");
 

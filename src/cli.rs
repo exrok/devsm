@@ -89,10 +89,12 @@ pub enum Command<'a> {
     Global,
     Server,
     RestartSelected,
-    Spawn { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
+    Start { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
+    Restart { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
     Exec { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String] },
     Run { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String], as_test: bool, derive_cache_key: bool },
-    Kill { job: &'a str },
+    Auto { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String] },
+    Stop { job: &'a str },
     Test { filters: Vec<TestFilter<'a>>, force: bool },
     RerunTests { only_failed: bool },
     Validate { path: Option<&'a str>, skip_path_checks: bool },
@@ -239,7 +241,7 @@ pub fn parse_run_trailing_params<'a>(
     Ok(value_map)
 }
 
-fn parse_spawn<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+fn parse_daemon_task<'a>(parser: &mut ArgParser<'a>, restart: bool) -> anyhow::Result<Command<'a>> {
     let mut as_test = false;
     let mut cached = false;
     let mut job = None;
@@ -280,7 +282,11 @@ fn parse_spawn<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
         bail!("Missing name of job");
     };
 
-    Ok(Command::Spawn { job, value_map, as_test, cached })
+    if restart {
+        Ok(Command::Restart { job, value_map, as_test, cached })
+    } else {
+        Ok(Command::Start { job, value_map, as_test, cached })
+    }
 }
 
 fn parse_exec<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
@@ -601,6 +607,42 @@ fn parse_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     Ok(Command::Logs { options })
 }
 
+fn parse_self_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let mut follow = false;
+    for component in parser.by_ref() {
+        match component {
+            Component::Flags(flags) => {
+                for flag in flags.chars() {
+                    match flag {
+                        'f' => follow = true,
+                        _ => bail!("Unknown flag -{} in self logs command", flag),
+                    }
+                }
+            }
+            Component::Long(long) => match long {
+                "follow" => follow = true,
+                _ => bail!("Unknown flag --{} in self logs command", long),
+            },
+            Component::Term(arg) => bail!("Unexpected argument: {:?}", arg),
+            Component::Value(val) => bail!("Unexpected value: {:?}", val),
+        }
+    }
+    Ok(Command::Get { resource: GetResource::SelfLogs { follow } })
+}
+
+fn parse_self<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let Some(Component::Term(subcommand)) = parser.next() else {
+        bail!("self requires a subcommand (server, validate, logs, complete)");
+    };
+    match subcommand {
+        "server" => Ok(Command::Server),
+        "validate" => parse_validate(parser),
+        "logs" => parse_self_logs(parser),
+        "complete" => parse_complete(parser),
+        _ => bail!("Unknown self subcommand: {}", subcommand),
+    }
+}
+
 pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Command<'a>)> {
     let mut parser = ArgParser::new(args);
     let mut global = GlobalArguments { from: None };
@@ -640,20 +682,20 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
             }
             Component::Term(command) => match command {
                 "global" => break 'command Command::Global,
-                "server" => break 'command Command::Server,
+                "self" => break 'command parse_self(&mut parser)?,
                 "restart-selected" => break 'command Command::RestartSelected,
-                "spawn" => break 'command parse_spawn(&mut parser)?,
+                "start" => break 'command parse_daemon_task(&mut parser, false)?,
+                "restart" => break 'command parse_daemon_task(&mut parser, true)?,
                 "exec" => break 'command parse_exec(&mut parser)?,
                 "run" => break 'command parse_run(&mut parser)?,
-                "kill" => {
+                "stop" => {
                     let Some(Component::Term(job)) = parser.next() else {
-                        bail!("kill requires a task name or job index");
+                        bail!("stop requires a task name or job index");
                     };
-                    break 'command Command::Kill { job };
+                    break 'command Command::Stop { job };
                 }
                 "test" => break 'command parse_test_filters(&mut parser)?,
                 "rerun-tests" => break 'command parse_rerun_tests(&mut parser),
-                "validate" => break 'command parse_validate(&mut parser)?,
                 "logs" => break 'command parse_logs(&mut parser)?,
                 "function" => {
                     let Some(Component::Term(subcommand)) = parser.next() else {
@@ -669,34 +711,11 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                         _ => bail!("Unknown function subcommand: {}", subcommand),
                     }
                 }
-                "complete" => break 'command parse_complete(&mut parser)?,
                 "get" => {
                     let Some(Component::Term(resource)) = parser.next() else {
                         bail!("get requires a resource name");
                     };
                     match resource {
-                        "self-logs" => {
-                            let mut follow = false;
-                            for component in parser.by_ref() {
-                                match component {
-                                    Component::Flags(flags) => {
-                                        for flag in flags.chars() {
-                                            match flag {
-                                                'f' => follow = true,
-                                                _ => bail!("Unknown flag -{} in self-logs command", flag),
-                                            }
-                                        }
-                                    }
-                                    Component::Long(long) => match long {
-                                        "follow" => follow = true,
-                                        _ => bail!("Unknown flag --{} in self-logs command", long),
-                                    },
-                                    Component::Term(arg) => bail!("Unexpected argument: {:?}", arg),
-                                    Component::Value(val) => bail!("Unexpected value: {:?}", val),
-                                }
-                            }
-                            break 'command Command::Get { resource: GetResource::SelfLogs { follow } };
-                        }
                         "default-user-config" => {
                             break 'command Command::Get { resource: GetResource::DefaultUserConfig };
                         }
@@ -736,7 +755,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                         _ => bail!("Unknown resource: {}", resource),
                     }
                 }
-                unknown_command => bail!("Unknown Command: {:?}", unknown_command),
+                job => break 'command Command::Auto { job, value_map: ValueMap::new(), trailing_args: parser.rest() },
             },
         }
     };
@@ -869,21 +888,22 @@ mod tests {
 
     #[test]
     fn parse_complete_forward_prefix_requires_task() {
-        let cli_args = args(&["complete", "forward-prefix", "--task=ls"]);
+        let cli_args = args(&["self", "complete", "forward-prefix", "--task=ls"]);
         let (_, command) = parse(&cli_args).unwrap();
         let Command::Complete { context: CompleteContext::ForwardPrefix { task } } = command else {
             panic!("expected forward-prefix completion context");
         };
         assert_eq!(task, "ls");
 
-        let cli_args = args(&["complete", "forward-prefix"]);
+        let cli_args = args(&["self", "complete", "forward-prefix"]);
         let err = parse(&cli_args).err().unwrap();
         assert!(err.to_string().contains("complete forward-prefix requires --task=NAME"), "unexpected error: {err}");
     }
 
     #[test]
     fn parse_complete_task_args_accepts_task_and_exclude() {
-        let cli_args = args(&["complete", "task-args", "--task=ls", "--exclude=args,other", "--", "--env", "x"]);
+        let cli_args =
+            args(&["self", "complete", "task-args", "--task=ls", "--exclude=args,other", "--", "--env", "x"]);
         let (_, command) = parse(&cli_args).unwrap();
         let Command::Complete { context: CompleteContext::TaskArgs { task, exclude, args } } = command else {
             panic!("expected task-args completion context");

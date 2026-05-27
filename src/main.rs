@@ -107,8 +107,14 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Spawn { job, value_map, as_test, cached } => {
-            if let Err(err) = spawn_task_command(job, value_map, as_test, cached) {
+        cli::Command::Start { job, value_map, as_test, cached } => {
+            if let Err(err) = start_task_command(job, value_map, as_test, cached) {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
+        }
+        cli::Command::Restart { job, value_map, as_test, cached } => {
+            if let Err(err) = restart_task_command(job, value_map, as_test, cached) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -126,7 +132,13 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Kill { job } => {
+        cli::Command::Auto { job, value_map, trailing_args } => {
+            if let Err(err) = auto_task_command(job, value_map, trailing_args) {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
+        }
+        cli::Command::Stop { job } => {
             if let Err(err) = kill_task_command(job) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
@@ -400,7 +412,7 @@ fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
 
     let current_exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(current_exe);
-    command.arg("server");
+    command.arg("self").arg("server");
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
     command.stderr(std::process::Stdio::null());
@@ -478,7 +490,7 @@ fn restart_selected_command() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn spawn_task_command(job: &str, value_map: jsony_value::ValueMap, as_test: bool, cached: bool) -> anyhow::Result<()> {
+fn start_task_command(job: &str, value_map: jsony_value::ValueMap, as_test: bool, cached: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let config = config::find_config_path_from(&cwd)
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
@@ -488,7 +500,26 @@ fn spawn_task_command(job: &str, value_map: jsony_value::ValueMap, as_test: bool
 
     let workspace = WorkspaceRef::Path { config: &config };
     let req = rpc::SpawnTaskRequest { task_name, profile, params: &params_bytes, as_test, cached };
-    let response = rpc_ws_command(RpcMessageKind::SpawnTask, &workspace, &req)?;
+    let response = rpc_ws_command(RpcMessageKind::StartTask, &workspace, &req)?;
+    handle_command_response(response)
+}
+
+fn restart_task_command(
+    job: &str,
+    value_map: jsony_value::ValueMap,
+    as_test: bool,
+    cached: bool,
+) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    let (task_name, profile) = job.rsplit_once(':').unwrap_or((job, ""));
+    let params_bytes = jsony::to_binary(&value_map);
+
+    let workspace = WorkspaceRef::Path { config: &config };
+    let req = rpc::SpawnTaskRequest { task_name, profile, params: &params_bytes, as_test, cached };
+    let response = rpc_ws_command(RpcMessageKind::RestartTask, &workspace, &req)?;
     handle_command_response(response)
 }
 
@@ -817,6 +848,20 @@ fn run_client(
     }
 
     Ok(())
+}
+
+fn auto_task_command(job: &str, params: jsony_value::ValueMap, trailing_args: &[String]) -> anyhow::Result<()> {
+    let workspace_config = config::load_from_env()?;
+    let (name, _) = job.rsplit_once(':').unwrap_or((job, ""));
+
+    if name != "~cargo"
+        && let Some((_, expr)) = resolve_name_in_config(&workspace_config, name)
+        && expr.managed == Some(false)
+    {
+        return exec_task(job, params, trailing_args);
+    }
+
+    run_client(job, params, trailing_args, false, false)
 }
 
 /// Apply an inferred-deps report received from the daemon to the user's
@@ -1201,16 +1246,15 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             println!("global\tOpen global workspace selector");
             println!("run\tRun a task and display output");
             println!("exec\tExecute task directly, bypassing daemon");
+            println!("start\tStart a task via daemon");
             println!("restart\tRestart a task via daemon");
             println!("restart-selected\tRestart selected task in TUI");
-            println!("kill\tTerminate a running task");
+            println!("stop\tTerminate a running task");
             println!("test\tRun tests with optional filters");
             println!("logs\tView and stream logs");
-            println!("validate\tValidate config file");
+            println!("self\tRun devsm self-management commands");
             println!("get\tGet information from daemon");
             println!("function\tCall a saved function");
-            println!("server\tStart daemon process");
-            println!("complete\tOutput completions for shell");
             true
         }
         cli::CompleteContext::Tasks => {
@@ -1344,7 +1388,6 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             true
         }
         cli::CompleteContext::GetResources => {
-            println!("self-logs\tRetrieve daemon logs");
             println!("workspace\tWorkspace resources");
             println!("workspaces\tList known workspaces");
             println!("default-user-config\tPrint default user config");
@@ -1369,21 +1412,21 @@ Usage: devsm [OPTIONS] [COMMAND]
 
 Commands:
   (default)          Launch the TUI interface (or workspace selector if not in a workspace)
+  <task> [args]      Run a task by name; uses exec automatically for managed = false
   global             Open global workspace selector
   run <job>          Run a job and display its output
                      --derive-cache-key: trace and write cache.key into devsm.toml
   exec <job>         Execute a task directly, bypassing the daemon
-  spawn <job>        Spawn a job via the daemon
+  start <job>        Start a job via the daemon without restarting an active matching job
+  restart <job>      Restart a job via the daemon
   restart-selected   Restart the currently selected task in TUI
-  kill <task>        Terminate a running task (by name or index)
+  stop <task>        Terminate a running task (by name or index)
   test [options] [filters]
                      Run tests with optional filters
   logs [options]     View and stream logs from tasks
-  validate [path]    Validate a config file
   get <resource>     Get information from the daemon
   function call <n>  Call a function defined in config
-  complete <context> Output completion data for shell scripts
-  server             Start the daemon process (internal)
+  self <command>     Run devsm self-management commands
 
 Options:
   -h, --help        Print this help message
@@ -1405,7 +1448,7 @@ Test Options:
 Validate Options:
   --skip-path-checks     Skip validation of pwd paths
 
-Spawn Options:
+Start/Restart Options:
   --cached               Skip restart if task has cache support and cache key matches
 
 Logs Options:
@@ -1421,11 +1464,16 @@ Logs Options:
   PATTERN                Search pattern (case-insensitive if all lowercase)
 
 Get Resources:
-  self-logs [-f]         Retrieve daemon logs (-f/--follow to tail)
   workspace config-path  Get config file path
   workspaces [--json]    List known workspaces (sorted by last loaded)
   default-user-config    Print default user config (keybindings)
   logged-rust-panics     Show logged Rust panics from daemon
+
+Self Commands:
+  self server            Start the daemon process (internal)
+  self validate [path]   Validate a config file
+  self logs [-f]         Retrieve daemon logs (-f/--follow to tail)
+  self complete <ctx>    Output completion data for shell scripts
 
 Complete Contexts:
   commands               List available commands

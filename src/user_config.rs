@@ -68,7 +68,7 @@ pub fn default_user_config_toml() -> String {
 #   select_search, log_search, task_launcher, test_filter_launcher - Overlay-specific
 #
 # Tips:
-#   - Run `devsm get self-logs --follow` to see keybindings and commands as you use them
+#   - Run `devsm self logs --follow` to see keybindings and commands as you use them
 #   - Press 'R' (Shift+r) to reload all configs including this user config (default binding)
 #   - Set a key to `nan` to unbind it (e.g., g = nan)
 #   - Chain bindings: "SPACE l" = "LaunchTask" (press SPACE then l)
