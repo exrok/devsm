@@ -48,6 +48,7 @@ cmd = [
   "cargo",
   "run",
   "--",
+  "self",
   "validate",
   "--skip-path-checks",
   "schema/devsm.example-big.toml",
