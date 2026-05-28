@@ -39,7 +39,7 @@ end
 
 function __fish_devsm_is_explicit_task_command
     switch $argv[1]
-        case run exec start restart stop
+        case run exec start restart stop status
             return 0
     end
     return 1
@@ -47,7 +47,7 @@ end
 
 function __fish_devsm_is_builtin_command
     switch $argv[1]
-        case global run exec start restart restart-selected stop test rerun-tests logs get function self completions
+        case global run exec start restart restart-selected stop status test rerun-tests logs get function self completions
             return 0
     end
     return 1
@@ -418,6 +418,7 @@ complete -c devsm -n __fish_devsm_needs_command -a 'start' -d 'Start a task via 
 complete -c devsm -n __fish_devsm_needs_command -a 'restart' -d 'Restart a task via daemon'
 complete -c devsm -n __fish_devsm_needs_command -a 'restart-selected' -d 'Restart selected task in TUI'
 complete -c devsm -n __fish_devsm_needs_command -a 'stop' -d 'Terminate a running task'
+complete -c devsm -n __fish_devsm_needs_command -a 'status' -d 'Show status of a task or group'
 complete -c devsm -n __fish_devsm_needs_command -a 'test' -d 'Run tests with optional filters'
 complete -c devsm -n __fish_devsm_needs_command -a 'rerun-tests' -d 'Rerun tests'
 complete -c devsm -n __fish_devsm_needs_command -a 'logs' -d 'View and stream logs'
@@ -438,6 +439,7 @@ complete -c devsm -n '__fish_devsm_using_command exec; and __fish_devsm_needs_ta
 complete -c devsm -n '__fish_devsm_using_command start; and __fish_devsm_needs_task' -xa '(__fish_devsm_runnables)'
 complete -c devsm -n '__fish_devsm_using_command restart; and __fish_devsm_needs_task' -xa '(__fish_devsm_runnables)'
 complete -c devsm -n '__fish_devsm_using_command stop; and __fish_devsm_needs_task' -xa '(__fish_devsm_runnables)'
+complete -c devsm -n '__fish_devsm_using_command status; and __fish_devsm_needs_task' -xa '(__fish_devsm_runnables)'
 
 # Task profiles (task:profile syntax) - when current token contains ':'
 complete -c devsm -n '__fish_devsm_using_command run; and __fish_devsm_completing_profile' -xa '(__fish_devsm_profiles_for_token)'

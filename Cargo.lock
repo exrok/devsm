@@ -188,26 +188,22 @@ checksum = "9028f49264629065d057f340a86acb84867925865f73bbf8d47b4d149a7e88b8"
 
 [[package]]
 name = "jsony"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b985872d20345f740f012ccffd65144759b12ffb6c01acf485e30e24c449ef06"
+version = "0.1.9"
 dependencies = [
  "itoa",
  "jsony_macros",
- "ryu",
+ "zmij",
 ]
 
 [[package]]
 name = "jsony_macros"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c18667b5fc4ed9586b42797ecfeb32f8d235ff7aec32e12f79797e3b79c316f4"
+checksum = "4da8678b34d03a741a66990d2344e354cc95292992b981804dc6da059635e611"
 
 [[package]]
 name = "jsony_value"
 version = "0.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e8b4557deb416471eaccaf33bfa3eaf392a2a28107f598e1ae8f03bdf157027"
 dependencies = [
  "foldhash",
  "jsony",
@@ -270,12 +266,6 @@ dependencies = [
  "wasi",
  "windows-sys",
 ]
-
-[[package]]
-name = "ryu"
-version = "1.0.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
 name = "sendfd"

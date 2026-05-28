@@ -1,7 +1,11 @@
 use super::*;
+use crate::config::Command as ConfigCommand;
+use crate::config::Requirement;
 use crate::rpc::DecodeResult;
 use crate::rpc::DecodingState;
-use crate::workspace::{FunctionGlobalAction, SpawnSpec};
+use crate::workspace::{
+    BaseTaskIndex, FunctionGlobalAction, Job, ScheduleRequirement, SpawnSpec, WorkspaceState as WsState,
+};
 use jsony_value::ValueMap;
 
 pub struct ClientMessage<'a> {
@@ -274,6 +278,7 @@ fn handle_rpc_message(
         RpcMessageKind::RerunTests => handle_rpc_rerun_tests(ws, payload),
         RpcMessageKind::CallFunction => handle_rpc_call_function(clients, ws, payload),
         RpcMessageKind::GetLoggedRustPanics => handle_rpc_get_logged_rust_panics(ws, payload),
+        RpcMessageKind::GetStatus => handle_rpc_get_status(ws, payload),
         _ => {
             kvlog::warn!("Unexpected RPC message kind from client", ?kind);
             return Err(rpc::HandlerError::new(404, "Unknown message kind"));
@@ -401,6 +406,311 @@ fn handle_rpc_call_function(clients: &Slab<ClientEntry>, ws: &mut WorkspaceEntry
         },
         Err(e) => CommandBody::Error(e.into()),
     }
+}
+
+fn exit_cause_label(cause: ExitCause) -> &'static str {
+    match cause {
+        ExitCause::Unknown => "unknown",
+        ExitCause::Killed => "killed",
+        ExitCause::Restarted => "restarted",
+        ExitCause::SpawnFailed => "spawn_failed",
+        ExitCause::ProfileConflict => "profile_conflict",
+        ExitCause::Timeout => "timeout",
+    }
+}
+
+fn job_state_label(job: &Job) -> &'static str {
+    match &job.process_status {
+        JobStatus::Scheduled { .. } => "scheduled",
+        JobStatus::Starting => "starting",
+        JobStatus::Running { ready_state: Some(false), .. } => "running (not ready)",
+        JobStatus::Running { .. } => "running",
+        JobStatus::Exited { status: 0, cause: ExitCause::Restarted, .. } => "restarted",
+        JobStatus::Exited { status, .. } => {
+            if *status == 0 {
+                "exited (success)"
+            } else {
+                "exited (failure)"
+            }
+        }
+        JobStatus::Cancelled => "cancelled",
+    }
+}
+
+fn job_ready_state(job: &Job) -> Option<bool> {
+    match &job.process_status {
+        JobStatus::Running { ready_state, .. } => *ready_state,
+        _ => None,
+    }
+}
+
+fn job_exit_info(job: &Job) -> (Option<i32>, Option<Box<str>>) {
+    match &job.process_status {
+        JobStatus::Exited { status, cause: ExitCause::Unknown, .. } => (Some(*status as i32), None),
+        JobStatus::Exited { status, cause, .. } => (Some(*status as i32), Some(exit_cause_label(*cause).into())),
+        JobStatus::Cancelled => (None, Some("cancelled".into())),
+        _ => (None, None),
+    }
+}
+
+fn job_duration_ms(job: &Job) -> Option<u64> {
+    let started = job.started_at;
+    let end = match &job.process_status {
+        JobStatus::Exited { finished_at, .. } => *finished_at,
+        JobStatus::Running { .. } | JobStatus::Starting | JobStatus::Scheduled { .. } => crate::clock::now(),
+        JobStatus::Cancelled => return None,
+    };
+    end.checked_duration_since(started).map(|d| d.as_millis() as u64)
+}
+
+fn job_age_secs(job: &Job) -> Option<u64> {
+    crate::clock::now().checked_duration_since(job.started_at).map(|d| d.as_secs())
+}
+
+fn render_command(cmd: &ConfigCommand<'_>) -> Box<str> {
+    match cmd {
+        ConfigCommand::Sh(script) => format!("sh -c {script:?}").into(),
+        ConfigCommand::Cmd(parts) => {
+            let mut out = String::new();
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                if p.contains(' ') || p.is_empty() {
+                    out.push_str(&format!("{p:?}"));
+                } else {
+                    out.push_str(p);
+                }
+            }
+            out.into()
+        }
+    }
+}
+
+fn blockers_for_scheduled(state: &WsState, after: &[ScheduleRequirement]) -> Vec<Box<str>> {
+    let mut out = Vec::new();
+    for req in after {
+        match req {
+            ScheduleRequirement::Task { job: ji, predicate } => {
+                let Some(blocking_job) = state.jobs.get(*ji) else {
+                    continue;
+                };
+                let bti = blocking_job.log_group.base_task_index();
+                let name = state.base_tasks.get(bti.idx()).map(|bt| bt.name.as_ref()).unwrap_or("?");
+                let kind = state.base_tasks.get(bti.idx()).map(|bt| bt.config.kind.as_str()).unwrap_or("task");
+                out.push(format!("{kind}.{name} ({:?})", predicate).into());
+            }
+            ScheduleRequirement::Resource { id, .. } => {
+                if !state.resources.is_free(*id) {
+                    out.push(format!("resource {}", state.resources.name(*id)).into());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn last_job_for_base_task(state: &WsState, bti: BaseTaskIndex) -> Option<JobIndex> {
+    let bt = state.base_tasks.get(bti.idx())?;
+    let non_term = bt.jobs.non_terminal();
+    if let Some(&ji) = non_term.last() {
+        return Some(ji);
+    }
+    bt.jobs.terminal().last().copied()
+}
+
+fn build_runnable_status(state: &WsState, bti: BaseTaskIndex, detailed: bool) -> rpc::RunnableStatus {
+    let bt = &state.base_tasks[bti.idx()];
+    let current_gen_id = state.config.current.id();
+    let expr = bt.config.expr();
+
+    let mut status = rpc::RunnableStatus {
+        name: bt.name.clone(),
+        kind: bt.config.kind.as_str().into(),
+        state: "never run".into(),
+        last_job_id: None,
+        last_run_started_secs_ago: None,
+        last_run_duration_ms: None,
+        exit_code: None,
+        exit_cause: None,
+        ready: None,
+        blocked_on: Vec::new(),
+        profile: None,
+        spawn_params: None,
+        config_generation_id: None,
+        config_is_current: true,
+        pwd: None,
+        command: None,
+        envvars: Vec::new(),
+        require: Vec::new(),
+    };
+
+    if let Some(ji) = last_job_for_base_task(state, bti) {
+        let job = &state.jobs[ji];
+        status.state = job_state_label(job).into();
+        status.last_job_id = state.jobs.public_id_of(ji);
+        status.last_run_started_secs_ago = job_age_secs(job);
+        status.last_run_duration_ms = job_duration_ms(job);
+        let (code, cause) = job_exit_info(job);
+        status.exit_code = code;
+        status.exit_cause = cause;
+        status.ready = job_ready_state(job);
+
+        let profile = job.spawn_profile();
+        if !profile.is_empty() {
+            status.profile = Some(profile.into());
+        }
+        let params = job.spawn_params();
+        if !params.entries().is_empty() {
+            status.spawn_params = Some(jsony::to_json(params).into());
+        }
+
+        status.config_generation_id = Some(job.spawn.generation_id);
+        status.config_is_current = job.spawn.generation_id == current_gen_id;
+
+        if let JobStatus::Scheduled { after } = &job.process_status {
+            status.blocked_on = blockers_for_scheduled(state, after);
+        }
+
+        if detailed {
+            let tc = job.task().config();
+            status.pwd = Some(tc.pwd.into());
+            status.command = Some(render_command(&tc.command));
+            status.envvars = tc.envvar.iter().map(|(k, v)| format!("{k}={v}").into()).collect();
+        }
+    }
+
+    if detailed && status.require.is_empty() {
+        status.require = expr
+            .require
+            .iter()
+            .map(|r| match r {
+                Requirement::Task(call) => {
+                    let p = call.profile.unwrap_or("");
+                    if p.is_empty() {
+                        format!("task {}", &*call.name).into()
+                    } else {
+                        format!("task {}:{}", &*call.name, p).into()
+                    }
+                }
+                Requirement::Resource { name, priority } => format!("resource {name} (priority {priority})").into(),
+            })
+            .collect();
+    }
+
+    status
+}
+
+fn group_overall(runnables: &[rpc::RunnableStatus]) -> Box<str> {
+    if runnables.is_empty() {
+        return "empty".into();
+    }
+    let mut any_running = false;
+    let mut any_scheduled = false;
+    let mut any_failed = false;
+    let mut all_success = true;
+    let mut any_run = false;
+    for r in runnables {
+        let s = r.state.as_ref();
+        if s.starts_with("running") || s == "starting" {
+            any_running = true;
+            any_run = true;
+        } else if s == "scheduled" {
+            any_scheduled = true;
+            any_run = true;
+        } else if s == "exited (failure)" || s == "cancelled" {
+            any_failed = true;
+            all_success = false;
+            any_run = true;
+        } else if s == "exited (success)" || s == "restarted" {
+            any_run = true;
+        } else if s == "never run" {
+            all_success = false;
+        }
+    }
+    if !any_run {
+        return "never run".into();
+    }
+    if any_running {
+        return "active".into();
+    }
+    if any_scheduled {
+        return "scheduled".into();
+    }
+    if any_failed {
+        return "degraded".into();
+    }
+    if all_success {
+        return "ok".into();
+    }
+    "mixed".into()
+}
+
+fn handle_rpc_get_status(ws: &mut WorkspaceEntry, payload: &[u8]) -> CommandBody {
+    let Ok(req) = jsony::from_binary::<rpc::GetStatusRequest>(payload) else {
+        return CommandBody::Error("Invalid request payload".into());
+    };
+
+    ws.handle.refresh_config_if_changed();
+    let state = ws.handle.state();
+    let name = req.name;
+
+    let explicit_group = WsState::is_explicit_group_reference(name);
+
+    if !explicit_group {
+        if let Some(bti) = state.lookup_name(name) {
+            let status = build_runnable_status(&state, bti, true);
+            let resp = rpc::StatusResponse::Task(status);
+            return CommandBody::Message(jsony::to_json(&resp).into());
+        }
+    }
+
+    let short = match name.split_once('.') {
+        Some(("group", rest)) => rest,
+        Some(("service" | "action" | "test", _)) => {
+            return CommandBody::Error(format!("Task '{}' not found", name).into());
+        }
+        _ => name,
+    };
+    let Some((group_name, calls)) = state.config.current.workspace().groups.iter().find(|(g, _)| *g == short) else {
+        if explicit_group {
+            return CommandBody::Error(format!("Group '{}' not found", short).into());
+        }
+        return CommandBody::Error(format!("'{}' is not a known task or group", name).into());
+    };
+
+    let mut runnables = Vec::with_capacity(calls.len());
+    for call in *calls {
+        let call_name: &str = &call.name;
+        let Some(bti) = state.lookup_name(call_name) else {
+            runnables.push(rpc::RunnableStatus {
+                name: call_name.into(),
+                kind: "?".into(),
+                state: "not configured".into(),
+                last_job_id: None,
+                last_run_started_secs_ago: None,
+                last_run_duration_ms: None,
+                exit_code: None,
+                exit_cause: None,
+                ready: None,
+                blocked_on: Vec::new(),
+                profile: None,
+                spawn_params: None,
+                config_generation_id: None,
+                config_is_current: true,
+                pwd: None,
+                command: None,
+                envvars: Vec::new(),
+                require: Vec::new(),
+            });
+            continue;
+        };
+        runnables.push(build_runnable_status(&state, bti, false));
+    }
+
+    let overall = group_overall(&runnables);
+    let resp = rpc::StatusResponse::Group(rpc::GroupStatus { name: (*group_name).into(), overall, runnables });
+    CommandBody::Message(jsony::to_json(&resp).into())
 }
 
 fn handle_rpc_get_logged_rust_panics(ws: &mut WorkspaceEntry, payload: &[u8]) -> CommandBody {
@@ -713,6 +1023,7 @@ fn handle_rpc_request_command(
             Err(e) => CommandBody::Error(e.into()),
         },
         RpcMessageKind::GetLoggedRustPanics => handle_rpc_get_logged_rust_panics(ws, payload),
+        RpcMessageKind::GetStatus => handle_rpc_get_status(ws, payload),
         _ => return Err(rpc::HandlerError::new(404, "Unknown command")),
     };
     Ok(token.respond(RpcMessageKind::CommandAck, &rpc::CommandResponse { workspace_id: ws_index, body }))

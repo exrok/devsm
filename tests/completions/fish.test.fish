@@ -72,9 +72,14 @@ echo "== fish completion tests =="
 set reply (comp_for "devsm ")
 assert_contains "run" "$reply" "top-level: run"
 assert_contains "completions" "$reply" "top-level: completions"
+assert_contains "status" "$reply" "top-level: status"
 assert_contains "build" "$reply" "top-level: task 'build'"
 assert_contains "api" "$reply" "top-level: task 'api'"
 assert_contains "all" "$reply" "top-level: group 'all'"
+
+set reply (comp_for "devsm status ")
+assert_contains "build" "$reply" "status: task 'build'"
+assert_contains "all" "$reply" "status: group 'all'"
 
 set reply (comp_for "devsm run ")
 assert_contains "build" "$reply" "run: 'build'"

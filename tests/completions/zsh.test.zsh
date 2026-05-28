@@ -178,6 +178,7 @@ run_helper _devsm_commands
 reply="${(j: :)CAPTURED}"
 assert_contains "run" "$reply" "commands: run"
 assert_contains "completions" "$reply" "commands: completions"
+assert_contains "status" "$reply" "commands: status"
 assert_contains "build" "$reply" "commands also includes runnables: build"
 assert_contains "all" "$reply" "commands also includes runnables: all"
 

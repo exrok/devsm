@@ -144,6 +144,12 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        cli::Command::Status { name } => {
+            if let Err(err) = status_command(name) {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
+        }
         cli::Command::Test { filters, force } => {
             let _log_guard = self_log::init_client_logging();
             if let Err(err) = test_client(filters, force) {
@@ -549,6 +555,145 @@ fn kill_task_command(job: &str) -> anyhow::Result<()> {
     let req = rpc::KillTaskRequest { task_name: job };
     let response = rpc_ws_command(RpcMessageKind::KillTask, &workspace, &req)?;
     handle_command_response(response)
+}
+
+fn status_command(name: &str) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    let workspace = WorkspaceRef::Path { config: &config };
+    let req = rpc::GetStatusRequest { name };
+    let response = rpc_ws_command(RpcMessageKind::GetStatus, &workspace, &req)?;
+
+    match response.body {
+        CommandBody::Error(err) => bail!("{err}"),
+        CommandBody::Empty => bail!("empty status response"),
+        CommandBody::Message(msg) => {
+            let parsed: rpc::StatusResponse =
+                jsony::from_json(&msg).map_err(|e| anyhow::anyhow!("Failed to decode status response: {e:?}"))?;
+            print_status_response(&parsed);
+            Ok(())
+        }
+    }
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    if ms < 1000 {
+        return format!("{ms}ms");
+    }
+    let secs = ms / 1000;
+    let rem_ms = ms % 1000;
+    if secs < 60 {
+        return format!("{secs}.{:03}s", rem_ms);
+    }
+    let m = secs / 60;
+    let s = secs % 60;
+    if m < 60 {
+        return format!("{m}m {s}s");
+    }
+    let h = m / 60;
+    let m = m % 60;
+    format!("{h}h {m}m {s}s")
+}
+
+fn format_age_secs(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs}s ago");
+    }
+    let m = secs / 60;
+    let s = secs % 60;
+    if m < 60 {
+        return format!("{m}m {s}s ago");
+    }
+    let h = m / 60;
+    let m = m % 60;
+    if h < 24 {
+        return format!("{h}h {m}m ago");
+    }
+    let d = h / 24;
+    let h = h % 24;
+    format!("{d}d {h}h ago")
+}
+
+fn print_runnable_summary(prefix: &str, r: &rpc::RunnableStatus) {
+    println!("{prefix}{}.{}: {}", r.kind, r.name, r.state);
+    if let Some(id) = r.last_job_id {
+        println!("{prefix}  Last job: #{id}");
+    }
+    if let Some(secs) = r.last_run_started_secs_ago {
+        println!("{prefix}  Started:  {}", format_age_secs(secs));
+    }
+    if let Some(ms) = r.last_run_duration_ms {
+        println!("{prefix}  Duration: {}", format_duration_ms(ms));
+    }
+    if let Some(code) = r.exit_code {
+        let cause = r.exit_cause.as_deref().unwrap_or("");
+        if cause.is_empty() {
+            println!("{prefix}  Exit:     code {code}");
+        } else {
+            println!("{prefix}  Exit:     code {code} ({cause})");
+        }
+    } else if let Some(cause) = r.exit_cause.as_deref() {
+        println!("{prefix}  Exit:     {cause}");
+    }
+    if let Some(ready) = r.ready {
+        println!("{prefix}  Ready:    {}", if ready { "yes" } else { "no" });
+    }
+    if !r.blocked_on.is_empty() {
+        println!("{prefix}  Blocked on:");
+        for dep in &r.blocked_on {
+            println!("{prefix}    - {dep}");
+        }
+    }
+    if let Some(profile) = r.profile.as_deref() {
+        println!("{prefix}  Profile:  {profile}");
+    }
+    if let Some(params) = r.spawn_params.as_deref() {
+        println!("{prefix}  Params:   {params}");
+    }
+    if let Some(gen_id) = r.config_generation_id {
+        let marker = if r.config_is_current { "current" } else { "stale (config reloaded since)" };
+        println!("{prefix}  Config:   generation {gen_id} — {marker}");
+    }
+}
+
+fn print_runnable_detail(r: &rpc::RunnableStatus) {
+    print_runnable_summary("", r);
+    if let Some(pwd) = r.pwd.as_deref() {
+        println!("  Pwd:      {pwd}");
+    }
+    if let Some(cmd) = r.command.as_deref() {
+        println!("  Command:  {cmd}");
+    }
+    if !r.envvars.is_empty() {
+        println!("  Env:");
+        for e in &r.envvars {
+            println!("    {e}");
+        }
+    }
+    if !r.require.is_empty() {
+        println!("  Require:");
+        for req in &r.require {
+            println!("    - {req}");
+        }
+    }
+}
+
+fn print_status_response(resp: &rpc::StatusResponse) {
+    match resp {
+        rpc::StatusResponse::Task(r) => {
+            print_runnable_detail(r);
+        }
+        rpc::StatusResponse::Group(g) => {
+            println!("group.{}: {}", g.name, g.overall);
+            println!("  {} runnable(s)", g.runnables.len());
+            for r in &g.runnables {
+                println!();
+                print_runnable_summary("  ", r);
+            }
+        }
+    }
 }
 
 fn rerun_tests_command(only_failed: bool) -> anyhow::Result<()> {
@@ -1274,6 +1419,7 @@ fn is_builtin_command_name(name: &str) -> bool {
             | "restart"
             | "restart-selected"
             | "stop"
+            | "status"
             | "test"
             | "rerun-tests"
             | "logs"
@@ -1387,6 +1533,7 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             println!("restart\tRestart a task via daemon");
             println!("restart-selected\tRestart selected task in TUI");
             println!("stop\tTerminate a running task");
+            println!("status\tShow status of a task or group");
             println!("test\tRun tests with optional filters");
             println!("logs\tView and stream logs");
             println!("self\tRun devsm self-management commands");
@@ -1581,6 +1728,7 @@ Commands:
   restart <job>      Restart a job via the daemon
   restart-selected   Restart the currently selected task in TUI
   stop <task>        Terminate a running task (by name or index)
+  status <name>      Show status of a task or group (systemctl-style)
   test [options] [filters]
                      Run tests with optional filters
   logs [options]     View and stream logs from tasks

@@ -55,6 +55,11 @@ _devsm() {
                     ':task:_devsm_runnables' \
                     && ret=0
                 ;;
+            (status)
+                _arguments "${_arguments_options[@]}" : \
+                    ':task:_devsm_runnables' \
+                    && ret=0
+                ;;
             (test)
                 _arguments "${_arguments_options[@]}" : \
                     '--force[Run tests even when cache would skip them]' \
@@ -182,6 +187,7 @@ _devsm_commands() {
         'restart:Restart a task via daemon'
         'restart-selected:Restart selected task in TUI'
         'stop:Terminate a running task'
+        'status:Show status of a task or group'
         'test:Run tests with optional filters'
         'rerun-tests:Rerun previously failed tests'
         'logs:View and stream logs'

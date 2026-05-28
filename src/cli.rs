@@ -95,6 +95,7 @@ pub enum Command<'a> {
     Run { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String], as_test: bool, derive_cache_key: bool },
     Auto { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String] },
     Stop { job: &'a str },
+    Status { name: &'a str },
     Test { filters: Vec<TestFilter<'a>>, force: bool },
     RerunTests { only_failed: bool },
     Validate { path: Option<&'a str>, skip_path_checks: bool },
@@ -720,6 +721,15 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                         bail!("stop requires a task name or job index");
                     };
                     break 'command Command::Stop { job };
+                }
+                "status" => {
+                    let Some(Component::Term(name)) = parser.next() else {
+                        bail!("status requires a task or group name");
+                    };
+                    if let Some(extra) = parser.next() {
+                        bail!("Unexpected argument after name: {:?}", extra);
+                    }
+                    break 'command Command::Status { name };
                 }
                 "test" => break 'command parse_test_filters(&mut parser)?,
                 "rerun-tests" => break 'command parse_rerun_tests(&mut parser),

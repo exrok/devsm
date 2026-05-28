@@ -54,4 +54,8 @@ impl ResourceSlab {
         debug_assert!(slot.is_some(), "release of free resource '{}'", &self.names[id.idx()]);
         *slot = None;
     }
+
+    pub fn name(&self, id: ResourceIndex) -> &str {
+        &self.names[id.idx()]
+    }
 }

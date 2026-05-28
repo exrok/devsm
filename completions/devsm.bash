@@ -24,14 +24,14 @@ __devsm_resolve_words() {
 
 __devsm_is_builtin_command() {
     case "$1" in
-        global|run|exec|start|restart|restart-selected|stop|test|rerun-tests|logs|get|function|self|completions) return 0 ;;
+        global|run|exec|start|restart|restart-selected|stop|status|test|rerun-tests|logs|get|function|self|completions) return 0 ;;
     esac
     return 1
 }
 
 __devsm_is_explicit_task_command() {
     case "$1" in
-        run|exec|start|restart|stop) return 0 ;;
+        run|exec|start|restart|stop|status) return 0 ;;
     esac
     return 1
 }
@@ -337,7 +337,7 @@ _devsm() {
             __devsm_complete_function "$_devsm_cmd_idx"
             return
             ;;
-        stop)
+        stop|status)
             __devsm_find_task "$_devsm_cmd_idx"
             if [[ -z "$_devsm_task_idx" ]]; then
                 if [[ "$_devsm_cur" == *:* ]]; then

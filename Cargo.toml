@@ -17,7 +17,7 @@ mio = { version = "1.0.4", features = [
 slab = "0.4.11"
 unicode-segmentation = "1.12.0"
 unicode-width = { version = "0.2.2", default-features = false }
-jsony = "0.1.8"
+jsony = "0.1.9"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 memchr = "2.7.6"
 sendfd = "0.4.4"
@@ -46,6 +46,10 @@ syscalls = { version = "0.8.1", default-features = false, features = [
 
 [patch."https://github.com/exrok/extui"]
 extui = { path = "/home/user/Projects/git/extui" }
+
+[patch.crates-io]
+jsony = { path = "/home/user/Projects/git/jsony" }
+jsony_value = { path = "/home/user/Projects/git/jsony/crates/jsony_value" }
 
 [dev-dependencies]
 vt100 = "*"

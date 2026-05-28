@@ -150,6 +150,7 @@ pub enum RpcMessageKind {
     GetWorkspaces = 0x011B,
     StartTask = 0x011C,
     RestartTask = 0x011D,
+    GetStatus = 0x011E,
 
     // Legacy responses
     OpenWorkspaceAck = 0x0200,
@@ -194,6 +195,7 @@ impl RpcMessageKind {
             0x011B => Some(Self::GetWorkspaces),
             0x011C => Some(Self::StartTask),
             0x011D => Some(Self::RestartTask),
+            0x011E => Some(Self::GetStatus),
             0x0200 => Some(Self::OpenWorkspaceAck),
             0x0201 => Some(Self::SubscribeAck),
             0x0203 => Some(Self::RunTaskAck),
@@ -222,6 +224,7 @@ impl RpcMessageKind {
                 | Self::RestartSelected
                 | Self::GetLoggedRustPanics
                 | Self::GetWorkspaces
+                | Self::GetStatus
         )
     }
 }
@@ -1263,6 +1266,57 @@ pub struct GetWorkspacesResponse {
     pub workspaces: Vec<WorkspaceInfo>,
 }
 
+/// Request the status of a task or group by name.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct GetStatusRequest<'a> {
+    pub name: &'a str,
+}
+
+/// Status information for a single runnable (task or test).
+///
+/// Returned both standalone (`StatusResponse::Task`) and as part of a
+/// group breakdown.
+#[derive(Jsony, Debug)]
+#[jsony(ToJson, FromJson)]
+pub struct RunnableStatus {
+    pub name: Box<str>,
+    pub kind: Box<str>,
+    pub state: Box<str>,
+    pub last_job_id: Option<u32>,
+    pub last_run_started_secs_ago: Option<u64>,
+    pub last_run_duration_ms: Option<u64>,
+    pub exit_code: Option<i32>,
+    pub exit_cause: Option<Box<str>>,
+    pub ready: Option<bool>,
+    pub blocked_on: Vec<Box<str>>,
+    pub profile: Option<Box<str>>,
+    pub spawn_params: Option<Box<str>>,
+    pub config_generation_id: Option<u64>,
+    pub config_is_current: bool,
+    pub pwd: Option<Box<str>>,
+    pub command: Option<Box<str>>,
+    pub envvars: Vec<Box<str>>,
+    pub require: Vec<Box<str>>,
+}
+
+/// Status of a group: an overall verdict plus a per-runnable breakdown.
+#[derive(Jsony, Debug)]
+#[jsony(ToJson, FromJson)]
+pub struct GroupStatus {
+    pub name: Box<str>,
+    pub overall: Box<str>,
+    pub runnables: Vec<RunnableStatus>,
+}
+
+/// Response payload for [`GetStatusRequest`].
+#[derive(Jsony, Debug)]
+#[jsony(ToJson, FromJson)]
+pub enum StatusResponse {
+    Task(RunnableStatus),
+    Group(GroupStatus),
+}
+
 /// Body of a command response.
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
@@ -1381,6 +1435,11 @@ impl RpcResponse<'_> for GetWorkspacesResponse {
 
 impl RpcRequest<'_> for GetWorkspacesRequest {
     const KIND: RpcMessageKind = RpcMessageKind::GetWorkspaces;
+    type Ack<'l> = CommandResponse;
+}
+
+impl<'a> RpcRequest<'a> for GetStatusRequest<'a> {
+    const KIND: RpcMessageKind = RpcMessageKind::GetStatus;
     type Ack<'l> = CommandResponse;
 }
 
