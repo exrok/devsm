@@ -738,6 +738,11 @@ fn forward_new_logs(
     let current_tail = logs.tail();
 
     if *last_log_id >= current_tail {
+        // Release `logs` before locking `state`: everywhere else that co-holds
+        // both takes `state` then `logs`. Holding `logs` across a `state` read
+        // here would invert that order and, with the writer-preferring std
+        // RwLock, risk an ABBA deadlock against the TUI/test readers.
+        drop(logs);
         let state = workspace.state.read().unwrap();
         for (job_index, job) in state.jobs.iter() {
             if job.log_group != log_group {
@@ -820,6 +825,7 @@ fn forward_new_logs(
     let _ = file.flush();
 
     *last_log_id = current_tail;
+    drop(logs);
 
     let state = workspace.state.read().unwrap();
     for (job_index, job) in state.jobs.iter() {
