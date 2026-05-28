@@ -581,26 +581,6 @@ pub struct LogWriter {
     remaining: usize,
 }
 
-fn write_line_unchecked(buf: &Logs, start: u32, line: &str, width: u32, job_id: LogGroup, style: Style) {
-    let index_start = buf.index_start();
-    let line_count = buf.line_count.load(Ordering::Acquire);
-    let next = (line_count + index_start) & (MAX_LINES - 1);
-    let time = buf.start_time.elapsed().as_secs() as u32;
-    unsafe {
-        std::ptr::copy_nonoverlapping(line.as_ptr(), buf.buffer.add(start as usize).as_ptr(), line.len());
-        buf.line_entries.add(next).write(LogEntry {
-            log_group: job_id,
-            start,
-            len: line.len() as u32,
-            width,
-            style,
-            time,
-        });
-        buf.log_groups.add(next).write(job_id);
-        buf.line_count.fetch_add(1, Ordering::Release);
-    }
-}
-
 impl LogWriter {
     #[allow(unused)]
     pub fn tail(&self) -> LogId {
@@ -659,7 +639,28 @@ impl LogWriter {
     }
 
     pub fn push_line(&mut self, line: &str, width: u32, job_id: LogGroup, style: Style) {
-        let offset = if let Some(offset) = self.range.munch(line.len())
+        self.push_line_with(line.len(), width, job_id, style, |dst| {
+            dst.copy_from_slice(line.as_bytes());
+            line.len()
+        });
+    }
+
+    /// Reserve `max_len` bytes in the ring buffer, hand `fill` a `&mut [u8]` over
+    /// the reserved span, and finalize the entry with the length `fill` returns.
+    ///
+    /// Used by the ingest path's slow case to copy only the safe bytes of a line
+    /// containing unsafe terminal escapes — no temporary allocation, the bytes
+    /// land straight in the log buffer. Any unused tail bytes
+    /// (`max_len - actual_len`) are simply skipped in the wrapping range.
+    pub fn push_line_with(
+        &mut self,
+        max_len: usize,
+        width: u32,
+        job_id: LogGroup,
+        style: Style,
+        fill: impl FnOnce(&mut [u8]) -> usize,
+    ) {
+        let offset = if let Some(offset) = self.range.munch(max_len)
             && self.remaining > 0
         {
             offset
@@ -669,7 +670,7 @@ impl LogWriter {
             self.range = lock.free_lines(count);
             kvlog::warn!("After cleanup new capacity is", count = self.range.len);
             self.remaining = MAX_LINES - *lock.line_count.get_mut();
-            if let Some(offset) = self.range.munch(line.len())
+            if let Some(offset) = self.range.munch(max_len)
                 && self.remaining > 0
             {
                 offset
@@ -680,7 +681,25 @@ impl LogWriter {
 
         let buf = self.buffer.read().unwrap();
         self.remaining -= 1;
-        write_line_unchecked(&buf, offset, line, width, job_id, style);
+        let dst = unsafe { std::slice::from_raw_parts_mut(buf.buffer.add(offset as usize).as_ptr(), max_len) };
+        let actual_len = fill(dst);
+        debug_assert!(actual_len <= max_len);
+        let index_start = buf.index_start();
+        let line_count = buf.line_count.load(Ordering::Acquire);
+        let next = (line_count + index_start) & (MAX_LINES - 1);
+        let time = buf.start_time.elapsed().as_secs() as u32;
+        unsafe {
+            buf.line_entries.add(next).write(LogEntry {
+                log_group: job_id,
+                start: offset,
+                len: actual_len as u32,
+                width,
+                style,
+                time,
+            });
+            buf.log_groups.add(next).write(job_id);
+            buf.line_count.fetch_add(1, Ordering::Release);
+        }
     }
 }
 

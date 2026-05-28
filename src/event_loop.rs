@@ -3,7 +3,7 @@ use crate::rpc::{CommandBody, DecodingState, RpcMessageKind};
 use crate::workspace::{self, ExitCause, JobIndex, JobStatus, Workspace, WorkspaceState};
 use crate::{
     config::{Command, TaskConfigRc, TaskKind},
-    line_width::{Segment, apply_raw_display_mode_vt_to_style},
+    line_width::{Segment, apply_raw_display_mode_vt_to_style, write_kept_bytes},
     log_storage::{LogGroup, LogWriter},
 };
 use anyhow::{Context, bail};
@@ -119,17 +119,24 @@ impl Drop for UntrackedChildGuard {
 impl ActiveProcess {
     fn append_line(&mut self, text: &[u8], writer: &mut LogWriter) {
         if let Ok(text) = std::str::from_utf8(text) {
+            let mut iter = Segment::iterator(text);
             let mut new_style = self.style;
-            let mut width = 0;
-            for segment in Segment::iterator(text) {
+            let mut width = 0usize;
+            for segment in &mut iter {
                 match segment {
-                    Segment::Ascii(text) => width += text.len(),
+                    Segment::Ascii(s) => width += s.len(),
                     Segment::AnsiEscapes(escape) => apply_raw_display_mode_vt_to_style(&mut new_style, escape),
-                    Segment::Utf8(text) => width += text.width(),
+                    Segment::Utf8(s) => width += s.width(),
                 }
             }
 
-            writer.push_line(text, width as u32, self.log_group, self.style);
+            if !iter.stripped {
+                writer.push_line(text, width as u32, self.log_group, self.style);
+            } else {
+                writer.push_line_with(text.len(), width as u32, self.log_group, self.style, |dst| {
+                    write_kept_bytes(text, dst)
+                });
+            }
             self.style = new_style;
         }
     }
@@ -390,18 +397,29 @@ impl EventLoop {
         let mut ready_matched = false;
         while let Some(line) = buffer.readline() {
             if let Ok(text) = std::str::from_utf8(line) {
+                let mut iter = Segment::iterator(text);
                 let mut new_style = process.style;
-                let mut width = 0;
-                for segment in Segment::iterator(text) {
+                let mut width = 0usize;
+                for segment in &mut iter {
                     match segment {
-                        Segment::Ascii(text) => width += text.len(),
+                        Segment::Ascii(s) => width += s.len(),
                         Segment::AnsiEscapes(escape) => apply_raw_display_mode_vt_to_style(&mut new_style, escape),
-                        Segment::Utf8(text) => width += text.width(),
+                        Segment::Utf8(s) => width += s.width(),
                     }
                 }
 
                 if let Some(workspace) = self.state.workspaces.get_mut(process.workspace_index as usize) {
-                    workspace.line_writer.push_line(text, width as u32, process.log_group, process.style);
+                    if !iter.stripped {
+                        workspace.line_writer.push_line(text, width as u32, process.log_group, process.style);
+                    } else {
+                        workspace.line_writer.push_line_with(
+                            text.len(),
+                            width as u32,
+                            process.log_group,
+                            process.style,
+                            |dst| write_kept_bytes(text, dst),
+                        );
+                    }
                 }
 
                 if let Some(ref checker) = process.ready_checker

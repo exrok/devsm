@@ -7,7 +7,7 @@ use unicode_width::UnicodeWidthStr;
 pub enum Segment<'a> {
     /// A segment containing only printable ASCII characters.
     Ascii(&'a str),
-    /// A segment representing an ANSI SGR escape code (`\x1b[...m`).
+    /// A segment representing an ANSI SGR escape code (`\x1b[...m`) or an OSC sequence.
     AnsiEscapes(&'a str),
     /// A printable segment containing non-ASCII Unicode characters.
     Utf8(&'a str),
@@ -15,11 +15,14 @@ pub enum Segment<'a> {
 
 /// An iterator that partitions a string into `Segment`s in a single pass.
 ///
-/// This iterator is optimized to process strings containing ANSI escape codes efficiently.
-/// It determines the type of the next segment by looking at the first byte of the
-/// remaining string and consumes just that segment, ensuring O(n) linear time complexity.
-struct SegmentIterator<'a> {
+/// Non-SGR CSI sequences (cursor moves, screen clears, etc.) and bare ESC + char
+/// sequences are dropped from the iteration — the corresponding bytes are skipped
+/// and never yielded. After iterating, `stripped` reports whether any such bytes
+/// were dropped, so the caller can fall back to a sanitized copy of the input.
+pub struct SegmentIterator<'a> {
     remaining: &'a str,
+    /// `true` once an unsafe escape has been skipped. Never written on the safe path.
+    pub stripped: bool,
 }
 
 fn numericalize_unchecked_iter(text: &str) -> impl Iterator<Item = u8> {
@@ -40,49 +43,77 @@ impl<'a> Iterator for SegmentIterator<'a> {
     type Item = Segment<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining.is_empty() {
-            return None;
-        }
-
-        let bytes = self.remaining.as_bytes();
-        let first_byte = bytes[0];
-
-        if first_byte == b'\x1b' {
-            if bytes.get(1) == Some(&b'[') {
-                // CSI sequence: \x1b[...m (SGR and other CSI commands)
-                let segment_len =
-                    bytes.iter().skip(2).position(|&b| b == b'm').map(|pos| pos + 3).unwrap_or(bytes.len());
-                self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
-                Some(Segment::AnsiEscapes(unsafe { std::str::from_utf8_unchecked(&bytes[2..segment_len - 1]) }))
-            } else if bytes.get(1) == Some(&b']') {
-                // OSC sequence: \x1b]...ST where ST is \x1b\\ or BEL (\x07)
-                // Common example: OSC 8 hyperlinks \x1b]8;params;uri\x1b\\
-                let segment_len = bytes
-                    .windows(2)
-                    .position(|w| w == b"\x1b\\")
-                    .map(|pos| pos + 2)
-                    .or_else(|| bytes.iter().position(|&b| b == b'\x07').map(|pos| pos + 1))
-                    .unwrap_or(bytes.len());
-                self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
-                Some(Segment::AnsiEscapes(""))
-            } else {
-                // Other escape sequence - skip ESC and next byte if present
-                let segment_len = if bytes.len() > 1 { 2 } else { 1 };
-                self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
-                Some(Segment::AnsiEscapes(""))
+        loop {
+            if self.remaining.is_empty() {
+                return None;
             }
-        } else if first_byte.is_ascii() {
-            let segment_len = bytes.iter().position(|&b| !b.is_ascii() || b == b'\x1b').unwrap_or(bytes.len());
-            let (segment_str, next_remaining) = self.remaining.split_at(segment_len);
-            self.remaining = next_remaining;
 
-            Some(Segment::Ascii(segment_str))
-        } else {
+            let bytes = self.remaining.as_bytes();
+            let first_byte = bytes[0];
+
+            if first_byte == b'\x1b' {
+                if bytes.get(1) == Some(&b'[') {
+                    // CSI sequence: `\x1b[` params (0x30..0x3F) intermediates (0x20..0x2F) final (0x40..0x7E).
+                    // Scan for the first byte >= 0x40 (the final byte). For SGR this is `m` and
+                    // costs the same single-byte comparison as the prior `position(==b'm')`.
+                    let mut j = 2;
+                    while j < bytes.len() && bytes[j] < 0x40 {
+                        j += 1;
+                    }
+                    if j < bytes.len() {
+                        let final_byte = bytes[j];
+                        if final_byte < 0x80 {
+                            let segment_len = j + 1;
+                            let body = unsafe { std::str::from_utf8_unchecked(&bytes[2..j]) };
+                            self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
+                            if final_byte == b'm' {
+                                return Some(Segment::AnsiEscapes(body));
+                            }
+                            self.stripped = true;
+                            continue;
+                        }
+                        // Malformed CSI: bytes[j] is a UTF-8 multibyte byte. Strip just
+                        // the ESC[…prefix and resume parsing at this char boundary (the
+                        // prior `\x1b[` are both ASCII, so position j is on a boundary).
+                        self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[j..]) };
+                        self.stripped = true;
+                        continue;
+                    }
+                    self.stripped = true;
+                    self.remaining = "";
+                    continue;
+                }
+                if bytes.get(1) == Some(&b']') {
+                    // OSC sequence: \x1b]...ST where ST is \x1b\\ or BEL (\x07).
+                    // OSC 8 hyperlinks and benign OSC (title, palette) all pass through.
+                    let segment_len = bytes
+                        .windows(2)
+                        .position(|w| w == b"\x1b\\")
+                        .map(|pos| pos + 2)
+                        .or_else(|| bytes.iter().position(|&b| b == b'\x07').map(|pos| pos + 1))
+                        .unwrap_or(bytes.len());
+                    self.remaining = unsafe { std::str::from_utf8_unchecked(&bytes[segment_len..]) };
+                    return Some(Segment::AnsiEscapes(""));
+                }
+                // Other escape sequence - skip ESC and the following char.
+                // Advance by full char so we never split inside a multibyte UTF-8 sequence.
+                let mut chars = self.remaining.chars();
+                chars.next();
+                chars.next();
+                self.remaining = chars.as_str();
+                self.stripped = true;
+                continue;
+            }
+            if first_byte.is_ascii() {
+                let segment_len = bytes.iter().position(|&b| !b.is_ascii() || b == b'\x1b').unwrap_or(bytes.len());
+                let (segment_str, next_remaining) = self.remaining.split_at(segment_len);
+                self.remaining = next_remaining;
+                return Some(Segment::Ascii(segment_str));
+            }
             let segment_len = bytes.iter().position(|&b| b.is_ascii() || b == b'\x1b').unwrap_or(bytes.len());
             let (segment_str, next_remaining) = self.remaining.split_at(segment_len);
             self.remaining = next_remaining;
-
-            Some(Segment::Utf8(segment_str))
+            return Some(Segment::Utf8(segment_str));
         }
     }
 }
@@ -90,15 +121,99 @@ impl<'a> Iterator for SegmentIterator<'a> {
 impl<'a> Segment<'a> {
     /// Returns an iterator over the segments of a string.
     ///
-    /// The iterator efficiently splits the text into `Ascii`, `Utf8`, and `AnsiEscapes`
-    /// segments in a single pass, allowing for optimized width calculation.
+    /// Yields `Ascii`, `Utf8`, and `AnsiEscapes` segments in a single pass. CSI
+    /// sequences whose final byte is not `m` (cursor moves, clears, mode sets,
+    /// scroll, etc.) and bare ESC + char sequences are skipped silently and
+    /// `SegmentIterator::stripped` is set so the caller can sanitize storage.
     ///
     /// # Assumptions
-    /// The function assumes the input `text` contains no control characters (`\t`, `\n`, etc.)
-    /// and that the only VT escape codes present are SGR display mode codes (`\x1b[...m`).
-    pub fn iterator(text: &'a str) -> impl Iterator<Item = Segment<'a>> {
-        SegmentIterator { remaining: text }
+    /// The input `text` contains no control characters (`\t`, `\n`, etc.).
+    pub fn iterator(text: &'a str) -> SegmentIterator<'a> {
+        SegmentIterator { remaining: text, stripped: false }
     }
+}
+
+/// Returns `(end_byte_offset, keep)` for the escape sequence starting at `start`
+/// (a `\x1b` byte). `keep == true` means the bytes `start..end` must be preserved
+/// when copying the line into storage.
+///
+/// Shared between `SegmentIterator` and `write_kept_bytes` so classification has
+/// one source of truth.
+fn classify_escape_at(bytes: &[u8], start: usize) -> (usize, bool) {
+    match bytes.get(start + 1) {
+        Some(&b'[') => {
+            let mut j = start + 2;
+            while j < bytes.len() && bytes[j] < 0x40 {
+                j += 1;
+            }
+            if j < bytes.len() {
+                if bytes[j] < 0x80 {
+                    (j + 1, bytes[j] == b'm')
+                } else {
+                    // Malformed CSI - strip only up to the multibyte byte, leaving
+                    // it for the next pass to interpret as a UTF-8 char.
+                    (j, false)
+                }
+            } else {
+                (bytes.len(), false)
+            }
+        }
+        Some(&b']') => {
+            let mut j = start + 2;
+            while j + 1 < bytes.len() {
+                if bytes[j] == b'\x1b' && bytes[j + 1] == b'\\' {
+                    return (j + 2, true);
+                }
+                if bytes[j] == b'\x07' {
+                    return (j + 1, true);
+                }
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'\x07' {
+                return (j + 1, true);
+            }
+            (bytes.len(), true)
+        }
+        Some(_) => {
+            // ESC + one char. Advance by full UTF-8 char so we never split inside a multibyte sequence.
+            let tail = unsafe { std::str::from_utf8_unchecked(&bytes[start + 1..]) };
+            let next_char_len = tail.chars().next().map_or(0, |c| c.len_utf8());
+            (start + 1 + next_char_len, false)
+        }
+        None => (start + 1, false),
+    }
+}
+
+/// Copies the safe bytes of `text` into `dst`, returning the number of bytes
+/// written. Skips non-SGR CSI sequences and bare ESC + char sequences; passes
+/// SGR (`\x1b[...m`) and OSC (including OSC 8 hyperlinks) through verbatim.
+///
+/// Caller must ensure `dst.len() >= text.len()`. Only invoked on the rare slow
+/// path where `SegmentIterator::stripped` indicates the line contains an unsafe
+/// escape — never on safe lines.
+pub fn write_kept_bytes(text: &str, dst: &mut [u8]) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut written = 0;
+    while i < bytes.len() {
+        let next_esc = bytes[i..].iter().position(|&b| b == b'\x1b').map_or(bytes.len(), |p| i + p);
+        if next_esc > i {
+            let span = &bytes[i..next_esc];
+            dst[written..written + span.len()].copy_from_slice(span);
+            written += span.len();
+        }
+        if next_esc == bytes.len() {
+            break;
+        }
+        let (end, keep) = classify_escape_at(bytes, next_esc);
+        if keep {
+            let span = &bytes[next_esc..end];
+            dst[written..written + span.len()].copy_from_slice(span);
+            written += span.len();
+        }
+        i = end;
+    }
+    written
 }
 
 /// Strips ANSI escape codes and checks if text contains needle (case-sensitive).
@@ -448,6 +563,92 @@ mod tests {
         let text = "日本語abc";
         let segments: Vec<_> = Segment::iterator(text).collect();
         assert_eq!(segments, vec![Segment::Utf8("日本語"), Segment::Ascii("abc"),]);
+    }
+
+    #[test]
+    fn test_escape_followed_by_multibyte_utf8() {
+        // ESC followed by a non-`[`/`]` multibyte char must not split inside the
+        // multibyte sequence. The iterator now skips ESC + char entirely and sets `stripped`.
+        let text = "\x1bé hello";
+        let mut iter = Segment::iterator(text);
+        let segments: Vec<_> = iter.by_ref().collect();
+        assert_eq!(segments, vec![Segment::Ascii(" hello")]);
+        assert!(iter.stripped);
+        assert_eq!(display_width(text), " hello".len());
+    }
+
+    #[test]
+    fn test_csi_with_multibyte_tail() {
+        // Malformed CSI - the multibyte char is NOT consumed; the ESC[…prefix is
+        // stripped and parsing resumes on the char boundary so the char shows up
+        // as a UTF-8 segment.
+        let text = "\x1b[31é";
+        let mut iter = Segment::iterator(text);
+        let segments: Vec<_> = iter.by_ref().collect();
+        assert_eq!(segments, vec![Segment::Utf8("é")]);
+        assert!(iter.stripped);
+        assert_eq!(display_width(text), UnicodeWidthStr::width("é"));
+    }
+
+    fn assert_stripped_to(text: &str, expected: &str) {
+        let mut iter = Segment::iterator(text);
+        for _ in iter.by_ref() {}
+        assert!(iter.stripped, "expected stripped=true for {text:?}");
+        let mut buf = vec![0u8; text.len()];
+        let n = write_kept_bytes(text, &mut buf);
+        assert_eq!(std::str::from_utf8(&buf[..n]).unwrap(), expected);
+    }
+
+    fn assert_not_stripped(text: &str) {
+        let mut iter = Segment::iterator(text);
+        for _ in iter.by_ref() {}
+        assert!(!iter.stripped, "expected stripped=false for {text:?}");
+    }
+
+    #[test]
+    fn test_iterator_not_stripped_for_safe_lines() {
+        assert_not_stripped("hello world");
+        assert_not_stripped("\x1b[1m\x1b[31mbold red\x1b[0m");
+        assert_not_stripped("\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        assert_not_stripped("\x1b]0;window title\x07visible");
+    }
+
+    #[test]
+    fn test_iterator_strips_screen_clear() {
+        assert_stripped_to("before\x1b[2Jafter", "beforeafter");
+    }
+
+    #[test]
+    fn test_iterator_strips_cursor_position() {
+        assert_stripped_to("row1\x1b[10;20Hrow2\x1b[Hhome", "row1row2home");
+    }
+
+    #[test]
+    fn test_iterator_strips_dec_private_modes() {
+        assert_stripped_to("\x1b[?25lhidden\x1b[?25h", "hidden");
+    }
+
+    #[test]
+    fn test_iterator_strips_other_escape() {
+        assert_stripped_to("before\x1bcafter", "beforeafter");
+    }
+
+    #[test]
+    fn test_iterator_strips_truncated_csi() {
+        assert_stripped_to("\x1b[31", "");
+    }
+
+    #[test]
+    fn test_iterator_keeps_sgr_around_clear() {
+        assert_stripped_to("\x1b[31mred\x1b[2J\x1b[0mreset", "\x1b[31mred\x1b[0mreset");
+    }
+
+    #[test]
+    fn test_write_kept_bytes_safe_passthrough() {
+        let text = "\x1b[31mhello\x1b[0m world";
+        let mut buf = vec![0u8; text.len()];
+        let n = write_kept_bytes(text, &mut buf);
+        assert_eq!(&buf[..n], text.as_bytes());
     }
 
     /// Computes the terminal display width of a string, ignoring ANSI SGR color codes.
