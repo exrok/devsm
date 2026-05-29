@@ -1128,6 +1128,13 @@ impl EventLoop {
                 false
             }
             ProcessRequest::AttachClient { stdin, stdout, socket, workspace_config, kind } => {
+                // Fault injection for the crash-reporting tests: panic on the
+                // event-loop thread (taking the daemon down) once a client has
+                // attached. Debug-only so it cannot fire in release builds.
+                #[cfg(debug_assertions)]
+                if std::env::var_os("DEVSM_TEST_PANIC_ON_ATTACH").is_some() {
+                    panic!("injected test panic on client attach");
+                }
                 let ws_index = match self.state.get_or_create_workspace_index(workspace_config) {
                     Ok(ws) => ws,
                     Err(err) => {

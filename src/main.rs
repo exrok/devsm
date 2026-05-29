@@ -92,6 +92,7 @@ fn main() {
             }
         }
         cli::Command::Server => {
+            self_log::install_daemon_panic_hook();
             let _log_guard = if std::env::var("DEVSM_LOG_STDOUT").as_deref() == Ok("1") {
                 None
             } else {
@@ -299,11 +300,13 @@ fn test_client(filters: Vec<cli::TestFilter>, force: bool) -> anyhow::Result<()>
 
     let mut protocol = ClientProtocol::new();
     let mut read_buf = Vec::with_capacity(1024);
+    let mut terminated_by_user = false;
 
     loop {
         let flags = SIGNAL_FLAGS.swap(0, Ordering::Relaxed);
 
         if flags & TERMINATION_FLAG != 0 {
+            terminated_by_user = true;
             protocol.send_empty(RpcMessageKind::Terminate, 0);
             socket.write_all(protocol.output())?;
             protocol.clear_output();
@@ -314,10 +317,8 @@ fn test_client(filters: Vec<cli::TestFilter>, force: bool) -> anyhow::Result<()>
         let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
 
         match socket.read(read_slice) {
-            Ok(0) => {
-                // Socket closed without TerminateAck - server encountered an error
-                bail!("Test run failed");
-            }
+            Ok(0) if terminated_by_user => return Ok(()),
+            Ok(0) => report_daemon_disconnect(),
             Ok(n) => {
                 unsafe { read_buf.set_len(read_buf.len() + n) };
                 loop {
@@ -339,7 +340,8 @@ fn test_client(filters: Vec<cli::TestFilter>, force: bool) -> anyhow::Result<()>
                 protocol.compact(&mut read_buf, 4096);
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => bail!("Socket read failed: {}", e),
+            Err(_) if terminated_by_user => return Ok(()),
+            Err(_) => report_daemon_disconnect(),
         }
     }
 }
@@ -824,7 +826,7 @@ fn client_with_config(cwd: &std::path::Path, config: &std::path::Path) -> anyhow
         let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
 
         match socket.read(read_slice) {
-            Ok(0) => break,
+            Ok(0) => report_daemon_disconnect(),
             Ok(n) => {
                 unsafe { read_buf.set_len(read_buf.len() + n) };
                 loop {
@@ -848,13 +850,9 @@ fn client_with_config(cwd: &std::path::Path, config: &std::path::Path) -> anyhow
             Err(e) if e.kind() == ErrorKind::Interrupted => {
                 kvlog::info!("Interrupted")
             }
-            Err(e) => {
-                bail!("Socket read failed: {}", e);
-            }
+            Err(_) => report_daemon_disconnect(),
         }
     }
-
-    Ok(())
 }
 
 fn reset_terminal_to_canonical() {
@@ -866,6 +864,58 @@ fn reset_terminal_to_canonical() {
             libc::tcsetattr(0, libc::TCSANOW, &termios);
         }
     }
+}
+
+/// Restores the terminal after the daemon — which put it in raw mode on our
+/// passed-through stdout fd — died without running its own cleanup.
+///
+/// Emits the disable sequences (each a no-op if that mode was never enabled, so
+/// this is safe for both the full-screen sessions and the plain log forwarders)
+/// and restores cooked mode. Does nothing when output is not a terminal.
+fn restore_terminal_on_crash() {
+    use std::os::fd::FromRawFd;
+
+    let mut seq = Vec::new();
+    seq.extend_from_slice(extui::vt::DISABLE_ALT_SCREEN);
+    seq.extend_from_slice(extui::vt::SHOW_CURSOR);
+    seq.extend_from_slice(extui::vt::DISABLE_NON_MOTION_MOUSE_EVENTS);
+    seq.extend_from_slice(extui::vt::DISABLE_BRACKETED_PASTE);
+    seq.extend_from_slice(extui::vt::POP_KEYBOARD_ENABLEMENT);
+
+    if unsafe { libc::isatty(1) } == 1 {
+        let mut stdout = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(1) });
+        let _ = stdout.write_all(&seq);
+    } else if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(&seq);
+    }
+
+    reset_terminal_to_canonical();
+}
+
+/// Cleans up the terminal and prints a diagnostic when the daemon connection
+/// drops unexpectedly (i.e. without a clean `TerminateAck`/`Disconnect`), then
+/// exits non-zero. Exiting here avoids the generic `error: {}` handler in
+/// `main` printing a second, less helpful line.
+fn report_daemon_disconnect() -> ! {
+    restore_terminal_on_crash();
+
+    let crash_path = self_log::crash_report_path();
+    eprintln!();
+    eprintln!("error: the devsm daemon became unreachable (connection closed unexpectedly).");
+    eprintln!("       The background daemon may have crashed.");
+    eprintln!();
+    if crash_path.exists() {
+        eprintln!("A crash report was written to:");
+    } else {
+        eprintln!("If the daemon crashed, a report may be found at:");
+    }
+    eprintln!("    {}", crash_path.display());
+    eprintln!("Recent daemon logs can also be viewed with: devsm self logs");
+    eprintln!();
+    eprintln!("Please review it for any private information, then report the issue at:");
+    eprintln!("    https://github.com/exrok/devsm/issues");
+
+    std::process::exit(1);
 }
 
 fn run_client(
@@ -973,7 +1023,8 @@ fn run_client(
         let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
 
         match socket.read(read_slice) {
-            Ok(0) => break,
+            Ok(0) if terminated_by_user => break,
+            Ok(0) => report_daemon_disconnect(),
             Ok(n) => {
                 unsafe { read_buf.set_len(read_buf.len() + n) };
                 loop {
@@ -1027,7 +1078,8 @@ fn run_client(
                 protocol.compact(&mut read_buf, 4096);
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => bail!("Socket read failed: {}", e),
+            Err(_) if terminated_by_user => break,
+            Err(_) => report_daemon_disconnect(),
         }
     }
 
@@ -1267,11 +1319,13 @@ fn logs_client(options: cli::LogsOptions) -> anyhow::Result<()> {
 
     let mut protocol = ClientProtocol::new();
     let mut read_buf = Vec::with_capacity(1024);
+    let mut terminated_by_user = false;
 
     loop {
         let flags = SIGNAL_FLAGS.swap(0, Ordering::Relaxed);
 
         if flags & TERMINATION_FLAG != 0 {
+            terminated_by_user = true;
             protocol.send_empty(RpcMessageKind::Terminate, 0);
             socket.write_all(protocol.output())?;
             protocol.clear_output();
@@ -1282,7 +1336,8 @@ fn logs_client(options: cli::LogsOptions) -> anyhow::Result<()> {
         let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
 
         match socket.read(read_slice) {
-            Ok(0) => break,
+            Ok(0) if terminated_by_user => break,
+            Ok(0) => report_daemon_disconnect(),
             Ok(n) => {
                 unsafe { read_buf.set_len(read_buf.len() + n) };
                 loop {
@@ -1304,7 +1359,8 @@ fn logs_client(options: cli::LogsOptions) -> anyhow::Result<()> {
                 protocol.compact(&mut read_buf, 4096);
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => bail!("Socket read failed: {}", e),
+            Err(_) if terminated_by_user => break,
+            Err(_) => report_daemon_disconnect(),
         }
     }
 

@@ -1,4 +1,6 @@
 use std::{
+    io::Write,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     thread::Thread,
 };
@@ -243,6 +245,126 @@ pub fn get_daemon_logs() -> Option<Vec<u8>> {
 
 pub fn daemon_log_state() -> Option<&'static Arc<Mutex<DaemonLogState>>> {
     DAEMON_LOGS.get()
+}
+
+static CRASH_REPORT_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Path to the daemon crash-report file.
+///
+/// Resolved identically by daemon and client so the client can point the user
+/// at the file the daemon would have written, without any RPC interchange.
+/// Uses `DEVSM_CRASH_REPORT` if set, otherwise the per-user state directory
+/// (`$XDG_STATE_HOME/devsm` or `$HOME/.local/state/devsm`), falling back to
+/// `/tmp/devsm-<uid>.crash.log`.
+pub fn crash_report_path() -> &'static Path {
+    CRASH_REPORT_PATH.get_or_init(|| {
+        resolve_crash_report_path(
+            std::env::var("DEVSM_CRASH_REPORT").ok(),
+            std::env::var("XDG_STATE_HOME").ok(),
+            std::env::var("HOME").ok(),
+            unsafe { libc::getuid() },
+        )
+    })
+}
+
+fn resolve_crash_report_path(
+    override_path: Option<String>,
+    xdg_state_home: Option<String>,
+    home: Option<String>,
+    uid: u32,
+) -> PathBuf {
+    if let Some(path) = override_path {
+        return PathBuf::from(path);
+    }
+    if let Some(state_home) = xdg_state_home.filter(|s| !s.is_empty()) {
+        return PathBuf::from(state_home).join("devsm/crash.log");
+    }
+    if let Some(home) = home.filter(|s| !s.is_empty()) {
+        return PathBuf::from(home).join(".local/state/devsm/crash.log");
+    }
+    PathBuf::from(format!("/tmp/devsm-{uid}.crash.log"))
+}
+
+/// Decodes binary kvlog entries into plain (ANSI-stripped) UTF-8 text.
+///
+/// kvlog only exposes a colored formatter, so this formats with colors and then
+/// strips the escape codes — yielding text the user can read and prune before
+/// attaching it to a bug report.
+pub fn decode_self_log_entries_to_plain_text(binary: &[u8], out: &mut String) {
+    let mut colored = Vec::new();
+    let mut parents = kvlog::collector::ParentSpanSuffixCache::new_boxed();
+    for (ts, level, span, fields) in kvlog::encoding::decode(binary).flatten() {
+        kvlog::collector::format_statement_with_colors(&mut colored, &mut parents, ts, level, span, fields);
+    }
+    let mut plain = Vec::new();
+    crate::line_width::strip_ansi_to_buffer_preserve_case(&String::from_utf8_lossy(&colored), &mut plain);
+    out.push_str(&String::from_utf8_lossy(&plain));
+}
+
+/// Installs a chained panic hook that writes a daemon crash report to
+/// [`crash_report_path`].
+///
+/// Installed unconditionally for the daemon process (even when self-logging is
+/// disabled via `DEVSM_LOG_STDOUT`), so a panic always leaves a report behind.
+pub fn install_daemon_panic_hook() {
+    let original = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        original(info);
+        write_daemon_crash_report(info);
+    }));
+}
+
+fn panic_payload_str<'a>(info: &'a std::panic::PanicHookInfo<'_>) -> &'a str {
+    if let Some(s) = info.payload().downcast_ref::<&str>() {
+        s
+    } else if let Some(s) = info.payload().downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
+    }
+}
+
+/// Writes a human-readable crash report. Best-effort: every step ignores its own
+/// IO error and the function never panics, since it runs from inside a panic.
+fn write_daemon_crash_report(info: &std::panic::PanicHookInfo) {
+    let path = crash_report_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = std::fs::File::create(path) else {
+        return;
+    };
+
+    let _ = writeln!(file, "=== devsm daemon crash report ===");
+    let _ = writeln!(file, "version: {}", env!("CARGO_PKG_VERSION"));
+    if let Ok(since_epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        let _ = writeln!(file, "time: {} (unix seconds)", since_epoch.as_secs());
+    }
+    let _ = writeln!(file, "panic: {}", panic_payload_str(info));
+    if let Some(location) = info.location() {
+        let _ = writeln!(file, "location: {location}");
+    }
+    let _ = writeln!(file, "\nbacktrace:\n{}", std::backtrace::Backtrace::force_capture());
+
+    let _ = writeln!(file, "\n--- recent daemon logs ---");
+    let Some(state) = daemon_log_state() else {
+        let _ = writeln!(file, "<daemon log ring buffer not initialized>");
+        return;
+    };
+    // try_lock, not lock: the panicking thread may already hold this mutex (a
+    // panic during push/snapshot), and lock() would self-deadlock the dying
+    // process. A poisoned guard still carries readable data, so recover it.
+    let snapshot = match state.try_lock() {
+        Ok(guard) => guard.snapshot(),
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner().snapshot(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let _ = writeln!(file, "<self-log buffer was locked; recent entries unavailable>");
+            return;
+        }
+    };
+    let mut text = String::new();
+    decode_self_log_entries_to_plain_text(&snapshot, &mut text);
+    let _ = file.write_all(text.as_bytes());
 }
 
 #[cfg(test)]
@@ -567,6 +689,49 @@ mod tests {
         let mut out = Vec::new();
         let new_offset = state.snapshot_from(9999, &mut out);
         assert_eq!(new_offset, 8);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn resolve_crash_report_path_resolution_order() {
+        assert_eq!(
+            resolve_crash_report_path(Some("/custom/crash.log".into()), Some("/state".into()), Some("/h".into()), 7),
+            PathBuf::from("/custom/crash.log")
+        );
+        assert_eq!(
+            resolve_crash_report_path(None, Some("/state".into()), Some("/h".into()), 7),
+            PathBuf::from("/state/devsm/crash.log")
+        );
+        assert_eq!(
+            resolve_crash_report_path(None, Some(String::new()), Some("/h".into()), 7),
+            PathBuf::from("/h/.local/state/devsm/crash.log")
+        );
+        assert_eq!(resolve_crash_report_path(None, None, None, 7), PathBuf::from("/tmp/devsm-7.crash.log"));
+    }
+
+    fn encoded_log_entry(message: &str) -> Vec<u8> {
+        let mut encoder = kvlog::encoding::Encoder::new();
+        encoder.append(kvlog::LogLevel::Info, 0).key("msg").value_via_display(&message);
+        encoder.bytes().to_vec()
+    }
+
+    #[test]
+    fn decode_self_log_entries_to_plain_text_is_readable_and_ansi_free() {
+        let mut binary = encoded_log_entry("hello from the daemon");
+        binary.extend_from_slice(&encoded_log_entry("second line"));
+
+        let mut out = String::new();
+        decode_self_log_entries_to_plain_text(&binary, &mut out);
+
+        assert!(out.contains("hello from the daemon"), "decoded text was: {out:?}");
+        assert!(out.contains("second line"), "decoded text was: {out:?}");
+        assert!(!out.contains('\x1b'), "decoded text still contained ANSI escapes: {out:?}");
+    }
+
+    #[test]
+    fn decode_self_log_entries_to_plain_text_empty_input() {
+        let mut out = String::new();
+        decode_self_log_entries_to_plain_text(&[], &mut out);
         assert!(out.is_empty());
     }
 }
