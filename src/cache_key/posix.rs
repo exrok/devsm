@@ -224,9 +224,22 @@ impl CacheKeyHasherPosix {
                     name_offset,
                     name_len: name_bytes.len() as u16,
                     d_type: (*entry).d_type,
-                    ino: (*entry).d_ino,
+                    ino: Self::dirent_ino(&*entry),
                 });
             }
+        }
+    }
+
+    #[inline]
+    fn dirent_ino(entry: &libc::dirent) -> u64 {
+        #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
+        {
+            entry.d_fileno as u64
+        }
+
+        #[cfg(not(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly")))]
+        {
+            entry.d_ino as u64
         }
     }
 }

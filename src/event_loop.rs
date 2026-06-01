@@ -83,6 +83,7 @@ pub(crate) struct ActiveProcess {
     #[cfg(target_os = "linux")]
     pub(crate) tracer: Option<Box<crate::auto_deps::Tracer>>,
     /// True if `install_ptrace_traceme` was applied to this child's command.
+    #[cfg(target_os = "linux")]
     pub(crate) is_traced: bool,
 }
 
@@ -690,12 +691,9 @@ impl EventLoop {
             false
         };
         #[cfg(not(target_os = "linux"))]
-        let installed_traceme = {
-            if trace_requested {
-                bail!("--derive-cache-key is only supported on Linux");
-            }
-            false
-        };
+        if trace_requested {
+            bail!("--derive-cache-key is only supported on Linux");
+        }
 
         let child = command.spawn().context("Failed to spawn process")?;
         let mut untracked_child = UntrackedChildGuard::new(child);
@@ -786,6 +784,7 @@ impl EventLoop {
             kill_sent_at: None,
             #[cfg(target_os = "linux")]
             tracer: None,
+            #[cfg(target_os = "linux")]
             is_traced: installed_traceme,
         });
         {
@@ -1284,19 +1283,11 @@ impl EventLoop {
         // pointer.
         #[cfg(target_os = "linux")]
         let any_traced = !self.state.traced_root_pids.is_empty();
-        #[cfg(not(target_os = "linux"))]
-        let any_traced = false;
 
-        let flags = libc::WNOHANG | {
-            #[cfg(target_os = "linux")]
-            {
-                if any_traced { libc::__WALL } else { 0 }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                0
-            }
-        };
+        #[cfg(target_os = "linux")]
+        let flags = libc::WNOHANG | if any_traced { libc::__WALL } else { 0 };
+        #[cfg(not(target_os = "linux"))]
+        let flags = libc::WNOHANG;
 
         loop {
             let mut status: i32 = 0;
