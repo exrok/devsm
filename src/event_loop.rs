@@ -1780,10 +1780,13 @@ impl EventLoop {
     }
 
     fn client_exited(&mut self, client_index: ClientIndex) {
-        let Some(client) = self.clients.try_remove(client_index as usize) else {
+        let Some(mut client) = self.clients.try_remove(client_index as usize) else {
             kvlog::debug!("Client already removed", index = client_index as usize);
             return;
         };
+        let mut encoder = crate::rpc::Encoder::new();
+        encoder.encode_empty(RpcMessageKind::Disconnect, 0);
+        let _ = client.socket.write_all(encoder.output());
         client.channel.set_terminated();
         let _ = client.channel.wake();
         let _ = self.state.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));

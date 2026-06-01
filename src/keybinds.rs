@@ -469,6 +469,7 @@ impl Keybinds {
         self.bind(Mode::TaskTree, "r", Command::RestartTask);
         self.bind(Mode::TaskTree, "d", Command::TerminateTask);
         self.bind(Mode::TaskTree, "s", Command::LaunchTask);
+        self.bind(Mode::TaskTree, "q", Command::Quit);
         self.bind(Mode::TaskTree, "g", Command::StartGroup);
         self.bind(Mode::TaskTree, "ENTER", Command::StartSelection);
         self.bind(Mode::TaskTree, "TAB", Command::ToggleGroupExpand);
@@ -813,6 +814,10 @@ mod tests {
         assert_eq!(keybinds.lookup(Mode::SelectSearch, ctrl_c), Some(Command::Quit));
         assert_eq!(keybinds.lookup(Mode::Global, ctrl_c), Some(Command::Quit));
 
+        let q: InputEvent = "q".parse().unwrap();
+        assert_eq!(keybinds.lookup(Mode::TaskTree, q), Some(Command::Quit));
+        assert_eq!(keybinds.lookup(Mode::Global, q), None);
+
         let home: InputEvent = "HOME".parse().unwrap();
         let end: InputEvent = "END".parse().unwrap();
         assert_eq!(keybinds.lookup(Mode::TaskTree, home), Some(Command::JumpToOldestLogs));
@@ -830,6 +835,9 @@ mod tests {
 
         let ctrl_c: InputEvent = "C-c".parse().unwrap();
         assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Global], ctrl_c), Some(Command::Quit));
+
+        let q: InputEvent = "q".parse().unwrap();
+        assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Global], q), Some(Command::Quit));
 
         let slash: InputEvent = "/".parse().unwrap();
         assert_eq!(keybinds.lookup_chain(&[Mode::TaskTree, Mode::Global], slash), Some(Command::SearchLogs));
