@@ -2,7 +2,7 @@ use crate::{
     cache_key::{CacheKeyHasher, expand_modified_path},
     cli::TestFilter,
     config::{
-        AllowMultiple, CARGO_AUTO_EXPR, CacheKeyInput, Command, ConfigGeneration, Environment, TaskConfigRc,
+        AllowMultiple, CARGO_AUTO_EXPR, CacheKeyInput, Command, ConfigGeneration, Environment, EvalError, TaskConfigRc,
         TaskConfigSource, TaskKind,
     },
     event_loop::MioChannel,
@@ -1194,15 +1194,15 @@ impl WorkspaceState {
         base_task: BaseTaskIndex,
         profile: &str,
         params: ValueMap<'static>,
-    ) -> Arc<ResolvedSpawnSpec> {
+    ) -> Result<Arc<ResolvedSpawnSpec>, EvalError> {
         let generation_id = self.base_tasks[base_task.idx()].config.generation_id();
         if let Some(spec) = self.find_cached_spawn_spec(generation_id, base_task, profile, &params) {
-            return spec;
+            return Ok(spec);
         }
         let config = self.base_tasks[base_task.idx()].config.clone();
         let env = Environment { profile, param: params.clone(), vars: config.vars };
-        let task = config.eval(&env).unwrap();
-        self.insert_spawn_spec(generation_id, base_task, profile, params, task)
+        let task = config.eval(&env)?;
+        Ok(self.insert_spawn_spec(generation_id, base_task, profile, params, task))
     }
 
     fn cache_spawn_spec(
@@ -1401,7 +1401,9 @@ impl WorkspaceState {
         let bt = &mut self.base_tasks[base_task.idx()];
         bt.update_profile_tracking(&profile);
 
-        let spec = self.get_or_create_spawn_spec(base_task, &profile, params.clone());
+        let spec = self.get_or_create_spawn_spec(base_task, &profile, params.clone()).map_err(|e| {
+            format!("Failed to evaluate task '{}': {:?}", self.base_tasks[base_task.idx()].name.as_ref(), e)
+        })?;
         let task = spec.task.clone();
 
         let mut batch: SpawnBatch<()> = SpawnBatch::new();
@@ -1519,7 +1521,7 @@ impl WorkspaceState {
             let eval_profile =
                 if profile.is_empty() { spawner.config.profiles.first().copied().unwrap_or("") } else { profile };
             let env = Environment { profile: eval_profile, param: params.clone(), vars: spawner.config.vars };
-            spawner.config.eval(&env).expect("Failed to eval queued service config")
+            spawner.config.eval(&env).map_err(|e| format!("Failed to evaluate queued service config: {:?}", e))?
         };
         let profile = if profile.is_empty() {
             self.base_tasks[base_task.idx()].config.profiles.first().copied().unwrap_or("").to_string()
@@ -2550,8 +2552,13 @@ impl WorkspaceState {
                     {
                         let max_age = cache_config.max_age;
                         let persistent = cache_config.persistent;
+                        // The spawned job stores its cache key under the *effective*
+                        // profile (empty resolves to the first declared profile), so the
+                        // expected key must resolve identically or a default-profile
+                        // required action would never hit cache and re-run every time.
+                        let effective_profile = self.effective_profile_for_task(base_task, &profile);
                         let expected_cache_key =
-                            self.compute_cache_key_with_require(cache_config.key, &profile, &params);
+                            self.compute_cache_key_with_require(cache_config.key, &effective_profile, &params);
                         let spawner = &self.base_tasks[base_task.idx()];
 
                         for &ji in spawner.jobs.all().iter().rev() {
@@ -3849,8 +3856,21 @@ mod scheduling_tests {
 
             state.base_tasks[base_task.idx()].config = state.base_tasks[failing_task.idx()].config.clone();
 
-            let reused = state.get_or_create_spawn_spec(base_task, "", ValueMap::new());
+            let reused = state.get_or_create_spawn_spec(base_task, "", ValueMap::new()).unwrap();
             assert!(Arc::ptr_eq(&cached, &reused));
+        }
+
+        // A task whose evaluation fails (here `with_pwd_var` has a scalar
+        // `pwd = { var = "workdir" }` with no default and no param) must surface
+        // an error rather than panic: `get_or_create_spawn_spec` runs under
+        // `state.write()`, and a panic would poison the lock and brick the
+        // daemon for all clients.
+        #[test]
+        fn get_or_create_spawn_spec_propagates_eval_error_without_panicking() {
+            let mut state = WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).unwrap();
+            let failing = state.lookup_name("with_pwd_var").unwrap();
+            let result = state.get_or_create_spawn_spec(failing, "", ValueMap::new());
+            assert!(result.is_err(), "expected eval error to propagate, got Ok");
         }
     }
 

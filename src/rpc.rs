@@ -642,7 +642,7 @@ impl WorkspaceClient {
 
     fn next_correlation(&mut self) -> u16 {
         let id = self.next_correlation;
-        self.next_correlation = if id == u16::MAX { 1 } else { id + 1 };
+        self.next_correlation = if id >= CORRELATION_MASK { 1 } else { id + 1 };
         id
     }
 
@@ -1483,10 +1483,12 @@ impl ClientProtocol {
 
     /// Returns the next correlation ID and advances the counter.
     ///
-    /// IDs cycle through 1..=u16::MAX, skipping 0 which is reserved for push messages.
+    /// IDs cycle through `1..=CORRELATION_MASK` (15 bits), skipping 0 which is
+    /// reserved for push messages. The high bit is the one-shot flag on the wire,
+    /// so correlation IDs must never set it or responses would be mispaired.
     pub fn next_correlation(&mut self) -> u16 {
         let id = self.next_correlation;
-        self.next_correlation = if id == u16::MAX { 1 } else { id + 1 };
+        self.next_correlation = if id >= CORRELATION_MASK { 1 } else { id + 1 };
         id
     }
 

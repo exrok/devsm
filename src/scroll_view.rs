@@ -29,7 +29,7 @@ fn get_entry_height(entry: &LogEntry, style: &LogStyle, width: u32) -> u32 {
     let prefix_width = style.prefix(entry.log_group).map(|p| p.width).unwrap_or(0) as u32;
     let first_line_width = width.saturating_sub(prefix_width);
 
-    if entry.width == 0 || entry.width <= first_line_width {
+    if width == 0 || entry.width == 0 || entry.width <= first_line_width {
         1
     } else {
         1 + (entry.width - first_line_width).div_ceil(width)

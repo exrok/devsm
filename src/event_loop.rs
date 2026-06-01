@@ -700,12 +700,6 @@ impl EventLoop {
         let child = command.spawn().context("Failed to spawn process")?;
         let mut untracked_child = UntrackedChildGuard::new(child);
 
-        #[cfg(target_os = "linux")]
-        if installed_traceme {
-            let pid = untracked_child.child_mut().id() as i32;
-            self.state.traced_root_pids.insert(pid, index);
-        }
-
         if let (Some(mut stdin), Some(script)) = (untracked_child.child_mut().stdin.take(), sh_script) {
             use std::io::Write;
             let _ = stdin.write_all(script.as_bytes());
@@ -768,6 +762,15 @@ impl EventLoop {
             self.state.timed_timeout_count += 1;
         }
         let child = untracked_child.disarm();
+        // Record the traced root pid only after all fallible fd/poll setup has
+        // succeeded. The slab vacant_key reserved as `index` is the slot this
+        // process now occupies, so the entry matches the committed process. An
+        // earlier insert would leak when registration failed and the guard
+        // killed the child without it ever entering `state.processes`.
+        #[cfg(target_os = "linux")]
+        if installed_traceme {
+            self.state.traced_root_pids.insert(child.id() as i32, index);
+        }
         let process_index = self.state.processes.insert(ActiveProcess {
             workspace_index,
             job_index,

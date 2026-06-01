@@ -34,7 +34,7 @@ annotate-snippets = "0.12.10"
 blake3 = { version = "1.8.3" }
 fast-glob = "1.0.0"
 # Use git dependency until version 0.2 is released.
-extui = { git = "https://github.com/exrok/extui", rev = "b3aa3cba62c0287254a247e2072d2a8df1cd7dd2" }
+extui = { git = "https://github.com/exrok/extui", rev = "dddbec91f758dace16d21b630427530237567619" }
 mimalloc = { version = "0.1.48", optional = true }
 smallvec = "1.15.1"
 
@@ -44,12 +44,10 @@ syscalls = { version = "0.8.1", default-features = false, features = [
     "all",
 ] }
 
-[patch."https://github.com/exrok/extui"]
-extui = { path = "/home/user/Projects/git/extui" }
 
 [patch.crates-io]
-jsony = { path = "/home/user/Projects/git/jsony" }
-jsony_value = { path = "/home/user/Projects/git/jsony/crates/jsony_value" }
+jsony = { git = "https://github.com/exrok/jsony", rev = "ef19c394b7d932719dff1d11475f0066bff5f0ad" }
+jsony_value = { git = "https://github.com/exrok/jsony", rev = "ef19c394b7d932719dff1d11475f0066bff5f0ad" }
 
 [dev-dependencies]
 vt100 = "*"
