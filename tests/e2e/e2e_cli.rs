@@ -15,6 +15,47 @@ use crate::rpc::{
 };
 use harness::{RpcEvent, RpcSubscriber, TestHarness, cargo_bin_path};
 
+fn run_client_with_timeout(harness: &TestHarness, args: &[&str], timeout: Duration) -> Option<harness::ClientResult> {
+    let mut cmd = Command::new(cargo_bin_path());
+    cmd.args(args)
+        .current_dir(&harness.temp_dir)
+        .env("DEVSM_SOCKET", &harness.socket_path)
+        .env("DEVSM_DB", "/dev/null")
+        .env("DEVSM_NO_AUTO_SPAWN", "1")
+        .env("DEVSM_CONNECT_TIMEOUT_MS", "5000")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("Failed to spawn client");
+    let stdin_handle = child.stdin.take();
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().expect("Failed to poll client") {
+            Some(status) => break status,
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(stdin_handle);
+                return None;
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    drop(stdin_handle);
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_string(&mut stdout).ok();
+    }
+    if let Some(mut err) = child.stderr.take() {
+        err.read_to_string(&mut stderr).ok();
+    }
+
+    Some(harness::ClientResult { status, stdout, stderr })
+}
+
 fn wait_for_line_count(path: &Path, needle: &str, expected: usize, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -91,6 +132,52 @@ combo = ["alpha", "beta"]
     assert!(result.success(), "explicit group failed: {}", result.stderr);
     assert!(result.stdout.contains("alpha-run"), "missing alpha output: {}", result.stdout);
     assert!(result.stdout.contains("beta-run"), "missing beta output: {}", result.stdout);
+}
+
+#[test]
+fn large_sh_script_group_spawn_keeps_daemon_responsive() {
+    let mut harness = TestHarness::new("large_sh_script_group");
+    let marker = harness.temp_dir.join("after.started");
+
+    let mut script = String::from("sleep 10\n");
+    for _ in 0..10_000 {
+        script.push_str("# filler line to fill the shell stdin pipe before the shell resumes reading\n");
+    }
+
+    harness.write_config(&format!(
+        r#"
+[action.blocking]
+sh = '''
+{script}'''
+
+[action.after]
+sh = "touch {marker}"
+
+[group]
+freeze = ["blocking", "after"]
+"#,
+        marker = marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let started = run_client_with_timeout(&harness, &["start", "group.freeze"], Duration::from_secs(5))
+        .expect("start group.freeze timed out");
+    assert!(started.success(), "group start failed: {}", started.stderr);
+
+    let status = run_client_with_timeout(&harness, &["status", "after"], Duration::from_secs(2));
+    assert!(
+        status.is_some(),
+        "daemon stopped responding after scheduling group.freeze; server log:\n{}",
+        harness.server_log()
+    );
+    let status = status.unwrap();
+    assert!(status.success(), "status after failed: {}", status.stderr);
+    assert!(
+        harness.wait_for_file(&marker, Duration::from_secs(2)),
+        "after task did not run; status output:\n{}",
+        status.stdout
+    );
 }
 
 #[test]

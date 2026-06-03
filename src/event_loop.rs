@@ -649,8 +649,12 @@ impl EventLoop {
             (ws.config.current.base_path().join(tc.pwd), ws[job_index].trace)
         };
 
-        let (mut command, sh_script) = match &tc.command {
-            Command::Sh(script) => (std::process::Command::new("/bin/sh"), Some(*script)),
+        let mut command = match &tc.command {
+            Command::Sh(script) => {
+                let mut cmd = std::process::Command::new("/bin/sh");
+                cmd.arg("-c").arg(*script);
+                cmd
+            }
             Command::Cmd(cmd_args) => {
                 if cmd_args.is_empty() {
                     bail!("Command must not be empty");
@@ -658,7 +662,7 @@ impl EventLoop {
                 let [cmd, args @ ..] = *cmd_args else { panic!("Expected atleast one command") };
                 let mut cmd = std::process::Command::new(cmd);
                 cmd.args(args);
-                (cmd, None)
+                cmd
             }
         };
 
@@ -676,8 +680,7 @@ impl EventLoop {
             });
         }
 
-        let stdin = if sh_script.is_some() { Stdio::piped() } else { Stdio::null() };
-        command.stdin(stdin);
+        command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
 
@@ -697,13 +700,6 @@ impl EventLoop {
 
         let child = command.spawn().context("Failed to spawn process")?;
         let mut untracked_child = UntrackedChildGuard::new(child);
-
-        if let (Some(mut stdin), Some(script)) = (untracked_child.child_mut().stdin.take(), sh_script) {
-            use std::io::Write;
-            let _ = stdin.write_all(script.as_bytes());
-            let _ = stdin.flush();
-            drop(stdin);
-        }
         if let Some(stdout) = &mut untracked_child.child_mut().stdout {
             unsafe {
                 if libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) == -1 {
