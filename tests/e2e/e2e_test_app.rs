@@ -368,6 +368,102 @@ require = [{{ resource = "shared" }}]
 }
 
 #[test]
+fn queued_replacement_waits_for_new_resource_requirements_before_stopping_current_profile() {
+    let mut harness = TestHarness::new("queued_service_waits_new_resource");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+
+[action.holder]
+cmd = ["test-app", "holder"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = [{{ resource = "R" }}]
+
+[action.need_beta]
+cmd = ["test-app", "need_beta"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["svc:beta"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "svc:alpha"]);
+    assert!(result.success(), "start svc:alpha: stdout={}, stderr={}", result.stdout, result.stderr);
+    let mut alpha = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(alpha.name(), "svc");
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+require = [{{ resource = "R" }}]
+
+[action.holder]
+cmd = ["test-app", "holder"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = [{{ resource = "R" }}]
+
+[action.need_beta]
+cmd = ["test-app", "need_beta"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["svc:beta"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "holder",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "holder spawn rejected: {:?}", resp.body);
+    let mut holder = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(holder.name(), "holder");
+
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "need_beta",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "need_beta spawn rejected: {:?}", resp.body);
+
+    assert!(
+        !alpha.wait_disconnected(Duration::from_millis(500)),
+        "svc:alpha must stay running while svc:beta is blocked by holder's resource; server_log={}",
+        harness.server_log()
+    );
+
+    holder.exit(0);
+    assert!(
+        alpha.wait_disconnected(Duration::from_secs(10)),
+        "svc:alpha should stop once svc:beta's new resource requirement is available; server_log={}",
+        harness.server_log()
+    );
+
+    let mut beta = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(beta.name(), "svc");
+    let mut need_beta = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(need_beta.name(), "need_beta");
+    need_beta.exit(0);
+    beta.exit(0);
+}
+
+#[test]
 fn single_profile_queued_requirement_waits_for_all_incompatible_instances() {
     let mut harness = TestHarness::new("single_profile_waits_all");
     let ctrl = TestAppServer::new(&harness.temp_dir);
@@ -1141,4 +1237,214 @@ good = ["a", "b"]
 
     first.exit(0);
     second.exit(0);
+}
+
+#[test]
+fn restart_eval_failure_keeps_existing_service_running() {
+    let mut harness = TestHarness::new("restart_eval_failure_keeps_service");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "svc"]);
+    assert!(result.success(), "svc should start: stdout={}, stderr={}", result.stdout, result.stderr);
+
+    let mut svc = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(svc.name(), "svc");
+
+    std::thread::sleep(Duration::from_millis(10));
+    harness.write_config(&format!(
+        r#"
+[action.bad]
+pwd = {{ var = "missing" }}
+cmd = ["true"]
+
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["bad"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+
+    let result = harness.run_client(&["restart", "svc"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("Failed to evaluate task 'bad'"),
+        "expected bad dependency eval error, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        !svc.wait_disconnected(Duration::from_millis(500)),
+        "existing svc must keep running after replacement dependency eval fails; server_log={}",
+        harness.server_log()
+    );
+    svc.exit(0);
+}
+
+#[test]
+fn queued_service_waits_for_dependencies_before_killing_current_profile() {
+    let mut harness = TestHarness::new("queued_service_waits_deps");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[action.setup]
+cmd = ["test-app", "setup"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+require = ["setup"]
+
+[action.user]
+cmd = ["test-app", "user"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["svc:beta"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "svc:alpha"]);
+    assert!(result.success(), "svc:alpha should submit: stdout={}, stderr={}", result.stdout, result.stderr);
+
+    let mut setup_alpha = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(setup_alpha.name(), "setup");
+    setup_alpha.exit(0);
+
+    let mut alpha = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(alpha.name(), "svc");
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "user",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    assert!(matches!(resp.body, CommandBody::Empty), "spawn user rejected: {:?}", resp.body);
+
+    let alpha_disconnected_before_setup = alpha.wait_disconnected(Duration::from_millis(500));
+
+    let mut setup_beta = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(setup_beta.name(), "setup");
+    setup_beta.exit(1);
+
+    assert!(
+        ctrl.try_accept(Duration::from_millis(300)).is_none(),
+        "svc:beta or user must not start after setup failure; server_log={}",
+        harness.server_log()
+    );
+
+    assert!(
+        !alpha_disconnected_before_setup,
+        "svc:alpha must not be killed while svc:beta setup is still pending; server_log={}",
+        harness.server_log()
+    );
+
+    assert!(
+        !alpha.wait_disconnected(Duration::from_millis(300)),
+        "svc:alpha must still be running after svc:beta setup fails; server_log={}",
+        harness.server_log()
+    );
+    alpha.exit(0);
+}
+
+#[test]
+fn queued_service_rejects_own_conflicting_service_requirements() {
+    let mut harness = TestHarness::new("queued_service_rejects_own_conflicts");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.dep]
+cmd = ["test-app", "dep"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["one", "two"]
+
+[service.svc]
+sh = "trap '' TERM; exec test-app svc \"$PROFILE\""
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+
+[action.user]
+cmd = ["test-app", "user"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["svc:beta"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "svc:alpha"]);
+    assert!(result.success(), "svc:alpha should submit: stdout={}, stderr={}", result.stdout, result.stderr);
+
+    let mut alpha = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(alpha.name(), "svc");
+
+    harness.write_config(&format!(
+        r#"
+[service.dep]
+cmd = ["test-app", "dep"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["one", "two"]
+
+[service.svc]
+sh = "trap '' TERM; exec test-app svc \"$PROFILE\""
+env.TEST_APP_SOCKET = "{ctrl_path}"
+profiles = ["alpha", "beta"]
+require = ["dep:one", "dep:two"]
+
+[action.user]
+cmd = ["test-app", "user"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["svc:beta"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "user",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+    match resp.body {
+        CommandBody::Error(err) => {
+            assert!(err.contains("conflicting service requirements"), "unexpected queued service error: {err}")
+        }
+        other => panic!("queued service with conflicting own requirements must be rejected, got {other:?}"),
+    }
+
+    assert!(
+        ctrl.try_accept(Duration::from_millis(300)).is_none(),
+        "dependency, queued service, or user action must not start after rejection; server_log={}",
+        harness.server_log()
+    );
+    assert!(
+        !alpha.wait_disconnected(Duration::from_millis(300)),
+        "existing alpha service must remain running after queued-service rejection; server_log={}",
+        harness.server_log()
+    );
+    alpha.exit(0);
 }

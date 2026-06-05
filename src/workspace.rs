@@ -712,7 +712,7 @@ pub enum TestJobStatus {
 pub struct TestJob {
     /// Index into base_tasks for this test.
     pub base_task_index: BaseTaskIndex,
-    pub job_index: JobIndex,
+    pub job_index: Option<JobIndex>,
     pub status: TestJobStatus,
 }
 
@@ -752,8 +752,14 @@ impl ServiceDependents {
 
     #[cfg(test)]
     pub fn remove_dependent(&mut self, service: JobIndex, dependent: JobIndex) {
-        if let Some(deps) = self.dependents.get_mut(&service) {
+        let should_remove_service = if let Some(deps) = self.dependents.get_mut(&service) {
             deps.remove(&dependent);
+            deps.is_empty()
+        } else {
+            false
+        };
+        if should_remove_service {
+            self.dependents.remove(&service);
         }
     }
 
@@ -780,14 +786,16 @@ impl ServiceDependents {
     }
 }
 
-/// Result of checking service compatibility with a request.
+/// Result of checking service compatibility with a request. References are
+/// [`JobRef`] because a candidate may be a service decided earlier in the same
+/// submit and not yet inserted into the slab.
 pub enum ServiceCompatibility {
-    /// A matching service is already running.
-    Compatible(JobIndex),
+    /// A matching service is already running or planned.
+    Compatible(JobRef),
     /// No service is currently running.
     Available,
     /// One or more services must terminate before the request can run.
-    Conflict { running_jobs: Vec<JobIndex>, running_profiles: Vec<String>, requested_profile: String },
+    Conflict { running_jobs: Vec<JobRef>, running_profiles: Vec<String>, requested_profile: String },
 }
 
 /// Key for deduplicating requirements across a batch of spawns.
@@ -822,11 +830,13 @@ pub struct PendingTask<T> {
     pub task_data: T,
 }
 
-/// Result of resolving a requirement during batch spawning.
+/// Result of resolving a requirement during batch spawning. `Pending`/`Spawned`
+/// carry a [`JobRef`] because a dependency may be a job decided earlier in the
+/// same submit that is not yet inserted into the slab.
 pub enum ResolvedRequirement {
     Cached,
-    Pending(JobIndex),
-    Spawned(JobIndex),
+    Pending(JobRef),
+    Spawned(JobRef),
 }
 
 /// A detected profile conflict within a batch.
@@ -971,6 +981,269 @@ pub struct WorkspaceState {
     cache_key_hasher: CacheKeyHasher,
     persistent_cache: PersistentCache,
     spawn_specs: hashbrown::HashMap<u64, Vec<Weak<ResolvedSpawnSpec>>>,
+}
+
+/// A reference to a job from within a [`SchedulePlan`]. Either an already-live
+/// job in the slab, or one this plan will create (by index into `new_jobs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JobRef {
+    Live(JobIndex),
+    Planned(usize),
+}
+
+/// A requirement of a planned job, resolved to a real [`ScheduleRequirement`]
+/// when the plan is applied.
+enum PlannedReq {
+    Task { target: JobRef, predicate: JobPredicate },
+    Resource { id: ResourceIndex, priority: i32 },
+}
+
+/// A job to create when the plan is applied. Planning never inserts jobs or
+/// bumps counters, so a plan that fails to build leaves `WorkspaceState`
+/// untouched and no rollback is needed.
+struct PlannedJob {
+    base_task: BaseTaskIndex,
+    task: TaskConfigRc,
+    profile: String,
+    params: ValueMap<'static>,
+    cache_key: String,
+    requirements: Vec<PlannedReq>,
+    /// Action deps a planned service holds until ready, for ready-barrier checks
+    /// during planning. Only populated for services; apply recomputes the real
+    /// `JobIndex` list once dep jobs exist.
+    action_deps_until_ready: Vec<JobRef>,
+    reason: ScheduleReason,
+    trace: bool,
+    /// Marks a synthetic terminal cached-success job (uses `cache_key`).
+    synthetic_cached: bool,
+}
+
+/// The full set of changes a submit intends to make: jobs to create, scheduled
+/// jobs to cancel, and running jobs to terminate. Built by reading state only,
+/// then applied in one infallible pass by [`WorkspaceState::apply_plan`].
+#[derive(Default)]
+struct SchedulePlan {
+    new_jobs: Vec<PlannedJob>,
+    cancelled_planned: hashbrown::HashSet<usize>,
+    cancel_scheduled: Vec<JobIndex>,
+    cancel_scheduled_set: hashbrown::HashSet<JobIndex>,
+    terminate_running: Vec<TerminatePlan>,
+    terminate_running_set: hashbrown::HashSet<JobIndex>,
+}
+
+struct TerminatePlan {
+    job: JobIndex,
+    job_id: LogGroup,
+    process_index: usize,
+    exit_cause: ExitCause,
+}
+
+/// A node in the held-reachability graph: one `(base, effective_profile, params)`
+/// requirement instance reachable from the validated task.
+struct HeldNode {
+    base: BaseTaskIndex,
+    profile: String,
+    params: ValueMap<'static>,
+    is_service: bool,
+}
+
+/// The require closure as a DAG with two edge colors. A `require` on a service
+/// is a *service edge*: that service (and its own service closure) stays held
+/// alongside the requirer. A `require` on an action is an *action edge*: the
+/// held set flows down into the action's subtree but sibling actions sequence
+/// and do not share held services. Node 0 is the synthetic owner of the
+/// validated task's own requirements.
+struct HeldGraph {
+    nodes: Vec<HeldNode>,
+    index: hashbrown::HashMap<RequirementKey, usize>,
+    service_edges: Vec<Vec<usize>>,
+    action_edges: Vec<Vec<usize>>,
+}
+
+impl HeldGraph {
+    fn with_root() -> Self {
+        let root =
+            HeldNode { base: BaseTaskIndex(0), profile: String::new(), params: ValueMap::new(), is_service: false };
+        Self {
+            nodes: vec![root],
+            index: hashbrown::HashMap::new(),
+            service_edges: vec![Vec::new()],
+            action_edges: vec![Vec::new()],
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    fn intern(&mut self, node: HeldNode) -> usize {
+        let key = RequirementKey::new(node.base, &node.profile, &node.params);
+        if let Some(id) = self.index.get(&key) {
+            return *id;
+        }
+        let id = self.nodes.len();
+        self.index.insert(key, id);
+        self.nodes.push(node);
+        self.service_edges.push(Vec::new());
+        self.action_edges.push(Vec::new());
+        id
+    }
+
+    /// For each node, the set of service variants it holds (transitive over
+    /// service edges, excluding the node itself).
+    fn service_closures(&self) -> Vec<hashbrown::HashSet<usize>> {
+        let mut closures = vec![hashbrown::HashSet::new(); self.len()];
+        for owner in 0..self.len() {
+            let mut stack: Vec<usize> = self.service_edges[owner].clone();
+            while let Some(service) = stack.pop() {
+                if closures[owner].insert(service) {
+                    stack.extend(self.service_edges[service].iter().copied());
+                }
+            }
+        }
+        closures
+    }
+
+    /// Action-spine adjacency: from a node, the action deps of the node and of
+    /// every service it holds. The held set propagates along these edges.
+    fn spine_adjacency(&self, closures: &[hashbrown::HashSet<usize>]) -> Vec<Vec<usize>> {
+        let mut adjacency = vec![Vec::new(); self.len()];
+        for owner in 0..self.len() {
+            let mut seen = hashbrown::HashSet::new();
+            for &action in
+                self.action_edges[owner].iter().chain(closures[owner].iter().flat_map(|&s| &self.action_edges[s]))
+            {
+                if seen.insert(action) {
+                    adjacency[owner].push(action);
+                }
+            }
+        }
+        adjacency
+    }
+}
+
+struct Reachability {
+    rows: hashbrown::HashMap<usize, Box<[u64]>>,
+}
+
+impl Reachability {
+    fn for_sources(adjacency: &[Vec<usize>], sources: impl IntoIterator<Item = usize>) -> Self {
+        let words = adjacency.len().div_ceil(64);
+        let mut rows = hashbrown::HashMap::new();
+
+        for src in sources {
+            if rows.contains_key(&src) {
+                continue;
+            }
+
+            let mut row = vec![0u64; words].into_boxed_slice();
+            Self::set_reached(&mut row, src);
+            let mut stack = adjacency[src].clone();
+
+            while let Some(next) = stack.pop() {
+                if Self::is_reached(&row, next) {
+                    continue;
+                }
+                Self::set_reached(&mut row, next);
+                stack.extend(adjacency[next].iter().copied());
+            }
+
+            rows.insert(src, row);
+        }
+
+        Self { rows }
+    }
+
+    fn reaches(&self, src: usize, dst: usize) -> bool {
+        src == dst || self.rows.get(&src).is_some_and(|row| Self::is_reached(row, dst))
+    }
+
+    fn is_reached(row: &[u64], node: usize) -> bool {
+        (row[node / 64] & (1u64 << (node % 64))) != 0
+    }
+
+    fn set_reached(row: &mut [u64], node: usize) {
+        row[node / 64] |= 1u64 << (node % 64);
+    }
+}
+
+impl SchedulePlan {
+    fn is_running_terminate_pending(&self, job: JobIndex) -> bool {
+        self.terminate_running_set.contains(&job)
+    }
+
+    /// A live job that this plan will cancel or terminate is no longer a
+    /// candidate for reuse, conflict, or barrier purposes.
+    fn is_conflict_pending(&self, job: JobIndex) -> bool {
+        self.cancel_scheduled_set.contains(&job) || self.terminate_running_set.contains(&job)
+    }
+
+    fn record_cancel_scheduled(&mut self, job: JobIndex) {
+        if self.cancel_scheduled_set.insert(job) {
+            self.cancel_scheduled.push(job);
+        }
+    }
+
+    fn record_terminate_running(&mut self, terminate: TerminatePlan) {
+        if self.terminate_running_set.insert(terminate.job) {
+            self.terminate_running.push(terminate);
+        }
+    }
+
+    fn push_job(&mut self, job: PlannedJob) -> JobRef {
+        let id = self.new_jobs.len();
+        self.new_jobs.push(job);
+        JobRef::Planned(id)
+    }
+
+    /// Jobs this plan will create and not cancel, for reuse and compatibility
+    /// checks that must see jobs decided earlier in the same submit.
+    fn active_planned_jobs(&self) -> impl Iterator<Item = (usize, &PlannedJob)> {
+        self.new_jobs
+            .iter()
+            .enumerate()
+            .filter(|(id, job)| !job.synthetic_cached && !self.cancelled_planned.contains(id))
+    }
+}
+
+/// Which scheduled/running jobs of a base task a new spawn supersedes.
+enum ConflictScan {
+    All,
+    SameProfile(String),
+    DifferentProfile(String),
+}
+
+impl ConflictScan {
+    fn matches(&self, profile: &str) -> bool {
+        match self {
+            ConflictScan::All => true,
+            ConflictScan::SameProfile(p) => profile == p,
+            ConflictScan::DifferentProfile(p) => profile != p,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ConflictOutcome {
+    predicates: Vec<PlannedReq>,
+    cancel_scheduled: Vec<JobIndex>,
+    cancel_planned: Vec<usize>,
+    terminate_running: Vec<TerminatePlan>,
+}
+
+impl ConflictOutcome {
+    fn record_into(self, plan: &mut SchedulePlan) -> Vec<PlannedReq> {
+        for job in self.cancel_scheduled {
+            plan.record_cancel_scheduled(job);
+        }
+        for id in self.cancel_planned {
+            plan.cancelled_planned.insert(id);
+        }
+        for terminate in self.terminate_running {
+            plan.record_terminate_running(terminate);
+        }
+        self.predicates
+    }
 }
 
 impl WorkspaceState {
@@ -1287,103 +1560,215 @@ impl WorkspaceState {
         spec
     }
 
-    /// Cancels every scheduled job for `base_task` through the canonical
-    /// transition path so terminal-side effects (history pruning,
-    /// service-dependents removal, list bookkeeping) all run.
+    /// Compute (read-only) the jobs that spawning `base_task`@`profile` conflicts
+    /// with, against live state and decisions already in `plan`. The caller
+    /// records the result once the new job is added. A live scheduled list never
+    /// changes during planning, so this is a plain filtered scan — bounded by the
+    /// base task's fan-out within one submit, with no scan-skip heuristic.
+    fn plan_conflicts(
+        &self,
+        plan: &SchedulePlan,
+        base_task: BaseTaskIndex,
+        profile: &str,
+        force_restart: bool,
+        protected_jobs: &[JobRef],
+    ) -> ConflictOutcome {
+        let allow_multiple =
+            if force_restart { AllowMultiple::False } else { self.base_tasks[base_task.idx()].config.allow_multiple };
+        let mut outcome = ConflictOutcome::default();
+
+        let scan = match allow_multiple {
+            AllowMultiple::True => return outcome,
+            AllowMultiple::False => ConflictScan::All,
+            AllowMultiple::DistinctProfiles => ConflictScan::SameProfile(profile.to_string()),
+            AllowMultiple::SingleProfile => ConflictScan::DifferentProfile(profile.to_string()),
+        };
+
+        for &job_index in self.base_tasks[base_task.idx()].jobs.scheduled() {
+            if plan.is_conflict_pending(job_index) || protected_jobs.contains(&JobRef::Live(job_index)) {
+                continue;
+            }
+            if scan.matches(self.jobs[job_index].spawn_profile()) {
+                outcome.cancel_scheduled.push(job_index);
+            }
+        }
+        for (id, job) in plan.new_jobs.iter().enumerate() {
+            if job.base_task != base_task
+                || job.synthetic_cached
+                || plan.cancelled_planned.contains(&id)
+                || protected_jobs.contains(&JobRef::Planned(id))
+            {
+                continue;
+            }
+            if scan.matches(&job.profile) {
+                outcome.cancel_planned.push(id);
+            }
+        }
+
+        for &job_index in self.base_tasks[base_task.idx()].jobs.running() {
+            if protected_jobs.contains(&JobRef::Live(job_index)) {
+                continue;
+            }
+            let job = &self.jobs[job_index];
+            let JobStatus::Running { process_index, .. } = &job.process_status else {
+                continue;
+            };
+            if !scan.matches(job.spawn_profile()) {
+                continue;
+            }
+            outcome
+                .predicates
+                .push(PlannedReq::Task { target: JobRef::Live(job_index), predicate: JobPredicate::Terminated });
+            if plan.is_running_terminate_pending(job_index) {
+                continue;
+            }
+            outcome.terminate_running.push(TerminatePlan {
+                job: job_index,
+                job_id: job.log_group,
+                process_index: *process_index,
+                exit_cause: ExitCause::Restarted,
+            });
+        }
+
+        outcome
+    }
+
+    fn validate_service_requirement_variants(
+        &self,
+        owner_base_task: BaseTaskIndex,
+        task: &TaskConfigRc,
+    ) -> Result<(), String> {
+        let task_name = self.base_tasks[owner_base_task.idx()].name.as_ref();
+        self.validate_service_requirement_variants_for("Task", task_name, task.config().require)
+    }
+
+    fn validate_service_requirement_variants_for(
+        &self,
+        owner_label: &str,
+        task_name: &str,
+        requirements: &[crate::config::Requirement<'_>],
+    ) -> Result<(), String> {
+        let graph = self.build_held_graph(requirements);
+        let closures = graph.service_closures();
+        let spine = graph.spine_adjacency(&closures);
+
+        // Service-ancestors of a variant node: every node that holds it via
+        // service edges. Two conflicting variants are co-held iff some holder of
+        // each pair sits on a common action spine (one reaches the other).
+        let mut held_by: Vec<Vec<usize>> = vec![Vec::new(); graph.len()];
+        let mut reachability_sources = hashbrown::HashSet::new();
+        for owner in 0..graph.len() {
+            for &service in &closures[owner] {
+                held_by[service].push(owner);
+                reachability_sources.insert(owner);
+            }
+        }
+        let reachability = Reachability::for_sources(&spine, reachability_sources);
+
+        let mut by_base: hashbrown::HashMap<BaseTaskIndex, Vec<usize>> = hashbrown::HashMap::new();
+        for (id, node) in graph.nodes.iter().enumerate() {
+            if node.is_service {
+                by_base.entry(node.base).or_default().push(id);
+            }
+        }
+
+        for (base, variants) in &by_base {
+            if matches!(self.base_tasks[base.idx()].config.allow_multiple, AllowMultiple::True) {
+                continue;
+            }
+            for i in 0..variants.len() {
+                for j in (i + 1)..variants.len() {
+                    let a = &graph.nodes[variants[i]];
+                    let b = &graph.nodes[variants[j]];
+                    if !self.service_variants_conflict(*base, &a.profile, &a.params, &b.profile, &b.params) {
+                        continue;
+                    }
+                    let co_held = held_by[variants[i]].iter().any(|&o1| {
+                        held_by[variants[j]]
+                            .iter()
+                            .any(|&o2| reachability.reaches(o1, o2) || reachability.reaches(o2, o1))
+                    });
+                    if co_held {
+                        let dep_task_name = self.base_tasks[base.idx()].name.as_ref();
+                        return Err(format!(
+                            "{} '{}' has conflicting service requirements on '{}'",
+                            owner_label, task_name, dep_task_name
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn build_held_graph(&self, requirements: &[crate::config::Requirement<'_>]) -> HeldGraph {
+        let mut graph = HeldGraph::with_root();
+        for child in self.classify_children(requirements) {
+            let is_service = child.is_service;
+            let id = graph.intern(child);
+            if is_service {
+                graph.service_edges[0].push(id);
+            } else {
+                graph.action_edges[0].push(id);
+            }
+        }
+
+        // `intern` appends, so walking ids in order expands every unique node
+        // exactly once; the dedup on `RequirementKey` terminates cyclic requires.
+        let mut owner = 1;
+        while owner < graph.len() {
+            let base = graph.nodes[owner].base;
+            let profile = graph.nodes[owner].profile.clone();
+            let params = graph.nodes[owner].params.clone();
+            let config = &self.base_tasks[base.idx()].config;
+            let env = Environment { profile: &profile, param: params, vars: config.vars };
+            if let Ok(task) = config.eval(&env) {
+                for child in self.classify_children(task.config().require) {
+                    let is_service = child.is_service;
+                    let id = graph.intern(child);
+                    if is_service {
+                        graph.service_edges[owner].push(id);
+                    } else {
+                        graph.action_edges[owner].push(id);
+                    }
+                }
+            }
+            owner += 1;
+        }
+        graph
+    }
+
+    fn classify_children(&self, requirements: &[crate::config::Requirement<'_>]) -> Vec<HeldNode> {
+        let mut out = Vec::new();
+        for req in requirements {
+            let crate::config::Requirement::Task(dep_call) = req else {
+                continue;
+            };
+            let dep_name = &*dep_call.name;
+            let Some(base) = self.lookup_name(dep_name) else {
+                continue;
+            };
+            let is_service = match self.base_tasks[base.idx()].config.kind {
+                TaskKind::Service => true,
+                TaskKind::Action => false,
+                TaskKind::Test => continue,
+            };
+            let profile = self.effective_profile_for_task(base, dep_call.profile.unwrap_or(""));
+            let params = dep_call.vars.clone().to_owned();
+            out.push(HeldNode { base, profile, params, is_service });
+        }
+        out
+    }
+
+    /// Test-only helper for exercising scheduled cancellation through the
+    /// canonical status-transition path.
+    #[cfg(test)]
     pub fn cancel_scheduled_jobs(&mut self, base_task: BaseTaskIndex) {
         let to_cancel: Vec<JobIndex> = self.base_tasks[base_task.idx()].jobs.scheduled().to_vec();
         for ji in to_cancel {
             self.update_job_status(ji, JobStatus::Cancelled);
         }
-    }
-
-    fn plan_conflicts(
-        &mut self,
-        base_task: BaseTaskIndex,
-        profile: &str,
-        force_restart: bool,
-        channel: &MioChannel,
-        protected_jobs: &[JobIndex],
-    ) -> Vec<ScheduleRequirement> {
-        let bt = &self.base_tasks[base_task.idx()];
-        let allow_multiple = if force_restart { AllowMultiple::False } else { bt.config.allow_multiple };
-        let mut pred = Vec::new();
-
-        match allow_multiple {
-            AllowMultiple::False => {
-                if protected_jobs.is_empty() {
-                    self.cancel_scheduled_jobs(base_task);
-                } else {
-                    let to_cancel: Vec<JobIndex> = self.base_tasks[base_task.idx()]
-                        .jobs
-                        .scheduled()
-                        .iter()
-                        .copied()
-                        .filter(|job_index| !protected_jobs.contains(job_index))
-                        .collect();
-                    for job_index in to_cancel {
-                        self.update_job_status(job_index, JobStatus::Cancelled);
-                    }
-                }
-
-                let running: Vec<JobIndex> = self.base_tasks[base_task.idx()].jobs.running().to_vec();
-                for job_index in running {
-                    if protected_jobs.contains(&job_index) {
-                        continue;
-                    }
-                    let job = &self.jobs[job_index];
-                    let JobStatus::Running { process_index, .. } = &job.process_status else {
-                        continue;
-                    };
-                    pred.push(ScheduleRequirement::Task { job: job_index, predicate: JobPredicate::Terminated });
-                    channel.send(crate::event_loop::ProcessRequest::TerminateJob {
-                        job_id: job.log_group,
-                        process_index: *process_index,
-                        exit_cause: ExitCause::Restarted,
-                    });
-                }
-            }
-            AllowMultiple::True => {
-                // No killing — new instance spawns alongside existing ones.
-            }
-            AllowMultiple::DistinctProfiles | AllowMultiple::SingleProfile => {
-                let match_same = matches!(allow_multiple, AllowMultiple::DistinctProfiles);
-                let to_cancel: Vec<_> = self.base_tasks[base_task.idx()]
-                    .jobs
-                    .scheduled()
-                    .iter()
-                    .filter(|ji| (self.jobs[**ji].spawn_profile() == profile) == match_same)
-                    .filter(|ji| !protected_jobs.contains(*ji))
-                    .copied()
-                    .collect();
-                for job_index in to_cancel {
-                    self.update_job_status(job_index, JobStatus::Cancelled);
-                }
-
-                let to_terminate: Vec<_> = self.base_tasks[base_task.idx()]
-                    .jobs
-                    .running()
-                    .iter()
-                    .filter(|ji| (self.jobs[**ji].spawn_profile() == profile) == match_same)
-                    .filter(|ji| !protected_jobs.contains(*ji))
-                    .copied()
-                    .collect();
-                for job_index in to_terminate {
-                    let job = &self.jobs[job_index];
-                    let JobStatus::Running { process_index, .. } = &job.process_status else {
-                        continue;
-                    };
-                    pred.push(ScheduleRequirement::Task { job: job_index, predicate: JobPredicate::Terminated });
-                    channel.send(crate::event_loop::ProcessRequest::TerminateJob {
-                        job_id: job.log_group,
-                        process_index: *process_index,
-                        exit_cause: ExitCause::Restarted,
-                    });
-                }
-            }
-        }
-
-        pred
     }
 
     /// O(1) lookup of the precomputed cycle/deadlock result for `root`.
@@ -1393,6 +1778,8 @@ impl WorkspaceState {
         self.require_analysis.problem(root)
     }
 
+    /// Spawn a single task (self-contained): build a plan, then apply it. A
+    /// failure to build leaves state untouched, so no rollback is needed.
     fn spawn_task(
         &mut self,
         workspace_id: u32,
@@ -1404,7 +1791,50 @@ impl WorkspaceState {
         force_restart: bool,
         trace: bool,
     ) -> Result<JobIndex, String> {
-        self.spawn_task_with_extra_requirements(
+        let mut plan = SchedulePlan::default();
+        let job_ref = self.spawn_task_with_extra_requirements_impl(
+            &mut plan,
+            workspace_id,
+            channel,
+            base_task,
+            params,
+            profile,
+            reason,
+            force_restart,
+            trace,
+            Vec::new(),
+            Vec::new(),
+        )?;
+        let created = self.apply_plan(plan, workspace_id, channel);
+        Ok(Self::resolve_job_ref(job_ref, &created))
+    }
+
+    fn resolve_job_ref(job_ref: JobRef, created: &[JobIndex]) -> JobIndex {
+        match job_ref {
+            JobRef::Live(ji) => ji,
+            JobRef::Planned(id) => created[id],
+        }
+    }
+
+    fn resolve_live_job_ref(job_ref: JobRef, created: &[JobIndex], state: &WorkspaceState) -> Option<JobIndex> {
+        let ji = Self::resolve_job_ref(job_ref, created);
+        state.jobs.get(ji).is_some().then_some(ji)
+    }
+
+    fn spawn_task_tracked(
+        &mut self,
+        plan: &mut SchedulePlan,
+        workspace_id: u32,
+        channel: &MioChannel,
+        base_task: BaseTaskIndex,
+        params: ValueMap,
+        profile: &str,
+        reason: ScheduleReason,
+        force_restart: bool,
+        trace: bool,
+    ) -> Result<JobRef, String> {
+        self.spawn_task_with_extra_requirements_impl(
+            plan,
             workspace_id,
             channel,
             base_task,
@@ -1418,8 +1848,13 @@ impl WorkspaceState {
         )
     }
 
-    fn spawn_task_with_extra_requirements(
+    /// Record one task spawn into `plan` (read-only against `WorkspaceState`).
+    /// Returns a [`JobRef`] to the (possibly reused) job; the actual insert
+    /// happens in [`Self::apply_plan`].
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_task_with_extra_requirements_impl(
         &mut self,
+        plan: &mut SchedulePlan,
         workspace_id: u32,
         channel: &MioChannel,
         base_task: BaseTaskIndex,
@@ -1428,9 +1863,9 @@ impl WorkspaceState {
         reason: ScheduleReason,
         force_restart: bool,
         trace: bool,
-        mut extra_requirements: Vec<ScheduleRequirement>,
-        protected_conflict_jobs: Vec<JobIndex>,
-    ) -> Result<JobIndex, String> {
+        extra_requirements: Vec<PlannedReq>,
+        protected_conflict_jobs: Vec<JobRef>,
+    ) -> Result<JobRef, String> {
         self.detect_require_problems(base_task)?;
 
         let profile = {
@@ -1440,90 +1875,114 @@ impl WorkspaceState {
         .to_string();
         let params = params.to_owned();
 
-        // Reuse a compatible scheduled/starting service instead of cancelling it.
-        // `plan_conflicts` under `AllowMultiple::False` (the default) cancels every
-        // scheduled job for the base task, so an explicit spawn racing a
-        // dependency-driven spawn of the same service (e.g. a group submission that
-        // lists both a dependent and the service itself) would orphan the dependents
-        // wired to the original job via `JobPredicate::Active` — they'd cascade into
-        // "will never be ready" cancellations once the predicate sees the cancelled
-        // job. Running services keep their documented "explicit spawn restarts"
-        // semantic.
-        if !force_restart {
-            let bt = &self.base_tasks[base_task.idx()];
-            let cache_never = bt.config.cache.as_ref().is_some_and(|c| c.never);
-            if bt.config.kind == TaskKind::Service && !cache_never {
-                for &ji in bt.jobs.non_terminal() {
+        // Reuse a compatible scheduled/starting service (live or planned this
+        // submit) instead of cancelling it. Cancelling a service that dependents
+        // are already wired to via `JobPredicate::Active` would cascade them into
+        // "will never be ready" cancellations. Running services keep their
+        // documented "explicit spawn restarts" semantic.
+        if !force_restart && self.base_tasks[base_task.idx()].config.kind == TaskKind::Service {
+            let cache_never = self.base_tasks[base_task.idx()].config.cache.as_ref().is_some_and(|c| c.never);
+            if !cache_never {
+                for &ji in self.base_tasks[base_task.idx()].jobs.non_terminal() {
+                    if plan.is_conflict_pending(ji) {
+                        continue;
+                    }
                     let job = &self.jobs[ji];
                     if matches!(job.process_status, JobStatus::Running { .. }) {
                         continue;
                     }
                     if service_matches_require(job, &profile, &params) {
-                        return Ok(ji);
+                        return Ok(JobRef::Live(ji));
+                    }
+                }
+                for (id, pjob) in plan.active_planned_jobs() {
+                    if pjob.base_task == base_task && pjob.profile == profile && pjob.params == params {
+                        return Ok(JobRef::Planned(id));
                     }
                 }
             }
         }
-
-        let bt = &mut self.base_tasks[base_task.idx()];
-        bt.update_profile_tracking(&profile);
 
         let spec = self.get_or_create_spawn_spec(base_task, &profile, params.clone()).map_err(|e| {
             format!("Failed to evaluate task '{}': {:?}", self.base_tasks[base_task.idx()].name.as_ref(), e)
         })?;
         let task = spec.task.clone();
 
+        self.validate_service_requirement_variants(base_task, &task)?;
+
+        let outcome = self.plan_conflicts(plan, base_task, &profile, force_restart, &protected_conflict_jobs);
+        let mut pred = outcome.record_into(plan);
+        pred.extend(extra_requirements);
+
+        let cache_key = self.compute_task_cache_key(&task, &profile, &params);
+        let resolved = self.resolve_task_dep_requirements(plan, workspace_id, channel, &task)?;
+        pred.extend(resolved);
+
+        let action_deps_until_ready = self.planned_action_deps_until_ready(plan, base_task, &pred);
+
+        Ok(plan.push_job(PlannedJob {
+            base_task,
+            task,
+            profile,
+            params,
+            cache_key,
+            requirements: pred,
+            action_deps_until_ready,
+            reason,
+            trace,
+            synthetic_cached: false,
+        }))
+    }
+
+    /// The action deps a planned service holds until ready (mirrors the field
+    /// `create_job` computes at apply time, but over [`JobRef`]s for barriers).
+    fn planned_action_deps_until_ready(
+        &self,
+        plan: &SchedulePlan,
+        base_task: BaseTaskIndex,
+        requirements: &[PlannedReq],
+    ) -> Vec<JobRef> {
+        if self.base_tasks[base_task.idx()].config.kind != TaskKind::Service {
+            return Vec::new();
+        }
+        requirements
+            .iter()
+            .filter_map(|req| match req {
+                PlannedReq::Task { target, predicate: JobPredicate::TerminatedNaturallyAndSuccessfully }
+                    if self.job_ref_is_action(plan, *target) =>
+                {
+                    Some(*target)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn compute_task_cache_key(&mut self, task: &TaskConfigRc, profile: &str, params: &ValueMap) -> String {
+        match task.config().cache.as_ref() {
+            Some(cache) => self.compute_cache_key_with_require(cache.key, profile, params),
+            None => String::new(),
+        }
+    }
+
+    /// Build, resolve, and convert a task's `require` list into planned
+    /// requirements, recording any newly-spawned dependencies into `plan`.
+    fn resolve_task_dep_requirements(
+        &mut self,
+        plan: &mut SchedulePlan,
+        workspace_id: u32,
+        channel: &MioChannel,
+        task: &TaskConfigRc,
+    ) -> Result<Vec<PlannedReq>, String> {
+        let mut out: Vec<PlannedReq> = Vec::new();
         let mut batch: SpawnBatch<()> = SpawnBatch::new();
         let mut req_keys = Vec::new();
-        let mut service_variants: hashbrown::HashMap<BaseTaskIndex, (String, ValueMap<'static>)> =
-            hashbrown::HashMap::new();
-
-        for req in task.config().require {
-            match req {
-                crate::config::Requirement::Resource { .. } => {}
-                crate::config::Requirement::Task(dep_call) => {
-                    let dep_name = &*dep_call.name;
-                    let dep_profile = dep_call.profile.unwrap_or("").to_string();
-                    let dep_params = dep_call.vars.clone().to_owned();
-
-                    let Some(dep_base_task) = self.lookup_name(dep_name) else {
-                        continue;
-                    };
-                    let dep_config = &self.base_tasks[dep_base_task.idx()].config;
-                    if dep_config.kind != TaskKind::Service {
-                        continue;
-                    }
-                    let dep_task_name = self.base_tasks[dep_base_task.idx()].name.clone();
-                    let dep_effective_profile = self.effective_profile_for_task(dep_base_task, &dep_profile);
-                    if let Some((existing_profile, existing_params)) = service_variants.get(&dep_base_task) {
-                        if self.service_variants_conflict(
-                            dep_base_task,
-                            existing_profile,
-                            existing_params,
-                            &dep_effective_profile,
-                            &dep_params,
-                        ) {
-                            return Err(format!(
-                                "Task '{}' has conflicting service requirements on '{}'",
-                                self.base_tasks[base_task.idx()].name.as_ref(),
-                                dep_task_name.as_ref()
-                            ));
-                        }
-                    } else {
-                        service_variants.insert(dep_base_task, (dep_effective_profile, dep_params));
-                    }
-                }
-            }
-        }
-
-        let mut pred = self.plan_conflicts(base_task, &profile, force_restart, channel, &protected_conflict_jobs);
-        pred.append(&mut extra_requirements);
 
         for req in task.config().require {
             match req {
                 crate::config::Requirement::Resource { name, priority } => {
                     let id = self.resources.intern(name);
-                    pred.push(ScheduleRequirement::Resource { id, priority: *priority });
+                    out.push(PlannedReq::Resource { id, priority: *priority });
                 }
                 crate::config::Requirement::Task(dep_call) => {
                     let dep_name = &*dep_call.name;
@@ -1534,9 +1993,8 @@ impl WorkspaceState {
                         kvlog::error!("unknown alias", dep_name);
                         continue;
                     };
-                    let dep_config = &self.base_tasks[dep_base_task.idx()].config;
 
-                    let predicate = match dep_config.kind {
+                    let predicate = match self.base_tasks[dep_base_task.idx()].config.kind {
                         TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
                         TaskKind::Service => JobPredicate::Active,
                         TaskKind::Test => continue,
@@ -1548,41 +2006,32 @@ impl WorkspaceState {
             }
         }
 
-        self.resolve_batch_requirements(workspace_id, channel, &mut batch)?;
+        self.resolve_batch_requirements(plan, workspace_id, channel, &mut batch)?;
 
         for (key, predicate) in &req_keys {
             match batch.get_resolved(key) {
                 Some(ResolvedRequirement::Cached) => {}
-                Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
-                    pred.push(ScheduleRequirement::Task { job: *ji, predicate: predicate.clone() });
+                Some(ResolvedRequirement::Pending(target)) | Some(ResolvedRequirement::Spawned(target)) => {
+                    out.push(PlannedReq::Task { target: *target, predicate: predicate.clone() });
                 }
                 None => {}
             }
         }
-
-        let cache_key = task
-            .config()
-            .cache
-            .as_ref()
-            .map_or(String::new(), |c| self.compute_cache_key_with_require(c.key, &profile, spec.params.as_ref()));
-
-        Ok(self.create_job(base_task, task, &profile, params, pred, cache_key, channel, workspace_id, reason, trace))
+        Ok(out)
     }
 
-    /// Schedule a queued service that waits for a blocking service to terminate.
-    ///
-    /// Creates a job in Scheduled state that will be spawned when the blocking
-    /// service terminates. This is used when a service with a different profile
-    /// is requested while another profile is still running.
+    /// Record a queued service that waits for blocking services to terminate
+    /// before it can start (used on a service profile conflict).
     fn schedule_queued_service(
         &mut self,
+        plan: &mut SchedulePlan,
+        workspace_id: u32,
+        channel: &MioChannel,
         base_task: BaseTaskIndex,
         params: ValueMap,
         profile: &str,
-        blocked_by: Vec<JobIndex>,
-        channel: &MioChannel,
-        workspace_id: u32,
-    ) -> Result<JobIndex, String> {
+        blocked_by: Vec<JobRef>,
+    ) -> Result<JobRef, String> {
         self.detect_require_problems(base_task)?;
         let task = {
             let spawner = &self.base_tasks[base_task.idx()];
@@ -1591,78 +2040,34 @@ impl WorkspaceState {
             let env = Environment { profile: eval_profile, param: params.clone(), vars: spawner.config.vars };
             spawner.config.eval(&env).map_err(|e| format!("Failed to evaluate queued service config: {:?}", e))?
         };
+        self.validate_service_requirement_variants(base_task, &task)?;
         let profile = if profile.is_empty() {
             self.base_tasks[base_task.idx()].config.profiles.first().copied().unwrap_or("").to_string()
         } else {
             profile.to_string()
         };
         let params = params.to_owned();
-        let cache_key = task
-            .config()
-            .cache
-            .as_ref()
-            .map_or(String::new(), |c| self.compute_cache_key_with_require(c.key, &profile, &params));
-        let mut requirements: Vec<ScheduleRequirement> = blocked_by
+        let cache_key = self.compute_task_cache_key(&task, &profile, &params);
+        let mut requirements: Vec<PlannedReq> = blocked_by
             .into_iter()
-            .map(|job| ScheduleRequirement::Task { job, predicate: JobPredicate::Terminated })
+            .map(|target| PlannedReq::Task { target, predicate: JobPredicate::Terminated })
             .collect();
+        let resolved = self.resolve_task_dep_requirements(plan, workspace_id, channel, &task)?;
+        requirements.extend(resolved);
+        let action_deps_until_ready = self.planned_action_deps_until_ready(plan, base_task, &requirements);
 
-        let mut batch: SpawnBatch<()> = SpawnBatch::new();
-        let mut req_keys = Vec::new();
-
-        for req in task.config().require {
-            match req {
-                crate::config::Requirement::Resource { name, priority } => {
-                    let id = self.resources.intern(name);
-                    requirements.push(ScheduleRequirement::Resource { id, priority: *priority });
-                }
-                crate::config::Requirement::Task(dep_call) => {
-                    let dep_name = &*dep_call.name;
-                    let dep_profile = dep_call.profile.unwrap_or("");
-                    let dep_params = dep_call.vars.clone().to_owned();
-
-                    let Some(dep_base_task) = self.lookup_name(dep_name) else {
-                        kvlog::error!("unknown alias", dep_name);
-                        continue;
-                    };
-                    let dep_config = &self.base_tasks[dep_base_task.idx()].config;
-
-                    let predicate = match dep_config.kind {
-                        TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
-                        TaskKind::Service => JobPredicate::Active,
-                        TaskKind::Test => continue,
-                    };
-
-                    let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
-                    req_keys.push((key, predicate));
-                }
-            }
-        }
-
-        self.resolve_batch_requirements(workspace_id, channel, &mut batch)?;
-
-        for (key, predicate) in &req_keys {
-            match batch.get_resolved(key) {
-                Some(ResolvedRequirement::Cached) => {}
-                Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
-                    requirements.push(ScheduleRequirement::Task { job: *ji, predicate: predicate.clone() });
-                }
-                None => {}
-            }
-        }
-
-        Ok(self.create_job(
+        Ok(plan.push_job(PlannedJob {
             base_task,
             task,
-            &profile,
+            profile,
             params,
-            requirements,
             cache_key,
-            channel,
-            workspace_id,
-            ScheduleReason::ProfileConflict,
-            false,
-        ))
+            requirements,
+            action_deps_until_ready,
+            reason: ScheduleReason::ProfileConflict,
+            trace: false,
+            synthetic_cached: false,
+        }))
     }
 
     fn create_job(
@@ -1671,18 +2076,18 @@ impl WorkspaceState {
         task: TaskConfigRc,
         profile: &str,
         params: ValueMap<'static>,
-        requirements: Vec<ScheduleRequirement>,
         cache_key: String,
+        requirements: Vec<ScheduleRequirement>,
         channel: &MioChannel,
         _workspace_id: u32,
         reason: ScheduleReason,
         trace: bool,
     ) -> JobIndex {
-        let spec = self.cache_spawn_spec(base_task, profile, params, task.clone());
         let (task_name, task_kind, job_id) = {
             let bt = &mut self.base_tasks[base_task.idx()];
             let task_name = bt.name.clone();
             let task_kind = bt.config.kind;
+            bt.update_profile_tracking(profile);
             if task_kind == TaskKind::Service {
                 bt.has_run_this_session = true;
             }
@@ -1690,6 +2095,7 @@ impl WorkspaceState {
             bt.spawn_counter = bt.spawn_counter.wrapping_add(1);
             (task_name, task_kind, LogGroup::new(base_task, pc))
         };
+        let spec = self.cache_spawn_spec(base_task, profile, params, task.clone());
 
         let action_deps_until_ready: SmallVec<[JobIndex; 2]> = if task_kind == TaskKind::Service {
             requirements
@@ -1784,9 +2190,112 @@ impl WorkspaceState {
         };
         global_list.push_terminated(job_index);
         self.change_number = self.change_number.wrapping_add(1);
+        if self.jobs.len() as u32 > self.max_job_history {
+            self.prune_history();
+        }
 
         kvlog::info!("Created cached success job", ?base_task, ?job_index, reason = reason.name());
         job_index
+    }
+
+    fn resolve_planned_reqs(reqs: &[PlannedReq], local_to_job: &[JobIndex]) -> Vec<ScheduleRequirement> {
+        let mut out = Vec::with_capacity(reqs.len());
+        for req in reqs {
+            match req {
+                PlannedReq::Resource { id, priority } => {
+                    out.push(ScheduleRequirement::Resource { id: *id, priority: *priority })
+                }
+                PlannedReq::Task { target, predicate } => {
+                    let job = match target {
+                        JobRef::Live(ji) => *ji,
+                        JobRef::Planned(local) => local_to_job[*local],
+                    };
+                    out.push(ScheduleRequirement::Task { job, predicate: predicate.clone() });
+                }
+            }
+        }
+        out
+    }
+
+    /// Apply a fully-built plan. This is the only mutating step and cannot fail:
+    /// jobs are inserted (deps before dependents), superseded jobs cancelled, and
+    /// running conflicts terminated. Returns the created `JobIndex` per planned
+    /// job, in plan order, so callers can resolve their [`JobRef`]s.
+    fn apply_plan(&mut self, plan: SchedulePlan, workspace_id: u32, channel: &MioChannel) -> Vec<JobIndex> {
+        let SchedulePlan { new_jobs, cancelled_planned, cancel_scheduled, terminate_running, .. } = plan;
+        let created_any = !new_jobs.is_empty();
+        let mut local_to_job: Vec<JobIndex> = Vec::with_capacity(new_jobs.len());
+
+        for planned in new_jobs {
+            let PlannedJob {
+                base_task,
+                task,
+                profile,
+                params,
+                cache_key,
+                requirements,
+                action_deps_until_ready: _,
+                reason,
+                trace,
+                synthetic_cached,
+            } = planned;
+            let job_index = if synthetic_cached {
+                self.create_cached_success_job(base_task, task, &profile, params, cache_key, reason)
+            } else {
+                let reqs = Self::resolve_planned_reqs(&requirements, &local_to_job);
+                self.create_job(
+                    base_task,
+                    task,
+                    &profile,
+                    params,
+                    cache_key,
+                    reqs,
+                    channel,
+                    workspace_id,
+                    reason,
+                    trace,
+                )
+            };
+            local_to_job.push(job_index);
+        }
+
+        // A planned job superseded by a later same-base spawn is created and then
+        // cancelled, exactly as the eager path did, so dependents wired to it
+        // cascade through the canonical "will never be ready" path.
+        for id in cancelled_planned {
+            let job_index = local_to_job[id];
+            if matches!(self.jobs.get(job_index).map(|j| &j.process_status), Some(JobStatus::Scheduled { .. })) {
+                self.update_job_status(job_index, JobStatus::Cancelled);
+            }
+        }
+
+        for job_index in cancel_scheduled {
+            let Some(job) = self.jobs.get(job_index) else { continue };
+            if !matches!(job.process_status, JobStatus::Scheduled { .. }) {
+                continue;
+            }
+            self.update_job_status(job_index, JobStatus::Cancelled);
+        }
+
+        for terminate in terminate_running {
+            let Some(job) = self.jobs.get(terminate.job) else { continue };
+            let JobStatus::Running { process_index, .. } = &job.process_status else {
+                continue;
+            };
+            if job.log_group != terminate.job_id || *process_index != terminate.process_index {
+                continue;
+            }
+            channel.send(crate::event_loop::ProcessRequest::TerminateJob {
+                job_id: terminate.job_id,
+                process_index: terminate.process_index,
+                exit_cause: terminate.exit_cause,
+            });
+        }
+
+        if created_any && self.jobs.len() as u32 > self.max_job_history {
+            self.prune_history();
+        }
+        local_to_job
     }
 }
 
@@ -1909,6 +2418,30 @@ impl WorkspaceState {
             let job = &self.jobs[job_index];
             job.spawn_profile() == profile && job.spawn_params() == params
         })
+    }
+
+    fn active_matching_job_in_plan(
+        &self,
+        base_task: BaseTaskIndex,
+        profile: &str,
+        params: &ValueMap<'static>,
+        plan: &SchedulePlan,
+    ) -> Option<JobRef> {
+        for &job_index in self.base_tasks[base_task.idx()].jobs.non_terminal().iter().rev() {
+            if plan.is_conflict_pending(job_index) {
+                continue;
+            }
+            let job = &self.jobs[job_index];
+            if job.spawn_profile() == profile && job.spawn_params() == params {
+                return Some(JobRef::Live(job_index));
+            }
+        }
+        for (id, pjob) in plan.active_planned_jobs() {
+            if pjob.base_task == base_task && pjob.profile.as_str() == profile && &pjob.params == params {
+                return Some(JobRef::Planned(id));
+            }
+        }
+        None
     }
 
     pub fn lookup_and_start_task_with_trace(
@@ -2101,6 +2634,11 @@ pub enum Scheduled {
     None,
 }
 
+struct ScheduledCandidate {
+    job: JobIndex,
+    resources: SmallVec<[(ResourceIndex, i32); 2]>,
+}
+
 impl WorkspaceState {
     fn effective_profile_for_task(&self, base_task: BaseTaskIndex, profile: &str) -> String {
         if profile.is_empty() {
@@ -2156,6 +2694,50 @@ impl WorkspaceState {
         }
     }
 
+    /// Whether a planned (not-yet-inserted) action job conflicts with a request.
+    fn planned_action_conflicts_with_request(
+        &self,
+        pjob: &PlannedJob,
+        action_base_task: BaseTaskIndex,
+        requested_profile: &str,
+    ) -> bool {
+        if pjob.base_task != action_base_task {
+            return false;
+        }
+        match self.base_tasks[action_base_task.idx()].config.allow_multiple {
+            AllowMultiple::True => false,
+            AllowMultiple::False => true,
+            AllowMultiple::DistinctProfiles => pjob.profile == requested_profile,
+            AllowMultiple::SingleProfile => pjob.profile != requested_profile,
+        }
+    }
+
+    fn job_ref_conflicts_as_action(
+        &self,
+        plan: &SchedulePlan,
+        target: JobRef,
+        action_base_task: BaseTaskIndex,
+        requested_profile: &str,
+    ) -> bool {
+        match target {
+            JobRef::Live(ji) => self.action_job_conflicts_with_request(action_base_task, ji, requested_profile),
+            JobRef::Planned(id) => {
+                self.planned_action_conflicts_with_request(&plan.new_jobs[id], action_base_task, requested_profile)
+            }
+        }
+    }
+
+    fn job_ref_is_action(&self, plan: &SchedulePlan, target: JobRef) -> bool {
+        let base = match target {
+            JobRef::Live(ji) => match self.jobs.get(ji) {
+                Some(job) => job.log_group.base_task_index(),
+                None => return false,
+            },
+            JobRef::Planned(id) => plan.new_jobs[id].base_task,
+        };
+        self.base_tasks[base.idx()].config.kind == TaskKind::Action
+    }
+
     fn service_uses_action_output_until_ready(
         &self,
         service_job: JobIndex,
@@ -2173,30 +2755,59 @@ impl WorkspaceState {
             .any(|dep| self.action_job_conflicts_with_request(action_base_task, *dep, requested_profile))
     }
 
-    fn action_output_ready_barriers(&self, action_base_task: BaseTaskIndex, requested_profile: &str) -> Vec<JobIndex> {
-        self.service_jobs
+    /// Services (live or planned this submit) that still depend on this action's
+    /// output until they become ready. The new action must wait for them so it
+    /// is not restarted out from under a service that still needs its output.
+    fn action_output_ready_barriers(
+        &self,
+        action_base_task: BaseTaskIndex,
+        requested_profile: &str,
+        plan: &SchedulePlan,
+    ) -> Vec<JobRef> {
+        let mut barriers: Vec<JobRef> = self
+            .service_jobs
             .non_terminal()
             .iter()
             .copied()
+            .filter(|service_job| !plan.is_conflict_pending(*service_job))
             .filter(|service_job| {
                 self.service_uses_action_output_until_ready(*service_job, action_base_task, requested_profile)
             })
-            .collect()
+            .map(JobRef::Live)
+            .collect();
+        for (id, pjob) in plan.active_planned_jobs() {
+            if self.base_tasks[pjob.base_task.idx()].config.kind != TaskKind::Service {
+                continue;
+            }
+            if pjob
+                .action_deps_until_ready
+                .iter()
+                .any(|dep| self.job_ref_conflicts_as_action(plan, *dep, action_base_task, requested_profile))
+            {
+                barriers.push(JobRef::Planned(id));
+            }
+        }
+        barriers
     }
 
     fn action_jobs_protected_by_ready_barriers(
         &self,
         action_base_task: BaseTaskIndex,
         requested_profile: &str,
-        barriers: &[JobIndex],
-    ) -> Vec<JobIndex> {
-        let mut protected = Vec::new();
+        barriers: &[JobRef],
+        plan: &SchedulePlan,
+    ) -> Vec<JobRef> {
+        let mut protected: Vec<JobRef> = Vec::new();
         for &barrier in barriers {
-            let Some(job) = self.jobs.get(barrier) else {
-                continue;
+            let deps: Vec<JobRef> = match barrier {
+                JobRef::Live(ji) => match self.jobs.get(ji) {
+                    Some(job) => job.action_deps_until_ready.iter().copied().map(JobRef::Live).collect(),
+                    None => Vec::new(),
+                },
+                JobRef::Planned(id) => plan.new_jobs[id].action_deps_until_ready.clone(),
             };
-            for &dep in &job.action_deps_until_ready {
-                if self.action_job_conflicts_with_request(action_base_task, dep, requested_profile)
+            for dep in deps {
+                if self.job_ref_conflicts_as_action(plan, dep, action_base_task, requested_profile)
                     && !protected.contains(&dep)
                 {
                     protected.push(dep);
@@ -2210,14 +2821,23 @@ impl WorkspaceState {
         &self,
         action_base_task: BaseTaskIndex,
         requested_profile: &str,
-    ) -> Vec<JobIndex> {
-        self.base_tasks[action_base_task.idx()]
+        plan: &SchedulePlan,
+    ) -> Vec<JobRef> {
+        let mut jobs: Vec<JobRef> = self.base_tasks[action_base_task.idx()]
             .jobs
             .non_terminal()
             .iter()
             .copied()
+            .filter(|job| !plan.is_conflict_pending(*job))
             .filter(|job| self.action_job_conflicts_with_request(action_base_task, *job, requested_profile))
-            .collect()
+            .map(JobRef::Live)
+            .collect();
+        for (id, pjob) in plan.active_planned_jobs() {
+            if self.planned_action_conflicts_with_request(pjob, action_base_task, requested_profile) {
+                jobs.push(JobRef::Planned(id));
+            }
+        }
+        jobs
     }
 
     /// Update a job's `JobStatus`, maintaining the side-tables that depend on it.
@@ -2507,6 +3127,97 @@ impl WorkspaceState {
         })
     }
 
+    fn winner_per_resource(
+        candidates: &[ScheduledCandidate],
+    ) -> hashbrown::HashMap<ResourceIndex, (JobIndex, i32, usize)> {
+        let mut winner_per_resource: hashbrown::HashMap<ResourceIndex, (JobIndex, i32, usize)> =
+            hashbrown::HashMap::new();
+        for (rank, c) in candidates.iter().enumerate() {
+            for &(id, priority) in &c.resources {
+                let take = match winner_per_resource.get(&id) {
+                    None => true,
+                    Some(&(_, cur_prio, cur_rank)) => priority > cur_prio || (priority == cur_prio && rank < cur_rank),
+                };
+                if take {
+                    winner_per_resource.insert(id, (c.job, priority, rank));
+                }
+            }
+        }
+        winner_per_resource
+    }
+
+    fn candidate_wins_all_resources(
+        candidate: &ScheduledCandidate,
+        winner_per_resource: &hashbrown::HashMap<ResourceIndex, (JobIndex, i32, usize)>,
+    ) -> bool {
+        candidate.resources.iter().all(|&(id, _)| winner_per_resource.get(&id).map(|w| w.0) == Some(candidate.job))
+    }
+
+    fn select_scheduled_candidate(candidates: &[ScheduledCandidate]) -> Option<JobIndex> {
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let winner_per_resource = Self::winner_per_resource(candidates);
+        for c in candidates {
+            if Self::candidate_wins_all_resources(c, &winner_per_resource) {
+                return Some(c.job);
+            }
+        }
+
+        // Crossed multi-resource priorities can otherwise produce no candidate
+        // that wins every resource. FIFO fallback preserves progress while the
+        // normal per-resource priority winner remains unchanged when one exists.
+        candidates.first().map(|c| c.job)
+    }
+
+    fn resource_available_after_terminations(&self, id: ResourceIndex, termination_jobs: &[JobIndex]) -> bool {
+        self.resources.holder(id).is_none_or(|holder| termination_jobs.contains(&holder))
+    }
+
+    fn requirements_ready_after_terminations(
+        &self,
+        requirements: &[ScheduleRequirement],
+        termination_jobs: &[JobIndex],
+    ) -> Option<SmallVec<[(ResourceIndex, i32); 2]>> {
+        let mut resources: SmallVec<[(ResourceIndex, i32); 2]> = SmallVec::new();
+        for req in requirements {
+            match req {
+                ScheduleRequirement::Resource { id, priority } => {
+                    if !self.resource_available_after_terminations(*id, termination_jobs) {
+                        return None;
+                    }
+                    resources.push((*id, *priority));
+                }
+                ScheduleRequirement::Task { job, predicate: JobPredicate::Terminated }
+                    if termination_jobs.contains(job) => {}
+                ScheduleRequirement::Task { .. } => {
+                    if !matches!(req.status(self), RequirementStatus::Met) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(resources)
+    }
+
+    fn scheduled_candidates_after_terminations(&self, termination_jobs: &[JobIndex]) -> Vec<ScheduledCandidate> {
+        let mut candidates = Vec::new();
+        for job_set in [&self.action_jobs, &self.service_jobs, &self.test_jobs] {
+            for &job_index in job_set.scheduled() {
+                let JobStatus::Scheduled { after } = &self[job_index].process_status else {
+                    kvlog::error!("Inconsistent JobStatus in queued service resource arbitration",
+                     status = ?&self[job_index].process_status, ?job_index);
+                    continue;
+                };
+                if let Some(resources) = self.requirements_ready_after_terminations(after, termination_jobs) {
+                    candidates.push(ScheduledCandidate { job: job_index, resources });
+                }
+            }
+        }
+        candidates
+    }
+
     /// Pick one job to start next.
     ///
     /// Returns the first scheduled job whose non-resource requirements are met
@@ -2522,12 +3233,7 @@ impl WorkspaceState {
             return Scheduled::None;
         }
 
-        struct Candidate {
-            job: JobIndex,
-            resources: SmallVec<[(ResourceIndex, i32); 2]>,
-        }
-
-        let mut candidates: Vec<Candidate> = Vec::new();
+        let mut candidates: Vec<ScheduledCandidate> = Vec::new();
 
         for job_set in [&self.action_jobs, &self.service_jobs, &self.test_jobs] {
             'pending: for &job_index in job_set.scheduled() {
@@ -2552,7 +3258,7 @@ impl WorkspaceState {
                         },
                     }
                 }
-                candidates.push(Candidate { job: job_index, resources });
+                candidates.push(ScheduledCandidate { job: job_index, resources });
             }
         }
 
@@ -2560,28 +3266,7 @@ impl WorkspaceState {
             return Scheduled::None;
         }
 
-        let mut winner_per_resource: hashbrown::HashMap<ResourceIndex, (JobIndex, i32, usize)> =
-            hashbrown::HashMap::new();
-        for (rank, c) in candidates.iter().enumerate() {
-            for &(id, priority) in &c.resources {
-                let take = match winner_per_resource.get(&id) {
-                    None => true,
-                    Some(&(_, cur_prio, cur_rank)) => priority > cur_prio || (priority == cur_prio && rank < cur_rank),
-                };
-                if take {
-                    winner_per_resource.insert(id, (c.job, priority, rank));
-                }
-            }
-        }
-
-        for c in &candidates {
-            let wins_all = c.resources.iter().all(|&(id, _)| winner_per_resource.get(&id).map(|w| w.0) == Some(c.job));
-            if wins_all {
-                return Scheduled::Ready(c.job);
-            }
-        }
-
-        Scheduled::None
+        Self::select_scheduled_candidate(&candidates).map_or(Scheduled::None, Scheduled::Ready)
     }
 
     /// Find services that should be terminated to allow queued services to proceed.
@@ -2602,14 +3287,20 @@ impl WorkspaceState {
                     continue;
                 };
                 let blocking_job = &self.jobs[*req_job];
-                if blocking_job.process_status.is_running() && self.service_dependents.can_stop(*req_job) {
-                    let exit_cause = if blocking_job.log_group.base_task_index() == scheduled_base_task {
-                        ExitCause::Restarted
-                    } else {
-                        ExitCause::ProfileConflict
-                    };
-                    return Some((*req_job, exit_cause));
+                if !blocking_job.process_status.is_running() || !self.service_dependents.can_stop(*req_job) {
+                    continue;
                 }
+                // Resource arbitration is constant for the scheduled job, so check it once a
+                // stoppable blocker exists rather than for every scheduled service every tick.
+                if !self.queued_service_replacement_requirements_met(scheduled_job_index, after) {
+                    break;
+                }
+                let exit_cause = if blocking_job.log_group.base_task_index() == scheduled_base_task {
+                    ExitCause::Restarted
+                } else {
+                    ExitCause::ProfileConflict
+                };
+                return Some((*req_job, exit_cause));
             }
         }
         None
@@ -2663,45 +3354,111 @@ impl WorkspaceState {
         })
     }
 
+    fn queued_service_replacement_requirements_met(
+        &self,
+        scheduled_job_index: JobIndex,
+        requirements: &[ScheduleRequirement],
+    ) -> bool {
+        let termination_jobs: SmallVec<[JobIndex; 4]> = requirements
+            .iter()
+            .filter_map(|req| match req {
+                ScheduleRequirement::Task { job, predicate: JobPredicate::Terminated } => Some(*job),
+                _ => None,
+            })
+            .collect();
+
+        let candidates = self.scheduled_candidates_after_terminations(&termination_jobs);
+        Self::select_scheduled_candidate(&candidates) == Some(scheduled_job_index)
+    }
+
     /// Check compatibility of a service request with running instances.
     ///
     /// Returns:
     /// - `Compatible(job_index)` if a matching service is running
     /// - `Available` if no instance is running
     /// - `Conflict { ... }` if a service is running with a different profile
+    #[cfg(test)]
     pub fn check_service_compatibility(
         &self,
         base_task: BaseTaskIndex,
         requested_profile: &str,
         requested_params: &ValueMap,
     ) -> ServiceCompatibility {
-        let spawner = &self.base_tasks[base_task.idx()];
+        self.check_service_compatibility_in_plan(
+            base_task,
+            requested_profile,
+            requested_params,
+            &SchedulePlan::default(),
+        )
+    }
+
+    /// Service compatibility against live state plus services already decided in
+    /// `plan` (so two requirements on the same service across one submit share an
+    /// instance instead of conflicting).
+    fn check_service_compatibility_in_plan(
+        &self,
+        base_task: BaseTaskIndex,
+        requested_profile: &str,
+        requested_params: &ValueMap,
+        plan: &SchedulePlan,
+    ) -> ServiceCompatibility {
+        let allow_multiple = self.base_tasks[base_task.idx()].config.allow_multiple;
         let requested_effective_profile = self.effective_profile_for_task(base_task, requested_profile);
 
-        for &ji in spawner.jobs.non_terminal() {
-            let job = &self.jobs[ji];
-            if service_matches_require(job, requested_profile, requested_params) {
-                return ServiceCompatibility::Compatible(ji);
+        let planned_match = |pjob: &PlannedJob| {
+            (requested_profile.is_empty() || pjob.profile == requested_effective_profile)
+                && &pjob.params == requested_params
+        };
+        let planned_blocks = |pjob: &PlannedJob| match allow_multiple {
+            AllowMultiple::True => false,
+            AllowMultiple::False => true,
+            AllowMultiple::DistinctProfiles => pjob.profile == requested_effective_profile,
+            AllowMultiple::SingleProfile => pjob.profile != requested_effective_profile,
+        };
+
+        for &ji in self.base_tasks[base_task.idx()].jobs.non_terminal() {
+            if plan.is_conflict_pending(ji) {
+                continue;
+            }
+            if service_matches_require(&self.jobs[ji], requested_profile, requested_params) {
+                return ServiceCompatibility::Compatible(JobRef::Live(ji));
+            }
+        }
+        for (id, pjob) in plan.active_planned_jobs() {
+            if pjob.base_task == base_task && planned_match(pjob) {
+                return ServiceCompatibility::Compatible(JobRef::Planned(id));
             }
         }
 
-        let mut blockers = Vec::new();
-        for &ji in spawner.jobs.non_terminal() {
-            let job = &self.jobs[ji];
-            let blocks = match spawner.config.allow_multiple {
+        let mut blockers: Vec<JobRef> = Vec::new();
+        for &ji in self.base_tasks[base_task.idx()].jobs.non_terminal() {
+            if plan.is_conflict_pending(ji) {
+                continue;
+            }
+            let blocks = match allow_multiple {
                 AllowMultiple::True => false,
                 AllowMultiple::False => true,
-                AllowMultiple::DistinctProfiles => job.spawn_profile() == requested_effective_profile,
-                AllowMultiple::SingleProfile => job.spawn_profile() != requested_effective_profile,
+                AllowMultiple::DistinctProfiles => self.jobs[ji].spawn_profile() == requested_effective_profile,
+                AllowMultiple::SingleProfile => self.jobs[ji].spawn_profile() != requested_effective_profile,
             };
             if blocks {
-                blockers.push(ji);
+                blockers.push(JobRef::Live(ji));
+            }
+        }
+        for (id, pjob) in plan.active_planned_jobs() {
+            if pjob.base_task == base_task && planned_blocks(pjob) {
+                blockers.push(JobRef::Planned(id));
             }
         }
 
         if !blockers.is_empty() {
-            let running_profiles =
-                blockers.iter().map(|ji| self.jobs[*ji].spawn_profile().to_string()).collect::<Vec<_>>();
+            let running_profiles = blockers
+                .iter()
+                .map(|job_ref| match job_ref {
+                    JobRef::Live(ji) => self.jobs[*ji].spawn_profile().to_string(),
+                    JobRef::Planned(id) => plan.new_jobs[*id].profile.clone(),
+                })
+                .collect::<Vec<_>>();
             return ServiceCompatibility::Conflict {
                 running_jobs: blockers,
                 running_profiles,
@@ -2716,8 +3473,9 @@ impl WorkspaceState {
     ///
     /// Takes a SpawnBatch and resolves all pending requirements, spawning each unique
     /// requirement at most once.
-    pub fn resolve_batch_requirements<T>(
+    fn resolve_batch_requirements<T>(
         &mut self,
+        plan: &mut SchedulePlan,
         workspace_id: u32,
         channel: &MioChannel,
         batch: &mut SpawnBatch<T>,
@@ -2753,6 +3511,9 @@ impl WorkspaceState {
                         let spawner = &self.base_tasks[base_task.idx()];
 
                         for &ji in spawner.jobs.all().iter().rev() {
+                            if plan.is_conflict_pending(ji) {
+                                continue;
+                            }
                             let job = &self.jobs[ji];
                             if matches!(job.process_status, JobStatus::Cancelled) {
                                 continue;
@@ -2767,8 +3528,20 @@ impl WorkspaceState {
                             if job.process_status.is_pending_completion()
                                 && (expected_cache_key.is_empty() || job.cache_key == expected_cache_key)
                             {
-                                resolved = Some(ResolvedRequirement::Pending(ji));
+                                resolved = Some(ResolvedRequirement::Pending(JobRef::Live(ji)));
                                 break;
+                            }
+                        }
+                        // An action decided earlier this same submit is pending too,
+                        // so a group sharing a cached action across entries reuses it.
+                        if resolved.is_none() {
+                            for (id, pjob) in plan.active_planned_jobs() {
+                                if pjob.base_task == base_task
+                                    && (expected_cache_key.is_empty() || pjob.cache_key == expected_cache_key)
+                                {
+                                    resolved = Some(ResolvedRequirement::Pending(JobRef::Planned(id)));
+                                    break;
+                                }
                             }
                         }
                         if resolved.is_none()
@@ -2785,26 +3558,31 @@ impl WorkspaceState {
                     }
 
                     let effective_profile = self.effective_profile_for_task(base_task, &profile);
-                    let ready_barriers = self.action_output_ready_barriers(base_task, &effective_profile);
-                    let mut protected_conflict_jobs =
-                        self.action_jobs_protected_by_ready_barriers(base_task, &effective_profile, &ready_barriers);
-                    for job in self.conflicting_non_terminal_action_jobs(base_task, &effective_profile) {
+                    let ready_barriers = self.action_output_ready_barriers(base_task, &effective_profile, plan);
+                    let mut protected_conflict_jobs = self.action_jobs_protected_by_ready_barriers(
+                        base_task,
+                        &effective_profile,
+                        &ready_barriers,
+                        plan,
+                    );
+                    for job in self.conflicting_non_terminal_action_jobs(base_task, &effective_profile, plan) {
                         if !protected_conflict_jobs.contains(&job) {
                             protected_conflict_jobs.push(job);
                         }
                     }
-                    let mut extra_requirements: Vec<ScheduleRequirement> = ready_barriers
+                    let mut extra_requirements: Vec<PlannedReq> = ready_barriers
                         .into_iter()
-                        .map(|job| ScheduleRequirement::Task { job, predicate: JobPredicate::Ready })
+                        .map(|target| PlannedReq::Task { target, predicate: JobPredicate::Ready })
                         .collect();
                     extra_requirements.extend(
                         protected_conflict_jobs
                             .iter()
                             .copied()
-                            .map(|job| ScheduleRequirement::Task { job, predicate: JobPredicate::Terminated }),
+                            .map(|target| PlannedReq::Task { target, predicate: JobPredicate::Terminated }),
                     );
 
-                    let new_job = self.spawn_task_with_extra_requirements(
+                    let new_job = self.spawn_task_with_extra_requirements_impl(
+                        plan,
                         workspace_id,
                         channel,
                         base_task,
@@ -2822,9 +3600,9 @@ impl WorkspaceState {
                     let cache_never = dep_config.cache.as_ref().is_some_and(|c| c.never);
 
                     if !cache_never {
-                        match self.check_service_compatibility(base_task, &profile, &params) {
-                            ServiceCompatibility::Compatible(ji) => {
-                                batch.mark_resolved(key, ResolvedRequirement::Pending(ji));
+                        match self.check_service_compatibility_in_plan(base_task, &profile, &params, plan) {
+                            ServiceCompatibility::Compatible(target) => {
+                                batch.mark_resolved(key, ResolvedRequirement::Pending(target));
                                 continue;
                             }
                             ServiceCompatibility::Conflict { running_jobs, running_profiles, requested_profile } => {
@@ -2835,12 +3613,13 @@ impl WorkspaceState {
                                     requested_profile,
                                 );
                                 let queued_job = self.schedule_queued_service(
+                                    plan,
+                                    workspace_id,
+                                    channel,
                                     base_task,
                                     params,
                                     &profile,
                                     running_jobs,
-                                    channel,
-                                    workspace_id,
                                 )?;
                                 batch.mark_resolved(key, ResolvedRequirement::Pending(queued_job));
                                 continue;
@@ -2849,7 +3628,8 @@ impl WorkspaceState {
                         }
                     }
 
-                    let new_job = self.spawn_task(
+                    let new_job = self.spawn_task_tracked(
+                        plan,
                         workspace_id,
                         channel,
                         base_task,
@@ -2887,12 +3667,17 @@ impl WorkspaceState {
             resources: Vec<(ResourceIndex, i32)>,
         }
 
+        enum TestJobSlot {
+            Cached { base_task_idx: BaseTaskIndex },
+            Ready { base_task_idx: BaseTaskIndex, job_ref: JobRef },
+        }
+
         for matched in &matched_tests {
             self.detect_require_problems(matched.base_task_idx)?;
         }
 
         let mut batch: SpawnBatch<TestRequirements> = SpawnBatch::new();
-        let mut test_jobs: Vec<Option<TestJob>> = Vec::new();
+        let mut test_jobs: Vec<Option<TestJobSlot>> = Vec::new();
 
         for matched in matched_tests {
             let position = test_jobs.len();
@@ -2914,101 +3699,14 @@ impl WorkspaceState {
                     cache_config.max_age,
                     cache_config.persistent,
                 ) {
-                    let job_index = self.create_cached_success_job(
-                        matched.base_task_idx,
-                        matched.task_config.clone(),
-                        &matched.spawn_profile,
-                        matched.spawn_params,
-                        cache_key,
-                        ScheduleReason::TestRun,
-                    );
-                    test_jobs[position] = Some(TestJob {
-                        base_task_index: matched.base_task_idx,
-                        job_index,
-                        status: TestJobStatus::Cached,
-                    });
+                    test_jobs[position] = Some(TestJobSlot::Cached { base_task_idx: matched.base_task_idx });
                     continue;
                 }
             }
 
             let mut requirements = Vec::new();
-
-            let mut service_variants: hashbrown::HashMap<BaseTaskIndex, Vec<(String, ValueMap<'static>)>> =
-                hashbrown::HashMap::new();
-            let mut services_to_check: Vec<(String, String, ValueMap<'static>)> = task_config
-                .config()
-                .require
-                .iter()
-                .filter_map(|req| {
-                    let crate::config::Requirement::Task(tc) = req else { return None };
-                    let dep_name = &*tc.name;
-                    let dep_base_task = self.lookup_name(dep_name)?;
-                    let dep_config = &self.base_tasks[dep_base_task.idx()].config;
-                    if dep_config.kind == TaskKind::Service {
-                        Some((dep_name.to_string(), tc.profile.unwrap_or("").to_string(), tc.vars.clone().to_owned()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            let mut visited_services: hashbrown::HashSet<RequirementKey> = hashbrown::HashSet::new();
-
-            while let Some((dep_name, dep_profile, dep_params)) = services_to_check.pop() {
-                let Some(dep_base_task) = self.lookup_name(&dep_name) else {
-                    continue;
-                };
-                let dep_config = &self.base_tasks[dep_base_task.idx()].config;
-                let dep_effective_profile = self.effective_profile_for_task(dep_base_task, &dep_profile);
-
-                if let Some(existing_variants) = service_variants.get(&dep_base_task) {
-                    if existing_variants.iter().any(|(existing_profile, existing_params)| {
-                        self.service_variants_conflict(
-                            dep_base_task,
-                            existing_profile,
-                            existing_params,
-                            &dep_effective_profile,
-                            &dep_params,
-                        )
-                    }) {
-                        let test_name = self.base_tasks[matched.base_task_idx.idx()].name.as_ref();
-                        let service_name = self.base_tasks[dep_base_task.idx()].name.as_ref();
-                        return Err(format!(
-                            "Test '{}' has conflicting service requirements on '{}'",
-                            test_name, service_name
-                        ));
-                    }
-                }
-                let variants = service_variants.entry(dep_base_task).or_default();
-                if !variants.iter().any(|(profile, params)| profile == &dep_effective_profile && params == &dep_params)
-                {
-                    variants.push((dep_effective_profile.clone(), dep_params.clone()));
-                }
-
-                let visit_key = RequirementKey::new(dep_base_task, &dep_effective_profile, &dep_params);
-                if !visited_services.insert(visit_key) {
-                    continue;
-                }
-
-                let env =
-                    Environment { profile: &dep_effective_profile, param: dep_params.clone(), vars: dep_config.vars };
-                if let Ok(srv_config) = dep_config.eval(&env) {
-                    for req in srv_config.config().require.iter() {
-                        let crate::config::Requirement::Task(tc) = req else { continue };
-                        let req_name = &*tc.name;
-                        let Some(req_base_task) = self.lookup_name(req_name) else {
-                            continue;
-                        };
-                        let req_config = &self.base_tasks[req_base_task.idx()].config;
-                        if req_config.kind == TaskKind::Service {
-                            services_to_check.push((
-                                req_name.to_string(),
-                                tc.profile.unwrap_or("").to_string(),
-                                tc.vars.clone().to_owned(),
-                            ));
-                        }
-                    }
-                }
-            }
+            let test_name = self.base_tasks[matched.base_task_idx.idx()].name.as_ref();
+            self.validate_service_requirement_variants_for("Test", test_name, task_config.config().require)?;
 
             let mut resources: Vec<(ResourceIndex, i32)> = Vec::new();
             for req in task_config.config().require.iter() {
@@ -3050,63 +3748,90 @@ impl WorkspaceState {
             });
         }
 
-        self.resolve_batch_requirements(workspace_id, channel, &mut batch)?;
+        let mut plan = SchedulePlan::default();
+        self.resolve_batch_requirements(&mut plan, workspace_id, channel, &mut batch)?;
 
         let tasks = batch.take_tasks();
 
         for task in tasks {
-            let task_config = task.task_data.task_config;
-            let mut pred = Vec::new();
+            let mut pred: Vec<PlannedReq> = Vec::new();
 
             for (key, predicate) in &task.task_data.requirements {
                 match batch.get_resolved(key) {
                     Some(ResolvedRequirement::Cached) => {}
-                    Some(ResolvedRequirement::Pending(ji)) | Some(ResolvedRequirement::Spawned(ji)) => {
-                        pred.push(ScheduleRequirement::Task { job: *ji, predicate: predicate.clone() });
+                    Some(ResolvedRequirement::Pending(target)) | Some(ResolvedRequirement::Spawned(target)) => {
+                        pred.push(PlannedReq::Task { target: *target, predicate: predicate.clone() });
                     }
                     None => {}
                 }
             }
 
             for (id, priority) in task.task_data.resources {
-                pred.push(ScheduleRequirement::Resource { id, priority });
+                pred.push(PlannedReq::Resource { id, priority });
             }
 
-            let cache_key = task_config.config().cache.as_ref().map_or(String::new(), |c| {
-                self.compute_cache_key_with_require(c.key, &task.task_data.spawn_profile, &task.task_data.spawn_params)
-            });
-
-            let job_index = self.create_job(
-                task.task_data.base_task_idx,
-                task_config,
+            let cache_key = self.compute_task_cache_key(
+                &task.task_data.task_config,
                 &task.task_data.spawn_profile,
-                task.task_data.spawn_params,
-                pred,
-                cache_key,
-                channel,
-                workspace_id,
-                ScheduleReason::TestRun,
-                false,
+                &task.task_data.spawn_params,
             );
-
-            test_jobs[task.task_data.position] = Some(TestJob {
-                base_task_index: task.task_data.base_task_idx,
-                job_index,
-                status: TestJobStatus::Pending,
+            let job_ref = plan.push_job(PlannedJob {
+                base_task: task.task_data.base_task_idx,
+                task: task.task_data.task_config,
+                profile: task.task_data.spawn_profile,
+                params: task.task_data.spawn_params,
+                cache_key,
+                requirements: pred,
+                action_deps_until_ready: Vec::new(),
+                reason: ScheduleReason::TestRun,
+                trace: false,
+                synthetic_cached: false,
             });
+
+            test_jobs[task.task_data.position] =
+                Some(TestJobSlot::Ready { base_task_idx: task.task_data.base_task_idx, job_ref });
         }
 
-        let test_jobs: Vec<TestJob> =
-            test_jobs.into_iter().map(|job| job.expect("test job slot should be filled")).collect();
+        let slots: Vec<(BaseTaskIndex, Option<JobRef>, TestJobStatus)> = test_jobs
+            .into_iter()
+            .map(|slot| match slot.expect("test job slot should be filled") {
+                TestJobSlot::Cached { base_task_idx } => (base_task_idx, None, TestJobStatus::Cached),
+                TestJobSlot::Ready { base_task_idx, job_ref } => (base_task_idx, Some(job_ref), TestJobStatus::Pending),
+            })
+            .collect();
+
+        let created = self.apply_plan(plan, workspace_id, channel);
+        let test_jobs: Vec<TestJob> = slots
+            .into_iter()
+            .filter_map(|(base_task_index, job_ref, status)| {
+                let job_index = match job_ref {
+                    Some(job_ref) => {
+                        let job_index = Self::resolve_job_ref(job_ref, &created);
+                        if self.jobs.get(job_index).is_none() {
+                            return None;
+                        }
+                        Some(job_index)
+                    }
+                    None => None,
+                };
+                Some(TestJob { base_task_index, job_index, status })
+            })
+            .collect();
+
         let test_run = TestRun { run_id, started_at: crate::clock::now(), test_jobs };
         self.active_test_run =
             Some(TestRun { run_id: test_run.run_id, started_at: test_run.started_at, test_jobs: Vec::new() });
 
         let group_id = self.last_test_group.as_ref().map_or(0, |g| g.group_id + 1);
-        let base_tasks_in_group: Vec<BaseTaskIndex> = test_run.test_jobs.iter().map(|tj| tj.base_task_index).collect();
-        let job_indices: Vec<JobIndex> = test_run.test_jobs.iter().map(|tj| tj.job_index).collect();
-
-        self.last_test_group = Some(TestGroup { group_id, base_tasks: base_tasks_in_group, job_indices });
+        let group_entries: Vec<(BaseTaskIndex, JobIndex)> =
+            test_run.test_jobs.iter().filter_map(|tj| tj.job_index.map(|ji| (tj.base_task_index, ji))).collect();
+        if group_entries.is_empty() {
+            self.last_test_group = None;
+        } else {
+            let base_tasks_in_group: Vec<BaseTaskIndex> = group_entries.iter().map(|(bti, _)| *bti).collect();
+            let job_indices: Vec<JobIndex> = group_entries.iter().map(|(_, ji)| *ji).collect();
+            self.last_test_group = Some(TestGroup { group_id, base_tasks: base_tasks_in_group, job_indices });
+        }
 
         Ok(test_run)
     }
@@ -3167,13 +3892,93 @@ pub struct SubmitResult {
     pub group_names: Vec<String>,
 }
 
+struct SpawnPlanEntry {
+    group_name: Option<String>,
+    task: TaskSpec,
+}
+
 impl Workspace {
-    fn submit_impl(&self, spec: SpawnSpec, start: bool) -> Result<SubmitResult, String> {
-        struct SubmitPlanEntry {
-            group_name: Option<String>,
-            task: TaskSpec,
+    fn spawn_plan_transactional(
+        &self,
+        state: &mut WorkspaceState,
+        entries: Vec<SpawnPlanEntry>,
+        start: bool,
+    ) -> Result<(Vec<(BaseTaskIndex, JobIndex)>, hashbrown::HashMap<String, Vec<JobIndex>>), String> {
+        for entry in &entries {
+            let Some(base_index) = state.base_index_by_name(&entry.task.name) else {
+                return Err(format!("Task '{}' not found", entry.task.name));
+            };
+            state.detect_require_problems(base_index)?;
         }
 
+        let mut sched = SchedulePlan::default();
+        let mut job_refs: Vec<(BaseTaskIndex, JobRef)> = Vec::new();
+        let mut group_refs: Vec<(String, JobRef)> = Vec::new();
+
+        // Build the whole submit by reading state only. Any failure returns here
+        // with nothing applied, so no rollback is needed.
+        for entry in entries {
+            let task = entry.task;
+            let Some(base_index) = state.base_index_by_name(&task.name) else {
+                return Err(format!("Task '{}' not found", task.name));
+            };
+
+            let job_ref = if start {
+                let profile = state.effective_profile_for_task(base_index, &task.profile);
+                let params = task.params.to_owned();
+                match state.active_matching_job_in_plan(base_index, &profile, &params, &sched) {
+                    Some(existing) => existing,
+                    None => state.spawn_task_with_extra_requirements_impl(
+                        &mut sched,
+                        self.workspace_id,
+                        &self.process_channel,
+                        base_index,
+                        params,
+                        &profile,
+                        ScheduleReason::Requested,
+                        false,
+                        task.trace,
+                        Vec::new(),
+                        Vec::new(),
+                    )?,
+                }
+            } else {
+                state.spawn_task_with_extra_requirements_impl(
+                    &mut sched,
+                    self.workspace_id,
+                    &self.process_channel,
+                    base_index,
+                    task.params,
+                    &task.profile,
+                    ScheduleReason::Requested,
+                    task.force_restart,
+                    task.trace,
+                    Vec::new(),
+                    Vec::new(),
+                )?
+            };
+            if let Some(group_name) = entry.group_name {
+                group_refs.push((group_name, job_ref));
+            }
+            job_refs.push((base_index, job_ref));
+        }
+
+        let created = state.apply_plan(sched, self.workspace_id, &self.process_channel);
+
+        let jobs: Vec<(BaseTaskIndex, JobIndex)> = job_refs
+            .into_iter()
+            .filter_map(|(bti, r)| WorkspaceState::resolve_live_job_ref(r, &created, state).map(|ji| (bti, ji)))
+            .collect();
+        let mut group_job_indices: hashbrown::HashMap<String, Vec<JobIndex>> = hashbrown::HashMap::new();
+        for (name, r) in group_refs {
+            if let Some(ji) = WorkspaceState::resolve_live_job_ref(r, &created, state) {
+                group_job_indices.entry(name).or_default().push(ji);
+            }
+        }
+        Ok((jobs, group_job_indices))
+    }
+
+    fn submit_impl(&self, spec: SpawnSpec, start: bool) -> Result<SubmitResult, String> {
         let state = &mut *self.state.write().unwrap();
         state.refresh_config();
         state.change_number = state.change_number.wrapping_add(1);
@@ -3183,7 +3988,7 @@ impl Workspace {
         for task in spec.tasks {
             let explicit_group = WorkspaceState::is_explicit_group_reference(&task.name);
             if !explicit_group && state.base_index_by_name(&task.name).is_some() {
-                plan.push(SubmitPlanEntry { group_name: None, task });
+                plan.push(SpawnPlanEntry { group_name: None, task });
                 continue;
             }
 
@@ -3203,46 +4008,11 @@ impl Workspace {
                 group_names.push(group_name.clone());
             }
             for group_task in group_tasks {
-                plan.push(SubmitPlanEntry { group_name: Some(group_name.clone()), task: group_task });
+                plan.push(SpawnPlanEntry { group_name: Some(group_name.clone()), task: group_task });
             }
         }
 
-        for entry in &plan {
-            let Some(base_index) = state.base_index_by_name(&entry.task.name) else {
-                return Err(format!("Task '{}' not found", entry.task.name));
-            };
-            state.detect_require_problems(base_index)?;
-        }
-
-        let mut jobs = Vec::new();
-        let mut group_job_indices: hashbrown::HashMap<String, Vec<JobIndex>> = hashbrown::HashMap::new();
-        for entry in plan {
-            let task = entry.task;
-            let (bti, ji) = if start {
-                state.lookup_and_start_task_with_trace(
-                    self.workspace_id,
-                    &self.process_channel,
-                    &task.name,
-                    task.params,
-                    &task.profile,
-                    task.trace,
-                )?
-            } else {
-                state.lookup_and_spawn_task_with_trace(
-                    self.workspace_id,
-                    &self.process_channel,
-                    &task.name,
-                    task.params,
-                    &task.profile,
-                    task.force_restart,
-                    task.trace,
-                )?
-            };
-            if let Some(group_name) = entry.group_name {
-                group_job_indices.entry(group_name).or_default().push(ji);
-            }
-            jobs.push((bti, ji));
-        }
+        let (jobs, group_job_indices) = self.spawn_plan_transactional(state, plan, start)?;
 
         for group_name in &group_names {
             if let Some(job_indices) = group_job_indices.get(group_name) {
@@ -3311,22 +4081,20 @@ impl Workspace {
                 state.lookup_and_terminate_task(&self.process_channel, task)?;
             }
             FunctionDefAction::Spawn { tasks } => {
-                for task_call in *tasks {
-                    let Some(base_index) = state.base_index_by_name(&task_call.name) else {
-                        return Err(format!("Task '{}' not found", &*task_call.name));
-                    };
-                    state.detect_require_problems(base_index)?;
-                }
-                for task_call in *tasks {
-                    state.lookup_and_spawn_task(
-                        self.workspace_id,
-                        &self.process_channel,
-                        &task_call.name,
-                        task_call.vars.clone().to_owned(),
-                        task_call.profile.unwrap_or(""),
-                        false,
-                    )?;
-                }
+                let plan = tasks
+                    .iter()
+                    .map(|task_call| SpawnPlanEntry {
+                        group_name: None,
+                        task: TaskSpec {
+                            name: task_call.name.to_string(),
+                            profile: task_call.profile.unwrap_or("").to_string(),
+                            params: task_call.vars.clone().to_owned(),
+                            force_restart: false,
+                            trace: false,
+                        },
+                    })
+                    .collect();
+                self.spawn_plan_transactional(state, plan, false)?;
             }
             FunctionDefAction::RestartSelected => {
                 return Ok(Some(FunctionGlobalAction::RestartSelected));
@@ -4240,10 +5008,10 @@ mod scheduling_tests {
 
             assert!(batch.get_resolved(&key).is_none());
 
-            batch.mark_resolved(key.clone(), ResolvedRequirement::Spawned(JobIndex::from_usize(5)));
+            batch.mark_resolved(key.clone(), ResolvedRequirement::Spawned(JobRef::Live(JobIndex::from_usize(5))));
 
             match batch.get_resolved(&key) {
-                Some(ResolvedRequirement::Spawned(ji)) => assert_eq!(ji.idx(), 5),
+                Some(ResolvedRequirement::Spawned(JobRef::Live(ji))) => assert_eq!(ji.idx(), 5),
                 _ => panic!("Expected Spawned resolution"),
             }
         }
@@ -4262,12 +5030,12 @@ mod scheduling_tests {
         fn mark_resolved_pending() {
             let mut batch: SpawnBatch<()> = SpawnBatch::new();
             let key = batch.add_requirement(BaseTaskIndex(0), "test", ValueMap::new().to_owned(), JobPredicate::Active);
-            let existing_job = JobIndex::from_usize(3);
+            let existing_job = JobRef::Live(JobIndex::from_usize(3));
 
             batch.mark_resolved(key.clone(), ResolvedRequirement::Pending(existing_job));
 
             match batch.get_resolved(&key) {
-                Some(ResolvedRequirement::Pending(ji)) => assert_eq!(ji.idx(), 3),
+                Some(ResolvedRequirement::Pending(JobRef::Live(ji))) => assert_eq!(ji.idx(), 3),
                 _ => panic!("Expected Pending resolution"),
             }
         }
@@ -4336,6 +5104,302 @@ mod scheduling_tests {
         }
     }
 
+    mod service_requirement_validation_tests {
+        use super::*;
+        use std::fs;
+
+        fn temp_manifest(name: &str, content: &str) -> PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "devsm-workspace-test-{}-{}-{}",
+                name,
+                std::process::id(),
+                crate::clock::now().elapsed().as_nanos()
+            ));
+            fs::create_dir_all(&path).expect("create temp workspace");
+            let manifest = path.join("devsm.toml");
+            fs::write(&manifest, content).expect("write temp manifest");
+            manifest
+        }
+
+        #[test]
+        fn direct_service_plus_action_transitive_service_conflict_is_rejected() {
+            let manifest = temp_manifest(
+                "direct-service-action-transitive-conflict",
+                r#"
+[service.svc]
+cmd = ["true"]
+profiles = ["alpha", "beta"]
+allow_multiple = false
+
+[action.child]
+cmd = ["true"]
+require = ["svc:beta"]
+
+[action.parent]
+cmd = ["true"]
+require = ["svc:alpha", "child"]
+"#,
+            );
+            let state = WorkspaceState::new(manifest).expect("load test config");
+            let parent = state.lookup_name("parent").expect("parent task");
+            let config = state.base_tasks[parent.idx()].config.clone();
+            let task = config
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .expect("eval parent");
+
+            let err = state
+                .validate_service_requirement_variants(parent, &task)
+                .expect_err("parent must reject service held while action needs incompatible service");
+            assert!(err.contains("conflicting service requirements"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn service_requirement_validation_is_bounded_on_shared_action_dag() {
+            const DEPTH: usize = 20;
+
+            let mut config = String::from(
+                r#"
+[service.held]
+cmd = ["true"]
+
+[action.root]
+cmd = ["true"]
+require = ["held", "a0"]
+"#,
+            );
+            for i in 0..DEPTH {
+                config.push_str(&format!(
+                    r#"
+[action.a{i}]
+cmd = ["true"]
+require = ["b{i}", "c{i}"]
+
+[action.b{i}]
+cmd = ["true"]
+require = ["a{}"]
+
+[action.c{i}]
+cmd = ["true"]
+require = ["a{}"]
+"#,
+                    i + 1,
+                    i + 1
+                ));
+            }
+            config.push_str(&format!(
+                r#"
+[action.a{DEPTH}]
+cmd = ["true"]
+"#
+            ));
+
+            let manifest = temp_manifest("shared-action-dag", &config);
+            let state = WorkspaceState::new(manifest).expect("load test config");
+            let root = state.lookup_name("root").expect("root task");
+            let root_config = state.base_tasks[root.idx()].config.clone();
+            let task = root_config
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: root_config.vars })
+                .expect("eval root");
+
+            let started = Instant::now();
+            state.validate_service_requirement_variants(root, &task).expect("valid shared DAG");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "service requirement validation must stay bounded on shared DAGs, elapsed {elapsed:?}"
+            );
+        }
+
+        fn validate_root(manifest: PathBuf, root_name: &str) -> Result<(), String> {
+            let state = WorkspaceState::new(manifest).expect("load test config");
+            let root = state.lookup_name(root_name).expect("root task");
+            let config = state.base_tasks[root.idx()].config.clone();
+            let task = config
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .expect("eval root");
+            state.validate_service_requirement_variants(root, &task)
+        }
+
+        #[test]
+        fn conflicting_variants_in_sibling_action_branches_are_accepted() {
+            // svc:alpha is held only over `left`, svc:beta only over `right`; the two
+            // are never co-held on a single path, so this must NOT be rejected. A naive
+            // "union held-sets at the shared `sink`" check would wrongly reject it.
+            let manifest = temp_manifest(
+                "sibling-branch-services",
+                r#"
+[service.svc]
+cmd = ["true"]
+profiles = ["alpha", "beta"]
+allow_multiple = false
+
+[action.left]
+cmd = ["true"]
+require = ["svc:alpha", "sink"]
+
+[action.right]
+cmd = ["true"]
+require = ["svc:beta", "sink"]
+
+[action.sink]
+cmd = ["true"]
+
+[action.root]
+cmd = ["true"]
+require = ["left", "right"]
+"#,
+            );
+            validate_root(manifest, "root").expect("sibling-branch conflicting variants must be accepted");
+        }
+
+        #[test]
+        fn conflicting_variants_through_service_closure_are_rejected() {
+            // svc:alpha (held directly) and svc:beta (held transitively through svc's
+            // own service requirement) are co-held, so this must be rejected.
+            let manifest = temp_manifest(
+                "service-closure-conflict",
+                r#"
+[service.leaf]
+cmd = ["true"]
+profiles = ["alpha", "beta"]
+allow_multiple = false
+
+[service.mid]
+cmd = ["true"]
+require = ["leaf:beta"]
+
+[action.root]
+cmd = ["true"]
+require = ["leaf:alpha", "mid"]
+"#,
+            );
+            let err =
+                validate_root(manifest, "root").expect_err("service-closure conflicting variants must be rejected");
+            assert!(err.contains("conflicting service requirements"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn cyclic_service_requirements_terminate() {
+            let manifest = temp_manifest(
+                "cyclic-service-requirements",
+                r#"
+[service.a]
+cmd = ["true"]
+require = ["b"]
+
+[service.b]
+cmd = ["true"]
+require = ["a"]
+
+[action.root]
+cmd = ["true"]
+require = ["a"]
+"#,
+            );
+            validate_root(manifest, "root").expect("cyclic service requirements must terminate and validate");
+        }
+
+        #[test]
+        fn distinct_service_per_branch_dag_stays_bounded() {
+            const DEPTH: usize = 30;
+
+            let mut config = String::from(
+                r#"
+[action.root]
+cmd = ["true"]
+require = ["a0"]
+"#,
+            );
+            for i in 0..DEPTH {
+                config.push_str(&format!(
+                    r#"
+[service.sb{i}]
+cmd = ["true"]
+
+[service.sc{i}]
+cmd = ["true"]
+
+[action.a{i}]
+cmd = ["true"]
+require = ["b{i}", "c{i}"]
+
+[action.b{i}]
+cmd = ["true"]
+require = ["sb{i}", "a{next}"]
+
+[action.c{i}]
+cmd = ["true"]
+require = ["sc{i}", "a{next}"]
+"#,
+                    next = i + 1
+                ));
+            }
+            config.push_str(&format!("\n[action.a{DEPTH}]\ncmd = [\"true\"]\n"));
+
+            let manifest = temp_manifest("distinct-service-per-branch", &config);
+            let started = Instant::now();
+            validate_root(manifest, "root").expect("distinct-service-per-branch DAG must validate");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(250),
+                "validation must stay polynomial on distinct-service-per-branch DAGs, elapsed {elapsed:?}"
+            );
+        }
+
+        #[test]
+        fn wide_conflicting_sibling_services_stays_bounded() {
+            const WIDTH: usize = 260;
+            const SINK_DEPTH: usize = 260;
+
+            let mut config = String::from(
+                r#"
+[service.svc]
+cmd = ["true"]
+allow_multiple = "distinct_profiles"
+
+[action.root]
+cmd = ["true"]
+require = [
+"#,
+            );
+            for i in 0..WIDTH {
+                config.push_str(&format!("  \"a{i}\",\n"));
+            }
+            config.push_str("]\n");
+
+            for i in 0..WIDTH {
+                config.push_str(&format!(
+                    r#"
+[action.a{i}]
+cmd = ["true"]
+require = [["svc", {{ id = "{i}" }}], "sink0"]
+"#
+                ));
+            }
+
+            for i in 0..SINK_DEPTH {
+                config.push_str(&format!(
+                    r#"
+[action.sink{i}]
+cmd = ["true"]
+require = ["sink{next}"]
+"#,
+                    next = i + 1
+                ));
+            }
+            config.push_str(&format!("\n[action.sink{SINK_DEPTH}]\ncmd = [\"true\"]\n"));
+
+            let manifest = temp_manifest("wide-conflicting-sibling-services", &config);
+            let started = Instant::now();
+            validate_root(manifest, "root").expect("sibling service variants should be sequenceable");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(250),
+                "validation must not repeat graph searches for every service pair, elapsed {elapsed:?}"
+            );
+        }
+    }
+
     mod service_compatibility_tests {
         use super::*;
         use jsony_value::ValueMap;
@@ -4378,18 +5442,48 @@ mod scheduling_tests {
             ji
         }
 
+        fn insert_scheduled_service(
+            state: &mut WorkspaceState,
+            base_task: BaseTaskIndex,
+            profile: &str,
+            params: ValueMap<'static>,
+        ) -> JobIndex {
+            let config = state.base_tasks[base_task.idx()].config.clone();
+            let task =
+                config.eval(&Environment { profile, param: params.clone(), vars: config.vars }).expect("eval service");
+            let spec = state.cache_spawn_spec(base_task, profile, params, task);
+            let pc = state.base_tasks[base_task.idx()].spawn_counter as usize;
+            state.base_tasks[base_task.idx()].spawn_counter =
+                state.base_tasks[base_task.idx()].spawn_counter.wrapping_add(1);
+            let ji = state.jobs.insert(Job {
+                process_status: JobStatus::Scheduled { after: Vec::new() },
+                log_group: LogGroup::new(base_task, pc),
+                started_at: crate::clock::now(),
+                cache_key: String::new(),
+                cache_synthetic: false,
+                spawn: spec,
+                held_resources: SmallVec::new(),
+                action_deps_until_ready: SmallVec::new(),
+                trace: false,
+                trace_report: None,
+            });
+            state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
+            state.service_jobs.push_scheduled(ji);
+            ji
+        }
+
         #[test]
         fn service_compatibility_enum_variants() {
-            let compatible = ServiceCompatibility::Compatible(JobIndex::from_usize(0));
+            let compatible = ServiceCompatibility::Compatible(JobRef::Live(JobIndex::from_usize(0)));
             let available = ServiceCompatibility::Available;
             let conflict = ServiceCompatibility::Conflict {
-                running_jobs: vec![JobIndex::from_usize(1)],
+                running_jobs: vec![JobRef::Live(JobIndex::from_usize(1))],
                 running_profiles: vec!["prod".to_string()],
                 requested_profile: "test".to_string(),
             };
 
             match compatible {
-                ServiceCompatibility::Compatible(ji) => assert_eq!(ji.idx(), 0),
+                ServiceCompatibility::Compatible(JobRef::Live(ji)) => assert_eq!(ji.idx(), 0),
                 _ => panic!("Expected Compatible"),
             }
 
@@ -4400,7 +5494,7 @@ mod scheduling_tests {
 
             match conflict {
                 ServiceCompatibility::Conflict { running_jobs, running_profiles, requested_profile } => {
-                    assert_eq!(running_jobs, vec![JobIndex::from_usize(1)]);
+                    assert_eq!(running_jobs, vec![JobRef::Live(JobIndex::from_usize(1))]);
                     assert_eq!(running_profiles, vec!["prod".to_string()]);
                     assert_eq!(requested_profile, "test");
                 }
@@ -4415,7 +5509,9 @@ mod scheduling_tests {
             let running = insert_running_service(&mut state, base_task, "dev", params(r#"{"id":"one"}"#));
 
             match state.check_service_compatibility(base_task, "dev", &params(r#"{"id":"two"}"#)) {
-                ServiceCompatibility::Conflict { running_jobs, .. } => assert_eq!(running_jobs, vec![running]),
+                ServiceCompatibility::Conflict { running_jobs, .. } => {
+                    assert_eq!(running_jobs, vec![JobRef::Live(running)])
+                }
                 ServiceCompatibility::Available => panic!("same-profile distinct_profiles request must conflict"),
                 ServiceCompatibility::Compatible(_) => panic!("different params must not reuse the running service"),
             }
@@ -4428,18 +5524,146 @@ mod scheduling_tests {
             let running = insert_running_service(&mut state, base_task, "dev", params(r#"{"id":"one"}"#));
 
             match state.check_service_compatibility(base_task, "", &params(r#"{"id":"two"}"#)) {
-                ServiceCompatibility::Conflict { running_jobs, .. } => assert_eq!(running_jobs, vec![running]),
+                ServiceCompatibility::Conflict { running_jobs, .. } => {
+                    assert_eq!(running_jobs, vec![JobRef::Live(running)])
+                }
                 ServiceCompatibility::Available => panic!("default-profile request must conflict with same profile"),
                 ServiceCompatibility::Compatible(_) => panic!("different params must not reuse the running service"),
             }
+        }
+
+        #[test]
+        fn empty_profile_request_matches_non_default_running_service() {
+            let mut state = WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).unwrap();
+            let base_task = state.lookup_name("service_conditional_cmd").unwrap();
+            let running = insert_running_service(&mut state, base_task, "watch", ValueMap::new());
+
+            match state.check_service_compatibility(base_task, "", &ValueMap::new()) {
+                ServiceCompatibility::Compatible(JobRef::Live(ji)) => assert_eq!(ji, running),
+                ServiceCompatibility::Available => panic!("bare-profile request must reuse matching running service"),
+                ServiceCompatibility::Conflict { running_jobs, .. } => {
+                    panic!("bare-profile request must not conflict with matching running service: {running_jobs:?}")
+                }
+                ServiceCompatibility::Compatible(JobRef::Planned(id)) => panic!("expected live job, got planned {id}"),
+            }
+        }
+
+        #[test]
+        fn empty_profile_request_matches_non_default_planned_service() {
+            let state = WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).unwrap();
+            let base_task = state.lookup_name("service_conditional_cmd").unwrap();
+            let config = state.base_tasks[base_task.idx()].config.clone();
+            let params = ValueMap::new();
+            let task = config
+                .eval(&Environment { profile: "watch", param: params.clone(), vars: config.vars })
+                .expect("eval service");
+            let mut plan = SchedulePlan::default();
+            let planned = plan.push_job(PlannedJob {
+                base_task,
+                task,
+                profile: "watch".to_string(),
+                params,
+                cache_key: String::new(),
+                requirements: Vec::new(),
+                action_deps_until_ready: Vec::new(),
+                reason: ScheduleReason::Dependency,
+                trace: false,
+                synthetic_cached: false,
+            });
+
+            match state.check_service_compatibility_in_plan(base_task, "", &ValueMap::new(), &plan) {
+                ServiceCompatibility::Compatible(job_ref) => assert_eq!(job_ref, planned),
+                ServiceCompatibility::Available => panic!("bare-profile request must reuse matching planned service"),
+                ServiceCompatibility::Conflict { running_jobs, .. } => {
+                    panic!("bare-profile request must not conflict with matching planned service: {running_jobs:?}")
+                }
+            }
+        }
+
+        #[test]
+        fn transaction_service_compatibility_ignores_pending_termination() {
+            let mut state = WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).unwrap();
+            let base_task = state.lookup_name("simple_service").unwrap();
+            let running = insert_running_service(&mut state, base_task, "", ValueMap::new());
+            let job = &state.jobs[running];
+            let JobStatus::Running { process_index, .. } = job.process_status else {
+                panic!("expected running service");
+            };
+
+            let mut plan = SchedulePlan::default();
+            plan.record_terminate_running(TerminatePlan {
+                job: running,
+                job_id: job.log_group,
+                process_index,
+                exit_cause: ExitCause::Restarted,
+            });
+
+            match state.check_service_compatibility_in_plan(base_task, "", &ValueMap::new(), &plan) {
+                ServiceCompatibility::Available => {}
+                ServiceCompatibility::Compatible(ji) => {
+                    panic!("service pending termination must not satisfy a new requirement: {ji:?}")
+                }
+                ServiceCompatibility::Conflict { running_jobs, .. } => {
+                    panic!("service pending termination must not block a new requirement: {running_jobs:?}")
+                }
+            }
+        }
+
+        #[test]
+        fn plan_conflicts_skips_already_planned_jobs() {
+            let mut state = WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).unwrap();
+            let base_task = state.lookup_name("simple_service").unwrap();
+            let scheduled = insert_scheduled_service(&mut state, base_task, "", ValueMap::new());
+            let running = insert_running_service(&mut state, base_task, "", ValueMap::new());
+
+            let mut plan = SchedulePlan::default();
+            let first = state.plan_conflicts(&plan, base_task, "", false, &[]);
+            assert_eq!(first.cancel_scheduled, vec![scheduled]);
+            assert_eq!(first.terminate_running.iter().map(|t| t.job).collect::<Vec<_>>(), vec![running]);
+            first.record_into(&mut plan);
+
+            let second = state.plan_conflicts(&plan, base_task, "", false, &[]);
+            assert_eq!(second.predicates.len(), 1, "already planned running jobs must still block new jobs");
+            match &second.predicates[0] {
+                PlannedReq::Task { target: JobRef::Live(job), predicate: JobPredicate::Terminated } => {
+                    assert_eq!(*job, running)
+                }
+                _ => panic!("expected terminated predicate for already planned running job"),
+            }
+            assert!(
+                second.cancel_scheduled.is_empty(),
+                "already planned scheduled cancellations must not be duplicated"
+            );
+            assert!(second.terminate_running.is_empty(), "already planned running terminations must not be duplicated");
         }
     }
 
     mod job_history_tests {
         use super::*;
+        use crate::log_storage::LogWriter;
+        use std::fs;
 
         fn manifest_path(relative: &str) -> PathBuf {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+        }
+
+        fn temp_manifest(name: &str, content: &str) -> PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "devsm-workspace-test-{}-{}-{}",
+                name,
+                std::process::id(),
+                crate::clock::now().elapsed().as_nanos()
+            ));
+            fs::create_dir_all(&path).expect("create temp workspace");
+            let manifest = path.join("devsm.toml");
+            fs::write(&manifest, content).expect("write temp manifest");
+            manifest
+        }
+
+        fn test_channel() -> Arc<MioChannel> {
+            let poll = Box::leak(Box::new(mio::Poll::new().expect("poll")));
+            let waker = Box::leak(Box::new(mio::Waker::new(poll.registry(), mio::Token(0)).expect("waker")));
+            Arc::new(MioChannel { waker, events: std::sync::Mutex::new(Vec::new()) })
         }
 
         /// Build a workspace state loaded from the big example config,
@@ -4735,6 +5959,193 @@ mod scheduling_tests {
         }
 
         #[test]
+        fn cached_success_jobs_respect_history_cap() {
+            let (mut state, base_task, spec) = fixture(32);
+            let task = spec.task.clone();
+
+            for i in 0..200 {
+                state.create_cached_success_job(
+                    base_task,
+                    task.clone(),
+                    "",
+                    ValueMap::new(),
+                    format!("cached-{i}"),
+                    ScheduleReason::TestRun,
+                );
+            }
+
+            assert!(
+                state.jobs.len() as u32 <= state.max_job_history,
+                "cached synthetic jobs must be pruned; got {} > {}",
+                state.jobs.len(),
+                state.max_job_history
+            );
+        }
+
+        #[test]
+        fn cached_test_batch_does_not_return_or_record_pruned_job_indices() {
+            let mut state =
+                WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).expect("load test config");
+            state.max_job_history = MIN_JOB_HISTORY;
+            let base_task = state.lookup_name("test.test_with_cache").expect("cached test task");
+            let config = state.base_tasks[base_task.idx()].config.clone();
+            let task = config
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .expect("eval cached test");
+            let spec = state.cache_spawn_spec(base_task, "", ValueMap::new(), task.clone());
+            let cache_key = String::new();
+
+            let pc = state.base_tasks[base_task.idx()].spawn_counter as usize;
+            state.base_tasks[base_task.idx()].spawn_counter =
+                state.base_tasks[base_task.idx()].spawn_counter.wrapping_add(1);
+            let now = crate::clock::now();
+            let seed = state.jobs.insert(Job {
+                process_status: JobStatus::Exited { finished_at: now, cause: ExitCause::Unknown, status: 0 },
+                log_group: LogGroup::new(base_task, pc),
+                started_at: now,
+                cache_key: cache_key.clone(),
+                cache_synthetic: false,
+                spawn: spec.clone(),
+                held_resources: SmallVec::new(),
+                action_deps_until_ready: SmallVec::new(),
+                trace: false,
+                trace_report: None,
+            });
+            state.base_tasks[base_task.idx()].jobs.push_terminated(seed);
+            state.test_jobs.push_terminated(seed);
+
+            let matched = (0..(MIN_JOB_HISTORY as usize + 40))
+                .map(|_| MatchedTest {
+                    base_task_idx: base_task,
+                    task_config: task.clone(),
+                    spawn_profile: String::new(),
+                    spawn_params: ValueMap::new(),
+                })
+                .collect();
+            let poll = Box::leak(Box::new(mio::Poll::new().expect("poll")));
+            let waker = Box::leak(Box::new(mio::Waker::new(poll.registry(), mio::Token(0)).expect("waker")));
+            let channel = MioChannel { waker, events: std::sync::Mutex::new(Vec::new()) };
+
+            let test_run = state.run_test_batch(matched, 0, &channel, 0, false).expect("cached test batch should run");
+
+            assert!(
+                test_run.test_jobs.iter().all(|job| job.job_index.is_none_or(|ji| state.jobs.get(ji).is_some())),
+                "returned TestRun must not contain pruned job indices"
+            );
+            assert!(
+                state.last_test_group.is_none(),
+                "cached-only test runs must not record a last_test_group with non-rerunnable synthetic jobs"
+            );
+        }
+
+        #[test]
+        fn cached_test_batch_reports_all_cached_matches_under_history_cap() {
+            let mut state =
+                WorkspaceState::new(manifest_path("schema/devsm.example-big.toml")).expect("load test config");
+            state.max_job_history = MIN_JOB_HISTORY;
+            let base_task = state.lookup_name("test.test_with_cache").expect("cached test task");
+            let config = state.base_tasks[base_task.idx()].config.clone();
+            let task = config
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .expect("eval cached test");
+            let spec = state.cache_spawn_spec(base_task, "", ValueMap::new(), task.clone());
+            let cache_key = String::new();
+
+            let pc = state.base_tasks[base_task.idx()].spawn_counter as usize;
+            state.base_tasks[base_task.idx()].spawn_counter =
+                state.base_tasks[base_task.idx()].spawn_counter.wrapping_add(1);
+            let now = crate::clock::now();
+            let seed = state.jobs.insert(Job {
+                process_status: JobStatus::Exited { finished_at: now, cause: ExitCause::Unknown, status: 0 },
+                log_group: LogGroup::new(base_task, pc),
+                started_at: now,
+                cache_key: cache_key.clone(),
+                cache_synthetic: false,
+                spawn: spec.clone(),
+                held_resources: SmallVec::new(),
+                action_deps_until_ready: SmallVec::new(),
+                trace: false,
+                trace_report: None,
+            });
+            state.base_tasks[base_task.idx()].jobs.push_terminated(seed);
+            state.test_jobs.push_terminated(seed);
+
+            let expected = MIN_JOB_HISTORY as usize + 40;
+            let matched = (0..expected)
+                .map(|_| MatchedTest {
+                    base_task_idx: base_task,
+                    task_config: task.clone(),
+                    spawn_profile: String::new(),
+                    spawn_params: ValueMap::new(),
+                })
+                .collect();
+            let poll = Box::leak(Box::new(mio::Poll::new().expect("poll")));
+            let waker = Box::leak(Box::new(mio::Waker::new(poll.registry(), mio::Token(0)).expect("waker")));
+            let channel = MioChannel { waker, events: std::sync::Mutex::new(Vec::new()) };
+
+            let test_run = state.run_test_batch(matched, 0, &channel, 0, false).expect("cached test batch should run");
+
+            assert_eq!(
+                test_run.test_jobs.len(),
+                expected,
+                "cached test accounting must include every matched test even when history pruning evicts synthetic jobs"
+            );
+            assert_eq!(
+                test_run.test_jobs.iter().filter(|job| matches!(job.status, TestJobStatus::Cached)).count(),
+                expected
+            );
+        }
+
+        #[test]
+        fn transactional_submit_does_not_return_or_record_pruned_planned_jobs() {
+            let manifest = temp_manifest(
+                "transactional-pruned-planned-jobs",
+                r#"
+[action.a]
+cmd = ["true"]
+"#,
+            );
+            let mut state = WorkspaceState::new(manifest.clone()).expect("load test config");
+            state.max_job_history = 1;
+
+            let writer = LogWriter::new();
+            let workspace = Workspace {
+                workspace_id: 0,
+                logs: writer.reader(),
+                state: RwLock::new(WorkspaceState::new(manifest).expect("load dummy workspace state")),
+                process_channel: test_channel(),
+            };
+
+            let task = |name: &str| TaskSpec {
+                name: name.into(),
+                profile: String::new(),
+                params: ValueMap::new(),
+                force_restart: false,
+                trace: false,
+            };
+            let entries = vec![
+                SpawnPlanEntry { group_name: Some("dupe".to_string()), task: task("a") },
+                SpawnPlanEntry { group_name: Some("dupe".to_string()), task: task("a") },
+            ];
+
+            let (jobs, group_jobs) = workspace
+                .spawn_plan_transactional(&mut state, entries, false)
+                .expect("transactional spawn should succeed");
+
+            assert!(
+                jobs.iter().all(|(_, ji)| state.jobs.get(*ji).is_some()),
+                "SubmitResult must not contain pruned job indices: {:?}",
+                jobs
+            );
+            let group = group_jobs.get("dupe").expect("group refs should be returned");
+            assert!(
+                group.iter().all(|ji| state.jobs.get(*ji).is_some()),
+                "group refs must not contain pruned job indices: {:?}",
+                group
+            );
+        }
+
+        #[test]
         fn update_job_status_returns_public_id_even_when_pruned() {
             // Reproduce a scenario where a terminal transition triggers a
             // prune that evicts the just-finished job. When `c` exits with
@@ -4852,6 +6263,61 @@ mod scheduling_tests {
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
             state.action_jobs.push_scheduled(ji);
+            ji
+        }
+
+        fn insert_running_service(state: &mut WorkspaceState, base_task: BaseTaskIndex, profile: &str) -> JobIndex {
+            let config = state.base_tasks[base_task.idx()].config.clone();
+            let task =
+                config.eval(&Environment { profile, param: ValueMap::new(), vars: config.vars }).expect("eval service");
+            let spec = state.cache_spawn_spec(base_task, profile, ValueMap::new(), task);
+            let bt = &mut state.base_tasks[base_task.idx()];
+            let pc = bt.spawn_counter as usize;
+            bt.spawn_counter = bt.spawn_counter.wrapping_add(1);
+            let ji = state.jobs.insert(Job {
+                process_status: JobStatus::Running { process_index: pc, ready_state: None },
+                log_group: LogGroup::new(base_task, pc),
+                started_at: crate::clock::now(),
+                cache_key: String::new(),
+                cache_synthetic: false,
+                spawn: spec,
+                held_resources: SmallVec::new(),
+                action_deps_until_ready: SmallVec::new(),
+                trace: false,
+                trace_report: None,
+            });
+            state.base_tasks[base_task.idx()].jobs.push_active(ji);
+            state.service_jobs.push_active(ji);
+            ji
+        }
+
+        fn insert_scheduled_service_with_requirements(
+            state: &mut WorkspaceState,
+            base_task: BaseTaskIndex,
+            profile: &str,
+            after: Vec<ScheduleRequirement>,
+        ) -> JobIndex {
+            let config = state.base_tasks[base_task.idx()].config.clone();
+            let task =
+                config.eval(&Environment { profile, param: ValueMap::new(), vars: config.vars }).expect("eval service");
+            let spec = state.cache_spawn_spec(base_task, profile, ValueMap::new(), task);
+            let bt = &mut state.base_tasks[base_task.idx()];
+            let pc = bt.spawn_counter as usize;
+            bt.spawn_counter = bt.spawn_counter.wrapping_add(1);
+            let ji = state.jobs.insert(Job {
+                process_status: JobStatus::Scheduled { after },
+                log_group: LogGroup::new(base_task, pc),
+                started_at: crate::clock::now(),
+                cache_key: String::new(),
+                cache_synthetic: false,
+                spawn: spec,
+                held_resources: SmallVec::new(),
+                action_deps_until_ready: SmallVec::new(),
+                trace: false,
+                trace_report: None,
+            });
+            state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
+            state.service_jobs.push_scheduled(ji);
             ji
         }
 
@@ -5005,6 +6471,54 @@ mod scheduling_tests {
                 other => panic!("expected None while B is held, got {other:?}"),
             }
             let _ = only_b;
+        }
+
+        #[test]
+        fn crossed_multi_resource_priorities_still_make_progress() {
+            let (mut state, base_task, spec) = fresh_state();
+            let r_a = state.resources.intern("A");
+            let r_b = state.resources.intern("B");
+
+            let first = insert_scheduled_with_resources(&mut state, base_task, spec.clone(), vec![(r_a, 10), (r_b, 0)]);
+            let second = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(r_a, 0), (r_b, 10)]);
+
+            match state.next_scheduled() {
+                Scheduled::Ready(ji) => assert!(
+                    ji == first || ji == second,
+                    "scheduler must pick a ready candidate from the crossed-priority set"
+                ),
+                other => panic!("crossed multi-resource priorities must not stall, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn queued_service_waits_until_it_wins_resource_contention_before_stopping_current_profile() {
+            let (mut state, action_base, action_spec) = fresh_state();
+            let service_base = state.lookup_name("service_conditional_cmd").expect("service task");
+            let running = insert_running_service(&mut state, service_base, "watch");
+            let resource = state.resources.intern("R");
+
+            let queued = insert_scheduled_service_with_requirements(
+                &mut state,
+                service_base,
+                "default",
+                vec![
+                    ScheduleRequirement::Task { job: running, predicate: JobPredicate::Terminated },
+                    ScheduleRequirement::Resource { id: resource, priority: 0 },
+                ],
+            );
+            let high_priority =
+                insert_scheduled_with_resources(&mut state, action_base, action_spec, vec![(resource, 10)]);
+
+            assert!(
+                state.service_to_terminate_for_queue().is_none(),
+                "queued replacement must not stop current service while another ready job wins its resource"
+            );
+            match state.next_scheduled() {
+                Scheduled::Ready(ji) => assert_eq!(ji, high_priority),
+                other => panic!("expected high-priority resource contender to run first, got {other:?}"),
+            }
+            let _ = queued;
         }
     }
 }

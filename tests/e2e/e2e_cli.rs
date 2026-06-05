@@ -906,6 +906,86 @@ cache.persistent = true
 }
 
 #[test]
+fn failed_test_batch_does_not_create_cached_partial_job() {
+    let mut harness = TestHarness::new("failed_test_batch_no_cached_partial");
+    let counter = harness.temp_dir.join("counter.txt");
+
+    fn last_job_id(status: &str) -> String {
+        status
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Last job: #"))
+            .expect("status should include a last job id")
+            .to_string()
+    }
+
+    fs::write(&counter, "0").unwrap();
+    harness.write_config(&format!(
+        r#"
+[test.foo]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+'''
+cache = {{}}
+"#,
+        counter = counter.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["test", "foo"]);
+    assert!(result.success(), "foo should pass: stdout={}, stderr={}", result.stdout, result.stderr);
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "foo should run once");
+
+    let before = harness.run_client(&["status", "test.foo"]);
+    assert!(before.success(), "status before failed batch should succeed: {}", before.stderr);
+    let before_job = last_job_id(&before.stdout);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["true"]
+var.port = {{ default = "8080" }}
+
+[test.foo]
+sh = '''
+count=$(cat {counter})
+count=$((count + 1))
+echo $count > {counter}
+'''
+cache = {{}}
+
+[test.bad]
+cmd = ["true"]
+require = [
+  ["svc", {{ port = "a" }}],
+  ["svc", {{ port = "b" }}],
+]
+"#,
+        counter = counter.display()
+    ));
+
+    let result = harness.run_client(&["test"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("conflicting service requirements"),
+        "expected conflict error, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "cached foo must not rerun");
+
+    let after = harness.run_client(&["status", "test.foo"]);
+    assert!(after.success(), "status after failed batch should succeed: {}", after.stderr);
+    assert_eq!(
+        last_job_id(&after.stdout),
+        before_job,
+        "failed batch must not create a new cached synthetic job for foo"
+    );
+}
+
+#[test]
 fn cache_profile_changed() {
     let mut harness = TestHarness::new("cache_profile");
     let dep_counter = harness.temp_dir.join("dep_counter.txt");
@@ -979,6 +1059,75 @@ require = ["main"]
     assert_eq!(fs::read_to_string(&dep_counter).unwrap().trim(), "2", "dep should still be cached");
     // main should run because its profile_changed key changed
     assert_eq!(fs::read_to_string(&main_counter).unwrap().trim(), "2", "main should run due to profile_changed");
+}
+
+#[test]
+fn failed_spawn_does_not_invalidate_profile_changed_cache() {
+    let mut harness = TestHarness::new("failed_spawn_profile_cache");
+    let dep_counter = harness.temp_dir.join("dep_counter.txt");
+    let main_counter = harness.temp_dir.join("main_counter.txt");
+
+    fs::write(&dep_counter, "0").unwrap();
+    fs::write(&main_counter, "0").unwrap();
+
+    harness.write_config(&format!(
+        r#"
+[action.dep]
+sh = '''
+count=$(cat {dep_counter})
+count=$((count + 1))
+echo $count > {dep_counter}
+'''
+profiles = ["default", "bad"]
+pwd = {{ if.profile = "bad", then = {{ var = "missing" }}, or_else = "./" }}
+
+[action.main]
+sh = '''
+count=$(cat {main_counter})
+count=$((count + 1))
+echo $count > {main_counter}
+'''
+cache.key = [{{ profile_changed = "dep" }}]
+
+[action.runner]
+cmd = ["true"]
+require = ["main"]
+"#,
+        dep_counter = dep_counter.display(),
+        main_counter = main_counter.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "dep"]);
+    assert!(result.success(), "dep default should run: stdout={}, stderr={}", result.stdout, result.stderr);
+    assert_eq!(fs::read_to_string(&dep_counter).unwrap().trim(), "1", "dep should run once");
+
+    let result = harness.run_client(&["run", "runner"]);
+    assert!(result.success(), "main should run: stdout={}, stderr={}", result.stdout, result.stderr);
+    assert_eq!(fs::read_to_string(&main_counter).unwrap().trim(), "1", "main should run once");
+
+    let result = harness.run_client(&["run", "runner"]);
+    assert!(result.success(), "cached main should skip: stdout={}, stderr={}", result.stdout, result.stderr);
+    assert_eq!(fs::read_to_string(&main_counter).unwrap().trim(), "1", "main should remain cached");
+
+    let result = harness.run_client(&["run", "dep:bad"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("Failed to evaluate task 'dep'"),
+        "expected dep:bad eval error, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+    assert_eq!(fs::read_to_string(&dep_counter).unwrap().trim(), "1", "failed dep spawn must not run");
+
+    let result = harness.run_client(&["run", "runner"]);
+    assert!(result.success(), "cached main should still skip: stdout={}, stderr={}", result.stdout, result.stderr);
+    assert_eq!(
+        fs::read_to_string(&main_counter).unwrap().trim(),
+        "1",
+        "failed dep spawn must not invalidate profile_changed cache"
+    );
 }
 
 #[test]
@@ -2080,6 +2229,41 @@ require = ["bad_dep"]
     assert!(result.success() || !result.success(), "Client should complete");
 
     assert!(!marker.exists(), "main should not have run when dependency spawn fails");
+}
+
+#[test]
+fn failed_dependency_resolution_rolls_back_earlier_dependencies() {
+    let mut harness = TestHarness::new("dep_resolution_rollback");
+    let marker = harness.temp_dir.join("ok_ran.txt");
+
+    harness.write_config(&format!(
+        r#"
+[action.ok]
+sh = "echo ok > {marker}"
+
+[action.bad]
+pwd = {{ var = "missing" }}
+cmd = ["true"]
+
+[action.main]
+cmd = ["true"]
+require = ["ok", "bad"]
+"#,
+        marker = marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "main"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("Failed to evaluate task 'bad'"),
+        "expected bad dependency eval error, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "earlier dependency must not run after later dependency resolution fails");
 }
 
 #[test]
@@ -3599,6 +3783,40 @@ bad = ["ok", "bad"]
 }
 
 #[test]
+fn group_dynamic_eval_error_prevents_partial_spawn() {
+    let mut harness = TestHarness::new("group_dynamic_error_no_partial");
+    let marker = harness.temp_dir.join("ok.ran");
+
+    harness.write_config(&format!(
+        r#"
+[action.ok]
+sh = "echo ok > {marker}"
+
+[action.bad]
+pwd = {{ var = "missing" }}
+cmd = ["true"]
+
+[group]
+bad = ["ok", "bad"]
+"#,
+        marker = marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "group.bad"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("Failed to evaluate task 'bad'"),
+        "expected dynamic eval error, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "group submit must roll back earlier valid entries after dynamic eval failure");
+}
+
+#[test]
 fn direct_and_nested_uncached_action_requirements_both_run() {
     let mut harness = TestHarness::new("direct_nested_uncached_action");
     let order = harness.temp_dir.join("order.log");
@@ -3736,6 +3954,49 @@ require = [
     );
 }
 
+#[test]
+fn action_with_transitive_incompatible_service_requirements_errors_up_front() {
+    let mut harness = TestHarness::new("transitive_incompat_action_svc_reqs");
+    harness.write_config(
+        r#"
+[service.base]
+cmd = ["sleep", "infinity"]
+profiles = ["alpha", "beta"]
+
+[service.svc_alpha]
+cmd = ["sleep", "infinity"]
+require = ["base:alpha"]
+
+[service.svc_beta]
+cmd = ["sleep", "infinity"]
+require = ["base:beta"]
+
+[action.user]
+cmd = ["true"]
+require = ["svc_alpha", "svc_beta"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+    let resp = client.send_unwrap(&SpawnTaskRequest {
+        task_name: "user",
+        profile: "",
+        params: &[],
+        as_test: false,
+        cached: false,
+    });
+
+    match resp.body {
+        CommandBody::Error(err) => {
+            assert!(err.contains("conflicting service requirements"), "unexpected error: {err}");
+        }
+        other => panic!("spawn must reject transitive incompatible service requirements up front, got {other:?}"),
+    }
+}
+
 /// A `function call` sends the spawn request straight to the daemon without
 /// the CLI's client-side `resolve_name_in_config` check. After a reload that
 /// removes the target task, the daemon must report it gone instead of silently
@@ -3789,4 +4050,38 @@ fn1 = { restart = "target" }
         result.stdout,
         result.stderr
     );
+}
+
+#[test]
+fn function_spawn_dynamic_eval_error_prevents_partial_spawn() {
+    let mut harness = TestHarness::new("function_spawn_dynamic_error_no_partial");
+    let marker = harness.temp_dir.join("ok.ran");
+
+    harness.write_config(&format!(
+        r#"
+[action.ok]
+sh = "echo ok > {marker}"
+
+[action.bad]
+pwd = {{ var = "missing" }}
+cmd = ["true"]
+
+[function]
+fn1 = {{ spawn = ["ok", "bad"] }}
+"#,
+        marker = marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["function", "call", "fn1"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("Failed to evaluate task 'bad'"),
+        "expected dynamic eval error, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "function spawn must roll back earlier entries after dynamic eval failure");
 }

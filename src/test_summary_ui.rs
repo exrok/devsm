@@ -68,8 +68,8 @@ struct TestDisplay {
     #[expect(unused, reason = "May be useful for future features")]
     base_task_index: BaseTaskIndex,
     #[expect(unused, reason = "May be useful for future features")]
-    job_index: JobIndex,
-    log_group: LogGroup,
+    job_index: Option<JobIndex>,
+    log_group: Option<LogGroup>,
     status: TestJobStatus,
     name: String,
     command: String,
@@ -248,12 +248,17 @@ fn init_tui_state(test_run: &TestRun, workspace: &Workspace, width: u16, height:
         .test_jobs
         .iter()
         .map(|tj| {
-            let job = &state.jobs[tj.job_index];
-            let command = format_command(&job.task().config().command);
+            let (job_index, log_group, command) = tj
+                .job_index
+                .and_then(|ji| {
+                    let job = state.jobs.get(ji)?;
+                    Some((Some(ji), Some(job.log_group), format_command(&job.task().config().command)))
+                })
+                .unwrap_or((None, None, String::new()));
             TestDisplay {
                 base_task_index: tj.base_task_index,
-                job_index: tj.job_index,
-                log_group: job.log_group,
+                job_index,
+                log_group,
                 status: tj.status,
                 name: format_test_name(tj, &state.base_tasks),
                 command,
@@ -281,7 +286,15 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
             continue;
         }
 
-        let job = &ws_state.jobs[test_job.job_index];
+        let Some(job_index) = test_job.job_index else {
+            continue;
+        };
+        let Some(job) = ws_state.jobs.get(job_index) else {
+            display.status = TestJobStatus::Failed(-1);
+            display.finished_at = Some(crate::clock::now());
+            changed = true;
+            continue;
+        };
         let (new_status, timeout_info) = match &job.process_status {
             JobStatus::Scheduled { .. } | JobStatus::Starting => {
                 all_done = false;
@@ -320,10 +333,12 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
             changed = true;
         }
 
-        let new_logs = collect_recent_logs(&logs, display.log_group, MAX_RECENT_LOGS);
-        if new_logs != display.recent_logs.make_contiguous() {
-            display.recent_logs = new_logs.into_iter().collect();
-            changed = true;
+        if let Some(log_group) = display.log_group {
+            let new_logs = collect_recent_logs(&logs, log_group, MAX_RECENT_LOGS);
+            if new_logs != display.recent_logs.make_contiguous() {
+                display.recent_logs = new_logs.into_iter().collect();
+                changed = true;
+            }
         }
     }
 
@@ -690,11 +705,13 @@ fn write_color_summary(buf: &mut Vec<u8>, state: &TuiState, workspace: &Workspac
             }
         }
 
-        let recent = collect_recent_logs(&logs, test.log_group, MAX_SUMMARY_LOGS);
-        if !recent.is_empty() {
-            splat!(buf, "  Last ", recent.len(), " log lines:\n");
-            for line in &recent {
-                splat!(buf, "", line, "\n");
+        if let Some(log_group) = test.log_group {
+            let recent = collect_recent_logs(&logs, log_group, MAX_SUMMARY_LOGS);
+            if !recent.is_empty() {
+                splat!(buf, "  Last ", recent.len(), " log lines:\n");
+                for line in &recent {
+                    splat!(buf, "", line, "\n");
+                }
             }
         }
     }
@@ -757,7 +774,13 @@ fn update_test_statuses(
             continue;
         }
 
-        let job = &state.jobs[test_job.job_index];
+        let Some(job_index) = test_job.job_index else {
+            continue;
+        };
+        let Some(job) = state.jobs.get(job_index) else {
+            test_job.status = TestJobStatus::Failed(-1);
+            continue;
+        };
         let (new_status, timeout_info) = match &job.process_status {
             JobStatus::Scheduled { .. } | JobStatus::Starting => {
                 all_done = false;
@@ -837,7 +860,7 @@ fn update_test_statuses(
                         }
                         writeln!(buf, "</logs>").ok();
 
-                        let public_id = state.jobs.public_id_of(test_job.job_index).unwrap_or(0);
+                        let public_id = state.jobs.public_id_of(job_index).unwrap_or(0);
                         writeln!(buf, "hint: `devsm logs --job={}` for full logs", public_id).ok();
                     }
                     writeln!(buf).ok();
