@@ -839,3 +839,306 @@ require = ["init", "frontend", "portal"]
     portal.exit(0);
     frontend.exit(0);
 }
+
+#[test]
+fn group_uncached_action_requirement_runs_per_service_until_ready() {
+    let mut harness = TestHarness::new("group_uncached_action_sequenced");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[action.setup]
+cmd = ["test-app", "setup"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+
+[service.a]
+cmd = ["test-app", "a"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "A_READY" }} }}
+require = ["setup"]
+
+[service.b]
+cmd = ["test-app", "b"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "B_READY" }} }}
+require = ["setup"]
+
+[group]
+sequenced = ["a", "b"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "group.sequenced"]);
+    assert!(result.success(), "uncached group should start: stdout={}, stderr={}", result.stdout, result.stderr);
+
+    let mut setup_a = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(setup_a.name(), "setup");
+    setup_a.exit(0);
+
+    let mut a = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(a.name(), "a");
+    assert!(
+        ctrl.try_accept(Duration::from_millis(300)).is_none(),
+        "second setup must wait until service a is ready; server_log={}",
+        harness.server_log()
+    );
+
+    a.write_stdout(b"A_READY\n");
+
+    let mut setup_b = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(setup_b.name(), "setup");
+    setup_b.exit(0);
+
+    let mut b = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(b.name(), "b");
+    b.write_stdout(b"B_READY\n");
+
+    assert!(
+        ctrl.try_accept(Duration::from_millis(300)).is_none(),
+        "uncached setup should run once per service, not more; server_log={}",
+        harness.server_log()
+    );
+
+    b.exit(0);
+    a.exit(0);
+}
+
+#[test]
+fn ready_barrier_prevents_resource_eviction_before_service_ready() {
+    let mut harness = TestHarness::new("ready_barrier_resource_eviction");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[action.setup]
+cmd = ["test-app", "setup"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = [{{ resource = "R" }}]
+
+[service.a]
+cmd = ["test-app", "a"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "A_READY" }} }}
+require = ["setup", {{ resource = "R" }}]
+
+[service.b]
+cmd = ["test-app", "b"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "B_READY" }} }}
+require = ["setup"]
+
+[group]
+sequenced = ["a", "b"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "group.sequenced"]);
+    assert!(
+        result.success(),
+        "uncached resource group should start: stdout={}, stderr={}",
+        result.stdout,
+        result.stderr
+    );
+
+    let mut setup_a = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(setup_a.name(), "setup");
+    setup_a.exit(0);
+
+    let mut a = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(a.name(), "a");
+    assert!(
+        !a.wait_disconnected(Duration::from_millis(500)),
+        "service a must not be evicted for setup_b's resource while setup_b is still waiting on a's ready barrier; server_log={}",
+        harness.server_log()
+    );
+
+    a.write_stdout(b"A_READY\n");
+    assert!(
+        a.wait_disconnected(Duration::from_secs(10)),
+        "service a should become evictable after ready so setup_b can acquire the resource; server_log={}",
+        harness.server_log()
+    );
+
+    let mut setup_b = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(setup_b.name(), "setup");
+    setup_b.exit(0);
+
+    let mut b = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(b.name(), "b");
+    b.write_stdout(b"B_READY\n");
+    b.exit(0);
+}
+
+#[test]
+fn group_uncached_action_requirement_continues_after_service_exits_before_ready() {
+    let mut harness = TestHarness::new("group_uncached_action_service_exits");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[action.setup]
+cmd = ["test-app", "setup"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+
+[service.a]
+cmd = ["test-app", "a"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "A_READY" }} }}
+require = ["setup"]
+
+[service.b]
+cmd = ["test-app", "b"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "B_READY" }} }}
+require = ["setup"]
+
+[group]
+sequenced = ["a", "b"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "group.sequenced"]);
+    assert!(result.success(), "uncached group should start: stdout={}, stderr={}", result.stdout, result.stderr);
+
+    let mut setup_a = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(setup_a.name(), "setup");
+    setup_a.exit(0);
+
+    let mut a = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(a.name(), "a");
+    assert!(
+        ctrl.try_accept(Duration::from_millis(300)).is_none(),
+        "second setup must wait while service a is not ready; server_log={}",
+        harness.server_log()
+    );
+
+    a.exit(0);
+
+    let mut setup_b = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(
+        setup_b.name(),
+        "setup",
+        "second setup must run after service a exits before ready; server_log={}",
+        harness.server_log()
+    );
+    setup_b.exit(0);
+
+    let mut b = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(b.name(), "b");
+    b.write_stdout(b"B_READY\n");
+    b.exit(0);
+}
+
+#[test]
+fn group_uncached_action_requirement_continues_after_first_action_failure() {
+    let mut harness = TestHarness::new("group_uncached_action_failure_continues");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[action.setup]
+cmd = ["test-app", "setup"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+
+[service.a]
+cmd = ["test-app", "a"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "A_READY" }} }}
+require = ["setup"]
+
+[service.b]
+cmd = ["test-app", "b"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "B_READY" }} }}
+require = ["setup"]
+
+[group]
+sequenced = ["a", "b"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "group.sequenced"]);
+    assert!(result.success(), "uncached group should start: stdout={}, stderr={}", result.stdout, result.stderr);
+
+    let mut setup_a = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(setup_a.name(), "setup");
+    setup_a.exit(1);
+
+    let mut setup_b = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(
+        setup_b.name(),
+        "setup",
+        "second setup must run after failed first setup cancels service a; server_log={}",
+        harness.server_log()
+    );
+    setup_b.exit(0);
+
+    let mut b = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(b.name(), "b");
+    b.write_stdout(b"B_READY\n");
+    b.exit(0);
+}
+
+#[test]
+fn group_cached_action_requirement_coalesces_services() {
+    let mut harness = TestHarness::new("group_cached_action_coalesces");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[action.setup]
+cmd = ["test-app", "setup"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+cache = {{}}
+
+[service.a]
+cmd = ["test-app", "a"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["setup"]
+
+[service.b]
+cmd = ["test-app", "b"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["setup"]
+
+[group]
+good = ["a", "b"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "group.good"]);
+    assert!(result.success(), "cached group should start: stderr={}", result.stderr);
+
+    let mut setup = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(setup.name(), "setup");
+    setup.exit(0);
+
+    let mut first = ctrl.accept(Duration::from_secs(10));
+    let mut second = ctrl.accept(Duration::from_secs(10));
+    let mut names = vec![first.name().to_string(), second.name().to_string()];
+    names.sort();
+    assert_eq!(names, ["a", "b"]);
+    assert!(
+        ctrl.try_accept(Duration::from_millis(300)).is_none(),
+        "cacheable setup should be shared and only run once; server_log={}",
+        harness.server_log()
+    );
+
+    first.exit(0);
+    second.exit(0);
+}

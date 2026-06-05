@@ -3560,6 +3560,77 @@ require = ["svc", { resource = "R" }]
     );
 }
 
+#[test]
+fn group_static_error_prevents_partial_spawn() {
+    let mut harness = TestHarness::new("group_static_error_no_partial");
+    let marker = harness.temp_dir.join("ok.ran");
+
+    harness.write_config(&format!(
+        r#"
+[action.ok]
+sh = "echo ok > {marker}"
+
+[action.bad]
+cmd = ["true"]
+require = ["loop"]
+
+[action.loop]
+cmd = ["true"]
+require = ["bad"]
+
+[group]
+bad = ["ok", "bad"]
+"#,
+        marker = marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "group.bad"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("require cycle"),
+        "expected static require-cycle error, got stdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "group submit must fail before spawning earlier valid entries");
+}
+
+#[test]
+fn direct_and_nested_uncached_action_requirements_both_run() {
+    let mut harness = TestHarness::new("direct_nested_uncached_action");
+    let order = harness.temp_dir.join("order.log");
+
+    harness.write_config(&format!(
+        r#"
+[action.setup]
+sh = "echo setup >> {order}"
+
+[service.a]
+sh = "echo a >> {order}; sleep 30"
+require = ["setup"]
+
+[action.user]
+sh = "echo user >> {order}"
+require = ["a", "setup"]
+"#,
+        order = order.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "user"]);
+    assert!(result.success(), "user should run: stdout={}, stderr={}", result.stdout, result.stderr);
+
+    let written = fs::read_to_string(&order).expect("order log should exist");
+    let setup_count = written.lines().filter(|line| *line == "setup").count();
+    assert_eq!(setup_count, 2, "direct and nested setup requirements must run separately:\n{written}");
+    assert!(written.lines().any(|line| line == "a"), "service should have run:\n{written}");
+    assert!(written.lines().any(|line| line == "user"), "dependent action should have run:\n{written}");
+}
+
 /// Sharing a resource via an Action chain (predicate
 /// TerminatedNaturallyAndSuccessfully) is *not* a deadlock — the action
 /// releases its hold before the requirer runs.
