@@ -728,18 +728,24 @@ impl Environment<'_> {
         }
     }
 
-    fn var_append<'a>(&self, name: &str, bump: &'a Bump, target: &mut bumpalo::collections::Vec<&'a str>) {
+    fn var_append<'a>(
+        &self,
+        name: &str,
+        bump: &'a Bump,
+        target: &mut bumpalo::collections::Vec<&'a str>,
+    ) -> Result<(), EvalError> {
         if let Some(s) = self.resolve_special(name) {
             target.push(bump.alloc_str(s));
-            return;
+            return Ok(());
         }
         match self.param[name].as_ref() {
             ValueRef::Null(_) => {
                 if let Some(default) = get_var_default(self.vars, name) {
                     target.push(bump.alloc_str(default));
                 }
+                Ok(())
             }
-            _ => append_value(&self.param[name], bump, target).unwrap(),
+            _ => append_value(&self.param[name], bump, target),
         }
     }
 }
@@ -819,7 +825,7 @@ impl<'a> BumpEval<'a> for StringListExpr<'static> {
             StringListExpr::List([StringListExpr::Literal(s)]) => Ok(std::slice::from_ref(s)),
             _ => {
                 let mut result = bumpalo::collections::Vec::new_in(bump);
-                eval_append_str(self, env, bump, &mut result);
+                eval_append_str(self, env, bump, &mut result)?;
                 Ok(result.into_bump_slice())
             }
         }
@@ -861,24 +867,25 @@ fn eval_append_str<'a>(
     env: &Environment,
     bump: &'a Bump,
     target: &mut bumpalo::collections::Vec<&'a str>,
-) {
+) -> Result<(), EvalError> {
     use StringListExpr as Expr;
     match expr {
         Expr::Literal(value) => target.push(value),
         Expr::List(string_list_exprs) => {
             for item in string_list_exprs.iter() {
-                eval_append_str(item, env, bump, target);
+                eval_append_str(item, env, bump, target)?;
             }
         }
-        Expr::Var(key) => env.var_append(key, bump, target),
+        Expr::Var(key) => return env.var_append(key, bump, target),
         Expr::If(branch) => {
             if branch.cond.eval(env) {
-                eval_append_str(&branch.then, env, bump, target);
+                eval_append_str(&branch.then, env, bump, target)?;
             } else if let Some(or_else) = &branch.or_else {
-                eval_append_str(or_else, env, bump, target);
+                eval_append_str(or_else, env, bump, target)?;
             }
         }
     }
+    Ok(())
 }
 
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
@@ -1202,6 +1209,40 @@ mod tests {
         assert!(!vars.contains(&"$profile"), "should exclude $profile: {:?}", vars);
         assert!(vars.contains(&"user_var"), "should include user_var: {:?}", vars);
         assert_eq!(vars.len(), 1);
+    }
+
+    // A Map appended to a string-list var must return `EvalError` rather than
+    // panic: eval runs under `state.write()`, where a panic poisons the lock and
+    // bricks the daemon for every client.
+    #[test]
+    fn map_valued_list_var_surfaces_eval_error_without_panicking() {
+        static TEST_EXPR: TaskConfigExpr<'static> = TaskConfigExpr {
+            kind: TaskKind::Action,
+            info: "",
+            pwd: StringExpr::Literal("./"),
+            command: CommandExpr::Cmd(StringListExpr::List(&[
+                StringListExpr::Literal("echo"),
+                StringListExpr::Var("mapvar"),
+            ])),
+            profiles: &[],
+            envvar: &[],
+            require: EMPTY_REQUIREMENTS,
+            cache: None,
+            ready: None,
+            timeout: None,
+            tags: &[],
+            managed: None,
+            hidden: ServiceHidden::Never,
+            allow_multiple: AllowMultiple::False,
+            cli: CliConfig::DEFAULT,
+            vars: &[],
+        };
+
+        let param =
+            jsony::from_json::<ValueMap>(r#"{ "mapvar": { "nested": "value" } }"#).expect("valid params").to_owned();
+        let env = Environment { profile: "", param, vars: &[] };
+
+        assert!(TEST_EXPR.eval(&env).is_err(), "expected eval error, got Ok");
     }
 
     #[test]

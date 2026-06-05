@@ -1,18 +1,21 @@
 # devsm: The TUI Development Service Manager
 
-devsm manages your services during development workflows optimized to keep
-you in the zone even when:
-- switching between developing numerous services,
-- executed test at various levels,
-- switching between profiles and git branches.
+WIP; Additional documentation in the works.
 
-devsm does thus by providing powerful TUI for managing actions and services you would
-do during development and getting feedback quickly with aggregated log views with
-powerful filtering. 
+devsm manages your services, tests and scripts:
+- Manages service lifetimes and task dependencies
+- Dispatch from anyway where in the repo
+- TUI based dashboard for lunching services, tests and logs
 
-The `devsm.toml` tersely defines all the actions, services and test for your workspace
-along with dependencies between them. 
+## Installation
 
+devsm is still alpha and under active development, expect breaking changes.
+
+The easiest installation is currently through cargo from the git repo:
+
+```sh
+cargo install --git https://github.com/exrok/devsm --force devsm
+```
 
 
 

@@ -203,40 +203,53 @@ fn matches_pattern(text: &str, pattern: &str, case_sensitive: bool, buffer: &mut
     haystack.contains(pattern)
 }
 
+/// Maps a job's exit status and cause to the wire `(exit_code, RpcExitCause)`.
+fn rpc_exit_status(status: u32, cause: &ExitCause) -> (i32, RpcExitCause) {
+    match cause {
+        ExitCause::Killed => (-1, RpcExitCause::Killed),
+        ExitCause::Restarted => (-1, RpcExitCause::Restarted),
+        ExitCause::Unknown => (status as i32, RpcExitCause::Unknown),
+        ExitCause::SpawnFailed => (status as i32, RpcExitCause::SpawnFailed),
+        ExitCause::ProfileConflict => (-1, RpcExitCause::ProfileConflict),
+        ExitCause::Timeout => (-1, RpcExitCause::Timeout),
+    }
+}
+
+// Renders into `out` rather than the client `File` so the caller can release
+// `logs.read()` before the blocking pipe write. A stalled client must not pin
+// the log ring lock and wedge daemon-wide ingestion.
 fn write_log_entry(
-    file: &mut File,
+    out: &mut Vec<u8>,
     entry: &LogEntry,
     logs: &Logs,
     config: &LogForwarderConfig,
     ansi_buffer: &mut Vec<u8>,
-) -> std::io::Result<()> {
+) {
     let text = unsafe { entry.text(logs) };
 
     if !matches_pattern(text, &config.pattern, config.case_sensitive, ansi_buffer) {
-        return Ok(());
+        return;
     }
 
     if config.with_taskname {
         let bti = entry.log_group.base_task_index();
         let task_name = config.task_names.get(bti.idx()).map(|s| s.as_str()).unwrap_or("?");
         if config.strip_ansi {
-            write!(file, "{}> ", task_name)?;
+            let _ = write!(out, "{}> ", task_name);
         } else {
             let color = SPAN_COLORS[bti.idx() % SPAN_COLORS.len()];
-            write!(file, "{} {} \x1b[m ", color, task_name)?;
+            let _ = write!(out, "{} {} \x1b[m ", color, task_name);
         }
     }
 
     if config.strip_ansi {
         ansi_buffer.clear();
         strip_ansi_to_buffer_preserve_case(text, ansi_buffer);
-        file.write_all(ansi_buffer)?;
+        out.extend_from_slice(ansi_buffer);
     } else {
-        file.write_all(text.as_bytes())?;
+        out.extend_from_slice(text.as_bytes());
     }
-    file.write_all(b"\n")?;
-
-    Ok(())
+    out.push(b'\n');
 }
 
 pub fn run_logs(
@@ -346,6 +359,7 @@ fn dump_logs(
         &matching_entries
     };
 
+    let mut out = Vec::new();
     for entry in entries_to_print {
         let text = unsafe { entry.text(&logs) };
 
@@ -353,23 +367,25 @@ fn dump_logs(
             let bti = entry.log_group.base_task_index();
             let task_name = config.task_names.get(bti.idx()).map(|s| s.as_str()).unwrap_or("?");
             if config.strip_ansi {
-                write!(file, "{}> ", task_name)?;
+                let _ = write!(out, "{}> ", task_name);
             } else {
                 let color = SPAN_COLORS[bti.idx() % SPAN_COLORS.len()];
-                write!(file, "{} {} \x1b[m ", color, task_name)?;
+                let _ = write!(out, "{} {} \x1b[m ", color, task_name);
             }
         }
 
         if config.strip_ansi {
             ansi_buffer.clear();
             strip_ansi_to_buffer_preserve_case(text, ansi_buffer);
-            file.write_all(ansi_buffer)?;
+            out.extend_from_slice(ansi_buffer);
         } else {
-            file.write_all(text.as_bytes())?;
+            out.extend_from_slice(text.as_bytes());
         }
-        file.write_all(b"\n")?;
+        out.push(b'\n');
     }
 
+    drop(logs);
+    file.write_all(&out)?;
     let _ = file.flush();
     Ok(())
 }
@@ -399,6 +415,7 @@ fn forward_logs_filtered(
     let view = logs.view(filter);
     let (a, b) = logs.slices_range(*last_log_id, LogId(current_tail.0.saturating_sub(1)));
 
+    let mut out = Vec::new();
     for slice in [a, b] {
         for entry in slice {
             if !view.contains(entry) {
@@ -411,12 +428,14 @@ fn forward_logs_filtered(
                 continue;
             }
 
-            let _ = write_log_entry(file, entry, &logs, config, ansi_buffer);
+            write_log_entry(&mut out, entry, &logs, config, ansi_buffer);
         }
     }
-    let _ = file.flush();
 
     *last_log_id = current_tail;
+    drop(logs);
+    let _ = file.write_all(&out);
+    let _ = file.flush();
     Ok(())
 }
 
@@ -456,23 +475,22 @@ fn send_termination(encoder: &mut Encoder, socket: &mut Option<UnixStream>) {
 }
 
 fn write_run_group_log_entry(
-    file: &mut File,
+    out: &mut Vec<u8>,
     entry: &LogEntry,
     logs: &Logs,
     task_names: &[String],
     with_taskname: bool,
-) -> std::io::Result<()> {
+) {
     if with_taskname {
         let bti = entry.log_group.base_task_index();
         let task_name = task_names.get(bti.idx()).map(|s| s.as_str()).unwrap_or("?");
         let color = SPAN_COLORS[bti.idx() % SPAN_COLORS.len()];
-        write!(file, "{} {} \x1b[m ", color, task_name)?;
+        let _ = write!(out, "{} {} \x1b[m ", color, task_name);
     }
 
     let text = unsafe { entry.text(logs) };
-    file.write_all(text.as_bytes())?;
-    file.write_all(b"\n")?;
-    Ok(())
+    out.extend_from_slice(text.as_bytes());
+    out.push(b'\n');
 }
 
 fn run_group_log_metadata(workspace: &Workspace, log_groups: &[LogGroup]) -> (Vec<String>, bool) {
@@ -509,17 +527,20 @@ fn forward_new_group_logs(
     }
 
     let (a, b) = logs.slices_range(*last_log_id, LogId(current_tail.0.saturating_sub(1)));
+    let mut out = Vec::new();
     for slice in [a, b] {
         for entry in slice {
             if !log_groups.contains(&entry.log_group) {
                 continue;
             }
-            let _ = write_run_group_log_entry(file, entry, &logs, task_names, with_taskname);
+            write_run_group_log_entry(&mut out, entry, &logs, task_names, with_taskname);
         }
     }
-    let _ = file.flush();
 
     *last_log_id = current_tail;
+    drop(logs);
+    let _ = file.write_all(&out);
+    let _ = file.flush();
     Ok(())
 }
 
@@ -538,14 +559,7 @@ fn group_exit_state(workspace: &Workspace, jobs: &[JobIndex]) -> (bool, Option<i
                 all_terminal = false;
             }
             JobStatus::Exited { status, cause, .. } => {
-                let (code, rpc_cause) = match cause {
-                    ExitCause::Killed => (-1, RpcExitCause::Killed),
-                    ExitCause::Restarted => (-1, RpcExitCause::Restarted),
-                    ExitCause::Unknown => (*status as i32, RpcExitCause::Unknown),
-                    ExitCause::SpawnFailed => (*status as i32, RpcExitCause::SpawnFailed),
-                    ExitCause::ProfileConflict => (-1, RpcExitCause::ProfileConflict),
-                    ExitCause::Timeout => (-1, RpcExitCause::Timeout),
-                };
+                let (code, rpc_cause) = rpc_exit_status(*status, cause);
                 if aggregate_code == Some(0) && code != 0 {
                     aggregate_code = Some(code);
                     aggregate_cause = Some(rpc_cause);
@@ -771,14 +785,7 @@ fn forward_new_logs(
                     }
                 }
                 JobStatus::Exited { status, cause, .. } => {
-                    let (code, rpc_cause) = match cause {
-                        ExitCause::Killed => (-1, RpcExitCause::Killed),
-                        ExitCause::Restarted => (-1, RpcExitCause::Restarted),
-                        ExitCause::Unknown => (*status as i32, RpcExitCause::Unknown),
-                        ExitCause::SpawnFailed => (*status as i32, RpcExitCause::SpawnFailed),
-                        ExitCause::ProfileConflict => (-1, RpcExitCause::ProfileConflict),
-                        ExitCause::Timeout => (-1, RpcExitCause::Timeout),
-                    };
+                    let (code, rpc_cause) = rpc_exit_status(*status, cause);
                     if let Some(report) = job.trace_report.clone() {
                         let event = JobTraceReportEvent {
                             job_index: public_id,
@@ -812,20 +819,22 @@ fn forward_new_logs(
     let view = logs.view(LogFilter::IsGroup(log_group));
     let (a, b) = logs.slices_range(*last_log_id, LogId(current_tail.0.saturating_sub(1)));
 
+    let mut out = Vec::new();
     for slice in [a, b] {
         for entry in slice {
             if !view.contains(entry) {
                 continue;
             }
             let text = unsafe { entry.text(&logs) };
-            let _ = file.write_all(text.as_bytes());
-            let _ = file.write_all(b"\n");
+            out.extend_from_slice(text.as_bytes());
+            out.push(b'\n');
         }
     }
-    let _ = file.flush();
 
     *last_log_id = current_tail;
     drop(logs);
+    let _ = file.write_all(&out);
+    let _ = file.flush();
 
     let state = workspace.state.read().unwrap();
     for (job_index, job) in state.jobs.iter() {
@@ -842,14 +851,7 @@ fn forward_new_logs(
                 }
             }
             JobStatus::Exited { status, cause, .. } => {
-                let (code, rpc_cause) = match cause {
-                    ExitCause::Killed => (-1, RpcExitCause::Killed),
-                    ExitCause::Restarted => (-1, RpcExitCause::Restarted),
-                    ExitCause::Unknown => (*status as i32, RpcExitCause::Unknown),
-                    ExitCause::SpawnFailed => (*status as i32, RpcExitCause::SpawnFailed),
-                    ExitCause::ProfileConflict => (-1, RpcExitCause::ProfileConflict),
-                    ExitCause::Timeout => (-1, RpcExitCause::Timeout),
-                };
+                let (code, rpc_cause) = rpc_exit_status(*status, cause);
                 return Ok((true, Some(code), Some(rpc_cause)));
             }
             JobStatus::Cancelled => {
