@@ -1448,3 +1448,84 @@ require = ["svc:beta"]
     );
     alpha.exit(0);
 }
+
+/// Regression: a pending service termination must not starve independent ready
+/// jobs. `blocker` holds resource `R` and ignores SIGINT (via `trap '' INT`),
+/// so once the scheduler decides to stop it to free `R` for the blocked
+/// `wants_r`, it keeps draining indefinitely. While it drains, the independent
+/// `independent` action (no requirements) must still start instead of waiting
+/// the drain out. Before the fix, `scheduled()` short-circuited on the pending
+/// termination and never reached independent ready work, so `independent` only
+/// ran after `blocker` was SIGKILL-escalated ~20s later.
+#[test]
+fn pending_service_termination_does_not_starve_independent_jobs() {
+    let mut harness = TestHarness::new("pending_term_independent");
+    let ctrl = TestAppServer::new(&harness.temp_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.blocker]
+cmd = ["sh", "-c", "trap '' INT; exec test-app blocker"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = [{{ resource = "R" }}]
+
+[action.wants_r]
+cmd = ["test-app", "wants_r"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = [{{ resource = "R" }}]
+
+[action.independent]
+cmd = ["test-app", "independent"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    // Non-blocking RPC submits so a failure never hangs on a `run` client that
+    // is itself waiting on the starved job.
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let mut client = WorkspaceClient::connect(&harness.socket_path, &config_path).expect("connect");
+    let spawn = |client: &mut WorkspaceClient, name: &'static str| {
+        let resp = client.send_unwrap(&SpawnTaskRequest {
+            task_name: name,
+            profile: "",
+            params: &[],
+            as_test: false,
+            cached: false,
+        });
+        assert!(matches!(resp.body, CommandBody::Empty), "{name} spawn rejected: {:?}", resp.body);
+    };
+
+    // Start the resource holder and wait until its process is running, which
+    // means it has acquired `R`.
+    spawn(&mut client, "blocker");
+    let mut blocker = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(blocker.name(), "blocker");
+
+    // `wants_r` blocks on `R`. The scheduler SIGINTs `blocker` to free it, but
+    // `blocker` ignores SIGINT and keeps holding `R`, so `wants_r` stays
+    // scheduled and the termination stays pending.
+    spawn(&mut client, "wants_r");
+    assert!(
+        ctrl.try_accept(Duration::from_millis(500)).is_none(),
+        "wants_r must stay blocked while blocker holds R; server_log={}",
+        harness.server_log()
+    );
+
+    // With `blocker`'s stop now pending, an independent action must still start
+    // promptly rather than waiting for `blocker` to exit.
+    spawn(&mut client, "independent");
+    let mut independent = ctrl.try_accept(Duration::from_secs(5)).unwrap_or_else(|| {
+        panic!("independent action starved by pending blocker termination; server_log={}", harness.server_log())
+    });
+    assert_eq!(independent.name(), "independent");
+    independent.exit(0);
+
+    // Cleanup: stop the holder so `R` frees and the queued `wants_r` runs.
+    blocker.exit(0);
+    let mut wants_r = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(wants_r.name(), "wants_r");
+    wants_r.exit(0);
+}

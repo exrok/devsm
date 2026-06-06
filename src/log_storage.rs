@@ -254,6 +254,15 @@ pub struct LogView<'a> {
 pub struct LogGroup(u32);
 
 impl LogGroup {
+    /// Packs a 12-bit base-task index into the low bits and a 20-bit run
+    /// counter into the high bits of a `u32`.
+    ///
+    /// Known, accepted limit: the run counter is 20 bits, so `counter` wraps
+    /// after 2^20 (~1.05M) spawns of a single base task and the resulting
+    /// `LogGroup` then aliases an earlier job of that task. This is the unique
+    /// on-the-wire correlation id, so the daemon-lifetime uniqueness it
+    /// otherwise provides does not hold past that many restarts of one task.
+    /// `wrapping_shl` keeps it a silent collision rather than a panic.
     pub fn new(base_task: BaseTaskIndex, counter: usize) -> LogGroup {
         LogGroup((counter.wrapping_shl(12) as u32) | (base_task.0 & 0xFFF))
     }

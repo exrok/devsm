@@ -206,6 +206,16 @@ fn blake3_to_u64(hasher: &blake3::Hasher) -> u64 {
     u64::from_le_bytes(bytes.as_bytes()[..8].try_into().unwrap())
 }
 
+/// Index into `WorkspaceState::base_tasks`. Capped at 12 bits (0..=0xfff)
+/// because [`LogGroup`](crate::log_storage::LogGroup) packs it into the low 12
+/// bits of a `u32` alongside a 20-bit run counter.
+///
+/// Known, accepted limit: `update_base_tasks` never reclaims the slot of a task
+/// that disappears from `devsm.toml` (it only marks it `removed`), so the count
+/// grows by every distinct `(name, kind)` ever seen across config reloads. A
+/// daemon that lives long enough to see 4096 distinct task names (e.g. repeated
+/// renames under hot reload) panics in [`Self::new_or_panic`]. Reclaiming slots
+/// once their jobs are pruned would lift this, but is out of scope here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(transparent)]
 pub struct BaseTaskIndex(pub u32);

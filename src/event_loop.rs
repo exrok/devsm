@@ -345,6 +345,21 @@ pub(crate) fn try_read(fd: RawFd, buffer: &mut Vec<u8>) -> ReadResult {
     }
 }
 
+/// Which class of pending service termination [`EventLoop::request_service_termination`]
+/// should look for: one freeing a queued service, or one freeing a resource.
+enum TerminationKind {
+    Queue,
+    Resource,
+}
+
+/// One workspace's decision for a single scheduling pass, computed while holding
+/// the workspace read lock and acted on after it is released.
+enum SchedulingStep {
+    Spawn { job_id: LogGroup, job_index: JobIndex, task: TaskConfigRc },
+    Cancel { job_index: JobIndex },
+    Idle,
+}
+
 impl EventLoop {
     pub(crate) fn read(&mut self, index: ProcessIndex, pipe: Pipe) -> anyhow::Result<()> {
         kvlog::debug!("Read process", index, pipe= ?pipe);
@@ -471,8 +486,47 @@ impl EventLoop {
 
         Ok(())
     }
+    /// Signal the one service a workspace wants stopped for the given reason, if
+    /// any. The signal is asynchronous (SIGINT to the process group) and
+    /// idempotent — [`ActiveProcess::request_termination`] no-ops once the
+    /// process is already draining — so callers may invoke this every scheduling
+    /// pass without re-signalling a service that is already on its way down.
+    fn request_service_termination(&mut self, ws_index: WorkspaceIndex, kind: TerminationKind) {
+        let Some(ws) = self.state.workspaces.get(ws_index as usize) else {
+            return;
+        };
+        let state = ws.handle.state();
+        let candidate = match kind {
+            TerminationKind::Queue => state.service_to_terminate_for_queue(),
+            TerminationKind::Resource => state.service_to_terminate_for_resource(),
+        };
+        let Some((service_to_kill, exit_cause)) = candidate else {
+            return;
+        };
+        let job = &state.jobs[service_to_kill];
+        let job_id = job.log_group;
+        let JobStatus::Running { process_index, .. } = job.process_status else {
+            return;
+        };
+        drop(state);
+
+        if let Some(process) = self.state.processes.get_mut(process_index)
+            && process.log_group == job_id
+        {
+            process.request_termination(exit_cause);
+        }
+    }
+
     pub(crate) fn scheduled(&mut self) {
         const MAX_ITERATIONS: u32 = 10_000;
+
+        // Snapshot the workspace keys once. The set is stable across this call
+        // (the event loop is single-threaded and only mutates `workspaces` while
+        // handling other events), and iterating an owned list frees the loop
+        // body to call `&mut self` methods without holding a borrow on
+        // `self.state.workspaces`.
+        let ws_indices: Vec<usize> = self.state.workspaces.iter().map(|(i, _)| i).collect();
+
         let mut iteration_count = 0u32;
         'outer: loop {
             iteration_count += 1;
@@ -484,62 +538,47 @@ impl EventLoop {
                 );
                 break;
             }
-            for (wsi, ws) in &self.state.workspaces {
-                let state = ws.handle.state();
+            for &wsi in &ws_indices {
+                // Fire any pending service terminations needed to unblock a
+                // queued service or free a contended resource. These are
+                // asynchronous: the service stays Running until its process
+                // exits, so we only signal and fall through to scheduling.
+                // Independent ready jobs below must not wait out the drain.
+                // Re-firing across passes is harmless (idempotent) and never
+                // spins, because only an actual spawn/cancel `continue`s 'outer.
+                self.request_service_termination(wsi as WorkspaceIndex, TerminationKind::Queue);
+                self.request_service_termination(wsi as WorkspaceIndex, TerminationKind::Resource);
 
-                if let Some((service_to_kill, exit_cause)) = state.service_to_terminate_for_queue() {
-                    let job = &state.jobs[service_to_kill];
-                    let job_id = job.log_group;
-                    let JobStatus::Running { process_index, .. } = job.process_status else {
-                        drop(state);
+                let step = {
+                    let Some(ws) = self.state.workspaces.get(wsi) else {
                         continue;
                     };
-                    drop(state);
-
-                    if let Some(process) = self.state.processes.get_mut(process_index)
-                        && process.log_group == job_id
-                    {
-                        process.request_termination(exit_cause);
+                    let state = ws.handle.state();
+                    match state.next_scheduled() {
+                        workspace::Scheduled::Ready(job_index) => {
+                            let job = &state.jobs[job_index];
+                            SchedulingStep::Spawn { job_id: job.log_group, job_index, task: job.task().clone() }
+                        }
+                        workspace::Scheduled::Never(job_index) => SchedulingStep::Cancel { job_index },
+                        workspace::Scheduled::None => SchedulingStep::Idle,
                     }
-                    break;
-                }
+                };
 
-                if let Some((service_to_kill, exit_cause)) = state.service_to_terminate_for_resource() {
-                    let job = &state.jobs[service_to_kill];
-                    let job_id = job.log_group;
-                    let JobStatus::Running { process_index, .. } = job.process_status else {
-                        drop(state);
-                        continue;
-                    };
-                    drop(state);
-
-                    if let Some(process) = self.state.processes.get_mut(process_index)
-                        && process.log_group == job_id
-                    {
-                        process.request_termination(exit_cause);
-                    }
-                    break;
-                }
-
-                match state.next_scheduled() {
-                    workspace::Scheduled::Ready(job_index) => {
-                        let job = &state.jobs[job_index];
-                        let job_correlation = job.log_group;
-                        let job_task = job.task().clone();
-                        drop(state);
-                        if let Err(err) = self.spawn(wsi as WorkspaceIndex, job_correlation, job_index, job_task) {
-                            self.handle_spawn_failure(wsi as WorkspaceIndex, job_correlation, job_index, err);
+                match step {
+                    SchedulingStep::Spawn { job_id, job_index, task } => {
+                        if let Err(err) = self.spawn(wsi as WorkspaceIndex, job_id, job_index, task) {
+                            self.handle_spawn_failure(wsi as WorkspaceIndex, job_id, job_index, err);
                         }
                         continue 'outer;
                     }
-                    workspace::Scheduled::Never(job_index) => {
+                    SchedulingStep::Cancel { job_index } => {
                         kvlog::info!("Scheduled task will never be ready cancelling", job_index);
-                        drop(state);
-                        let mut ws_state = ws.handle.state.write().unwrap();
-                        ws_state.update_job_status(job_index, JobStatus::Cancelled);
+                        if let Some(ws) = self.state.workspaces.get(wsi) {
+                            ws.handle.state.write().unwrap().update_job_status(job_index, JobStatus::Cancelled);
+                        }
                         continue 'outer;
                     }
-                    workspace::Scheduled::None => (),
+                    SchedulingStep::Idle => {}
                 }
             }
             break;
