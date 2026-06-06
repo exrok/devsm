@@ -83,7 +83,7 @@ cmd = ["echo", "hello from devsm"]
     let result = harness.run_client(&["run", "echo_test"]);
 
     assert!(result.success(), "Expected success, got: {}", result.stderr);
-    assert!(result.stderr.contains("Task exited (code 0)"), "Expected exit message, got: {}", result.stderr);
+    assert!(result.stdout.contains("hello from devsm"), "Expected task output, got: {}", result.stdout);
 }
 
 #[test]
@@ -100,8 +100,7 @@ sh = "exit 42"
 
     let result = harness.run_client(&["run", "fail_task"]);
 
-    assert!(result.success(), "Client should exit successfully even if task fails");
-    assert!(result.stderr.contains("Task exited (code 42)"), "Expected exit code 42 in stderr, got: {}", result.stderr);
+    assert_eq!(result.exit_code(), 42, "Client should forward task exit code, stderr: {}", result.stderr);
 }
 
 #[test]
@@ -126,7 +125,6 @@ combo = ["alpha", "beta"]
     assert!(result.success(), "bare group failed: {}", result.stderr);
     assert!(result.stdout.contains("alpha-run"), "missing alpha output: {}", result.stdout);
     assert!(result.stdout.contains("beta-run"), "missing beta output: {}", result.stdout);
-    assert!(result.stderr.contains("Task exited (code 0)"), "missing exit status: {}", result.stderr);
 
     let result = harness.run_client(&["run", "group.combo"]);
     assert!(result.success(), "explicit group failed: {}", result.stderr);
@@ -1371,6 +1369,34 @@ cli.forward-arguments = true
 }
 
 #[test]
+fn run_forwards_shell_task_arguments_as_positional_params() {
+    let mut harness = TestHarness::new("run_forward_sh_args");
+    let output_file = harness.temp_dir.join("forwarded.txt");
+    harness.write_config(&format!(
+        r#"
+[action.capture]
+sh = '''printf '%s\n' "$@" > {output}'''
+cli.forward-arguments = true
+"#,
+        output = output_file.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "capture", "-al", "/tmp/two words", "--color=auto", "semi;colon"]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+
+    let content = fs::read_to_string(&output_file).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["-al", "/tmp/two words", "--color=auto", "semi;colon"],
+        "forwarded shell args mismatch: {:?}",
+        lines
+    );
+}
+
+#[test]
 fn exec_forwards_task_arguments() {
     let harness = TestHarness::new("exec_forward_args");
     let output_file = harness.temp_dir.join("forwarded.txt");
@@ -1389,6 +1415,32 @@ cli.forward-arguments = true
     let content = fs::read_to_string(&output_file).unwrap_or_default();
     let lines: Vec<&str> = content.lines().collect();
     assert_eq!(lines, vec!["-al", "/tmp", "--color=auto"], "forwarded args mismatch: {:?}", lines);
+}
+
+#[test]
+fn exec_forwards_shell_task_arguments_as_positional_params() {
+    let harness = TestHarness::new("exec_forward_sh_args");
+    let output_file = harness.temp_dir.join("forwarded.txt");
+    harness.write_config(&format!(
+        r#"
+[action.capture]
+sh = '''printf '%s\n' "$@" > {output}'''
+cli.forward-arguments = true
+"#,
+        output = output_file.display()
+    ));
+
+    let result = harness.run_client(&["exec", "capture", "-al", "/tmp/two words", "--color=auto", "semi;colon"]);
+    assert!(result.success(), "Expected success, got stderr: {}", result.stderr);
+
+    let content = fs::read_to_string(&output_file).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["-al", "/tmp/two words", "--color=auto", "semi;colon"],
+        "forwarded shell args mismatch: {:?}",
+        lines
+    );
 }
 
 #[test]
@@ -3304,11 +3356,7 @@ cmd = ["echo", "hot reloaded"]
 
     let result = harness.run_client(&["run", "new_task"]);
     assert!(result.success(), "new_task should be found after config reload: {}", result.stderr);
-    assert!(
-        result.stderr.contains("Task exited (code 0)"),
-        "new_task should exit successfully, got: {}",
-        result.stderr
-    );
+    assert!(result.stdout.contains("hot reloaded"), "new_task should run updated task, got: {}", result.stdout);
 }
 
 // ============================================================================

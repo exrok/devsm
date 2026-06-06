@@ -30,7 +30,7 @@ use crate::{
 fn format_command(cmd: &Command) -> String {
     match cmd {
         Command::Cmd(args) => args.join(" "),
-        Command::Sh(script) => format!("sh -c '{}'", script.trim()),
+        Command::Sh { script, .. } => format!("sh -c '{}'", script.trim()),
     }
 }
 
@@ -837,7 +837,7 @@ fn update_test_statuses(
                         Command::Cmd(items) => {
                             writeln!(buf, "command: {}", items.join(" ")).ok();
                         }
-                        Command::Sh(script) => {
+                        Command::Sh { script, .. } => {
                             writeln!(buf, "sh: {}", script.trim()).ok();
                         }
                     }

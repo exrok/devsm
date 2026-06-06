@@ -469,7 +469,19 @@ fn job_age_secs(job: &Job) -> Option<u64> {
 
 fn render_command(cmd: &ConfigCommand<'_>) -> Box<str> {
     match cmd {
-        ConfigCommand::Sh(script) => format!("sh -c {script:?}").into(),
+        ConfigCommand::Sh { script, args } => {
+            let mut rendered = format!("sh -c {script:?}");
+            let parts = if args.is_empty() { &[][..] } else { &["devsm"][..] };
+            for arg in parts.iter().copied().chain(args.iter().copied()) {
+                rendered.push(' ');
+                if arg.contains(' ') || arg.is_empty() {
+                    rendered.push_str(&format!("{arg:?}"));
+                } else {
+                    rendered.push_str(arg);
+                }
+            }
+            rendered.into()
+        }
         ConfigCommand::Cmd(parts) => {
             let mut out = String::new();
             for (i, p) in parts.iter().enumerate() {

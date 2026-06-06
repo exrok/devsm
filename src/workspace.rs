@@ -4231,7 +4231,14 @@ impl Workspace {
                         let pwd = state.config.current.base_path().join(config.pwd).to_string_lossy().to_string();
                         let cmd = match &config.command {
                             Command::Cmd(args) => args.iter().map(|s| s.to_string()).collect(),
-                            Command::Sh(sh) => vec!["sh".to_string(), "-c".to_string(), sh.to_string()],
+                            Command::Sh { script, args } => {
+                                let mut cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+                                if !args.is_empty() {
+                                    cmd.push("devsm".to_string());
+                                    cmd.extend(args.iter().map(|s| s.to_string()));
+                                }
+                                cmd
+                            }
                         };
                         (pwd, cmd)
                     }

@@ -1260,8 +1260,8 @@ fn exec_task(job: &str, params: jsony_value::ValueMap, trailing_args: &[String])
 
     let path = workspace_config.base_path.join(tc.pwd);
 
-    let (mut command, sh_script) = match &tc.command {
-        config::Command::Sh(script) => (std::process::Command::new("/bin/sh"), Some(*script)),
+    let (mut command, sh_command) = match &tc.command {
+        config::Command::Sh { script, args } => (std::process::Command::new("/bin/sh"), Some((*script, *args))),
         config::Command::Cmd(cmd_args) => {
             if cmd_args.is_empty() {
                 bail!("Command must not be empty");
@@ -1277,8 +1277,11 @@ fn exec_task(job: &str, params: jsony_value::ValueMap, trailing_args: &[String])
 
     command.current_dir(path).envs(tc.envvar.iter().copied());
 
-    if let Some(script) = sh_script {
+    if let Some((script, args)) = sh_command {
         command.arg("-c").arg(script);
+        if !args.is_empty() {
+            command.arg("devsm").args(args);
+        }
     }
 
     let err = command.exec();

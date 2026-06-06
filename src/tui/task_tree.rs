@@ -724,7 +724,7 @@ impl TaskTreeState {
 
             let command = match &job.task().config().command {
                 Command::Cmd(args) => args.join(" "),
-                Command::Sh(script) => {
+                Command::Sh { script, .. } => {
                     let prefix = if script.len() > 50 { format!("{}...", &script[..50]) } else { script.to_string() };
                     format!("sh: {}", prefix)
                 }

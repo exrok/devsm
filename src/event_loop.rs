@@ -689,9 +689,12 @@ impl EventLoop {
         };
 
         let mut command = match &tc.command {
-            Command::Sh(script) => {
+            Command::Sh { script, args } => {
                 let mut cmd = std::process::Command::new("/bin/sh");
                 cmd.arg("-c").arg(*script);
+                if !args.is_empty() {
+                    cmd.arg("devsm").args(*args);
+                }
                 cmd
             }
             Command::Cmd(cmd_args) => {

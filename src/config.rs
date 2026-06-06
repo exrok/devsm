@@ -278,7 +278,7 @@ impl TaskConfigRc {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Command<'a> {
     Cmd(&'a [&'a str]),
-    Sh(&'a str),
+    Sh { script: &'a str, args: &'a [&'a str] },
 }
 
 #[derive(Clone, Debug)]
@@ -748,6 +748,12 @@ impl Environment<'_> {
             _ => append_value(&self.param[name], bump, target),
         }
     }
+
+    fn forwarded_args<'a>(&self, bump: &'a Bump) -> Result<&'a [&'a str], EvalError> {
+        let mut result = bumpalo::collections::Vec::new_in(bump);
+        self.var_append("args", bump, &mut result)?;
+        Ok(result.into_bump_slice())
+    }
 }
 
 #[derive(Debug)]
@@ -778,7 +784,7 @@ impl<'a> BumpEval<'a> for CommandExpr<'static> {
     fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<Command<'a>, EvalError> {
         Ok(match self {
             CommandExpr::Cmd(cmd_expr) => Command::Cmd(cmd_expr.bump_eval(env, bump)?),
-            CommandExpr::Sh(sh_expr) => Command::Sh(sh_expr.bump_eval(env, bump)?),
+            CommandExpr::Sh(sh_expr) => Command::Sh { script: sh_expr.bump_eval(env, bump)?, args: &[] },
         })
     }
 }
@@ -786,9 +792,18 @@ impl<'a> BumpEval<'a> for CommandExpr<'static> {
 impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
     type Object = TaskConfig<'a>;
     fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<TaskConfig<'a>, EvalError> {
+        let command = match &self.command {
+            CommandExpr::Cmd(cmd_expr) => Command::Cmd(cmd_expr.bump_eval(env, bump)?),
+            CommandExpr::Sh(sh_expr) => {
+                let script = sh_expr.bump_eval(env, bump)?;
+                let args = if self.cli.forward_arguments { env.forwarded_args(bump)? } else { &[] };
+                Command::Sh { script, args }
+            }
+        };
+
         Ok(TaskConfig {
             pwd: self.pwd.bump_eval(env, bump)?,
-            command: self.command.bump_eval(env, bump)?,
+            command,
             require: self.require,
             cache: self.cache.clone(),
             ready: self.ready.clone(),
