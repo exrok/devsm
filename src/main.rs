@@ -127,16 +127,25 @@ fn main() {
             }
         }
         cli::Command::Run { job, value_map, trailing_args, as_test, derive_cache_key } => {
-            let _log_guard = self_log::init_client_logging();
-            if let Err(err) = run_client(job, value_map, trailing_args, as_test, derive_cache_key) {
-                eprintln!("error: {}", err);
-                std::process::exit(1);
+            let log_guard = self_log::init_client_logging();
+            match run_client(job, value_map, trailing_args, as_test, derive_cache_key) {
+                Ok(code) => {
+                    drop(log_guard);
+                    std::process::exit(code);
+                }
+                Err(err) => {
+                    eprintln!("error: {}", err);
+                    std::process::exit(1);
+                }
             }
         }
         cli::Command::Auto { job, value_map, trailing_args } => {
-            if let Err(err) = auto_task_command(job, value_map, trailing_args) {
-                eprintln!("error: {}", err);
-                std::process::exit(1);
+            match auto_task_command(job, value_map, trailing_args) {
+                Ok(code) => std::process::exit(code),
+                Err(err) => {
+                    eprintln!("error: {}", err);
+                    std::process::exit(1);
+                }
             }
         }
         cli::Command::Stop { job } => {
@@ -924,7 +933,7 @@ fn run_client(
     trailing_args: &[String],
     mut as_test: bool,
     mut derive_cache_key: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i32> {
     reset_terminal_to_canonical();
 
     let cwd = std::env::current_dir()?;
@@ -1037,20 +1046,17 @@ fn run_client(
                                     } else {
                                         eprintln!("Task terminated");
                                     }
-                                } else if let Some(status) = exit_status {
-                                    eprintln!("Task exited (code {})", status);
                                 }
                                 if derive_cache_key {
                                     apply_trace_report(&bare_task_name, &config, trace_report.take(), exit_status);
                                 }
-                                return Ok(());
+                                return Ok(if group.is_none() { exit_status.unwrap_or(0) } else { 0 });
                             }
                             RpcMessageKind::JobStatus => {
                                 if let Ok(event) = jsony::from_binary::<JobStatusEvent>(payload) {
                                     match event.status {
                                         JobStatusKind::Restarting => eprintln!("Terminating previous run..."),
                                         JobStatusKind::Waiting => eprintln!("Waiting for dependencies..."),
-                                        JobStatusKind::Running => eprintln!("Task started"),
                                         _ => {}
                                     }
                                 }
@@ -1083,10 +1089,10 @@ fn run_client(
         }
     }
 
-    Ok(())
+    Ok(if group.is_none() { exit_status.unwrap_or(0) } else { 0 })
 }
 
-fn auto_task_command(job: &str, params: jsony_value::ValueMap, trailing_args: &[String]) -> anyhow::Result<()> {
+fn auto_task_command(job: &str, params: jsony_value::ValueMap, trailing_args: &[String]) -> anyhow::Result<i32> {
     let workspace_config = config::load_from_env()?;
     let (name, _) = job.rsplit_once(':').unwrap_or((job, ""));
 
@@ -1095,7 +1101,7 @@ fn auto_task_command(job: &str, params: jsony_value::ValueMap, trailing_args: &[
         && let Some((_, expr)) = resolve_name_in_config(&workspace_config, name)
         && expr.managed == Some(false)
     {
-        return exec_task(job, params, trailing_args);
+        return exec_task(job, params, trailing_args).map(|()| 0);
     }
 
     run_client(job, params, trailing_args, false, false)
