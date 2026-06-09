@@ -2,14 +2,14 @@
 //!
 //! Fuzzy-searchable list of user-invocable commands. Opens via
 //! `Command::OpenCommandPalette`, runs the selected command on confirm, closes
-//! on cancel. Rendered into a dedicated secondary DoubleBuffer sized exactly
+//! on cancel. Rendered into a dedicated secondary Buffer sized exactly
 //! to the palette box so keystroke updates diff just the box area. The log
 //! view treats the box as a `skip_rect` cutout: it clears the cells outside
 //! the box on each full reset but never writes to the cells inside, so the
 //! overlay owns them.
 
 use extui::{
-    AnsiColor, DoubleBuffer, Rect, Style,
+    AnsiColor, Buffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
 use unicode_width::UnicodeWidthStr;
@@ -119,11 +119,11 @@ impl CommandPaletteState {
         PaletteAction::None
     }
 
-    /// Renders the palette into its dedicated DoubleBuffer. `rect` is the
+    /// Renders the palette into its dedicated Buffer. `rect` is the
     /// palette box itself (in buffer-local coordinates) — the overlay buffer
     /// is sized exactly to this rect, so cells outside it don't exist in the
     /// overlay and the log view owns them.
-    pub fn render(&mut self, out: &mut DoubleBuffer, rect: Rect) {
+    pub fn render(&mut self, out: &mut Buffer, rect: Rect) {
         if rect.is_empty() {
             return;
         }
@@ -198,7 +198,7 @@ impl CommandPaletteState {
     }
 }
 
-fn draw_border(out: &mut DoubleBuffer, rect: Rect, style: extui::Style, title: &str) {
+fn draw_border(out: &mut Buffer, rect: Rect, style: extui::Style, title: &str) {
     if rect.w < 2 || rect.h < 2 {
         return;
     }

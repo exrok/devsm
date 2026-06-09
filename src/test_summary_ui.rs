@@ -13,7 +13,7 @@ use std::{
 };
 
 use extui::{
-    AnsiColor, DoubleBuffer, Rect, Rgb, Style, TerminalFlags, splat, vt,
+    AnsiColor, Buffer, Rect, Rgb, Style, TerminalFlags, splat, vt,
     vt::{BufferWrite, Modifier, MoveCursorUp},
 };
 
@@ -172,7 +172,7 @@ fn run_tui_mode(
     let mut tui_state = init_tui_state(&test_run, workspace, width, height);
 
     let mut encoder = Encoder::new();
-    let mut db = DoubleBuffer::new(width, 1);
+    let mut db = Buffer::new(width, 1);
     let mut prev_inline_height: u16 = 0;
 
     prev_inline_height = paint_frame(&mut db, &mut terminal, &tui_state, prev_inline_height, false)?;
@@ -435,7 +435,7 @@ fn compute_layout(state: &TuiState, budget: Option<u16>) -> Layout {
 
 /// Erases the previously painted inline region after a terminal resize.
 ///
-/// `extui::DoubleBuffer::render_inline` assumes the cursor is one row below a
+/// `extui::Buffer::render_inline` assumes the cursor is one row below a
 /// region with exactly `prev_height` terminal rows. A width shrink causes the
 /// terminal to re-wrap previously emitted rows, which inflates the actual
 /// footprint and breaks that assumption. Move up by the worst-case wrapped
@@ -464,7 +464,7 @@ fn cleanup_inline_region(
 }
 
 fn paint_frame(
-    db: &mut DoubleBuffer,
+    db: &mut Buffer,
     terminal: &mut extui::Terminal,
     state: &TuiState,
     prev_inline_height: u16,
@@ -495,13 +495,13 @@ fn paint_frame(
     db.render_inline(terminal, prev_inline_height)
 }
 
-fn row_rect(db: &DoubleBuffer, row: u16) -> Rect {
+fn row_rect(db: &Buffer, row: u16) -> Rect {
     Rect { x: 0, y: row, w: db.width(), h: 1 }
 }
 
 const HEADER_BG: AnsiColor = AnsiColor::Grey[3];
 
-fn render_test_header(rect: Rect, db: &mut DoubleBuffer, test: &TestDisplay) {
+fn render_test_header(rect: Rect, db: &mut Buffer, test: &TestDisplay) {
     let badge_style = status_color(test.status).with_fg(AnsiColor::Black);
     let status_str = match test.status {
         TestJobStatus::Pending => "WAIT",
@@ -535,7 +535,7 @@ fn render_test_header(rect: Rect, db: &mut DoubleBuffer, test: &TestDisplay) {
     r.with(grey).fmt(db, format_args!(" $ {}", test.command));
 }
 
-fn render_log_line(rect: Rect, db: &mut DoubleBuffer, line: &str) {
+fn render_log_line(rect: Rect, db: &mut Buffer, line: &str) {
     let bytes = line.as_bytes();
     let mut r = rect.display().skip(4);
     let mut style = Style::DEFAULT;
@@ -631,7 +631,7 @@ fn apply_sgr(mut style: Style, params: &str) -> Style {
     style
 }
 
-fn render_status_line(rect: Rect, db: &mut DoubleBuffer, state: &TuiState) {
+fn render_status_line(rect: Rect, db: &mut Buffer, state: &TuiState) {
     let counts = status_counts(state);
     let total = state.tests.len();
     let done = counts.passed + counts.cached + counts.failed;

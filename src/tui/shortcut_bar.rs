@@ -1,4 +1,4 @@
-use extui::{AnsiColor, DoubleBuffer, Rect};
+use extui::{AnsiColor, Buffer, Rect};
 
 use crate::keybinds::{BindingEntry, Command, Keybinds, Mode};
 use crate::tui::task_tree::{MetaGroupKind, SelectionState};
@@ -14,7 +14,7 @@ impl ShortcutEntry {
     }
 }
 
-pub fn render_shortcut_bar(frame: &mut DoubleBuffer, rect: Rect, entries: &[ShortcutEntry]) {
+pub fn render_shortcut_bar(frame: &mut Buffer, rect: Rect, entries: &[ShortcutEntry]) {
     let bar_bg = AnsiColor::Grey[3].with_fg(AnsiColor::Grey[3]);
     let key_style = AnsiColor::Grey[3].with_fg(AnsiColor::Grey[15]);
     let label_style = AnsiColor::Grey[3].with_fg(AnsiColor::Grey[11]);

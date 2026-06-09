@@ -4,7 +4,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 use extui::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use extui::{AnsiColor, DoubleBuffer, HAlign, Rect, Style, TerminalFlags, vt};
+use extui::{AnsiColor, Buffer, HAlign, Rect, Style, TerminalFlags, vt};
 
 use crate::db::Db;
 use crate::searcher::{Entry, FatSearch};
@@ -57,7 +57,7 @@ pub fn run(stdin: File, stdout: File) -> anyhow::Result<Selection> {
     let mut selected: usize = 0;
     let mut scroll_offset: usize = 0;
     let mut needs_query = true;
-    let mut frame = DoubleBuffer::new(w, h);
+    let mut frame = Buffer::new(w, h);
     let mut events = extui::event::Events::default();
 
     loop {
@@ -70,7 +70,7 @@ pub fn run(stdin: File, stdout: File) -> anyhow::Result<Selection> {
 
         let (new_w, new_h) = terminal.size()?;
         if new_w != frame.width() || new_h != frame.height() {
-            frame = DoubleBuffer::new(new_w, new_h);
+            frame = Buffer::new(new_w, new_h);
         }
 
         render(&mut frame, &pattern, cursor, &results, selected, scroll_offset, &items);
@@ -98,7 +98,7 @@ pub fn run(stdin: File, stdout: File) -> anyhow::Result<Selection> {
                 Event::Resized => {
                     let (rw, rh) = terminal.size()?;
                     if rw != frame.width() || rh != frame.height() {
-                        frame = DoubleBuffer::new(rw, rh);
+                        frame = Buffer::new(rw, rh);
                     }
                 }
                 _ => {}
@@ -181,7 +181,7 @@ fn process_key(
 }
 
 fn render(
-    frame: &mut DoubleBuffer,
+    frame: &mut Buffer,
     pattern: &str,
     cursor: usize,
     results: &[Entry],

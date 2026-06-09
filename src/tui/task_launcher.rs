@@ -5,7 +5,7 @@
 //! autocomplete at each stage.
 
 use extui::{
-    AnsiColor, DoubleBuffer, Rect, Style,
+    AnsiColor, Buffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
 use jsony_value::ValueMap;
@@ -450,7 +450,7 @@ impl TaskLauncherState {
     }
 
     /// Renders the launcher overlay.
-    pub fn render(&mut self, out: &mut DoubleBuffer, mut rect: Rect) {
+    pub fn render(&mut self, out: &mut Buffer, mut rect: Rect) {
         let input_rect = rect.take_top(1);
 
         let prefix = self.build_display_prefix();

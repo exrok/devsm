@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use extui::event::KeyEvent;
-use extui::{AnsiColor, DoubleBuffer, Rect, Style};
+use extui::{AnsiColor, Buffer, Rect, Style};
 
 use crate::keybinds::{Command, InputEvent, Keybinds, Mode};
 use crate::line_width::{Segment, apply_raw_display_mode_vt_to_style};
@@ -110,7 +110,7 @@ impl ConfigErrorState {
         ConfigErrorAction::None
     }
 
-    pub fn render(&mut self, out: &mut DoubleBuffer, mut rect: Rect) {
+    pub fn render(&mut self, out: &mut Buffer, mut rect: Rect) {
         let header_style = AnsiColor::Red1.with_fg(AnsiColor::White);
         let mut header_rect = rect.take_top(1);
         header_rect.with(header_style).fill(out);
@@ -159,7 +159,7 @@ impl ConfigErrorState {
     }
 }
 
-fn render_ansi_line(rect: Rect, out: &mut DoubleBuffer, text: &str) {
+fn render_ansi_line(rect: Rect, out: &mut Buffer, text: &str) {
     use extui::DisplayRect;
 
     let mut current_style = Style::DEFAULT;

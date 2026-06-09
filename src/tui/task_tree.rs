@@ -1,4 +1,4 @@
-use extui::{AnsiColor, DoubleBuffer, HAlign, Rect};
+use extui::{AnsiColor, Buffer, HAlign, Rect};
 
 use crate::{
     config::{Command, ServiceHidden, TaskKind},
@@ -562,7 +562,7 @@ impl TaskTreeState {
         StatusKind::of(&ws[ji].process_status, task_kind)
     }
 
-    pub fn render_primary(&mut self, out: &mut DoubleBuffer, mut rect: Rect, ws: &WorkspaceState) {
+    pub fn render_primary(&mut self, out: &mut Buffer, mut rect: Rect, ws: &WorkspaceState) {
         let sel = match self.selection_state(ws) {
             Some(sel) => sel,
             None => return,
@@ -689,7 +689,7 @@ impl TaskTreeState {
         }
     }
 
-    pub fn render_secondary(&mut self, out: &mut DoubleBuffer, mut rect: Rect, ws: &WorkspaceState) {
+    pub fn render_secondary(&mut self, out: &mut Buffer, mut rect: Rect, ws: &WorkspaceState) {
         let now = crate::clock::now();
         let sel = match self.selection_state(ws) {
             Some(sel) => sel,

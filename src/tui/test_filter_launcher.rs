@@ -4,7 +4,7 @@
 //! in the format `name +tag -tag` with context-aware autocomplete.
 
 use extui::{
-    AnsiColor, DoubleBuffer, Rect, Style,
+    AnsiColor, Buffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
 use unicode_width::UnicodeWidthStr;
@@ -306,7 +306,7 @@ impl TestFilterLauncherState {
         TestFilterAction::Start { filters: std::mem::take(&mut self.filters) }
     }
 
-    pub fn render(&mut self, out: &mut DoubleBuffer, mut rect: Rect) {
+    pub fn render(&mut self, out: &mut Buffer, mut rect: Rect) {
         let input_rect = rect.take_top(1);
 
         let prefix = self.build_display_prefix();

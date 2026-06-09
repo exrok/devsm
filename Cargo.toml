@@ -17,11 +17,11 @@ mio = { version = "1.0.4", features = [
 slab = "0.4.11"
 unicode-segmentation = "1.12.0"
 unicode-width = { version = "0.2.2", default-features = false }
-jsony = "0.1.9"
+jsony = "0.1.10"
 bumpalo = { version = "3.19.0", features = ["collections"] }
 memchr = "2.7.6"
 sendfd = "0.4.4"
-jsony_value = "0.0.1"
+jsony_value = "0.1.0"
 toml-spanner.rev = "95f04e879babef0b66fc445a45f215a46d69565a"
 toml-spanner.git = "https://github.com/exrok/toml-spanner"
 toml-spanner.default-features = false
@@ -34,7 +34,7 @@ annotate-snippets = "0.12.10"
 blake3 = { version = "1.8.3" }
 fast-glob = "1.0.0"
 # Use git dependency until version 0.2 is released.
-extui = { git = "https://github.com/exrok/extui", rev = "dddbec91f758dace16d21b630427530237567619" }
+extui = { git = "https://github.com/exrok/extui", rev = "3cffdf2409f4c97e59300527b69d2b2f9686ffc1" }
 mimalloc = { version = "0.1.48", optional = true }
 smallvec = "1.15.1"
 
@@ -44,18 +44,12 @@ syscalls = { version = "0.8.1", default-features = false, features = [
     "all",
 ] }
 
-
-[patch.crates-io]
-jsony = { git = "https://github.com/exrok/jsony", rev = "ef19c394b7d932719dff1d11475f0066bff5f0ad" }
-jsony_value = { git = "https://github.com/exrok/jsony", rev = "ef19c394b7d932719dff1d11475f0066bff5f0ad" }
-
 [dev-dependencies]
 vt100 = "*"
 
 [profile.profile]
 inherits = "release"
 debug = 1
-
 
 [features]
 fuzz = []

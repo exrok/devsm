@@ -1,5 +1,5 @@
 use extui::{
-    AnsiColor, DoubleBuffer, Rect, Style,
+    AnsiColor, Buffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
 use unicode_width::UnicodeWidthStr;
@@ -120,19 +120,19 @@ impl SelectSearch {
     }
     pub fn render<Id: PackU64>(
         &mut self,
-        out: &mut DoubleBuffer,
+        out: &mut Buffer,
         rect: Rect,
         label: &str,
-        render: impl Fn(&mut extui::DoubleBuffer, Rect, Id, bool),
+        render: impl Fn(&mut extui::Buffer, Rect, Id, bool),
     ) {
         self.render_internal(out, rect, label, &move |out, r, id, sel| render(out, r, Id::unpack_u64(id), sel));
     }
     fn render_internal(
         &mut self,
-        out: &mut DoubleBuffer,
+        out: &mut Buffer,
         mut rect: Rect,
         label: &str,
-        func: &dyn Fn(&mut extui::DoubleBuffer, Rect, u64, bool),
+        func: &dyn Fn(&mut extui::Buffer, Rect, u64, bool),
     ) {
         // todo need to scroll text but is probably better to put this in a separate input boxk
         let input_rect = rect.take_top(1);

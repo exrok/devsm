@@ -1,5 +1,5 @@
 use extui::{
-    AnsiColor, DoubleBuffer, Rect, Style,
+    AnsiColor, Buffer, Rect, Style,
     event::{KeyCode, KeyEvent},
 };
 use unicode_width::UnicodeWidthStr;
@@ -308,7 +308,7 @@ impl LogSearchState {
     }
 
     /// Renders the search UI.
-    pub fn render(&mut self, out: &mut DoubleBuffer, mut rect: Rect, logs: &Logs) {
+    pub fn render(&mut self, out: &mut Buffer, mut rect: Rect, logs: &Logs) {
         self.flush();
 
         let input_rect = rect.take_top(1);
@@ -382,7 +382,7 @@ fn filter_contains(filter: &LogFilter, entry: &LogEntry) -> bool {
 /// For non-selected entries, ANSI colors are preserved.
 fn render_raw_to_buffer_with_highlight(
     rect: Rect,
-    out: &mut DoubleBuffer,
+    out: &mut Buffer,
     text: &str,
     base_style: Style,
     highlight_style: Style,

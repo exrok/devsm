@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use extui::event::{Event, KeyEvent};
 use extui::vt::BufferWrite;
-use extui::{AnsiColor, DoubleBuffer, HAlign, Rect, Style, TerminalFlags, vt};
+use extui::{AnsiColor, Buffer, HAlign, Rect, Style, TerminalFlags, vt};
 use jsony_value::ValueMap;
 
 use crate::config::TaskKind;
@@ -179,7 +179,7 @@ enum DragKind {
 }
 
 struct TuiState {
-    frame: DoubleBuffer,
+    frame: Buffer,
     frame_width: u16,
     frame_height: u16,
 
@@ -194,11 +194,11 @@ struct TuiState {
     menu_height_override: Option<u16>,
     drag: Option<DragKind>,
 
-    /// Dedicated secondary DoubleBuffer for log overlays like the command
+    /// Dedicated secondary Buffer for log overlays like the command
     /// palette. Sized to just the overlay rect so its cell diff is cheap.
     /// Lives in `TuiState` (not per-overlay) so its back buffer survives
     /// across re-renders, giving efficient keystroke updates.
-    log_overlay: Option<DoubleBuffer>,
+    log_overlay: Option<Buffer>,
     /// Rect that the cached `log_overlay` was last sized to. Comparing against
     /// the new rect tells us when to reset the buffer instead of diffing.
     log_overlay_last_rect: Option<Rect>,
@@ -391,7 +391,7 @@ fn render<'a>(
     if let Some(band_rect) = log_overlay_rect {
         let geometry_changed = tui.log_overlay_last_rect != Some(band_rect);
         if geometry_changed || tui.log_overlay.is_none() {
-            let mut buffer = DoubleBuffer::new(band_rect.w, band_rect.h);
+            let mut buffer = Buffer::new(band_rect.w, band_rect.h);
             buffer.x_offset = band_rect.x;
             buffer.y_offset = band_rect.y;
             buffer.bounded = true;
@@ -447,7 +447,7 @@ struct StatusBarData {
     chain_label: Option<String>,
 }
 
-fn render_status_bar(frame: &mut DoubleBuffer, rect: Rect, data: &StatusBarData) {
+fn render_status_bar(frame: &mut Buffer, rect: Rect, data: &StatusBarData) {
     rect.with(AnsiColor::Grey[4].with_fg(AnsiColor::Grey[4])).fill(frame);
 
     let mode_text = format_args!(" {} ", data.mode_name);
@@ -618,7 +618,7 @@ enum ProcessKeyResult {
 }
 
 fn render_help_menu(
-    frame: &mut DoubleBuffer,
+    frame: &mut Buffer,
     mut rect: Rect,
     keybinds: &Keybinds,
     help: &mut HelpMenu,
@@ -1644,7 +1644,7 @@ pub fn run(
 
     let mut previous = 0;
     let mut tui = TuiState {
-        frame: DoubleBuffer::new(w, initial_frame_height),
+        frame: Buffer::new(w, initial_frame_height),
         frame_width: w,
         frame_height: initial_frame_height,
         logs: LogStack::default(),
@@ -1923,7 +1923,7 @@ mod test {
     fn test_tui_state(width: u16, height: u16) -> TuiState {
         let frame_height = compute_menu_height(height) + 1;
         TuiState {
-            frame: DoubleBuffer::new(width, frame_height),
+            frame: Buffer::new(width, frame_height),
             frame_width: width,
             frame_height,
             logs: LogStack::default(),
