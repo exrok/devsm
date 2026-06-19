@@ -11,21 +11,143 @@ use crate::{
 };
 pub use job_index_list::JobIndexList;
 pub use job_store::{JobIndex, JobStore};
-pub use require_graph::{RequireAnalysis, TaskInput};
+pub use require_graph::{ProfileTaskInput, RequireAnalysis, TaskInput};
 pub use resource::{ResourceIndex, ResourceSlab};
 
-fn task_inputs<'a>(base_tasks: &'a [BaseTask]) -> Vec<TaskInput<'a>> {
-    base_tasks
-        .iter()
-        .map(|bt| TaskInput { name: bt.name.as_ref(), kind: bt.config.kind, require: bt.config.require })
-        .collect()
+const OTHER_REQUIRE_PROFILE: &str = "\0devsm-other-profile";
+
+fn analysis_profiles_for(config: &TaskConfigSource) -> Vec<String> {
+    let mut profiles: Vec<String> = if config.profiles.is_empty() {
+        vec![String::new()]
+    } else {
+        config.profiles.iter().map(|p| (*p).to_string()).collect()
+    };
+    let expr = crate::config::RequirementListExpr { items: config.require };
+    expr.visit_profile_predicates(&mut |profile| {
+        if !profiles.iter().any(|p| p == profile) {
+            profiles.push(profile.to_string());
+        }
+    });
+    profiles.push(OTHER_REQUIRE_PROFILE.to_string());
+    profiles
+}
+
+fn profiled_task_name(base_name: &str, profile: &str, fallback: bool) -> String {
+    if fallback {
+        format!("{base_name}:<other>")
+    } else if profile.is_empty() {
+        base_name.to_string()
+    } else {
+        format!("{base_name}:{profile}")
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct VariantLookupKey {
+    base: BaseTaskIndex,
+    profile: Box<str>,
+}
+
+struct ProfileVariantMeta {
+    base_task: BaseTaskIndex,
+    kind: TaskKind,
+    fallback: bool,
+}
+
+struct ProfiledRequireLookup<'a> {
+    name_map: &'a hashbrown::HashMap<Box<str>, NameEntry>,
+    default_profiles: &'a [String],
+    variant_map: &'a hashbrown::HashMap<VariantLookupKey, usize>,
+    fallback_map: &'a hashbrown::HashMap<BaseTaskIndex, usize>,
+}
+
+impl ProfiledRequireLookup<'_> {
+    fn lookup_base(&self, name: &str) -> Option<BaseTaskIndex> {
+        let (kind_filter, short) = match name.split_once('.') {
+            Some(("service", rest)) => (Some(TaskKind::Service), rest),
+            Some(("action", rest)) => (Some(TaskKind::Action), rest),
+            Some(("test", rest)) => (Some(TaskKind::Test), rest),
+            Some(("group", _)) => return None,
+            _ => (None, name),
+        };
+        let entry = self.name_map.get(short)?;
+        match kind_filter {
+            Some(TaskKind::Service) => match entry.task {
+                TaskEntry::Service(i) => Some(i),
+                _ => None,
+            },
+            Some(TaskKind::Action) => match entry.task {
+                TaskEntry::Action(i) => Some(i),
+                _ => None,
+            },
+            Some(TaskKind::Test) => entry.test,
+            None => entry.task.index().or(entry.test),
+        }
+    }
+}
+
+impl require_graph::NameLookup for ProfiledRequireLookup<'_> {
+    fn lookup(&self, name: &str, profile: Option<&str>) -> Option<usize> {
+        let base = self.lookup_base(name)?;
+        let requested_profile = profile.unwrap_or_else(|| self.default_profiles[base.idx()].as_str());
+        let key = VariantLookupKey { base, profile: requested_profile.into() };
+        self.variant_map.get(&key).copied().or_else(|| self.fallback_map.get(&base).copied())
+    }
 }
 
 fn build_require_analysis(
     base_tasks: &[BaseTask],
     name_map: &hashbrown::HashMap<Box<str>, NameEntry>,
 ) -> RequireAnalysis {
-    RequireAnalysis::build(&task_inputs(base_tasks), name_map)
+    let default_profiles: Vec<String> =
+        base_tasks.iter().map(|bt| bt.config.profiles.first().copied().unwrap_or("").to_string()).collect();
+    let mut requirement_storage: Vec<Vec<crate::config::Requirement<'_>>> = Vec::new();
+    let mut profile_storage: Vec<String> = Vec::new();
+    let mut name_storage: Vec<String> = Vec::new();
+    let mut meta: Vec<ProfileVariantMeta> = Vec::new();
+    let mut variant_map: hashbrown::HashMap<VariantLookupKey, usize> = hashbrown::HashMap::new();
+    let mut fallback_map: hashbrown::HashMap<BaseTaskIndex, usize> = hashbrown::HashMap::new();
+
+    for (idx, bt) in base_tasks.iter().enumerate() {
+        let base_task = BaseTaskIndex::new_or_panic(idx);
+        for profile in analysis_profiles_for(&bt.config) {
+            let fallback = profile == OTHER_REQUIRE_PROFILE;
+            let eval_profile = if fallback { OTHER_REQUIRE_PROFILE } else { profile.as_str() };
+            let mut requirements = Vec::new();
+            crate::config::RequirementListExpr { items: bt.config.require }
+                .eval_for_profile_append(eval_profile, &mut requirements);
+            let input_idx = meta.len();
+            if fallback {
+                fallback_map.insert(base_task, input_idx);
+            } else {
+                variant_map.insert(VariantLookupKey { base: base_task, profile: profile.clone().into() }, input_idx);
+            }
+            requirement_storage.push(requirements);
+            profile_storage.push(profile.clone());
+            name_storage.push(profiled_task_name(bt.name.as_ref(), &profile, fallback));
+            meta.push(ProfileVariantMeta { base_task, kind: bt.config.kind, fallback });
+        }
+    }
+
+    let inputs: Vec<ProfileTaskInput<'_>> = meta
+        .iter()
+        .enumerate()
+        .map(|(idx, meta)| ProfileTaskInput {
+            base_task: meta.base_task,
+            profile: profile_storage[idx].as_str(),
+            fallback: meta.fallback,
+            name: name_storage[idx].as_str(),
+            kind: meta.kind,
+            require: requirement_storage[idx].as_slice(),
+        })
+        .collect();
+    let lookup = ProfiledRequireLookup {
+        name_map,
+        default_profiles: &default_profiles,
+        variant_map: &variant_map,
+        fallback_map: &fallback_map,
+    };
+    RequireAnalysis::build_profiled(&inputs, &lookup)
 }
 use jsony_value::{Value, ValueMap, ValueNumber, ValueRef};
 use smallvec::SmallVec;
@@ -1487,7 +1609,14 @@ impl WorkspaceState {
         self.config.update_base_tasks(&mut self.base_tasks, &mut self.name_map);
         self.spawn_specs.clear();
         self.require_analysis = build_require_analysis(&self.base_tasks, &self.name_map);
-        let inputs = task_inputs(&self.base_tasks);
+        let empty_requirements: Vec<Vec<crate::config::Requirement<'_>>> =
+            self.base_tasks.iter().map(|_| Vec::new()).collect();
+        let inputs: Vec<TaskInput<'_>> = self
+            .base_tasks
+            .iter()
+            .zip(empty_requirements.iter())
+            .map(|(bt, require)| TaskInput { name: bt.name.as_ref(), kind: bt.config.kind, require })
+            .collect();
         for (name, err) in self.require_analysis.iter_problems(&inputs) {
             kvlog::warn!("require graph problem", task = name, error = err);
         }
@@ -1784,8 +1913,8 @@ impl WorkspaceState {
     /// O(1) lookup of the precomputed cycle/deadlock result for `root`.
     /// Runs before any job is created so a problematic spawn fails up-front
     /// instead of leaving jobs stuck in `Scheduled` forever.
-    pub fn detect_require_problems(&self, root: BaseTaskIndex) -> Result<(), String> {
-        self.require_analysis.problem(root)
+    pub fn detect_require_problems(&self, root: BaseTaskIndex, profile: &str) -> Result<(), String> {
+        self.require_analysis.problem_for_profile(root, profile)
     }
 
     /// Spawn a single task (self-contained): build a plan, then apply it. A
@@ -1876,13 +2005,12 @@ impl WorkspaceState {
         extra_requirements: Vec<PlannedReq>,
         protected_conflict_jobs: Vec<JobRef>,
     ) -> Result<JobRef, String> {
-        self.detect_require_problems(base_task)?;
-
         let profile = {
             let bt = &self.base_tasks[base_task.idx()];
             if profile.is_empty() { bt.config.profiles.first().copied().unwrap_or("") } else { profile }
         }
         .to_string();
+        self.detect_require_problems(base_task, &profile)?;
         let params = params.to_owned();
 
         // Reuse a compatible scheduled/starting service (live or planned this
@@ -2042,11 +2170,14 @@ impl WorkspaceState {
         profile: &str,
         blocked_by: Vec<JobRef>,
     ) -> Result<JobRef, String> {
-        self.detect_require_problems(base_task)?;
+        let eval_profile = if profile.is_empty() {
+            self.base_tasks[base_task.idx()].config.profiles.first().copied().unwrap_or("")
+        } else {
+            profile
+        };
+        self.detect_require_problems(base_task, eval_profile)?;
         let task = {
             let spawner = &self.base_tasks[base_task.idx()];
-            let eval_profile =
-                if profile.is_empty() { spawner.config.profiles.first().copied().unwrap_or("") } else { profile };
             let env = Environment { profile: eval_profile, param: params.clone(), vars: spawner.config.vars };
             spawner.config.eval(&env).map_err(|e| format!("Failed to evaluate queued service config: {:?}", e))?
         };
@@ -3683,7 +3814,7 @@ impl WorkspaceState {
         }
 
         for matched in &matched_tests {
-            self.detect_require_problems(matched.base_task_idx)?;
+            self.detect_require_problems(matched.base_task_idx, &matched.spawn_profile)?;
         }
 
         let mut batch: SpawnBatch<TestRequirements> = SpawnBatch::new();
@@ -3918,7 +4049,8 @@ impl Workspace {
             let Some(base_index) = state.base_index_by_name(&entry.task.name) else {
                 return Err(format!("Task '{}' not found", entry.task.name));
             };
-            state.detect_require_problems(base_index)?;
+            let profile = state.effective_profile_for_task(base_index, &entry.task.profile);
+            state.detect_require_problems(base_index, &profile)?;
         }
 
         let mut sched = SchedulePlan::default();
@@ -4341,10 +4473,10 @@ impl Workspace {
                 let Some(base_index) = state.lookup_name(name) else {
                     return Err(format!("Task '{}' not found", name));
                 };
-                state.detect_require_problems(base_index)?;
                 let bt = &state.base_tasks[base_index.idx()];
                 let profile =
                     if profile.is_empty() { bt.config.profiles.first().copied().unwrap_or("") } else { profile };
+                state.detect_require_problems(base_index, profile)?;
                 let Some(cache_config) = &bt.config.cache else {
                     drop(state);
                     let state = &mut *self.state.write().unwrap();
@@ -4471,8 +4603,8 @@ impl Workspace {
             let Some(base_index) = state.lookup_name(name) else {
                 return Err(format!("Task '{}' not found", name));
             };
-            state.detect_require_problems(base_index)?;
             let profile = state.effective_profile_for_task(base_index, profile);
+            state.detect_require_problems(base_index, &profile)?;
             let active_params = params.clone().to_owned();
             if state.active_matching_job(base_index, &profile, &active_params).is_some() {
                 return Ok(None);

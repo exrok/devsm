@@ -305,6 +305,46 @@ dev = ["a", "b"]
     assert!(result.success(), "stop group failed: {}", result.stderr);
 }
 
+#[test]
+fn status_for_job_shows_evaluated_profile_requirements() {
+    let mut harness = TestHarness::new("status_profile_requirements");
+    harness.write_config(
+        r#"
+[action.setup]
+cmd = ["true"]
+
+[action.live_dep]
+cmd = ["true"]
+
+[action.backend]
+profiles = ["default", "live"]
+cmd = ["true"]
+require = [
+  "setup",
+  { if.profile = "live", then = "live_dep" },
+]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "backend"]);
+    assert!(result.success(), "default backend run failed: {}", result.stderr);
+
+    let result = harness.run_client(&["status", "backend"]);
+    assert!(result.success(), "status failed: {}", result.stderr);
+    assert!(
+        result.stdout.contains("task setup"),
+        "status should include evaluated setup requirement:\n{}",
+        result.stdout
+    );
+    assert!(
+        !result.stdout.contains("live_dep"),
+        "status must not include requirements from non-selected profile branches:\n{}",
+        result.stdout
+    );
+}
+
 fn fake_status(name: &str, kind: &str, state: &str, job_id: Option<u32>) -> RunnableStatus {
     RunnableStatus {
         name: name.into(),
@@ -1483,6 +1523,70 @@ require = ["dep:release"]
     let content = fs::read_to_string(&output_file).unwrap_or_default();
     let lines: Vec<&str> = content.lines().collect();
     assert_eq!(lines, vec!["dep_release", "main"], "dep should run with release profile, got: {:?}", lines);
+}
+
+#[test]
+fn profile_dependent_require_runs_only_matching_branch() {
+    let mut harness = TestHarness::new("profile_dependent_require");
+    let output_file = harness.temp_dir.join("output.txt");
+    let live_marker = harness.temp_dir.join("live_dep.txt");
+    harness.write_config(&format!(
+        r#"
+[action.setup]
+sh = "echo setup >> {output}"
+
+[action.live_dep]
+sh = "echo live > {live_marker}"
+
+[action.backend]
+profiles = ["default", "traffic-live"]
+sh = "echo backend >> {output}"
+require = [
+  "setup",
+  {{ if.profile = "traffic-live", then = "live_dep" }},
+]
+"#,
+        output = output_file.display(),
+        live_marker = live_marker.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "backend"]);
+    assert!(result.success(), "default profile should succeed: {}", result.stderr);
+    assert!(!live_marker.exists(), "traffic-live-only dependency must not run for default profile");
+
+    let result = harness.run_client(&["run", "backend:traffic-live"]);
+    assert!(result.success(), "traffic-live profile should succeed: {}", result.stderr);
+    assert!(harness.wait_for_file(&live_marker, Duration::from_secs(2)), "traffic-live dependency should run");
+}
+
+#[test]
+fn profile_dependent_require_cycle_only_blocks_matching_profile() {
+    let mut harness = TestHarness::new("profile_dependent_cycle");
+    let marker = harness.temp_dir.join("default.txt");
+    harness.write_config(&format!(
+        r#"
+[action.backend]
+profiles = ["default", "bad"]
+sh = "echo default > {marker}"
+require = [
+  {{ if.profile = "bad", then = "backend:bad" }},
+]
+"#,
+        marker = marker.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "backend"]);
+    assert!(result.success(), "default profile should not see bad-profile cycle: {}", result.stderr);
+    assert!(harness.wait_for_file(&marker, Duration::from_secs(2)), "default profile should run");
+
+    let result = harness.run_client(&["run", "backend:bad"]);
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    assert!(!result.success(), "bad profile should fail due to profile-specific cycle");
+    assert!(combined.contains("require cycle"), "expected require cycle error, got: {combined}");
 }
 
 #[test]
@@ -4133,6 +4237,113 @@ require = ["action.dep", "service.svc"]
         result.status,
         stdout,
         stderr,
+    );
+}
+
+#[test]
+fn validate_checks_conditional_require_branches() {
+    let harness = TestHarness::new("validate_conditional_require");
+    harness.write_config(
+        r#"
+[action.user]
+cmd = ["echo", "user"]
+profiles = ["default", "live"]
+require = [
+  { if.profile = "live", then = "missing_dep" },
+]
+"#,
+    );
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let result = Command::new(cargo_bin_path())
+        .args(["self", "validate"])
+        .arg(&config_path)
+        .arg("--skip-path-checks")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("validate should run");
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "validate should fail for conditional missing dep");
+    assert!(
+        stdout.contains("missing_dep") || stderr.contains("missing_dep"),
+        "validate should mention missing conditional dep; stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn validate_accepts_implicitly_profiled_conditional_require() {
+    let harness = TestHarness::new("validate_inferred_conditional_profile");
+    harness.write_config(
+        r#"
+[action.setup]
+cmd = ["echo", "setup"]
+
+[action.backend]
+cmd = ["echo", "backend"]
+require = [
+  { if.profile = "live", then = "setup" },
+]
+
+[action.user]
+cmd = ["echo", "user"]
+require = ["backend:live"]
+"#,
+    );
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let result = Command::new(cargo_bin_path())
+        .args(["self", "validate"])
+        .arg(&config_path)
+        .arg("--skip-path-checks")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("validate should run");
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        result.status.success(),
+        "validate should accept inferred profile from conditional require; stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+#[test]
+fn validate_rejects_explicit_profiles_missing_conditional_require_profile() {
+    let harness = TestHarness::new("validate_incomplete_explicit_profiles");
+    harness.write_config(
+        r#"
+[action.setup]
+cmd = ["echo", "setup"]
+
+[action.backend]
+profiles = ["default"]
+cmd = ["echo", "backend"]
+require = [
+  { if.profile = "live", then = "setup" },
+]
+"#,
+    );
+
+    let config_path = harness.temp_dir.join("devsm.toml");
+    let result = Command::new(cargo_bin_path())
+        .args(["self", "validate"])
+        .arg(&config_path)
+        .arg("--skip-path-checks")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("validate should run");
+
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "validate should reject incomplete explicit profiles");
+    assert!(
+        stdout.contains("not listed in `profiles`") || stderr.contains("not listed in `profiles`"),
+        "validate should explain missing explicit profile; stdout: {stdout}\nstderr: {stderr}"
     );
 }
 

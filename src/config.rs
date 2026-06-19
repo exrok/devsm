@@ -41,7 +41,7 @@ impl<'a> std::ops::Deref for Alias<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TaskCall<'a> {
     pub name: Alias<'a>,
     pub profile: Option<&'a str>,
@@ -56,14 +56,85 @@ pub struct TaskCall<'a> {
 /// (e.g. a build directory). While one task holds a resource, other tasks
 /// declaring the same `name` wait. `priority` resolves contention; ties break
 /// FIFO by enqueue time.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Requirement<'a> {
     Task(TaskCall<'a>),
     Resource { name: &'a str, priority: i32 },
 }
 
-/// Empty slice of requirements, used as default for the `require` field.
-pub static EMPTY_REQUIREMENTS: &[Requirement<'static>] = &[];
+#[derive(Debug, Clone)]
+pub enum RequirementExpr<'a> {
+    Requirement(Requirement<'a>),
+    If(&'a If<'a, RequirementListExpr<'a>>),
+}
+
+#[derive(Debug, Clone)]
+pub struct RequirementListExpr<'a> {
+    pub items: &'a [RequirementExpr<'a>],
+}
+
+/// Empty slice of requirement expressions, used as default for parsed `require`.
+pub static EMPTY_REQUIREMENT_EXPRS: &[RequirementExpr<'static>] = &[];
+
+impl<'a> RequirementExpr<'a> {
+    pub fn visit_requirements(&self, f: &mut impl FnMut(&Requirement<'a>)) {
+        match self {
+            RequirementExpr::Requirement(req) => f(req),
+            RequirementExpr::If(if_expr) => {
+                if_expr.then.visit_requirements(f);
+                if let Some(or_else) = &if_expr.or_else {
+                    or_else.visit_requirements(f);
+                }
+            }
+        }
+    }
+
+    pub fn eval_for_profile_append(&self, profile: &str, out: &mut Vec<Requirement<'a>>) {
+        match self {
+            RequirementExpr::Requirement(req) => out.push(req.clone()),
+            RequirementExpr::If(if_expr) => {
+                if if_expr.cond.eval_profile(profile) {
+                    if_expr.then.eval_for_profile_append(profile, out);
+                } else if let Some(or_else) = &if_expr.or_else {
+                    or_else.eval_for_profile_append(profile, out);
+                }
+            }
+        }
+    }
+
+    pub fn visit_profile_predicates(&self, f: &mut impl FnMut(&'a str)) {
+        match self {
+            RequirementExpr::Requirement(_) => {}
+            RequirementExpr::If(if_expr) => {
+                if_expr.cond.visit_profiles(f);
+                if_expr.then.visit_profile_predicates(f);
+                if let Some(or_else) = &if_expr.or_else {
+                    or_else.visit_profile_predicates(f);
+                }
+            }
+        }
+    }
+}
+
+impl<'a> RequirementListExpr<'a> {
+    pub fn visit_requirements(&self, f: &mut impl FnMut(&Requirement<'a>)) {
+        for item in self.items {
+            item.visit_requirements(f);
+        }
+    }
+
+    pub fn eval_for_profile_append(&self, profile: &str, out: &mut Vec<Requirement<'a>>) {
+        for item in self.items {
+            item.eval_for_profile_append(profile, out);
+        }
+    }
+
+    pub fn visit_profile_predicates(&self, f: &mut impl FnMut(&'a str)) {
+        for item in self.items {
+            item.visit_profile_predicates(f);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VarMeta<'a> {
@@ -434,7 +505,7 @@ pub struct TaskConfigExpr<'a> {
     command: CommandExpr<'a>,
     pub profiles: &'a [&'a str],
     envvar: &'a [(&'a str, StringExpr<'a>)],
-    pub require: &'a [Requirement<'a>],
+    pub require: &'a [RequirementExpr<'a>],
     pub cache: Option<CacheConfig<'a>>,
     pub ready: Option<ReadyConfig<'a>>,
     /// Timeout configuration for the task.
@@ -464,7 +535,7 @@ pub struct TestConfigExpr<'a> {
     pub pwd: StringExpr<'a>,
     command: CommandExpr<'a>,
     envvar: &'a [(&'a str, StringExpr<'a>)],
-    pub require: &'a [Requirement<'a>],
+    pub require: &'a [RequirementExpr<'a>],
     pub tags: &'a [&'a str],
     pub cache: Option<CacheConfig<'a>>,
     /// Timeout configuration for the test.
@@ -512,7 +583,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         ])),
         profiles: &[],
         envvar: &[],
-        require: EMPTY_REQUIREMENTS,
+        require: EMPTY_REQUIREMENT_EXPRS,
         cache: None,
         ready: None,
         timeout: None,
@@ -760,6 +831,7 @@ impl Environment<'_> {
 pub enum EvalError {
     Todo,
     EmptyBranch,
+    DuplicateResource,
 }
 
 impl TaskConfigExpr<'static> {
@@ -804,7 +876,7 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
         Ok(TaskConfig {
             pwd: self.pwd.bump_eval(env, bump)?,
             command,
-            require: self.require,
+            require: RequirementListExpr { items: self.require }.bump_eval(env, bump)?,
             cache: self.cache.clone(),
             ready: self.ready.clone(),
             timeout: self.timeout.clone(),
@@ -820,6 +892,84 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
             },
         })
     }
+}
+
+fn clone_requirement_for_eval<'a>(req: &Requirement<'static>) -> Requirement<'a> {
+    match req {
+        Requirement::Task(call) => {
+            Requirement::Task(TaskCall { name: Alias(call.name.0), profile: call.profile, vars: call.vars.clone() })
+        }
+        Requirement::Resource { name, priority } => Requirement::Resource { name, priority: *priority },
+    }
+}
+
+impl RequirementExpr<'static> {
+    fn bump_eval_append<'a>(
+        &self,
+        env: &Environment,
+        bump: &'a Bump,
+        target: &mut bumpalo::collections::Vec<'a, Requirement<'a>>,
+    ) -> Result<(), EvalError> {
+        match self {
+            RequirementExpr::Requirement(req) => {
+                target.push(clone_requirement_for_eval(req));
+                Ok(())
+            }
+            RequirementExpr::If(if_expr) => {
+                if if_expr.cond.eval(env) {
+                    if_expr.then.bump_eval_append(env, bump, target)
+                } else if let Some(or_else) = &if_expr.or_else {
+                    or_else.bump_eval_append(env, bump, target)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+impl RequirementListExpr<'static> {
+    fn bump_eval_append<'a>(
+        &self,
+        env: &Environment,
+        bump: &'a Bump,
+        target: &mut bumpalo::collections::Vec<'a, Requirement<'a>>,
+    ) -> Result<(), EvalError> {
+        for item in self.items {
+            item.bump_eval_append(env, bump, target)?;
+        }
+        Ok(())
+    }
+}
+
+impl<'a> BumpEval<'a> for RequirementListExpr<'static> {
+    type Object = &'a [Requirement<'a>];
+
+    fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<Self::Object, EvalError> {
+        if self.items.is_empty() {
+            return Ok(&[]);
+        }
+        let mut result = bumpalo::collections::Vec::new_in(bump);
+        self.bump_eval_append(env, bump, &mut result)?;
+        if has_duplicate_resource(&result) {
+            return Err(EvalError::DuplicateResource);
+        }
+        Ok(result.into_bump_slice())
+    }
+}
+
+fn has_duplicate_resource(requirements: &[Requirement<'_>]) -> bool {
+    for (i, req) in requirements.iter().enumerate() {
+        let Requirement::Resource { name, .. } = req else { continue };
+        for prior in &requirements[..i] {
+            if let Requirement::Resource { name: prior_name, .. } = prior
+                && prior_name == name
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl<'a> BumpEval<'a> for StringExpr<'static> {
@@ -908,10 +1058,20 @@ enum Predicate<'a> {
     Profile(&'a str),
 }
 impl<'a> Predicate<'a> {
-    fn eval(&self, env: &Environment) -> bool {
+    fn visit_profiles(&self, f: &mut impl FnMut(&'a str)) {
         match self {
-            Predicate::Profile(p) => *p == env.profile,
+            Predicate::Profile(p) => f(p),
         }
+    }
+
+    fn eval_profile(&self, profile: &str) -> bool {
+        match self {
+            Predicate::Profile(p) => *p == profile,
+        }
+    }
+
+    fn eval(&self, env: &Environment) -> bool {
+        self.eval_profile(env.profile)
     }
 }
 
@@ -1132,7 +1292,7 @@ mod tests {
             ])),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_REQUIREMENTS,
+            require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
             timeout: None,
@@ -1162,7 +1322,7 @@ mod tests {
             command: CommandExpr::Cmd(StringListExpr::If(&IF_BRANCH)),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_REQUIREMENTS,
+            require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
             timeout: None,
@@ -1209,7 +1369,7 @@ mod tests {
             ])),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_REQUIREMENTS,
+            require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
             timeout: None,
@@ -1241,7 +1401,7 @@ mod tests {
             ])),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_REQUIREMENTS,
+            require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
             timeout: None,
@@ -1274,7 +1434,7 @@ mod tests {
             ])),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_REQUIREMENTS,
+            require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
             timeout: None,
@@ -1301,7 +1461,7 @@ mod tests {
             ])),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_REQUIREMENTS,
+            require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
             timeout: None,
@@ -1319,7 +1479,7 @@ mod tests {
             command: CommandExpr::Sh(StringExpr::Literal("git checkout \"$@\"")),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_REQUIREMENTS,
+            require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
             timeout: None,
@@ -1350,7 +1510,7 @@ mod tests {
             )),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_REQUIREMENTS,
+            require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
             timeout: None,
@@ -1379,7 +1539,7 @@ mod tests {
             )),
             profiles: &[],
             envvar: &[],
-            require: EMPTY_REQUIREMENTS,
+            require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
             timeout: None,

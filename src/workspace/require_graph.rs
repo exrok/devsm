@@ -40,6 +40,8 @@ pub struct TaskInput<'a> {
 
 pub struct RequireAnalysis {
     entries: Vec<AnalysisEntry>,
+    profile_entries: hashbrown::HashMap<ProfileProblemKey, AnalysisEntry>,
+    fallback_entries: Vec<AnalysisEntry>,
 }
 
 #[derive(Default, Clone)]
@@ -48,24 +50,96 @@ struct AnalysisEntry {
     deadlock: Option<Arc<str>>,
 }
 
+#[derive(Hash, PartialEq, Eq)]
+struct ProfileProblemKey {
+    base: usize,
+    profile: Box<str>,
+}
+
+pub struct ProfileTaskInput<'a> {
+    pub base_task: BaseTaskIndex,
+    pub profile: &'a str,
+    pub fallback: bool,
+    pub name: &'a str,
+    pub kind: TaskKind,
+    pub require: &'a [Requirement<'a>],
+}
+
 impl RequireAnalysis {
     pub fn empty() -> Self {
-        Self { entries: Vec::new() }
+        Self { entries: Vec::new(), profile_entries: hashbrown::HashMap::new(), fallback_entries: Vec::new() }
     }
 
+    #[cfg(test)]
     pub fn build(tasks: &[TaskInput<'_>], name_map: &dyn NameLookup) -> Self {
         if tasks.is_empty() {
             return Self::empty();
         }
         let mut analyzer = Analyzer::new(tasks, name_map);
         analyzer.run();
-        Self { entries: analyzer.entries }
+        Self { entries: analyzer.entries, profile_entries: hashbrown::HashMap::new(), fallback_entries: Vec::new() }
+    }
+
+    pub fn build_profiled(tasks: &[ProfileTaskInput<'_>], name_map: &dyn NameLookup) -> Self {
+        if tasks.is_empty() {
+            return Self::empty();
+        }
+
+        let flat: Vec<TaskInput<'_>> =
+            tasks.iter().map(|t| TaskInput { name: t.name, kind: t.kind, require: t.require }).collect();
+        let mut analyzer = Analyzer::new(&flat, name_map);
+        analyzer.run();
+
+        let n_base = tasks.iter().map(|t| t.base_task.idx()).max().map_or(0, |m| m + 1);
+        let mut entries = vec![AnalysisEntry::default(); n_base];
+        let mut fallback_entries = vec![AnalysisEntry::default(); n_base];
+        let mut has_entry = vec![false; n_base];
+        let mut has_fallback = vec![false; n_base];
+        let mut profile_entries = hashbrown::HashMap::new();
+
+        for (i, task) in tasks.iter().enumerate() {
+            let base = task.base_task.idx();
+            let entry = analyzer.entries[i].clone();
+            if !has_entry[base] || task.fallback {
+                entries[base] = entry.clone();
+                has_entry[base] = true;
+            }
+            if task.fallback {
+                fallback_entries[base] = entry;
+                has_fallback[base] = true;
+            } else {
+                profile_entries.insert(ProfileProblemKey { base, profile: task.profile.into() }, entry);
+            }
+        }
+
+        for base in 0..n_base {
+            if !has_fallback[base] {
+                fallback_entries[base] = entries[base].clone();
+            }
+        }
+
+        Self { entries, profile_entries, fallback_entries }
     }
 
     /// O(1) lookup. Same `Err` strings as the previous on-demand detectors.
     /// Cycle errors take precedence over deadlock errors.
     pub fn problem(&self, root: BaseTaskIndex) -> Result<(), String> {
-        let Some(entry) = self.entries.get(root.idx()) else {
+        Self::problem_for_entry(self.entries.get(root.idx()))
+    }
+
+    pub fn problem_for_profile(&self, root: BaseTaskIndex, profile: &str) -> Result<(), String> {
+        if self.profile_entries.is_empty() {
+            return self.problem(root);
+        }
+        let key = ProfileProblemKey { base: root.idx(), profile: profile.into() };
+        if let Some(entry) = self.profile_entries.get(&key) {
+            return Self::problem_for_entry(Some(entry));
+        }
+        Self::problem_for_entry(self.fallback_entries.get(root.idx()))
+    }
+
+    fn problem_for_entry(entry: Option<&AnalysisEntry>) -> Result<(), String> {
+        let Some(entry) = entry else {
             return Ok(());
         };
         if let Some(s) = &entry.cycle {
@@ -91,11 +165,11 @@ impl RequireAnalysis {
 /// to [`RequireAnalysis::build`]. Implemented for both the daemon-side
 /// `name_map` and a transient `validate.rs` lookup.
 pub trait NameLookup {
-    fn lookup(&self, name: &str) -> Option<usize>;
+    fn lookup(&self, name: &str, profile: Option<&str>) -> Option<usize>;
 }
 
 impl NameLookup for hashbrown::HashMap<Box<str>, NameEntry> {
-    fn lookup(&self, name: &str) -> Option<usize> {
+    fn lookup(&self, name: &str, _profile: Option<&str>) -> Option<usize> {
         let (kind_filter, short) = match name.split_once('.') {
             Some(("service", rest)) => (Some(TaskKind::Service), rest),
             Some(("action", rest)) => (Some(TaskKind::Action), rest),
@@ -203,7 +277,7 @@ impl<'a> Analyzer<'a> {
                 let edge = &edges[*ei];
                 *ei += 1;
                 let Requirement::Task(call) = edge else { continue };
-                let Some(w) = self.name_map.lookup(&call.name) else { continue };
+                let Some(w) = self.name_map.lookup(&call.name, call.profile) else { continue };
 
                 match self.color[w] {
                     GRAY => {
@@ -244,7 +318,7 @@ impl<'a> Analyzer<'a> {
         if self.entries[v].cycle.is_none() {
             for edge in self.tasks[v].require {
                 let Requirement::Task(call) = edge else { continue };
-                let Some(w) = self.name_map.lookup(&call.name) else { continue };
+                let Some(w) = self.name_map.lookup(&call.name, call.profile) else { continue };
                 if self.color[w] == BLACK
                     && let Some(s) = &self.entries[w].cycle
                 {
@@ -257,7 +331,7 @@ impl<'a> Analyzer<'a> {
         let mut desc = ResourceSet::empty(self.resource_names.len());
         for edge in self.tasks[v].require {
             let Requirement::Task(call) = edge else { continue };
-            let Some(w) = self.name_map.lookup(&call.name) else { continue };
+            let Some(w) = self.name_map.lookup(&call.name, call.profile) else { continue };
             if self.color[w] != BLACK {
                 continue;
             }
@@ -293,7 +367,7 @@ impl<'a> Analyzer<'a> {
             }
             for edge in self.tasks[v].require {
                 let Requirement::Task(call) = edge else { continue };
-                let Some(w) = self.name_map.lookup(&call.name) else { continue };
+                let Some(w) = self.name_map.lookup(&call.name, call.profile) else { continue };
                 if self.tasks[w].kind != TaskKind::Service {
                     continue;
                 }
@@ -387,7 +461,7 @@ mod tests {
 
     struct NameMap(hashbrown::HashMap<&'static str, usize>);
     impl NameLookup for NameMap {
-        fn lookup(&self, name: &str) -> Option<usize> {
+        fn lookup(&self, name: &str, _profile: Option<&str>) -> Option<usize> {
             self.0.get(name).copied()
         }
     }

@@ -4,9 +4,9 @@ use toml_spanner::{Context, Document, Failed, Item, Table, Value};
 
 use crate::config::{
     Alias, AllowMultiple, CacheConfig, CacheKeyInput, CliAutocomplete, CliConfig, CommandExpr, FunctionDef,
-    FunctionDefAction, If, Predicate, ReadyConfig, ReadyPredicate, Requirement, ServiceHidden, StringExpr,
-    StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, TimeoutConfig, TimeoutPredicate, VarMeta,
-    WorkspaceConfig, parse_duration,
+    FunctionDefAction, If, Predicate, ReadyConfig, ReadyPredicate, Requirement, RequirementExpr, RequirementListExpr,
+    ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, TimeoutConfig,
+    TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
 };
 
 fn parse_predicate<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Predicate<'a>, Failed> {
@@ -337,7 +337,7 @@ fn parse_task<'a>(
     let mut pwd = StringExpr::Literal("./");
     let mut profiles_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
-    let mut require: &[Requirement<'a>] = &[];
+    let mut require: &[RequirementExpr<'a>] = &[];
     let mut cache: Option<CacheConfig<'a>> = None;
     let mut ready: Option<ReadyConfig<'a>> = None;
     let mut timeout: Option<TimeoutConfig<'a>> = None;
@@ -373,9 +373,9 @@ fn parse_task<'a>(
                 let arr = value.require_array(ctx)?;
                 let mut calls = bumpalo::collections::Vec::new_in(alloc);
                 for item in arr {
-                    calls.push(parse_requirement(item, ctx)?);
+                    calls.push(parse_requirement_expr(alloc, item, ctx)?);
                 }
-                check_no_duplicate_resources(&calls, value, ctx)?;
+                check_no_duplicate_resources_in_exprs(&calls, value, ctx)?;
                 require = calls.into_bump_slice();
             }
             "cache" => {
@@ -560,7 +560,7 @@ fn parse_test<'a>(
 ) -> Result<TestConfigExpr<'a>, Failed> {
     let mut pwd = StringExpr::Literal("./");
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
-    let mut require: &[Requirement<'a>] = &[];
+    let mut require: &[RequirementExpr<'a>] = &[];
     let mut tags_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut cache: Option<CacheConfig<'a>> = None;
     let mut timeout: Option<TimeoutConfig<'a>> = None;
@@ -587,9 +587,9 @@ fn parse_test<'a>(
                 let arr = value.require_array(ctx)?;
                 let mut calls = bumpalo::collections::Vec::new_in(alloc);
                 for item in arr {
-                    calls.push(parse_requirement(item, ctx)?);
+                    calls.push(parse_requirement_expr(alloc, item, ctx)?);
                 }
-                check_no_duplicate_resources(&calls, value, ctx)?;
+                check_no_duplicate_resources_in_exprs(&calls, value, ctx)?;
                 require = calls.into_bump_slice();
             }
             "tag" => match value.value() {
@@ -644,6 +644,72 @@ fn parse_test<'a>(
         cli,
         vars: vars_vec.into_bump_slice(),
     })
+}
+
+fn parse_requirement_expr<'a>(
+    alloc: &'a Bump,
+    value: &Item<'a>,
+    ctx: &mut Context<'a>,
+) -> Result<RequirementExpr<'a>, Failed> {
+    if let Value::Table(table) = value.value()
+        && table.get("if").is_some()
+    {
+        return parse_conditional_requirement(alloc, table, value, ctx);
+    }
+    Ok(RequirementExpr::Requirement(parse_requirement(value, ctx)?))
+}
+
+fn parse_conditional_requirement<'a>(
+    alloc: &'a Bump,
+    table: &Table<'a>,
+    value: &Item<'a>,
+    ctx: &mut Context<'a>,
+) -> Result<RequirementExpr<'a>, Failed> {
+    let mut cond: Option<Predicate<'a>> = None;
+    let mut then_expr: Option<RequirementListExpr<'a>> = None;
+    let mut or_else: Option<RequirementListExpr<'a>> = None;
+
+    for (key, val) in table {
+        match key.name {
+            "if" => cond = Some(parse_predicate(val, ctx)?),
+            "then" => then_expr = Some(parse_requirement_branch(alloc, val, ctx)?),
+            "or_else" | "else" => or_else = Some(parse_requirement_branch(alloc, val, ctx)?),
+            _ => {
+                ctx.report_unexpected_key(0, val, key.span);
+            }
+        }
+    }
+
+    match (cond, then_expr) {
+        (Some(cond), Some(then)) => {
+            check_no_duplicate_resources_in_exprs(then.items, value, ctx)?;
+            if let Some(or_else) = &or_else {
+                check_no_duplicate_resources_in_exprs(or_else.items, value, ctx)?;
+            }
+            Ok(RequirementExpr::If(alloc.alloc(If { cond, then, or_else })))
+        }
+        (Some(_), None) => Err(ctx.report_missing_field("then", value)),
+        _ => Err(ctx.report_custom_error("invalid requirement expression", value)),
+    }
+}
+
+fn parse_requirement_branch<'a>(
+    alloc: &'a Bump,
+    value: &Item<'a>,
+    ctx: &mut Context<'a>,
+) -> Result<RequirementListExpr<'a>, Failed> {
+    match value.value() {
+        Value::Array(arr) => {
+            let mut items = bumpalo::collections::Vec::new_in(alloc);
+            for item in arr {
+                items.push(parse_requirement_expr(alloc, item, ctx)?);
+            }
+            Ok(RequirementListExpr { items: items.into_bump_slice() })
+        }
+        _ => Ok(RequirementListExpr {
+            items: std::slice::from_ref(alloc.alloc(parse_requirement_expr(alloc, value, ctx)?)),
+        }),
+    }
 }
 
 fn parse_requirement<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Requirement<'a>, Failed> {
@@ -718,6 +784,20 @@ fn check_no_duplicate_resources<'a>(
         }
     }
     Ok(())
+}
+
+fn check_no_duplicate_resources_in_exprs<'a>(
+    items: &[RequirementExpr<'a>],
+    value: &Item<'a>,
+    ctx: &mut Context<'a>,
+) -> Result<(), Failed> {
+    let mut concrete = Vec::new();
+    for item in items {
+        if let RequirementExpr::Requirement(req) = item {
+            concrete.push(req.clone());
+        }
+    }
+    check_no_duplicate_resources(&concrete, value, ctx)
 }
 
 fn parse_task_call<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<TaskCall<'a>, Failed> {
@@ -1237,7 +1317,7 @@ mod test {
         let (_, task) = &config.tasks[0];
         assert_eq!(task.require.len(), 1);
         match &task.require[0] {
-            Requirement::Resource { name, priority } => {
+            RequirementExpr::Requirement(Requirement::Resource { name, priority }) => {
                 assert_eq!(*name, "cargo-bin");
                 assert_eq!(*priority, 2);
             }
@@ -1255,9 +1335,72 @@ mod test {
         let config = result.unwrap();
         let (_, task) = &config.tasks[0];
         match &task.require[0] {
-            Requirement::Resource { priority, .. } => assert_eq!(*priority, 0),
+            RequirementExpr::Requirement(Requirement::Resource { priority, .. }) => assert_eq!(*priority, 0),
             other => panic!("expected resource requirement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_profile_dependent_requirement_item() {
+        let text = r#"
+[action.t]
+cmd = ["echo"]
+profiles = ["default", "traffic-live"]
+require = [
+  "setup",
+  { if.profile = "traffic-live", then = "ingest-live" },
+]
+"#;
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "Expected success: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let (_, task) = &config.tasks[0];
+
+        let mut default_require = Vec::new();
+        RequirementListExpr { items: task.require }.eval_for_profile_append("default", &mut default_require);
+        assert_eq!(default_require.len(), 1);
+        let Requirement::Task(call) = &default_require[0] else { panic!("expected task call") };
+        assert_eq!(&*call.name, "setup");
+
+        let mut live_require = Vec::new();
+        RequirementListExpr { items: task.require }.eval_for_profile_append("traffic-live", &mut live_require);
+        assert_eq!(live_require.len(), 2);
+        let Requirement::Task(call) = &live_require[1] else { panic!("expected task call") };
+        assert_eq!(&*call.name, "ingest-live");
+    }
+
+    #[test]
+    fn conditional_requirement_branch_accepts_list_and_nested_var_call() {
+        let text = r#"
+[action.t]
+cmd = ["echo"]
+profiles = ["default", "live"]
+require = [
+  { if.profile = "live", then = [["svc", { port = 8080 }], { resource = "R" }], or_else = "setup" },
+]
+"#;
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "Expected success: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let (_, task) = &config.tasks[0];
+
+        let mut default_require = Vec::new();
+        RequirementListExpr { items: task.require }.eval_for_profile_append("default", &mut default_require);
+        assert_eq!(default_require.len(), 1);
+        let Requirement::Task(call) = &default_require[0] else { panic!("expected task call") };
+        assert_eq!(&*call.name, "setup");
+
+        let mut live_require = Vec::new();
+        RequirementListExpr { items: task.require }.eval_for_profile_append("live", &mut live_require);
+        assert_eq!(live_require.len(), 2);
+        let Requirement::Task(call) = &live_require[0] else { panic!("expected task call") };
+        assert_eq!(&*call.name, "svc");
+        assert!(matches!(call.vars["port"].as_ref(), jsony_value::ValueRef::String(s) if &**s == "8080"));
+        assert!(matches!(live_require[1], Requirement::Resource { name: "R", priority: 0 }));
     }
 
     #[test]

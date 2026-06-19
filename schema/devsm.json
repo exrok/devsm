@@ -194,8 +194,42 @@
               "description": "Higher priority wins resource contention; default 0"
             }
           }
+        },
+        {
+          "$ref": "#/definitions/ifRequirementExpr"
         }
       ]
+    },
+    "requirementBranch": {
+      "description": "A conditional requirement branch: either one requirement or an array of requirements. Array branches are parsed as requirement lists; use a nested array for task calls with variables, e.g. [[\"task\", { \"var\": \"value\" }]].",
+      "anyOf": [
+        { "$ref": "#/definitions/requirement" },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/requirement"
+          }
+        }
+      ]
+    },
+    "ifRequirementExpr": {
+      "type": "object",
+      "description": "Conditional requirement expression",
+      "additionalProperties": false,
+      "required": ["if", "then"],
+      "properties": {
+        "if": {
+          "$ref": "#/definitions/predicate"
+        },
+        "then": {
+          "$ref": "#/definitions/requirementBranch",
+          "description": "Requirement(s) if condition is true"
+        },
+        "or_else": {
+          "$ref": "#/definitions/requirementBranch",
+          "description": "Requirement(s) if condition is false"
+        }
+      }
     },
     "envTable": {
       "type": "object",

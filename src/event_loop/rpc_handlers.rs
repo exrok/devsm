@@ -592,26 +592,35 @@ fn add_job_to_runnable_status(
         status.pwd = Some(tc.pwd.into());
         status.command = Some(render_command(&tc.command));
         status.envvars = tc.envvar.iter().map(|(k, v)| format!("{k}={v}").into()).collect();
+        status.require = render_requirements(tc.require);
     }
 }
 
-fn add_runnable_requirements(state: &WsState, bti: BaseTaskIndex, status: &mut rpc::RunnableStatus) {
-    let expr = state.base_tasks[bti.idx()].config.expr();
-    status.require = expr
-        .require
-        .iter()
-        .map(|r| match r {
-            Requirement::Task(call) => {
-                let p = call.profile.unwrap_or("");
-                if p.is_empty() {
-                    format!("task {}", &*call.name).into()
-                } else {
-                    format!("task {}:{}", &*call.name, p).into()
-                }
+fn render_requirement(requirement: &Requirement<'_>) -> Box<str> {
+    match requirement {
+        Requirement::Task(call) => {
+            let p = call.profile.unwrap_or("");
+            if p.is_empty() {
+                format!("task {}", &*call.name).into()
+            } else {
+                format!("task {}:{}", &*call.name, p).into()
             }
-            Requirement::Resource { name, priority } => format!("resource {name} (priority {priority})").into(),
-        })
-        .collect();
+        }
+        Requirement::Resource { name, priority } => format!("resource {name} (priority {priority})").into(),
+    }
+}
+
+fn render_requirements(requirements: &[Requirement<'_>]) -> Vec<Box<str>> {
+    requirements.iter().map(render_requirement).collect()
+}
+
+fn add_unevaluated_runnable_requirements(state: &WsState, bti: BaseTaskIndex, status: &mut rpc::RunnableStatus) {
+    let expr = state.base_tasks[bti.idx()].config.expr();
+    let mut require = Vec::new();
+    for item in expr.require {
+        item.visit_requirements(&mut |r| require.push(render_requirement(r)));
+    }
+    status.require = require;
 }
 
 fn build_runnable_status_for_job(
@@ -623,9 +632,6 @@ fn build_runnable_status_for_job(
     let mut status = base_runnable_status(state, bti);
     let job = &state.jobs[ji];
     add_job_to_runnable_status(state, &mut status, ji, job, detailed);
-    if detailed && status.require.is_empty() {
-        add_runnable_requirements(state, bti, &mut status);
-    }
     status
 }
 
@@ -634,9 +640,8 @@ fn build_runnable_status(state: &WsState, bti: BaseTaskIndex, detailed: bool) ->
     if let Some(ji) = last_job_for_base_task(state, bti) {
         let job = &state.jobs[ji];
         add_job_to_runnable_status(state, &mut status, ji, job, detailed);
-    }
-    if detailed && status.require.is_empty() {
-        add_runnable_requirements(state, bti, &mut status);
+    } else if detailed {
+        add_unevaluated_runnable_requirements(state, bti, &mut status);
     }
     status
 }

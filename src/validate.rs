@@ -7,7 +7,7 @@ use toml_spanner::{Item, Table, Value};
 use crate::config::toml_handler;
 use crate::config::{StringExpr, TaskKind, WorkspaceConfig};
 use crate::diagnostic::{Diagnostic, DiagnosticLabel, DiagnosticLevel, emit_diagnostic, toml_error_to_diagnostic};
-use crate::workspace::require_graph::{NameLookup, RequireAnalysis, TaskInput};
+use crate::workspace::require_graph::{NameLookup, ProfileTaskInput, RequireAnalysis};
 
 pub struct ValidateOptions {
     pub skip_path_checks: bool,
@@ -230,6 +230,29 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
         for profile in task_expr.profiles.iter() {
             task_profiles.insert((name, profile));
         }
+        let inferred_profiles = requirement_profile_predicates(task_expr.require);
+        if task_has_profiles_field(root, name) {
+            for profile in inferred_profiles {
+                if !task_expr.profiles.contains(&profile) {
+                    let label = find_require_array_span(root, name)
+                        .map(|span| vec![DiagnosticLabel::primary(span).with_message("profile predicate here")])
+                        .unwrap_or_default();
+                    emit(
+                        Diagnostic::error()
+                            .with_message(format!(
+                                "profile-dependent require uses profile '{}' not listed in `profiles`",
+                                profile
+                            ))
+                            .with_labels(label)
+                            .with_notes(vec![format!("add '{}' to the explicit profiles list", profile)]),
+                    );
+                }
+            }
+        } else {
+            for profile in inferred_profiles {
+                task_profiles.insert((name, profile));
+            }
+        }
     }
 
     for (name, _) in config.tests.iter() {
@@ -267,34 +290,40 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
     }
 
     for (task_name, task_expr) in config.tasks.iter() {
-        for req in task_expr.require.iter() {
-            let crate::config::Requirement::Task(call) = req else { continue };
-            let required_name: &str = &call.name;
-            let resolved = resolve_qualified_reference(required_name, &name_kinds, &test_names);
+        for req_expr in task_expr.require.iter() {
+            req_expr.visit_requirements(&mut |req| {
+                let crate::config::Requirement::Task(call) = req else { return };
+                let required_name: &str = &call.name;
+                let resolved = resolve_qualified_reference(required_name, &name_kinds, &test_names);
 
-            let Some(short) = resolved else {
-                if let Some(span) = find_require_span(root, task_name, required_name) {
+                let Some(short) = resolved else {
+                    if let Some(span) = find_require_span(root, task_name, required_name) {
+                        emit(
+                            Diagnostic::error()
+                                .with_message(format!("required task '{}' does not exist", required_name))
+                                .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                                .with_notes(vec![format!("in task '{}'", task_name)]),
+                        );
+                    }
+                    return;
+                };
+                if let Some(profile) = call.profile
+                    && !task_profiles.contains(&(short, profile))
+                    && let Some(span) = find_require_span(root, task_name, required_name)
+                {
+                    let available: Vec<_> =
+                        task_profiles.iter().filter(|(n, _)| *n == short).map(|(_, p)| *p).collect();
                     emit(
                         Diagnostic::error()
-                            .with_message(format!("required task '{}' does not exist", required_name))
+                            .with_message(format!(
+                                "required task '{}' does not have profile '{}'",
+                                required_name, profile
+                            ))
                             .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                            .with_notes(vec![format!("in task '{}'", task_name)]),
+                            .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
                     );
                 }
-                continue;
-            };
-            if let Some(profile) = call.profile
-                && !task_profiles.contains(&(short, profile))
-                && let Some(span) = find_require_span(root, task_name, required_name)
-            {
-                let available: Vec<_> = task_profiles.iter().filter(|(n, _)| *n == short).map(|(_, p)| *p).collect();
-                emit(
-                    Diagnostic::error()
-                        .with_message(format!("required task '{}' does not have profile '{}'", required_name, profile))
-                        .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                        .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
-                );
-            }
+            });
         }
 
         if let Some(cache) = &task_expr.cache {
@@ -317,71 +346,215 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
     }
 
     for (test_name, test_expr) in config.tests.iter() {
-        for req in test_expr.require.iter() {
-            let crate::config::Requirement::Task(call) = req else { continue };
-            let required_name: &str = &call.name;
-            let resolved = resolve_qualified_reference(required_name, &name_kinds, &test_names);
+        for req_expr in test_expr.require.iter() {
+            req_expr.visit_requirements(&mut |req| {
+                let crate::config::Requirement::Task(call) = req else { return };
+                let required_name: &str = &call.name;
+                let resolved = resolve_qualified_reference(required_name, &name_kinds, &test_names);
 
-            let Some(short) = resolved else {
-                if let Some(span) = find_test_require_span(root, test_name, required_name) {
+                let Some(short) = resolved else {
+                    if let Some(span) = find_test_require_span(root, test_name, required_name) {
+                        emit(
+                            Diagnostic::error()
+                                .with_message(format!("required task '{}' does not exist", required_name))
+                                .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                                .with_notes(vec![format!("in test '{}'", test_name)]),
+                        );
+                    }
+                    return;
+                };
+                if let Some(profile) = call.profile
+                    && !task_profiles.contains(&(short, profile))
+                    && let Some(span) = find_test_require_span(root, test_name, required_name)
+                {
+                    let available: Vec<_> =
+                        task_profiles.iter().filter(|(n, _)| *n == short).map(|(_, p)| *p).collect();
                     emit(
                         Diagnostic::error()
-                            .with_message(format!("required task '{}' does not exist", required_name))
+                            .with_message(format!(
+                                "required task '{}' does not have profile '{}'",
+                                required_name, profile
+                            ))
                             .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                            .with_notes(vec![format!("in test '{}'", test_name)]),
+                            .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
                     );
                 }
-                continue;
-            };
-            if let Some(profile) = call.profile
-                && !task_profiles.contains(&(short, profile))
-                && let Some(span) = find_test_require_span(root, test_name, required_name)
-            {
-                let available: Vec<_> = task_profiles.iter().filter(|(n, _)| *n == short).map(|(_, p)| *p).collect();
-                emit(
-                    Diagnostic::error()
-                        .with_message(format!("required task '{}' does not have profile '{}'", required_name, profile))
-                        .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                        .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
-                );
-            }
+            });
         }
     }
 }
 
+fn requirement_profile_predicates<'a>(require: &'a [crate::config::RequirementExpr<'a>]) -> Vec<&'a str> {
+    let mut profiles = Vec::new();
+    crate::config::RequirementListExpr { items: require }.visit_profile_predicates(&mut |profile| {
+        if !profiles.contains(&profile) {
+            profiles.push(profile);
+        }
+    });
+    profiles
+}
+
+fn task_has_profiles_field(root: &Table, task_name: &str) -> bool {
+    table_by_task_name(root, task_name).is_some_and(|table| table.get("profiles").is_some())
+}
+
+const VALIDATE_OTHER_PROFILE: &str = "\0devsm-other-profile";
+
+fn analysis_profiles<'a>(
+    declared_profiles: &[&'a str],
+    require: &'a [crate::config::RequirementExpr<'a>],
+) -> Vec<String> {
+    let mut profiles: Vec<String> = if declared_profiles.is_empty() {
+        vec![String::new()]
+    } else {
+        declared_profiles.iter().map(|p| (*p).to_string()).collect()
+    };
+    crate::config::RequirementListExpr { items: require }.visit_profile_predicates(&mut |profile| {
+        if !profiles.iter().any(|p| p == profile) {
+            profiles.push(profile.to_string());
+        }
+    });
+    profiles.push(VALIDATE_OTHER_PROFILE.to_string());
+    profiles
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_validate_variant<'a>(
+    base: usize,
+    base_name: &str,
+    kind: TaskKind,
+    require_exprs: &'a [crate::config::RequirementExpr<'a>],
+    profile: String,
+    variant_base: &mut Vec<usize>,
+    variant_kind: &mut Vec<TaskKind>,
+    variant_fallback: &mut Vec<bool>,
+    profile_storage: &mut Vec<String>,
+    name_storage: &mut Vec<String>,
+    requirement_storage: &mut Vec<Vec<crate::config::Requirement<'a>>>,
+    variant_map: &mut hashbrown::HashMap<(usize, Box<str>), usize>,
+    fallback_map: &mut hashbrown::HashMap<usize, usize>,
+) {
+    let fallback = profile == VALIDATE_OTHER_PROFILE;
+    let eval_profile = if fallback { VALIDATE_OTHER_PROFILE } else { profile.as_str() };
+    let mut requirements = Vec::new();
+    crate::config::RequirementListExpr { items: require_exprs }
+        .eval_for_profile_append(eval_profile, &mut requirements);
+    let input_idx = variant_base.len();
+    if fallback {
+        fallback_map.insert(base, input_idx);
+        name_storage.push(format!("{base_name}:<other>"));
+    } else {
+        variant_map.insert((base, profile.clone().into()), input_idx);
+        if profile.is_empty() {
+            name_storage.push(base_name.to_string());
+        } else {
+            name_storage.push(format!("{base_name}:{profile}"));
+        }
+    }
+    requirement_storage.push(requirements);
+    profile_storage.push(profile);
+    variant_base.push(base);
+    variant_kind.push(kind);
+    variant_fallback.push(fallback);
+}
+
+fn duplicate_resource_name<'a>(requirements: &'a [crate::config::Requirement<'a>]) -> Option<&'a str> {
+    for (i, req) in requirements.iter().enumerate() {
+        let crate::config::Requirement::Resource { name, .. } = req else { continue };
+        for prior in &requirements[..i] {
+            if let crate::config::Requirement::Resource { name: prior_name, .. } = prior
+                && prior_name == name
+            {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
 fn validate_require_graph(config: &WorkspaceConfig, root: &Table, emit: &mut dyn FnMut(Diagnostic)) {
-    let mut tasks: Vec<TaskInput> = Vec::with_capacity(config.tasks.len() + config.tests.len());
     let mut name_map: hashbrown::HashMap<&str, usize> = hashbrown::HashMap::new();
-    let mut name_kind: Vec<&str> = Vec::new();
+    let mut base_names: Vec<&str> = Vec::with_capacity(config.tasks.len() + config.tests.len());
+    let mut base_kinds: Vec<TaskKind> = Vec::with_capacity(config.tasks.len() + config.tests.len());
+    let mut default_profiles: Vec<String> = Vec::with_capacity(config.tasks.len() + config.tests.len());
+    let mut variant_base: Vec<usize> = Vec::new();
+    let mut variant_kind: Vec<TaskKind> = Vec::new();
+    let mut variant_fallback: Vec<bool> = Vec::new();
+    let mut profile_storage: Vec<String> = Vec::new();
+    let mut name_storage: Vec<String> = Vec::new();
+    let mut requirement_storage: Vec<Vec<crate::config::Requirement<'_>>> = Vec::new();
+    let mut variant_map: hashbrown::HashMap<(usize, Box<str>), usize> = hashbrown::HashMap::new();
+    let mut fallback_map: hashbrown::HashMap<usize, usize> = hashbrown::HashMap::new();
 
     for (name, expr) in config.tasks.iter() {
         if name_map.contains_key(*name) {
             continue;
         }
-        name_map.insert(*name, tasks.len());
-        tasks.push(TaskInput { name, kind: expr.kind, require: expr.require });
-        name_kind.push(*name);
+        let base = base_names.len();
+        name_map.insert(*name, base);
+        base_names.push(name);
+        base_kinds.push(expr.kind);
+        default_profiles.push(expr.profiles.first().copied().unwrap_or("").to_string());
+        for profile in analysis_profiles(expr.profiles, expr.require) {
+            push_validate_variant(
+                base,
+                name,
+                expr.kind,
+                expr.require,
+                profile,
+                &mut variant_base,
+                &mut variant_kind,
+                &mut variant_fallback,
+                &mut profile_storage,
+                &mut name_storage,
+                &mut requirement_storage,
+                &mut variant_map,
+                &mut fallback_map,
+            );
+        }
     }
 
     for (name, test_expr) in config.tests.iter() {
         if name_map.contains_key(*name) {
             continue;
         }
-        name_map.insert(*name, tasks.len());
-        tasks.push(TaskInput { name, kind: TaskKind::Test, require: test_expr.require });
-        name_kind.push(*name);
+        let base = base_names.len();
+        name_map.insert(*name, base);
+        base_names.push(name);
+        base_kinds.push(TaskKind::Test);
+        default_profiles.push(String::new());
+        for profile in analysis_profiles(&[], test_expr.require) {
+            push_validate_variant(
+                base,
+                name,
+                TaskKind::Test,
+                test_expr.require,
+                profile,
+                &mut variant_base,
+                &mut variant_kind,
+                &mut variant_fallback,
+                &mut profile_storage,
+                &mut name_storage,
+                &mut requirement_storage,
+                &mut variant_map,
+                &mut fallback_map,
+            );
+        }
     }
 
-    if tasks.is_empty() {
+    if variant_base.is_empty() {
         return;
     }
 
     struct StrLookup<'a> {
         map: &'a hashbrown::HashMap<&'a str, usize>,
-        tasks: &'a [TaskInput<'a>],
+        base_kinds: &'a [TaskKind],
+        default_profiles: &'a [String],
+        variant_map: &'a hashbrown::HashMap<(usize, Box<str>), usize>,
+        fallback_map: &'a hashbrown::HashMap<usize, usize>,
     }
     impl<'a> NameLookup for StrLookup<'a> {
-        fn lookup(&self, name: &str) -> Option<usize> {
+        fn lookup(&self, name: &str, profile: Option<&str>) -> Option<usize> {
             let (kind_filter, short) = match name.split_once('.') {
                 Some(("service", rest)) => (Some(TaskKind::Service), rest),
                 Some(("action", rest)) => (Some(TaskKind::Action), rest),
@@ -390,19 +563,67 @@ fn validate_require_graph(config: &WorkspaceConfig, root: &Table, emit: &mut dyn
             };
             let idx = self.map.get(short).copied()?;
             match kind_filter {
-                Some(k) if self.tasks[idx].kind == k => Some(idx),
-                Some(_) => None,
-                None => Some(idx),
-            }
+                Some(k) if self.base_kinds[idx] != k => return None,
+                Some(_) | None => {}
+            };
+            let requested_profile = profile.unwrap_or_else(|| self.default_profiles[idx].as_str());
+            self.variant_map
+                .get(&(idx, requested_profile.into()))
+                .copied()
+                .or_else(|| self.fallback_map.get(&idx).copied())
         }
     }
-    let analysis = RequireAnalysis::build(&tasks, &StrLookup { map: &name_map, tasks: &tasks });
 
-    for (name, message) in analysis.iter_problems(&tasks) {
+    let inputs: Vec<ProfileTaskInput<'_>> = variant_base
+        .iter()
+        .enumerate()
+        .map(|(idx, base)| ProfileTaskInput {
+            base_task: crate::workspace::BaseTaskIndex::new_or_panic(*base),
+            profile: profile_storage[idx].as_str(),
+            fallback: variant_fallback[idx],
+            name: name_storage[idx].as_str(),
+            kind: variant_kind[idx],
+            require: requirement_storage[idx].as_slice(),
+        })
+        .collect();
+    let lookup = StrLookup {
+        map: &name_map,
+        base_kinds: &base_kinds,
+        default_profiles: &default_profiles,
+        variant_map: &variant_map,
+        fallback_map: &fallback_map,
+    };
+    let analysis = RequireAnalysis::build_profiled(&inputs, &lookup);
+
+    let mut emitted = HashSet::new();
+    for (idx, base) in variant_base.iter().enumerate() {
+        if let Some(resource) = duplicate_resource_name(&requirement_storage[idx])
+            && emitted.insert((*base, format!("duplicate resource `{resource}` within evaluated `require`")))
+        {
+            let name = base_names[*base];
+            let label = find_require_array_span(root, name)
+                .map(|span| vec![DiagnosticLabel::primary(span).with_message("declared here")])
+                .unwrap_or_default();
+            emit(
+                Diagnostic::error()
+                    .with_message(format!("duplicate resource `{resource}` within evaluated `require`"))
+                    .with_labels(label),
+            );
+        }
+        if variant_fallback[idx] {
+            continue;
+        }
+        let bti = crate::workspace::BaseTaskIndex::new_or_panic(*base);
+        let profile = profile_storage[idx].as_str();
+        let Err(message) = analysis.problem_for_profile(bti, profile) else { continue };
+        if !emitted.insert((*base, message.clone())) {
+            continue;
+        }
+        let name = base_names[*base];
         let label = find_require_array_span(root, name)
             .map(|span| vec![DiagnosticLabel::primary(span).with_message("declared here")])
             .unwrap_or_default();
-        emit(Diagnostic::error().with_message(message.to_string()).with_labels(label));
+        emit(Diagnostic::error().with_message(message).with_labels(label));
     }
 }
 
@@ -534,19 +755,37 @@ fn find_test_require_span(root: &Table, test_name: &str, required_name: &str) ->
 }
 
 fn match_task_call_span(item: &Item, target_name: &str) -> Option<Range<usize>> {
-    let item_name = match item.value() {
-        Value::String(s) => s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s),
+    match item.value() {
+        Value::String(s) => {
+            let item_name = s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s);
+            if item_name == target_name { Some(item.span().range()) } else { None }
+        }
         Value::Array(arr) if !arr.is_empty() => {
             if let Value::String(s) = arr.as_slice()[0].value() {
-                s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s)
-            } else {
-                return None;
+                let item_name = s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s);
+                if item_name == target_name {
+                    return Some(item.span().range());
+                }
             }
+            for child in arr {
+                if let Some(span) = match_task_call_span(child, target_name) {
+                    return Some(span);
+                }
+            }
+            None
         }
-        _ => return None,
-    };
-
-    if item_name == target_name { Some(item.span().range()) } else { None }
+        Value::Table(table) if table.get("if").is_some() => {
+            for key in ["then", "or_else", "else"] {
+                if let Some(branch) = table.get(key)
+                    && let Some(span) = match_task_call_span(branch, target_name)
+                {
+                    return Some(span);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn table_by_task_name<'a>(root: &'a Table<'a>, task_name: &str) -> Option<&'a Table<'a>> {

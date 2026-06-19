@@ -122,6 +122,15 @@ require = ["simple_cmd"]
 cmd = ["./deploy.sh"]
 require = ["full_basic:release"]
 
+# Action with profile-dependent require
+[action.with_profile_dependent_require]
+cmd = ["./run-profiled.sh", { var = "$profile" }]
+profiles = ["default", "traffic-live"]
+require = [
+  "simple_cmd",
+  { if.profile = "traffic-live", then = "with_cache_empty" },
+]
+
 # Action with require using variables
 [action.with_require_vars]
 cmd = ["./run-tests.sh"]
