@@ -263,8 +263,9 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
     for (group_name, calls) in config.groups.iter() {
         for call in calls.iter() {
             let task_name: &str = &call.name;
+            let resolved = resolve_qualified_reference(task_name, &name_kinds, &test_names);
 
-            if !task_names.contains(task_name) {
+            let Some(short) = resolved else {
                 if let Some(span) = find_group_item_span(root, group_name, task_name) {
                     emit(
                         Diagnostic::error()
@@ -273,12 +274,14 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                             .with_notes(vec![format!("in group '{}'", group_name)]),
                     );
                 }
-            } else if let Some(profile) = call.profile
-                && !task_profiles.contains(&(task_name, profile))
+                continue;
+            };
+
+            if let Some(profile) = call.profile
+                && !task_profiles.contains(&(short, profile))
                 && let Some(span) = find_group_item_span(root, group_name, task_name)
             {
-                let available: Vec<_> =
-                    task_profiles.iter().filter(|(n, _)| *n == task_name).map(|(_, p)| *p).collect();
+                let available: Vec<_> = task_profiles.iter().filter(|(n, _)| *n == short).map(|(_, p)| *p).collect();
                 emit(
                     Diagnostic::error()
                         .with_message(format!("task '{}' does not have profile '{}'", task_name, profile))
@@ -702,6 +705,9 @@ fn find_group_item_span(root: &Table, group_name: &str, task_name: &str) -> Opti
                     continue;
                 }
             }
+            Value::Table(table) if table_task_call_name_matches(table, task_name) => {
+                return Some(item.span().range());
+            }
             _ => continue,
         };
 
@@ -710,6 +716,27 @@ fn find_group_item_span(root: &Table, group_name: &str, task_name: &str) -> Opti
         }
     }
     None
+}
+
+fn table_task_call_name_matches(table: &Table, target_name: &str) -> bool {
+    if let Some(name_value) = table.get("name")
+        && let Some(name) = name_value.as_str()
+    {
+        let item_name = name.rsplit_once(':').map(|(n, _)| n).unwrap_or(name);
+        return item_name == target_name;
+    }
+
+    for kind in ["action", "service", "test"] {
+        let Some(selector_value) = table.get(kind) else { continue };
+        let Some(selector) = selector_value.as_str() else { continue };
+        let short = selector.rsplit_once(':').map(|(n, _)| n).unwrap_or(selector);
+        if let Some((target_kind, target_short)) = target_name.split_once('.') {
+            return target_kind == kind && target_short == short;
+        }
+        return target_name == short;
+    }
+
+    false
 }
 
 fn find_require_span(root: &Table, task_name: &str, required_name: &str) -> Option<Range<usize>> {
@@ -784,6 +811,7 @@ fn match_task_call_span(item: &Item, target_name: &str) -> Option<Range<usize>> 
             }
             None
         }
+        Value::Table(table) if table_task_call_name_matches(table, target_name) => Some(item.span().range()),
         _ => None,
     }
 }

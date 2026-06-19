@@ -5521,7 +5521,7 @@ require = [
                     r#"
 [action.a{i}]
 cmd = ["true"]
-require = [["svc", {{ id = "{i}" }}], "sink0"]
+require = [{{ name = "svc", vars = {{ id = "{i}" }} }}, "sink0"]
 "#
                 ));
             }

@@ -143,23 +143,38 @@
       }
     },
     "taskCall": {
-      "description": "Reference to a task: simple name, name:profile, or [name, {vars}]",
+      "description": "Reference to a task: simple name, name:profile, or an object with vars",
       "oneOf": [
         {
           "type": "string",
           "description": "Task name, optionally with profile (e.g., 'build' or 'build:release')"
         },
         {
-          "type": "array",
-          "description": "Task call with variables: [name:profile, {var1: value1, ...}]",
-          "minItems": 1,
-          "maxItems": 2,
-          "items": [
-            {
+          "type": "object",
+          "description": "Task call object with optional profile and vars",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
               "type": "string",
-              "description": "Task name, optionally with profile"
+              "description": "Task name, optionally with profile or kind prefix"
             },
-            {
+            "action": {
+              "type": "string",
+              "description": "Action task name"
+            },
+            "service": {
+              "type": "string",
+              "description": "Service task name"
+            },
+            "test": {
+              "type": "string",
+              "description": "Test task name"
+            },
+            "profile": {
+              "type": "string",
+              "description": "Profile to use for the task"
+            },
+            "vars": {
               "type": "object",
               "description": "Variables to pass to the task",
               "additionalProperties": {
@@ -170,6 +185,12 @@
                 ]
               }
             }
+          },
+          "oneOf": [
+            { "required": ["name"] },
+            { "required": ["action"] },
+            { "required": ["service"] },
+            { "required": ["test"] }
           ]
         }
       ]
@@ -201,7 +222,7 @@
       ]
     },
     "requirementBranch": {
-      "description": "A conditional requirement branch: either one requirement or an array of requirements. Array branches are parsed as requirement lists; use a nested array for task calls with variables, e.g. [[\"task\", { \"var\": \"value\" }]].",
+      "description": "A conditional requirement branch: either one requirement or an array of requirements. Use task-call objects for variables, e.g. { name = \"task\", vars = { var = \"value\" } }.",
       "anyOf": [
         { "$ref": "#/definitions/requirement" },
         {

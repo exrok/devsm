@@ -656,7 +656,7 @@ fn parse_requirement_expr<'a>(
     {
         return parse_conditional_requirement(alloc, table, value, ctx);
     }
-    Ok(RequirementExpr::Requirement(parse_requirement(value, ctx)?))
+    Ok(RequirementExpr::Requirement(parse_requirement(alloc, value, ctx)?))
 }
 
 fn parse_conditional_requirement<'a>(
@@ -712,11 +712,13 @@ fn parse_requirement_branch<'a>(
     }
 }
 
-fn parse_requirement<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Requirement<'a>, Failed> {
+fn parse_requirement<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Requirement<'a>, Failed> {
     match value.value() {
-        Value::String(_) | Value::Array(_) => Ok(Requirement::Task(parse_task_call(value, ctx)?)),
-        Value::Table(table) => parse_resource_entry(table, value, ctx),
-        _ => Err(ctx.report_expected_but_found(&"a string, array, or `{ resource = \"...\" }` table", value)),
+        Value::String(_) => Ok(Requirement::Task(parse_task_call(alloc, value, ctx)?)),
+        Value::Array(_) => Ok(Requirement::Task(parse_task_call(alloc, value, ctx)?)),
+        Value::Table(table) if table.get("resource").is_some() => parse_resource_entry(table, value, ctx),
+        Value::Table(_) => Ok(Requirement::Task(parse_task_call(alloc, value, ctx)?)),
+        _ => Err(ctx.report_expected_but_found(&"a string, task-call table, or `{ resource = \"...\" }` table", value)),
     }
 }
 
@@ -743,10 +745,9 @@ fn parse_resource_entry<'a>(
                 }
                 _ => return Err(ctx.report_expected_but_found(&"an integer", val)),
             },
-            "name" | "profile" | "vars" => {
+            "name" | "profile" | "vars" | "action" | "service" | "test" => {
                 return Err(ctx.report_custom_error(
-                    "resource requirement cannot also specify `name`, `profile`, or `vars` — \
-                     use a string or array entry for task-call requirements",
+                    "resource requirement cannot also specify task-call fields like `name`, `profile`, or `vars`",
                     val,
                 ));
             }
@@ -800,48 +801,93 @@ fn check_no_duplicate_resources_in_exprs<'a>(
     check_no_duplicate_resources(&concrete, value, ctx)
 }
 
-fn parse_task_call<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<TaskCall<'a>, Failed> {
+fn split_task_call_name<'a>(name: &'a str) -> (&'a str, Option<&'a str>) {
+    match name.rsplit_once(':') {
+        Some((n, p)) => (n, Some(p)),
+        None => (name, None),
+    }
+}
+
+fn parse_task_call_vars<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<jsony_value::ValueMap<'a>, Failed> {
+    let vars_table = value.require_table(ctx)?;
+    let mut vars = jsony_value::ValueMap::new();
+    for (key, val) in vars_table {
+        let val_str = match val.value() {
+            Value::String(s) => s.to_string(),
+            Value::Integer(i) => i.to_string(),
+            Value::Boolean(b) => b.to_string(),
+            _ => continue,
+        };
+        vars.insert(key.name.into(), val_str.into());
+    }
+    Ok(vars)
+}
+
+fn parse_task_call<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<TaskCall<'a>, Failed> {
     match value.value() {
         Value::String(&s) => {
-            let (name, profile) = match s.rsplit_once(':') {
-                Some((n, p)) => (n, Some(p)),
-                None => (s, None),
-            };
+            let (name, profile) = split_task_call_name(s);
             Ok(TaskCall { name: Alias(name), profile, vars: jsony_value::ValueMap::new() })
         }
-        Value::Array(arr) => {
-            if arr.is_empty() {
-                return Err(ctx.report_custom_error("task call array cannot be empty", value));
-            }
-            if arr.len() > 2 {
-                return Err(ctx.report_custom_error("task call array can have at most 2 elements", value));
-            }
-
-            let first = &arr.as_slice()[0];
-            let s = first.require_string(ctx)?;
-            let (name, profile) = match s.rsplit_once(':') {
-                Some((n, p)) => (n, Some(p)),
-                None => (s, None),
-            };
-
+        Value::Array(_) => Err(ctx.report_custom_error(
+            "task call arrays are no longer supported; use { name = \"...\", vars = { ... } }",
+            value,
+        )),
+        Value::Table(table) => {
+            let mut selector: Option<&'a str> = None;
+            let mut profile: Option<&'a str> = None;
             let mut vars = jsony_value::ValueMap::new();
-            if arr.len() == 2 {
-                let second = &arr.as_slice()[1];
-                let vars_table = second.require_table(ctx)?;
-                for (key, val) in vars_table {
-                    let val_str = match val.value() {
-                        Value::String(s) => s.to_string(),
-                        Value::Integer(i) => i.to_string(),
-                        Value::Boolean(b) => b.to_string(),
-                        _ => continue,
-                    };
-                    vars.insert(key.name.into(), val_str.into());
+
+            for (key, val) in table {
+                match key.name {
+                    "name" => {
+                        if selector.is_some() {
+                            return Err(ctx.report_custom_error(
+                                "task call must specify exactly one of `name`, `action`, `service`, or `test`",
+                                val,
+                            ));
+                        }
+                        selector = Some(val.require_string(ctx)?);
+                    }
+                    "action" | "service" | "test" => {
+                        if selector.is_some() {
+                            return Err(ctx.report_custom_error(
+                                "task call must specify exactly one of `name`, `action`, `service`, or `test`",
+                                val,
+                            ));
+                        }
+                        let task_name = val.require_string(ctx)?;
+                        selector = Some(alloc.alloc_str(&format!("{}.{}", key.name, task_name)));
+                    }
+                    "profile" => profile = Some(val.require_string(ctx)?),
+                    "vars" => vars = parse_task_call_vars(val, ctx)?,
+                    "args" => {
+                        return Err(ctx.report_custom_error("task call uses `vars`, not `args`", val));
+                    }
+                    _ => {
+                        return Err(ctx.report_custom_error(
+                            "unknown key on task call (expected `name`, `action`, `service`, `test`, `profile`, or `vars`)",
+                            val,
+                        ));
+                    }
                 }
             }
 
-            Ok(TaskCall { name: Alias(name), profile, vars })
+            let Some(selector) = selector else {
+                return Err(ctx.report_custom_error(
+                    "task call must specify one of `name`, `action`, `service`, or `test`",
+                    value,
+                ));
+            };
+
+            let (name, inline_profile) = split_task_call_name(selector);
+            if inline_profile.is_some() && profile.is_some() {
+                return Err(ctx.report_custom_error("task call profile specified both inline and in `profile`", value));
+            }
+
+            Ok(TaskCall { name: Alias(name), profile: profile.or(inline_profile), vars })
         }
-        _ => Err(ctx.report_expected_but_found(&"a string or array", value)),
+        _ => Err(ctx.report_expected_but_found(&"a string or task-call table", value)),
     }
 }
 
@@ -862,12 +908,14 @@ fn parse_function_action<'a>(
                     Value::Array(arr) => {
                         let mut calls = bumpalo::collections::Vec::new_in(alloc);
                         for item in arr {
-                            calls.push(parse_task_call(item, ctx)?);
+                            calls.push(parse_task_call(alloc, item, ctx)?);
                         }
                         calls.into_bump_slice()
                     }
-                    Value::String(_) => std::slice::from_ref(alloc.alloc(parse_task_call(val, ctx)?)),
-                    _ => return Err(ctx.report_expected_but_found(&"a string or array", val)),
+                    Value::String(_) | Value::Table(_) => {
+                        std::slice::from_ref(alloc.alloc(parse_task_call(alloc, val, ctx)?))
+                    }
+                    _ => return Err(ctx.report_expected_but_found(&"a string, task-call table, or array", val)),
                 };
                 FunctionDefAction::Spawn { tasks }
             }
@@ -1007,7 +1055,7 @@ fn parse_root<'a>(
                     let group_array = group_value.require_array(ctx)?;
                     let mut calls = bumpalo::collections::Vec::new_in(alloc);
                     for item in group_array {
-                        calls.push(parse_task_call(item, ctx)?);
+                        calls.push(parse_task_call(alloc, item, ctx)?);
                     }
                     groups_vec.push((name.name, calls.into_bump_slice()));
                 }
@@ -1047,6 +1095,11 @@ mod test {
 
     fn collect_messages(doc: &Document<'_>) -> Vec<String> {
         doc.errors().iter().map(|e| e.message(doc.ctx.source())).collect()
+    }
+
+    fn assert_task_call(call: &TaskCall<'_>, name: &str, profile: Option<&str>) {
+        assert_eq!(&*call.name, name);
+        assert_eq!(call.profile, profile);
     }
 
     #[test]
@@ -1341,6 +1394,73 @@ mod test {
     }
 
     #[test]
+    fn parse_task_call_object_forms_everywhere() {
+        let text = r#"
+[function]
+fn1 = { spawn = [{ name = "dep", vars = { foo = "sadf" } }, { service = "svc" }] }
+
+[action.dep]
+cmd = ["echo"]
+
+[service.svc]
+cmd = ["echo"]
+
+[test.unit]
+cmd = ["echo"]
+
+[action.t]
+cmd = ["echo"]
+require = [
+  "dep:release",
+  { name = "dep", profile = "release", vars = { foo = "sadf" } },
+  { name = "dep:release", vars = { foo = "sadf" } },
+  { action = "dep", profile = "release" },
+  { service = "svc" },
+  { test = "unit" },
+  { name = "service.svc" },
+]
+
+[group]
+g = [{ name = "dep", vars = { foo = "sadf" } }, { action = "dep" }, { service = "svc" }]
+"#;
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "Expected success: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let (_, task) = config.tasks.iter().find(|(name, _)| *name == "t").expect("task t");
+
+        assert_eq!(task.require.len(), 7);
+        let RequirementExpr::Requirement(Requirement::Task(call)) = &task.require[0] else { panic!("task call") };
+        assert_task_call(call, "dep", Some("release"));
+        let RequirementExpr::Requirement(Requirement::Task(call)) = &task.require[1] else { panic!("task call") };
+        assert_task_call(call, "dep", Some("release"));
+        assert!(matches!(call.vars["foo"].as_ref(), jsony_value::ValueRef::String(s) if &**s == "sadf"));
+        let RequirementExpr::Requirement(Requirement::Task(call)) = &task.require[2] else { panic!("task call") };
+        assert_task_call(call, "dep", Some("release"));
+        let RequirementExpr::Requirement(Requirement::Task(call)) = &task.require[3] else { panic!("task call") };
+        assert_task_call(call, "action.dep", Some("release"));
+        let RequirementExpr::Requirement(Requirement::Task(call)) = &task.require[4] else { panic!("task call") };
+        assert_task_call(call, "service.svc", None);
+        let RequirementExpr::Requirement(Requirement::Task(call)) = &task.require[5] else { panic!("task call") };
+        assert_task_call(call, "test.unit", None);
+        let RequirementExpr::Requirement(Requirement::Task(call)) = &task.require[6] else { panic!("task call") };
+        assert_task_call(call, "service.svc", None);
+
+        let (_, group_calls) = config.groups.iter().find(|(name, _)| *name == "g").expect("group g");
+        assert_task_call(&group_calls[0], "dep", None);
+        assert!(matches!(group_calls[0].vars["foo"].as_ref(), jsony_value::ValueRef::String(s) if &**s == "sadf"));
+        assert_task_call(&group_calls[1], "action.dep", None);
+        assert_task_call(&group_calls[2], "service.svc", None);
+
+        let func = config.functions.iter().find(|f| f.name == "fn1").expect("fn1");
+        let FunctionDefAction::Spawn { tasks } = &func.action else { panic!("spawn function") };
+        assert_task_call(&tasks[0], "dep", None);
+        assert!(matches!(tasks[0].vars["foo"].as_ref(), jsony_value::ValueRef::String(s) if &**s == "sadf"));
+        assert_task_call(&tasks[1], "service.svc", None);
+    }
+
+    #[test]
     fn parse_profile_dependent_requirement_item() {
         let text = r#"
 [action.t]
@@ -1378,7 +1498,7 @@ require = [
 cmd = ["echo"]
 profiles = ["default", "live"]
 require = [
-  { if.profile = "live", then = [["svc", { port = 8080 }], { resource = "R" }], or_else = "setup" },
+  { if.profile = "live", then = [{ name = "svc", vars = { port = 8080 } }, { resource = "R" }], or_else = "setup" },
 ]
 "#;
         let arena = toml_spanner::Arena::new();
@@ -1412,8 +1532,68 @@ require = [
         assert!(result.is_err());
         let messages = collect_messages(&doc);
         assert!(
-            messages.iter().any(|m| m.contains("resource") || m.contains("priority")),
-            "expected error to mention `resource`/`priority`, got: {:?}",
+            messages.iter().any(|m| m.contains("unknown key on task call")),
+            "expected task-call unknown-key message, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn reject_task_call_array_form() {
+        let text = "[action.t]\ncmd = [\"echo\"]\nrequire = [[\"dep\", { foo = \"bar\" }]]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("task call arrays are no longer supported")),
+            "expected array rejection, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn reject_task_call_args_key() {
+        let text = "[action.t]\ncmd = [\"echo\"]\nrequire = [{ name = \"dep\", args = { foo = \"bar\" } }]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("uses `vars`, not `args`")),
+            "expected args rejection, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn reject_task_call_conflicting_selectors() {
+        let text = "[action.t]\ncmd = [\"echo\"]\nrequire = [{ name = \"dep\", service = \"svc\" }]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("exactly one of `name`, `action`, `service`, or `test`")),
+            "expected selector conflict, got: {:?}",
+            messages
+        );
+    }
+
+    #[test]
+    fn reject_task_call_duplicate_profile() {
+        let text = "[action.t]\ncmd = [\"echo\"]\nrequire = [{ name = \"dep:prod\", profile = \"dev\" }]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc);
+        assert!(
+            messages.iter().any(|m| m.contains("profile specified both inline and in `profile`")),
+            "expected duplicate profile rejection, got: {:?}",
             messages
         );
     }

@@ -579,7 +579,10 @@ allow_multiple = false
 [test.bad]
 cmd = ["test-app", "bad"]
 env.TEST_APP_SOCKET = "{ctrl_path}"
-require = [["svc:alpha", {{ id = "one" }}], ["svc:alpha", {{ id = "two" }}]]
+require = [
+  {{ name = "svc:alpha", vars = {{ id = "one" }} }},
+  {{ name = "svc:alpha", vars = {{ id = "two" }} }},
+]
 "#,
         ctrl_path = ctrl.path.display(),
     ));

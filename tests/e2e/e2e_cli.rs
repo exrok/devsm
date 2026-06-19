@@ -116,7 +116,7 @@ sh = "echo alpha-run"
 sh = "echo beta-run"
 
 [group]
-combo = ["alpha", "beta"]
+combo = [{ action = "alpha" }, { name = "beta" }]
 "#,
     );
     harness.spawn_server();
@@ -242,7 +242,7 @@ sh = "echo a >> {starts}; trap 'echo a > {stopped_a}; exit 0' INT; while true; d
 sh = "echo b >> {starts}; trap 'echo b > {stopped_b}; exit 0' INT; while true; do sleep 0.1; done"
 
 [group]
-dev = ["a", "b"]
+dev = [{{ service = "a" }}, {{ name = "service.b" }}]
 "#,
         starts = starts.display(),
         stopped_a = stopped_a.display(),
@@ -1165,8 +1165,8 @@ cache = {{}}
 [test.bad]
 cmd = ["true"]
 require = [
-  ["svc", {{ port = "a" }}],
-  ["svc", {{ port = "b" }}],
+  {{ name = "svc", vars = {{ port = "a" }} }},
+  {{ name = "svc", vars = {{ port = "b" }} }},
 ]
 "#,
         counter = counter.display()
@@ -1602,7 +1602,7 @@ env.MSG = {{ var = "msg" }}
 
 [action.main]
 sh = "echo main >> {output}"
-require = [["dep", {{ msg = "hello_from_params" }}]]
+require = [{{ name = "dep", vars = {{ msg = "hello_from_params" }} }}]
 "#,
         output = output_file.display()
     ));
@@ -1964,11 +1964,11 @@ env.VALUE = {{ var = "value" }}
 
 [action.main_a]
 sh = "echo main_a >> {output}"
-require = [["dep", {{ value = "aaa" }}]]
+require = [{{ name = "dep", vars = {{ value = "aaa" }} }}]
 
 [action.main_b]
 sh = "echo main_b >> {output}"
-require = [["dep", {{ value = "bbb" }}]]
+require = [{{ name = "dep", vars = {{ value = "bbb" }} }}]
 "#,
         counter = counter.display(),
         output = output.display()
@@ -2019,11 +2019,11 @@ env.MODE = {{ var = "mode" }}
 
 [action.task_a]
 sh = "touch {task_a_marker}"
-require = [["backend", {{ mode = "alpha" }}]]
+require = [{{ name = "backend", vars = {{ mode = "alpha" }} }}]
 
 [action.task_b]
 sh = "touch {task_b_marker}"
-require = [["backend", {{ mode = "beta" }}]]
+require = [{{ name = "backend", vars = {{ mode = "beta" }} }}]
 "#,
         service_log = service_log.display(),
         task_a_marker = task_a_marker.display(),
@@ -2073,11 +2073,11 @@ env.MODE = {{ var = "mode" }}
 
 [action.task_1]
 sh = "touch {task_1_marker}"
-require = [["backend", {{ mode = "same" }}]]
+require = [{{ name = "backend", vars = {{ mode = "same" }} }}]
 
 [action.task_2]
 sh = "touch {task_2_marker}"
-require = [["backend", {{ mode = "same" }}]]
+require = [{{ name = "backend", vars = {{ mode = "same" }} }}]
 "#,
         service_log = service_log.display(),
         task_1_marker = task_1_marker.display(),
@@ -3574,6 +3574,31 @@ fn1 = {{ restart = "my_task" }}
 }
 
 #[test]
+fn function_spawn_uses_object_vars() {
+    let mut harness = TestHarness::new("function_spawn_object_vars");
+    let marker = harness.temp_dir.join("function_spawn.txt");
+    harness.write_config(&format!(
+        r#"
+[action.target]
+sh = "echo $MSG > {marker}"
+env.MSG = {{ var = "msg" }}
+
+[function]
+fn1 = {{ spawn = {{ name = "target", vars = {{ msg = "from_function" }} }} }}
+"#,
+        marker = marker.display()
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["function", "call", "fn1"]);
+
+    assert!(result.success(), "Expected success, got: {}", result.stderr);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(fs::read_to_string(marker).unwrap(), "from_function\n");
+}
+
+#[test]
 fn function_call_default_restart_selected() {
     let mut harness = TestHarness::new("function_call_default");
     harness.write_config(
@@ -4363,8 +4388,8 @@ var.port = { default = "8080" }
 [action.user]
 cmd = ["true"]
 require = [
-  ["svc", { port = "a" }],
-  ["svc", { port = "b" }],
+  { name = "svc", vars = { port = "a" } },
+  { name = "svc", vars = { port = "b" } },
 ]
 "#,
     );

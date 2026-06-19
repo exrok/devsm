@@ -2,7 +2,7 @@
 
 [function]
 f1 = { kill = "full_basic" }
-f2 = { spawn = [["with_var", { dir = "/tmp/" }], "multiline_sh"] }
+f2 = { spawn = [{ name = "with_var", vars = { dir = "/tmp/" } }, "multiline_sh"] }
 f3 = { restart = "full_basic" }
 
 # Minimal action with cmd array
@@ -134,7 +134,7 @@ require = [
 # Action with require using variables
 [action.with_require_vars]
 cmd = ["./run-tests.sh"]
-require = [["with_var", { dir = "/usr/local" }]]
+require = [{ name = "with_var", vars = { dir = "/usr/local" } }]
 
 # Action with require using profile and variables
 [action.with_require_full]
@@ -142,10 +142,7 @@ cmd = ["./integration-test.sh"]
 require = [
   "simple_cmd",
   "full_basic:debug",
-  [
-    "with_var",
-    { dir = "/tmp" },
-  ],
+  { name = "with_var", vars = { dir = "/tmp" } },
 ]
 
 # Action with empty cache (simple success-based caching)
@@ -252,7 +249,7 @@ profiles = ["default", "verbose", "release", "frontend"]
 env.RUST_LOG = { if.profile = "verbose", then = "debug", or_else = "info" }
 env.BUILD_DIR = { var = "build_dir" }
 env.CI = "true"
-require = ["simple_cmd", "full_basic:release", ["with_var", { dir = "/opt" }]]
+require = ["simple_cmd", "full_basic:release", { name = "with_var", vars = { dir = "/opt" } }]
 cache.key = [
   { modified = "Cargo.toml" },
   { profile_changed = "with_cache_modified" },
@@ -351,10 +348,7 @@ env.ENVIRONMENT = { if.profile = "docker", then = "container", or_else = "local"
 require = [
   "simple_service",
   "full_service:staging",
-  [
-    "service_with_env:dev",
-    { log_level = "debug" },
-  ],
+  { name = "service_with_env:dev", vars = { log_level = "debug" } },
 ]
 info = "Complex service with all supported fields"
 
@@ -420,10 +414,7 @@ cmd = ["./e2e-tests.sh"]
 require = [
   "simple_cmd",
   "full_basic:debug",
-  [
-    "with_var",
-    { dir = "/test-data" },
-  ],
+  { name = "with_var", vars = { dir = "/test-data" } },
 ]
 
 # Resource lock with priority (serialized against other resource users)
@@ -511,29 +502,17 @@ simple = ["simple_cmd", "simple_sh"]
 with_profiles = ["full_basic:release", "service_conditional_cmd:watch"]
 # Group with tasks using variables
 with_vars = [
-  [
-    "with_var",
-    { dir = "/home" },
-  ],
-  [
-    "with_require_vars",
-    { extra = "value" },
-  ],
+  { name = "with_var", vars = { dir = "/home" } },
+  { name = "with_require_vars", vars = { extra = "value" } },
 ]
 # Group mixing all formats
 mixed = [
   "simple_cmd",
   "full_basic:debug",
-  [
-    "with_var",
-    { dir = "/usr" },
-  ],
+  { name = "with_var", vars = { dir = "/usr" } },
   "simple_service",
   "full_service:production",
-  [
-    "service_with_env:production",
-    { log_level = "warn" },
-  ],
+  { name = "service_with_env:production", vars = { log_level = "warn" } },
 ]
 # CI-style group
 ci = ["with_cache_empty", "with_cache_modified", "simple_test", "full_test"]
@@ -548,8 +527,5 @@ dev = [
 deploy = [
   "with_cache_multiple",
   "full_basic:release",
-  [
-    "complex_service:docker",
-    { db_url = "postgres://prod/db" },
-  ],
+  { name = "complex_service:docker", vars = { db_url = "postgres://prod/db" } },
 ]
