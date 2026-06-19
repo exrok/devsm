@@ -187,7 +187,7 @@ _devsm_commands() {
         'restart:Restart a task via daemon'
         'restart-selected:Restart selected task in TUI'
         'stop:Terminate a running task'
-        'status:Show status of a task or group'
+        'status:Show active tasks or task/group status'
         'test:Run tests with optional filters'
         'rerun-tests:Rerun previously failed tests'
         'logs:View and stream logs'

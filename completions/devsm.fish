@@ -418,7 +418,7 @@ complete -c devsm -n __fish_devsm_needs_command -a 'start' -d 'Start a task via 
 complete -c devsm -n __fish_devsm_needs_command -a 'restart' -d 'Restart a task via daemon'
 complete -c devsm -n __fish_devsm_needs_command -a 'restart-selected' -d 'Restart selected task in TUI'
 complete -c devsm -n __fish_devsm_needs_command -a 'stop' -d 'Terminate a running task'
-complete -c devsm -n __fish_devsm_needs_command -a 'status' -d 'Show status of a task or group'
+complete -c devsm -n __fish_devsm_needs_command -a 'status' -d 'Show active tasks or task/group status'
 complete -c devsm -n __fish_devsm_needs_command -a 'test' -d 'Run tests with optional filters'
 complete -c devsm -n __fish_devsm_needs_command -a 'rerun-tests' -d 'Rerun tests'
 complete -c devsm -n __fish_devsm_needs_command -a 'logs' -d 'View and stream logs'

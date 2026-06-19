@@ -1309,12 +1309,20 @@ pub struct GroupStatus {
     pub runnables: Vec<RunnableStatus>,
 }
 
+/// Status of the current workspace's active jobs.
+#[derive(Jsony, Debug)]
+#[jsony(ToJson, FromJson)]
+pub struct GlobalStatus {
+    pub runnables: Vec<RunnableStatus>,
+}
+
 /// Response payload for [`GetStatusRequest`].
 #[derive(Jsony, Debug)]
 #[jsony(ToJson, FromJson)]
 pub enum StatusResponse {
     Task(RunnableStatus),
     Group(GroupStatus),
+    Global(GlobalStatus),
 }
 
 /// Body of a command response.

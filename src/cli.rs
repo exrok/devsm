@@ -79,12 +79,40 @@ impl<'a> Iterator for ArgParser<'a> {
     }
 }
 
+fn is_help(component: &Component<'_>) -> bool {
+    matches!(component, Component::Long("help") | Component::Flags("h"))
+}
+
+fn parse_no_args<'a>(
+    parser: &mut ArgParser<'a>,
+    command: Command<'a>,
+    topic: HelpTopic,
+    command_name: &str,
+) -> anyhow::Result<Command<'a>> {
+    for component in parser.by_ref() {
+        if is_help(&component) {
+            return Ok(Command::Help(topic));
+        }
+        match component {
+            Component::Term(arg) => bail!("Unexpected argument in {command_name} command: {:?}", arg),
+            Component::Long(long) => bail!("Unknown flag --{} in {command_name} command", long),
+            Component::Flags(flags) => {
+                if let Some(flag) = flags.chars().next() {
+                    bail!("Unknown flag -{} in {command_name} command", flag);
+                }
+            }
+            Component::Value(val) => bail!("Unexpected value: {:?}", val),
+        }
+    }
+    Ok(command)
+}
+
 pub struct GlobalArguments<'a> {
     pub from: Option<&'a str>,
 }
 
 pub enum Command<'a> {
-    Help,
+    Help(HelpTopic),
     Tui,
     Global,
     Server,
@@ -95,7 +123,7 @@ pub enum Command<'a> {
     Run { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String], as_test: bool, derive_cache_key: bool },
     Auto { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String] },
     Stop { job: &'a str },
-    Status { name: &'a str },
+    Status { name: Option<&'a str> },
     Test { filters: Vec<TestFilter<'a>>, force: bool },
     RerunTests { only_failed: bool },
     Validate { path: Option<&'a str>, skip_path_checks: bool },
@@ -104,6 +132,36 @@ pub enum Command<'a> {
     Logs { options: LogsOptions<'a> },
     Complete { context: CompleteContext<'a> },
     Completions { shell: CompletionShell },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HelpTopic {
+    General,
+    Global,
+    Run,
+    Exec,
+    Start,
+    Restart,
+    RestartSelected,
+    Stop,
+    Status,
+    Test,
+    RerunTests,
+    Logs,
+    Get,
+    GetWorkspace,
+    GetWorkspaceConfigPath,
+    GetWorkspaces,
+    GetDefaultUserConfig,
+    GetLoggedRustPanics,
+    Function,
+    FunctionCall,
+    Completions,
+    SelfCommand,
+    SelfServer,
+    SelfValidate,
+    SelfLogs,
+    SelfComplete,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -256,9 +314,11 @@ fn parse_daemon_task<'a>(parser: &mut ArgParser<'a>, restart: bool) -> anyhow::R
     let mut cached = false;
     let mut job = None;
     let mut value_map = ValueMap::new();
+    let help_topic = if restart { HelpTopic::Restart } else { HelpTopic::Start };
 
     while let Some(component) = parser.next() {
         match component {
+            Component::Long("help") => return Ok(Command::Help(help_topic)),
             Component::Long("as-test") => as_test = true,
             Component::Long("cached") => cached = true,
             Component::Long(key) => {
@@ -278,6 +338,9 @@ fn parse_daemon_task<'a>(parser: &mut ArgParser<'a>, restart: bool) -> anyhow::R
                 }
             }
             Component::Flags(flags) => {
+                if flags == "h" {
+                    return Ok(Command::Help(help_topic));
+                }
                 if let Some(flag) = flags.chars().next() {
                     bail!("Unknown flag -{}", flag);
                 }
@@ -301,6 +364,7 @@ fn parse_daemon_task<'a>(parser: &mut ArgParser<'a>, restart: bool) -> anyhow::R
 
 fn parse_exec<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     let job = match parser.next() {
+        Some(component) if is_help(&component) => return Ok(Command::Help(HelpTopic::Exec)),
         Some(Component::Term(name)) => name,
         Some(f) => bail!("Expected name of job, found {:?}", f),
         None => bail!("Missing name of job"),
@@ -316,6 +380,7 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
 
     while let Some(component) = parser.next() {
         match component {
+            Component::Long("help") => return Ok(Command::Help(HelpTopic::Run)),
             Component::Long("as-test") => {
                 as_test = true;
             }
@@ -340,6 +405,9 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
                 }
             }
             Component::Flags(flags) => {
+                if flags == "h" {
+                    return Ok(Command::Help(HelpTopic::Run));
+                }
                 if let Some(flag) = flags.chars().next() {
                     bail!("Unknown flag -{}", flag);
                 }
@@ -372,10 +440,14 @@ fn parse_validate<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
                 path = Some(arg);
             }
             Component::Long(long) => match long {
+                "help" => return Ok(Command::Help(HelpTopic::SelfValidate)),
                 "skip-path-checks" => skip_path_checks = true,
                 _ => bail!("Unknown flag --{} in validate command", long),
             },
             Component::Flags(flags) => {
+                if flags == "h" {
+                    return Ok(Command::Help(HelpTopic::SelfValidate));
+                }
                 if let Some(flag) = flags.chars().next() {
                     bail!("Unknown flag -{}", flag);
                 }
@@ -409,11 +481,16 @@ fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<
             Component::Long(long) => {
                 if matches!(long, "force" | "no-cache") {
                     force = true;
+                } else if long == "help" {
+                    return Ok(Command::Help(HelpTopic::Test));
                 } else {
                     bail!("Unexpected flag --{} in test command", long);
                 }
             }
             Component::Flags(flags) => {
+                if flags == "h" {
+                    return Ok(Command::Help(HelpTopic::Test));
+                }
                 // Check if this is actually a negative tag filter (e.g., -slow)
                 // Single-character flags starting with a letter are treated as exclude tags
                 if !flags.is_empty() && flags.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
@@ -430,16 +507,24 @@ fn parse_test_filters<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<
     Ok(Command::Test { filters, force })
 }
 
-fn parse_rerun_tests<'a>(parser: &mut ArgParser<'a>) -> Command<'a> {
+fn parse_rerun_tests<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     let mut only_failed = false;
     for component in parser.by_ref() {
-        if let Component::Long(long) = component
-            && long == "only-failed"
-        {
-            only_failed = true;
+        match component {
+            Component::Long("help") => return Ok(Command::Help(HelpTopic::RerunTests)),
+            Component::Long("only-failed") => only_failed = true,
+            Component::Long(long) => bail!("Unknown flag --{} in rerun-tests command", long),
+            Component::Flags("h") => return Ok(Command::Help(HelpTopic::RerunTests)),
+            Component::Flags(flags) => {
+                if let Some(flag) = flags.chars().next() {
+                    bail!("Unknown flag -{} in rerun-tests command", flag);
+                }
+            }
+            Component::Term(arg) => bail!("Unexpected argument in rerun-tests command: {:?}", arg),
+            Component::Value(val) => bail!("Unexpected value: {:?}", val),
         }
     }
-    Command::RerunTests { only_failed }
+    Ok(Command::RerunTests { only_failed })
 }
 
 fn parse_task_selector(value: &str) -> TaskSelector<'_> {
@@ -473,6 +558,7 @@ fn parse_complete<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
                 context_str = Some(arg);
             }
             Component::Long(long) => match long {
+                "help" => return Ok(Command::Help(HelpTopic::SelfComplete)),
                 "task" => {
                     let Some(val) = parser.next_value() else {
                         bail!("Flag --task requires a value (use --task=NAME)");
@@ -492,6 +578,9 @@ fn parse_complete<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>>
                 _ => bail!("Unknown flag --{} in complete command", long),
             },
             Component::Flags(flags) => {
+                if flags == "h" {
+                    return Ok(Command::Help(HelpTopic::SelfComplete));
+                }
                 if let Some(flag) = flags.chars().next() {
                     bail!("Unknown flag -{}", flag);
                 }
@@ -560,6 +649,7 @@ fn parse_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
                 options.pattern = Some(arg);
             }
             Component::Long(long) => match long {
+                "help" => return Ok(Command::Help(HelpTopic::Logs)),
                 "follow" => options.follow = true,
                 "retry" => options.retry = true,
                 "without-taskname" => options.without_taskname = true,
@@ -602,6 +692,9 @@ fn parse_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
                 _ => bail!("Unknown flag --{} in logs command", long),
             },
             Component::Flags(flags) => {
+                if flags.chars().any(|flag| flag == 'h') {
+                    return Ok(Command::Help(HelpTopic::Logs));
+                }
                 for flag in flags.chars() {
                     match flag {
                         'f' => options.follow = true,
@@ -623,6 +716,9 @@ fn parse_self_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>
     for component in parser.by_ref() {
         match component {
             Component::Flags(flags) => {
+                if flags.chars().any(|flag| flag == 'h') {
+                    return Ok(Command::Help(HelpTopic::SelfLogs));
+                }
                 for flag in flags.chars() {
                     match flag {
                         'f' => follow = true,
@@ -631,6 +727,7 @@ fn parse_self_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>
                 }
             }
             Component::Long(long) => match long {
+                "help" => return Ok(Command::Help(HelpTopic::SelfLogs)),
                 "follow" => follow = true,
                 _ => bail!("Unknown flag --{} in self logs command", long),
             },
@@ -642,8 +739,11 @@ fn parse_self_logs<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>
 }
 
 fn parse_completions<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
-    let Some(Component::Term(shell)) = parser.next() else {
-        bail!("completions requires a shell name (bash, fish, zsh)");
+    let shell = match parser.next() {
+        Some(component) if is_help(&component) => return Ok(Command::Help(HelpTopic::Completions)),
+        Some(Component::Term(shell)) => shell,
+        Some(other) => bail!("Expected shell name, found {:?}", other),
+        None => bail!("completions requires a shell name (bash, fish, zsh)"),
     };
     let shell = match shell {
         "bash" => CompletionShell::Bash,
@@ -652,17 +752,23 @@ fn parse_completions<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'
         _ => bail!("Unknown shell: {} (expected bash, fish, or zsh)", shell),
     };
     if let Some(extra) = parser.next() {
+        if is_help(&extra) {
+            return Ok(Command::Help(HelpTopic::Completions));
+        }
         bail!("Unexpected argument after shell: {:?}", extra);
     }
     Ok(Command::Completions { shell })
 }
 
 fn parse_self<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
-    let Some(Component::Term(subcommand)) = parser.next() else {
-        bail!("self requires a subcommand (server, validate, logs, complete)");
+    let subcommand = match parser.next() {
+        Some(component) if is_help(&component) => return Ok(Command::Help(HelpTopic::SelfCommand)),
+        Some(Component::Term(subcommand)) => subcommand,
+        Some(other) => bail!("Expected self subcommand, found {:?}", other),
+        None => bail!("self requires a subcommand (server, validate, logs, complete)"),
     };
     match subcommand {
-        "server" => Ok(Command::Server),
+        "server" => parse_no_args(parser, Command::Server, HelpTopic::SelfServer, "self server"),
         "validate" => parse_validate(parser),
         "logs" => parse_self_logs(parser),
         "complete" => parse_complete(parser),
@@ -684,14 +790,14 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                 #[allow(clippy::never_loop)]
                 for flag in flags.chars() {
                     match flag {
-                        'h' => break 'command Command::Help,
+                        'h' => break 'command Command::Help(HelpTopic::General),
                         _ => bail!("Unknown flag, -{}", flag),
                     }
                 }
             }
             Component::Long(long) => {
                 if long == "help" {
-                    break 'command Command::Help;
+                    break 'command Command::Help(HelpTopic::General);
                 }
                 if long == "from" {
                     if let Some(Component::Long(value) | Component::Value(value)) = parser.next() {
@@ -708,71 +814,137 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                 bail!("Dangling value found: {:?}", value)
             }
             Component::Term(command) => match command {
-                "global" => break 'command Command::Global,
+                "global" => break 'command parse_no_args(&mut parser, Command::Global, HelpTopic::Global, "global")?,
                 "self" => break 'command parse_self(&mut parser)?,
                 "completions" => break 'command parse_completions(&mut parser)?,
-                "restart-selected" => break 'command Command::RestartSelected,
+                "restart-selected" => {
+                    break 'command parse_no_args(
+                        &mut parser,
+                        Command::RestartSelected,
+                        HelpTopic::RestartSelected,
+                        "restart-selected",
+                    )?;
+                }
                 "start" => break 'command parse_daemon_task(&mut parser, false)?,
                 "restart" => break 'command parse_daemon_task(&mut parser, true)?,
                 "exec" => break 'command parse_exec(&mut parser)?,
                 "run" => break 'command parse_run(&mut parser)?,
                 "stop" => {
-                    let Some(Component::Term(job)) = parser.next() else {
-                        bail!("stop requires a task name or job index");
+                    let job = match parser.next() {
+                        Some(component) if is_help(&component) => break 'command Command::Help(HelpTopic::Stop),
+                        Some(Component::Term(job)) => job,
+                        Some(other) => bail!("Expected task name or job index, found {:?}", other),
+                        None => bail!("stop requires a task name or job index"),
                     };
+                    if let Some(extra) = parser.next() {
+                        if is_help(&extra) {
+                            break 'command Command::Help(HelpTopic::Stop);
+                        }
+                        bail!("Unexpected argument after task name or job index: {:?}", extra);
+                    }
                     break 'command Command::Stop { job };
                 }
                 "status" => {
-                    let Some(Component::Term(name)) = parser.next() else {
-                        bail!("status requires a task or group name");
-                    };
+                    let mut name = None;
                     if let Some(extra) = parser.next() {
+                        if is_help(&extra) {
+                            break 'command Command::Help(HelpTopic::Status);
+                        }
+                        match extra {
+                            Component::Term(arg) => name = Some(arg),
+                            other => bail!("Expected task or group name, found {:?}", other),
+                        }
+                    }
+                    if let Some(extra) = parser.next() {
+                        if is_help(&extra) {
+                            break 'command Command::Help(HelpTopic::Status);
+                        }
                         bail!("Unexpected argument after name: {:?}", extra);
                     }
                     break 'command Command::Status { name };
                 }
                 "test" => break 'command parse_test_filters(&mut parser)?,
-                "rerun-tests" => break 'command parse_rerun_tests(&mut parser),
+                "rerun-tests" => break 'command parse_rerun_tests(&mut parser)?,
                 "logs" => break 'command parse_logs(&mut parser)?,
                 "function" => {
-                    let Some(Component::Term(subcommand)) = parser.next() else {
-                        bail!("function requires a subcommand (call)");
+                    let subcommand = match parser.next() {
+                        Some(component) if is_help(&component) => break 'command Command::Help(HelpTopic::Function),
+                        Some(Component::Term(subcommand)) => subcommand,
+                        Some(other) => bail!("Expected function subcommand, found {:?}", other),
+                        None => bail!("function requires a subcommand (call)"),
                     };
                     match subcommand {
                         "call" => {
-                            let Some(Component::Term(fn_name)) = parser.next() else {
-                                bail!("function call requires a function name");
+                            let fn_name = match parser.next() {
+                                Some(component) if is_help(&component) => {
+                                    break 'command Command::Help(HelpTopic::FunctionCall);
+                                }
+                                Some(Component::Term(fn_name)) => fn_name,
+                                Some(other) => bail!("Expected function name, found {:?}", other),
+                                None => bail!("function call requires a function name"),
                             };
+                            if let Some(extra) = parser.next() {
+                                if is_help(&extra) {
+                                    break 'command Command::Help(HelpTopic::FunctionCall);
+                                }
+                                bail!("Unexpected argument after function name: {:?}", extra);
+                            }
                             break 'command Command::FunctionCall { name: fn_name };
                         }
                         _ => bail!("Unknown function subcommand: {}", subcommand),
                     }
                 }
                 "get" => {
-                    let Some(Component::Term(resource)) = parser.next() else {
-                        bail!("get requires a resource name");
+                    let resource = match parser.next() {
+                        Some(component) if is_help(&component) => break 'command Command::Help(HelpTopic::Get),
+                        Some(Component::Term(resource)) => resource,
+                        Some(other) => bail!("Expected resource name, found {:?}", other),
+                        None => bail!("get requires a resource name"),
                     };
                     match resource {
                         "default-user-config" => {
-                            break 'command Command::Get { resource: GetResource::DefaultUserConfig };
+                            break 'command parse_no_args(
+                                &mut parser,
+                                Command::Get { resource: GetResource::DefaultUserConfig },
+                                HelpTopic::GetDefaultUserConfig,
+                                "get default-user-config",
+                            )?;
                         }
                         "workspace" => {
-                            let Some(Component::Term(sub)) = parser.next() else {
-                                bail!("get workspace requires a sub-resource");
+                            let sub = match parser.next() {
+                                Some(component) if is_help(&component) => {
+                                    break 'command Command::Help(HelpTopic::GetWorkspace);
+                                }
+                                Some(Component::Term(sub)) => sub,
+                                Some(other) => bail!("Expected workspace resource, found {:?}", other),
+                                None => bail!("get workspace requires a sub-resource"),
                             };
                             match sub {
                                 "config-path" => {
-                                    break 'command Command::Get { resource: GetResource::WorkspaceConfigPath };
+                                    break 'command parse_no_args(
+                                        &mut parser,
+                                        Command::Get { resource: GetResource::WorkspaceConfigPath },
+                                        HelpTopic::GetWorkspaceConfigPath,
+                                        "get workspace config-path",
+                                    )?;
                                 }
                                 _ => bail!("Unknown workspace resource: {}", sub),
                             }
                         }
                         "logged-rust-panics" => {
-                            break 'command Command::Get { resource: GetResource::LoggedRustPanics };
+                            break 'command parse_no_args(
+                                &mut parser,
+                                Command::Get { resource: GetResource::LoggedRustPanics },
+                                HelpTopic::GetLoggedRustPanics,
+                                "get logged-rust-panics",
+                            )?;
                         }
                         "workspaces" => {
                             let mut json = false;
                             for component in parser.by_ref() {
+                                if is_help(&component) {
+                                    break 'command Command::Help(HelpTopic::GetWorkspaces);
+                                }
                                 match component {
                                     Component::Long(long) => match long {
                                         "json" => json = true,
@@ -948,5 +1120,83 @@ mod tests {
         assert_eq!(task, "ls");
         assert_eq!(exclude, vec!["args", "other"]);
         assert_eq!(args, &["--env".to_string(), "x".to_string()]);
+    }
+
+    #[test]
+    fn parse_logs_help() {
+        let cli_args = args(&["logs", "--help"]);
+        let (_, command) = parse(&cli_args).unwrap();
+        let Command::Help(topic) = command else {
+            panic!("expected help command");
+        };
+        assert_eq!(topic, HelpTopic::Logs);
+    }
+
+    #[test]
+    fn parse_builtin_subcommand_help_topics() {
+        let cases = [
+            (&["global", "--help"][..], HelpTopic::Global),
+            (&["run", "--help"][..], HelpTopic::Run),
+            (&["exec", "--help"][..], HelpTopic::Exec),
+            (&["start", "--help"][..], HelpTopic::Start),
+            (&["restart", "--help"][..], HelpTopic::Restart),
+            (&["restart-selected", "--help"][..], HelpTopic::RestartSelected),
+            (&["stop", "--help"][..], HelpTopic::Stop),
+            (&["status", "--help"][..], HelpTopic::Status),
+            (&["test", "--help"][..], HelpTopic::Test),
+            (&["rerun-tests", "--help"][..], HelpTopic::RerunTests),
+            (&["logs", "--help"][..], HelpTopic::Logs),
+            (&["get", "--help"][..], HelpTopic::Get),
+            (&["get", "workspace", "--help"][..], HelpTopic::GetWorkspace),
+            (&["get", "workspace", "config-path", "--help"][..], HelpTopic::GetWorkspaceConfigPath),
+            (&["get", "workspaces", "--help"][..], HelpTopic::GetWorkspaces),
+            (&["get", "default-user-config", "--help"][..], HelpTopic::GetDefaultUserConfig),
+            (&["get", "logged-rust-panics", "--help"][..], HelpTopic::GetLoggedRustPanics),
+            (&["function", "--help"][..], HelpTopic::Function),
+            (&["function", "call", "--help"][..], HelpTopic::FunctionCall),
+            (&["completions", "--help"][..], HelpTopic::Completions),
+            (&["self", "--help"][..], HelpTopic::SelfCommand),
+            (&["self", "server", "--help"][..], HelpTopic::SelfServer),
+            (&["self", "validate", "--help"][..], HelpTopic::SelfValidate),
+            (&["self", "logs", "--help"][..], HelpTopic::SelfLogs),
+            (&["self", "complete", "--help"][..], HelpTopic::SelfComplete),
+        ];
+
+        for (values, expected) in cases {
+            let cli_args = args(values);
+            let (_, command) = parse(&cli_args).unwrap();
+            let Command::Help(topic) = command else {
+                panic!("expected help command for {values:?}");
+            };
+            assert_eq!(topic, expected, "args: {values:?}");
+        }
+    }
+
+    #[test]
+    fn parse_status_accepts_no_name() {
+        let cli_args = args(&["status"]);
+        let (_, command) = parse(&cli_args).unwrap();
+        let Command::Status { name } = command else {
+            panic!("expected status command");
+        };
+        assert_eq!(name, None);
+    }
+
+    #[test]
+    fn parse_run_help_before_task_but_preserves_trailing_task_help() {
+        let cli_args = args(&["run", "--help"]);
+        let (_, command) = parse(&cli_args).unwrap();
+        let Command::Help(topic) = command else {
+            panic!("expected help command");
+        };
+        assert_eq!(topic, HelpTopic::Run);
+
+        let cli_args = args(&["run", "build", "--help"]);
+        let (_, command) = parse(&cli_args).unwrap();
+        let Command::Run { job, trailing_args, .. } = command else {
+            panic!("expected run command");
+        };
+        assert_eq!(job, "build");
+        assert_eq!(trailing_args, &cli_args[2..]);
     }
 }

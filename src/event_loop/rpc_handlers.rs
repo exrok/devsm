@@ -4,7 +4,7 @@ use crate::config::Requirement;
 use crate::rpc::DecodeResult;
 use crate::rpc::DecodingState;
 use crate::workspace::{
-    BaseTaskIndex, FunctionGlobalAction, Job, ScheduleRequirement, SpawnSpec, WorkspaceState as WsState,
+    BaseTaskIndex, FunctionGlobalAction, Job, JobIndex, ScheduleRequirement, SpawnSpec, WorkspaceState as WsState,
 };
 use jsony_value::ValueMap;
 
@@ -531,12 +531,9 @@ fn last_job_for_base_task(state: &WsState, bti: BaseTaskIndex) -> Option<JobInde
     bt.jobs.terminal().last().copied()
 }
 
-fn build_runnable_status(state: &WsState, bti: BaseTaskIndex, detailed: bool) -> rpc::RunnableStatus {
+fn base_runnable_status(state: &WsState, bti: BaseTaskIndex) -> rpc::RunnableStatus {
     let bt = &state.base_tasks[bti.idx()];
-    let current_gen_id = state.config.current.id();
-    let expr = bt.config.expr();
-
-    let mut status = rpc::RunnableStatus {
+    rpc::RunnableStatus {
         name: bt.name.clone(),
         kind: bt.config.kind.as_str().into(),
         state: "never run".into(),
@@ -555,61 +552,92 @@ fn build_runnable_status(state: &WsState, bti: BaseTaskIndex, detailed: bool) ->
         command: None,
         envvars: Vec::new(),
         require: Vec::new(),
-    };
+    }
+}
 
+fn add_job_to_runnable_status(
+    state: &WsState,
+    status: &mut rpc::RunnableStatus,
+    ji: JobIndex,
+    job: &Job,
+    detailed: bool,
+) {
+    status.state = job_state_label(job).into();
+    status.last_job_id = state.jobs.public_id_of(ji);
+    status.last_run_started_secs_ago = job_age_secs(job);
+    status.last_run_duration_ms = job_duration_ms(job);
+    let (code, cause) = job_exit_info(job);
+    status.exit_code = code;
+    status.exit_cause = cause;
+    status.ready = job_ready_state(job);
+
+    let profile = job.spawn_profile();
+    if !profile.is_empty() {
+        status.profile = Some(profile.into());
+    }
+    let params = job.spawn_params();
+    if !params.entries().is_empty() {
+        status.spawn_params = Some(jsony::to_json(params).into());
+    }
+
+    status.config_generation_id = Some(job.spawn.generation_id);
+    status.config_is_current = job.spawn.generation_id == state.config.current.id();
+
+    if let JobStatus::Scheduled { after } = &job.process_status {
+        status.blocked_on = blockers_for_scheduled(state, after);
+    }
+
+    if detailed {
+        let tc = job.task().config();
+        status.pwd = Some(tc.pwd.into());
+        status.command = Some(render_command(&tc.command));
+        status.envvars = tc.envvar.iter().map(|(k, v)| format!("{k}={v}").into()).collect();
+    }
+}
+
+fn add_runnable_requirements(state: &WsState, bti: BaseTaskIndex, status: &mut rpc::RunnableStatus) {
+    let expr = state.base_tasks[bti.idx()].config.expr();
+    status.require = expr
+        .require
+        .iter()
+        .map(|r| match r {
+            Requirement::Task(call) => {
+                let p = call.profile.unwrap_or("");
+                if p.is_empty() {
+                    format!("task {}", &*call.name).into()
+                } else {
+                    format!("task {}:{}", &*call.name, p).into()
+                }
+            }
+            Requirement::Resource { name, priority } => format!("resource {name} (priority {priority})").into(),
+        })
+        .collect();
+}
+
+fn build_runnable_status_for_job(
+    state: &WsState,
+    bti: BaseTaskIndex,
+    ji: JobIndex,
+    detailed: bool,
+) -> rpc::RunnableStatus {
+    let mut status = base_runnable_status(state, bti);
+    let job = &state.jobs[ji];
+    add_job_to_runnable_status(state, &mut status, ji, job, detailed);
+    if detailed && status.require.is_empty() {
+        add_runnable_requirements(state, bti, &mut status);
+    }
+    status
+}
+
+fn build_runnable_status(state: &WsState, bti: BaseTaskIndex, detailed: bool) -> rpc::RunnableStatus {
+    let mut status = base_runnable_status(state, bti);
     if let Some(ji) = last_job_for_base_task(state, bti) {
         let job = &state.jobs[ji];
-        status.state = job_state_label(job).into();
-        status.last_job_id = state.jobs.public_id_of(ji);
-        status.last_run_started_secs_ago = job_age_secs(job);
-        status.last_run_duration_ms = job_duration_ms(job);
-        let (code, cause) = job_exit_info(job);
-        status.exit_code = code;
-        status.exit_cause = cause;
-        status.ready = job_ready_state(job);
-
-        let profile = job.spawn_profile();
-        if !profile.is_empty() {
-            status.profile = Some(profile.into());
-        }
-        let params = job.spawn_params();
-        if !params.entries().is_empty() {
-            status.spawn_params = Some(jsony::to_json(params).into());
-        }
-
-        status.config_generation_id = Some(job.spawn.generation_id);
-        status.config_is_current = job.spawn.generation_id == current_gen_id;
-
-        if let JobStatus::Scheduled { after } = &job.process_status {
-            status.blocked_on = blockers_for_scheduled(state, after);
-        }
-
-        if detailed {
-            let tc = job.task().config();
-            status.pwd = Some(tc.pwd.into());
-            status.command = Some(render_command(&tc.command));
-            status.envvars = tc.envvar.iter().map(|(k, v)| format!("{k}={v}").into()).collect();
-        }
+        add_job_to_runnable_status(state, &mut status, ji, job, detailed);
     }
-
     if detailed && status.require.is_empty() {
-        status.require = expr
-            .require
-            .iter()
-            .map(|r| match r {
-                Requirement::Task(call) => {
-                    let p = call.profile.unwrap_or("");
-                    if p.is_empty() {
-                        format!("task {}", &*call.name).into()
-                    } else {
-                        format!("task {}:{}", &*call.name, p).into()
-                    }
-                }
-                Requirement::Resource { name, priority } => format!("resource {name} (priority {priority})").into(),
-            })
-            .collect();
+        add_runnable_requirements(state, bti, &mut status);
     }
-
     status
 }
 
@@ -666,6 +694,18 @@ fn handle_rpc_get_status(ws: &mut WorkspaceEntry, payload: &[u8]) -> CommandBody
     ws.handle.refresh_config_if_changed();
     let state = ws.handle.state();
     let name = req.name;
+
+    if name.is_empty() {
+        let mut runnables: Vec<_> = state
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.process_status.is_pending_completion())
+            .map(|(ji, job)| build_runnable_status_for_job(&state, job.spawn.base_task, ji, false))
+            .collect();
+        runnables.sort_by_key(|r| r.last_job_id.unwrap_or(u32::MAX));
+        let resp = rpc::StatusResponse::Global(rpc::GlobalStatus { runnables });
+        return CommandBody::Message(jsony::to_json(&resp).into());
+    }
 
     let explicit_group = WsState::is_explicit_group_reference(name);
 

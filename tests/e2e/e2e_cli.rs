@@ -3,15 +3,16 @@
 use crate::harness;
 
 use std::fs;
-use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read, Write};
+use std::os::unix::{fs::PermissionsExt, net::UnixListener, net::UnixStream};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::rpc::{
-    CommandBody, ExitCause, JobStatusKind, KillTaskRequest, SpawnTaskRequest, SubscribeAck, SubscriptionFilter,
-    WorkspaceClient,
+    CommandBody, CommandResponse, DecodeResult, DecodingState, Encoder, ExitCause, GetStatusRequest, JobStatusKind,
+    KillTaskRequest, RpcMessageKind, RunnableStatus, SpawnTaskRequest, StatusResponse, SubscribeAck,
+    SubscriptionFilter, WorkspaceClient,
 };
 use harness::{RpcEvent, RpcSubscriber, TestHarness, cargo_bin_path};
 
@@ -264,6 +265,173 @@ dev = ["a", "b"]
     assert!(result.success(), "stop group failed: {}", result.stderr);
     assert!(harness.wait_for_file(&stopped_a, Duration::from_secs(3)), "service a was not stopped");
     assert!(harness.wait_for_file(&stopped_b, Duration::from_secs(3)), "service b was not stopped");
+}
+
+#[test]
+fn status_without_name_lists_active_tasks() {
+    let mut harness = TestHarness::new("status_active_tasks");
+    let started_a = harness.temp_dir.join("a.started");
+    let started_b = harness.temp_dir.join("b.started");
+    harness.write_config(&format!(
+        r#"
+[service.a]
+sh = "touch {started_a}; while true; do sleep 0.1; done"
+
+[service.b]
+sh = "touch {started_b}; while true; do sleep 0.1; done"
+
+[group]
+dev = ["a", "b"]
+"#,
+        started_a = started_a.display(),
+        started_b = started_b.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["start", "dev"]);
+    assert!(result.success(), "start group failed: {}", result.stderr);
+    assert!(harness.wait_for_file(&started_a, Duration::from_secs(3)), "service a did not start");
+    assert!(harness.wait_for_file(&started_b, Duration::from_secs(3)), "service b did not start");
+
+    let result = harness.run_client(&["status"]);
+    assert!(result.success(), "status failed: {}", result.stderr);
+    assert!(result.stdout.contains("2 active task(s)"), "unexpected status output:\n{}", result.stdout);
+    assert!(result.stdout.contains("service.a: running"), "missing service a:\n{}", result.stdout);
+    assert!(result.stdout.contains("service.b: running"), "missing service b:\n{}", result.stdout);
+    assert!(result.stdout.contains("Last job: #"), "missing job ids:\n{}", result.stdout);
+
+    let result = harness.run_client(&["stop", "dev"]);
+    assert!(result.success(), "stop group failed: {}", result.stderr);
+}
+
+fn fake_status(name: &str, kind: &str, state: &str, job_id: Option<u32>) -> RunnableStatus {
+    RunnableStatus {
+        name: name.into(),
+        kind: kind.into(),
+        state: state.into(),
+        last_job_id: job_id,
+        last_run_started_secs_ago: job_id.map(|_| 1),
+        last_run_duration_ms: job_id.map(|_| 1000),
+        exit_code: None,
+        exit_cause: None,
+        ready: None,
+        blocked_on: Vec::new(),
+        profile: None,
+        spawn_params: None,
+        config_generation_id: None,
+        config_is_current: true,
+        pwd: None,
+        command: None,
+        envvars: Vec::new(),
+        require: Vec::new(),
+    }
+}
+
+fn read_fake_get_status_name(stream: &mut UnixStream) -> String {
+    let mut state = DecodingState::new();
+    let mut buffer = Vec::new();
+    loop {
+        let mut chunk = [0; 4096];
+        let n = stream.read(&mut chunk).expect("read fake status request");
+        assert_ne!(n, 0, "client closed fake status connection before request");
+        buffer.extend_from_slice(&chunk[..n]);
+
+        match state.decode(&buffer) {
+            DecodeResult::Message { kind: RpcMessageKind::GetStatus, payload, .. } => {
+                let req: GetStatusRequest = jsony::from_binary(payload).expect("decode fake status request");
+                return req.name.to_string();
+            }
+            DecodeResult::Message { kind, .. } => panic!("unexpected fake status request kind: {kind:?}"),
+            DecodeResult::MissingData { .. } => continue,
+            DecodeResult::Empty => continue,
+            DecodeResult::Error(err) => panic!("fake status protocol error: {err:?}"),
+        }
+    }
+}
+
+fn write_fake_command_response(stream: &mut UnixStream, body: CommandBody) {
+    let mut encoder = Encoder::new();
+    encoder.encode_push(RpcMessageKind::CommandAck, &CommandResponse { workspace_id: 0, body });
+    stream.write_all(encoder.output()).expect("write fake status response");
+}
+
+#[test]
+fn status_without_name_falls_back_for_old_daemon() {
+    let harness = TestHarness::new("status_old_daemon_fallback");
+    harness.write_config(
+        r#"
+[action.idle]
+cmd = ["true"]
+
+[service.active]
+cmd = ["true"]
+"#,
+    );
+
+    let listener = UnixListener::bind(&harness.socket_path).expect("bind fake daemon socket");
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let started = Instant::now();
+        let mut accepted = 0;
+        while accepted < 3 && started.elapsed() < Duration::from_secs(5) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    accepted += 1;
+                    let name = read_fake_get_status_name(&mut stream);
+                    let body = match name.as_str() {
+                        "" => CommandBody::Error("'' is not a known task or group".into()),
+                        "action.idle" => {
+                            let resp = StatusResponse::Task(fake_status("idle", "action", "exited (success)", Some(0)));
+                            CommandBody::Message(jsony::to_json(&resp).into())
+                        }
+                        "service.active" => {
+                            let resp = StatusResponse::Task(fake_status("active", "service", "running", Some(1)));
+                            CommandBody::Message(jsony::to_json(&resp).into())
+                        }
+                        other => panic!("unexpected fake status query: {other}"),
+                    };
+                    write_fake_command_response(&mut stream, body);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("fake daemon accept failed: {err}"),
+            }
+        }
+        assert_eq!(accepted, 3, "fake daemon did not receive all fallback status requests");
+    });
+
+    let result = harness.run_client(&["status"]);
+    assert!(result.success(), "status fallback failed: {}", result.stderr);
+    assert!(result.stdout.contains("1 active task(s)"), "unexpected status output:\n{}", result.stdout);
+    assert!(result.stdout.contains("service.active: running"), "missing active service:\n{}", result.stdout);
+    assert!(!result.stdout.contains("action.idle"), "inactive task should be filtered:\n{}", result.stdout);
+
+    server.join().unwrap();
+}
+
+#[test]
+fn subcommand_help_does_not_require_daemon() {
+    let harness = TestHarness::new("subcommand_help");
+    harness.write_config(
+        r#"
+[action.dummy]
+cmd = ["true"]
+"#,
+    );
+
+    for args in [
+        &["logs", "--help"][..],
+        &["status", "--help"][..],
+        &["self", "logs", "--help"][..],
+        &["get", "workspaces", "--help"][..],
+    ] {
+        let result = harness.run_client(args);
+        assert!(result.success(), "{args:?} should print help: {}", result.stderr);
+        assert!(result.stderr.is_empty(), "{args:?} should not warn: {}", result.stderr);
+        assert!(result.stdout.contains("Usage: devsm"), "{args:?} did not print usage:\n{}", result.stdout);
+    }
 }
 
 #[test]

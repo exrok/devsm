@@ -9,6 +9,7 @@ use sendfd::SendWithFd;
 use std::{
     io::{ErrorKind, Read, Write},
     os::unix::{net::UnixStream, process::CommandExt},
+    path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
@@ -65,8 +66,8 @@ fn main() {
         }
     };
     match command {
-        cli::Command::Help => {
-            print_help();
+        cli::Command::Help(topic) => {
+            print_help_topic(topic);
         }
         cli::Command::Tui => {
             let _log_guard = self_log::init_client_logging();
@@ -568,16 +569,19 @@ fn kill_task_command(job: &str) -> anyhow::Result<()> {
     handle_command_response(response)
 }
 
-fn status_command(name: &str) -> anyhow::Result<()> {
+fn status_command(name: Option<&str>) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let config = config::find_config_path_from(&cwd)
         .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
 
     let workspace = WorkspaceRef::Path { config: &config };
-    let req = rpc::GetStatusRequest { name };
+    let req = rpc::GetStatusRequest { name: name.unwrap_or("") };
     let response = rpc_ws_command(RpcMessageKind::GetStatus, &workspace, &req)?;
 
     match response.body {
+        CommandBody::Error(err) if name.is_none() && err.as_ref() == "'' is not a known task or group" => {
+            status_command_legacy_global_fallback(&config)
+        }
         CommandBody::Error(err) => bail!("{err}"),
         CommandBody::Empty => bail!("empty status response"),
         CommandBody::Message(msg) => {
@@ -587,6 +591,49 @@ fn status_command(name: &str) -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn status_command_legacy_global_fallback(config_path: &Path) -> anyhow::Result<()> {
+    let base_path = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let content = std::fs::read_to_string(config_path)?.leak();
+    let workspace_config = config::load_workspace_config_from_path(base_path, config_path, content)?;
+    let workspace = WorkspaceRef::Path { config: config_path };
+
+    let mut names = Vec::new();
+    for (name, expr) in workspace_config.tasks {
+        names.push(format!("{}.{}", expr.kind.as_str(), name));
+    }
+    for (name, _) in workspace_config.tests {
+        names.push(format!("test.{name}"));
+    }
+
+    let mut runnables = Vec::new();
+    for query_name in &names {
+        let req = rpc::GetStatusRequest { name: query_name };
+        let response = rpc_ws_command(RpcMessageKind::GetStatus, &workspace, &req)?;
+        match response.body {
+            CommandBody::Message(msg) => {
+                let parsed: rpc::StatusResponse =
+                    jsony::from_json(&msg).map_err(|e| anyhow::anyhow!("Failed to decode status response: {e:?}"))?;
+                if let rpc::StatusResponse::Task(r) = parsed
+                    && is_active_runnable(&r)
+                {
+                    runnables.push(r);
+                }
+            }
+            CommandBody::Empty => {}
+            CommandBody::Error(err) => bail!("{err}"),
+        }
+    }
+
+    runnables.sort_by_key(|r| r.last_job_id.unwrap_or(u32::MAX));
+    print_status_response(&rpc::StatusResponse::Global(rpc::GlobalStatus { runnables }));
+    Ok(())
+}
+
+fn is_active_runnable(r: &rpc::RunnableStatus) -> bool {
+    let state = r.state.as_ref();
+    state == "scheduled" || state == "starting" || state.starts_with("running")
 }
 
 fn format_duration_ms(ms: u64) -> String {
@@ -699,6 +746,17 @@ fn print_status_response(resp: &rpc::StatusResponse) {
         rpc::StatusResponse::Group(g) => {
             println!("group.{}: {}", g.name, g.overall);
             println!("  {} runnable(s)", g.runnables.len());
+            for r in &g.runnables {
+                println!();
+                print_runnable_summary("  ", r);
+            }
+        }
+        rpc::StatusResponse::Global(g) => {
+            if g.runnables.is_empty() {
+                println!("No active tasks.");
+                return;
+            }
+            println!("{} active task(s)", g.runnables.len());
             for r in &g.runnables {
                 println!();
                 print_runnable_summary("  ", r);
@@ -1598,7 +1656,7 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             println!("restart\tRestart a task via daemon");
             println!("restart-selected\tRestart selected task in TUI");
             println!("stop\tTerminate a running task");
-            println!("status\tShow status of a task or group");
+            println!("status\tShow active tasks or task/group status");
             println!("test\tRun tests with optional filters");
             println!("logs\tView and stream logs");
             println!("self\tRun devsm self-management commands");
@@ -1775,6 +1833,271 @@ fn print_completions(context: cli::CompleteContext) -> bool {
     }
 }
 
+fn print_help_topic(topic: cli::HelpTopic) {
+    match topic {
+        cli::HelpTopic::General => print_help(),
+        cli::HelpTopic::Global => print!(
+            "\
+Usage: devsm global
+
+Open the global workspace selector.
+"
+        ),
+        cli::HelpTopic::Run => print!(
+            "\
+Usage: devsm run [OPTIONS] <job> [args]
+
+Run a job and display its output.
+
+Options:
+  --as-test             Run the job as part of a test group
+  --derive-cache-key    Trace and write cache.key into devsm.toml
+  -h, --help            Print this help message
+
+Job parameters may be passed before <job> as --key=value flags or JSON.
+Arguments after <job> are passed through to the task.
+"
+        ),
+        cli::HelpTopic::Exec => print!(
+            "\
+Usage: devsm exec <job> [args]
+
+Execute a task directly, bypassing the daemon.
+
+Options:
+  -h, --help            Print this help message
+"
+        ),
+        cli::HelpTopic::Start => print!(
+            "\
+Usage: devsm start [OPTIONS] <job> [params]
+
+Start a job via the daemon without restarting an active matching job.
+
+Options:
+  --as-test             Run the job as part of a test group
+  --cached              Skip start if cache support says the job is current
+  -h, --help            Print this help message
+"
+        ),
+        cli::HelpTopic::Restart => print!(
+            "\
+Usage: devsm restart [OPTIONS] <job> [params]
+
+Restart a job via the daemon.
+
+Options:
+  --as-test             Run the job as part of a test group
+  --cached              Skip restart if cache support says the job is current
+  -h, --help            Print this help message
+"
+        ),
+        cli::HelpTopic::RestartSelected => print!(
+            "\
+Usage: devsm restart-selected
+
+Restart the currently selected task in an active TUI session.
+"
+        ),
+        cli::HelpTopic::Stop => print!(
+            "\
+Usage: devsm stop <task>
+
+Terminate a running task by name or job index.
+
+Options:
+  -h, --help            Print this help message
+"
+        ),
+        cli::HelpTopic::Status => print!(
+            "\
+Usage: devsm status [name]
+
+Show active tasks when no name is provided. With a name, show status for a task
+or group.
+
+Options:
+  -h, --help            Print this help message
+"
+        ),
+        cli::HelpTopic::Test => print!(
+            "\
+Usage: devsm test [OPTIONS] [filters]
+
+Run tests with optional filters.
+
+Filters:
+  +tag                  Include tests with this tag
+  -tag                  Exclude tests with this tag
+  name                  Include tests matching this name
+
+Options:
+  --force, --no-cache   Run matching tests even when cache would skip them
+  -h, --help            Print this help message
+"
+        ),
+        cli::HelpTopic::RerunTests => print!(
+            "\
+Usage: devsm rerun-tests [OPTIONS]
+
+Rerun the previous test group.
+
+Options:
+  --only-failed         Only rerun failed tests
+  -h, --help            Print this help message
+"
+        ),
+        cli::HelpTopic::Logs => print!(
+            "\
+Usage: devsm logs [OPTIONS] [PATTERN]
+
+View and stream logs from tasks.
+
+Options:
+  --max-age=DURATION     Show logs since DURATION ago (5s, 10m, 1h)
+  --task=NAME[@latest]   Filter by task name (repeatable)
+  --kind=KIND[@latest]   Filter by kind: service, action, test (repeatable)
+  --job=INDEX            Filter by job index
+  --follow, -f           Stream new logs
+  --retry                With @latest, wait for next job
+  --oldest=N             Show oldest N lines
+  --newest=N             Show newest N lines
+  --without-taskname     Omit task name prefixes
+  -h, --help             Print this help message
+"
+        ),
+        cli::HelpTopic::Get => print!(
+            "\
+Usage: devsm get <resource>
+
+Resources:
+  workspace config-path  Get config file path
+  workspaces [--json]    List known workspaces
+  default-user-config    Print default user config
+  logged-rust-panics     Show logged Rust panics from daemon
+"
+        ),
+        cli::HelpTopic::GetWorkspace => print!(
+            "\
+Usage: devsm get workspace <resource>
+
+Resources:
+  config-path            Get config file path
+"
+        ),
+        cli::HelpTopic::GetWorkspaceConfigPath => print!(
+            "\
+Usage: devsm get workspace config-path
+
+Print the current workspace devsm.toml path.
+"
+        ),
+        cli::HelpTopic::GetWorkspaces => print!(
+            "\
+Usage: devsm get workspaces [OPTIONS]
+
+List known workspaces, sorted by last loaded.
+
+Options:
+  --json                 Output JSON
+  -h, --help             Print this help message
+"
+        ),
+        cli::HelpTopic::GetDefaultUserConfig => print!(
+            "\
+Usage: devsm get default-user-config
+
+Print the default user config.
+"
+        ),
+        cli::HelpTopic::GetLoggedRustPanics => print!(
+            "\
+Usage: devsm get logged-rust-panics
+
+Show logged Rust panics from the daemon.
+"
+        ),
+        cli::HelpTopic::Function => print!(
+            "\
+Usage: devsm function <command>
+
+Commands:
+  call <name>            Call a function defined in config
+"
+        ),
+        cli::HelpTopic::FunctionCall => print!(
+            "\
+Usage: devsm function call <name>
+
+Call a function defined in config.
+"
+        ),
+        cli::HelpTopic::Completions => print!(
+            "\
+Usage: devsm completions <shell>
+
+Print a shell completion script.
+
+Shells:
+  bash
+  fish
+  zsh
+"
+        ),
+        cli::HelpTopic::SelfCommand => print!(
+            "\
+Usage: devsm self <command>
+
+Commands:
+  server                 Start the daemon process
+  validate [path]        Validate a config file
+  logs [-f]              Retrieve daemon logs
+  complete <ctx>         Output completion data for shell scripts
+"
+        ),
+        cli::HelpTopic::SelfServer => print!(
+            "\
+Usage: devsm self server
+
+Start the daemon process.
+"
+        ),
+        cli::HelpTopic::SelfValidate => print!(
+            "\
+Usage: devsm self validate [OPTIONS] [path]
+
+Validate a config file.
+
+Options:
+  --skip-path-checks     Skip validation of pwd paths
+  -h, --help             Print this help message
+"
+        ),
+        cli::HelpTopic::SelfLogs => print!(
+            "\
+Usage: devsm self logs [OPTIONS]
+
+Retrieve daemon logs.
+
+Options:
+  --follow, -f           Stream new logs
+  -h, --help             Print this help message
+"
+        ),
+        cli::HelpTopic::SelfComplete => print!(
+            "\
+Usage: devsm self complete <context> [OPTIONS]
+
+Output completion data for shell scripts.
+
+Contexts:
+  commands, tasks, runnables, tests, profiles, vars, forward-prefix,
+  task-args, groups, functions, tags, get-resources, kinds
+"
+        ),
+    }
+}
+
 fn print_help() {
     print!(
         "\
@@ -1793,7 +2116,7 @@ Commands:
   restart <job>      Restart a job via the daemon
   restart-selected   Restart the currently selected task in TUI
   stop <task>        Terminate a running task (by name or index)
-  status <name>      Show status of a task or group (systemctl-style)
+  status [name]      Show active tasks, or status of a task/group
   test [options] [filters]
                      Run tests with optional filters
   logs [options]     View and stream logs from tasks
