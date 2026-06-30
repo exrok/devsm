@@ -104,7 +104,7 @@ impl StatusKind {
         match status {
             Starting => StatusKind::Wait,
             Scheduled { .. } => StatusKind::Wait,
-            Running { .. } => StatusKind::Live,
+            Running { .. } | RemoteRunning { .. } => StatusKind::Live,
             Exited { status, cause, .. } => match cause {
                 ExitCause::Restarted => StatusKind::Past,
                 ExitCause::Killed | ExitCause::ProfileConflict | ExitCause::Timeout => StatusKind::Quit,

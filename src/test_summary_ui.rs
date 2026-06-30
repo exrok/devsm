@@ -300,7 +300,7 @@ fn update_tui_state(tui_state: &mut TuiState, workspace: &Workspace, test_run: &
                 all_done = false;
                 (TestJobStatus::Pending, None)
             }
-            JobStatus::Running { .. } => {
+            JobStatus::Running { .. } | JobStatus::RemoteRunning { .. } => {
                 all_done = false;
                 (TestJobStatus::Running, None)
             }
@@ -786,7 +786,7 @@ fn update_test_statuses(
                 all_done = false;
                 (TestJobStatus::Pending, None)
             }
-            JobStatus::Running { .. } => {
+            JobStatus::Running { .. } | JobStatus::RemoteRunning { .. } => {
                 all_done = false;
                 (TestJobStatus::Running, None)
             }

@@ -167,6 +167,12 @@ pub enum RpcMessageKind {
     JobExited = 0x0302,
     DebugTrace = 0x0303,
     JobTraceReport = 0x0304,
+    // Exec gating: the daemon tells a waiting `devsm exec` client whether its
+    // requirements are satisfied (`ExecProceed`), still pending (`ExecWaiting`),
+    // or can never be satisfied (`ExecError`).
+    ExecProceed = 0x0305,
+    ExecWaiting = 0x0306,
+    ExecError = 0x0307,
     Disconnect = 0x03FF,
 }
 
@@ -206,6 +212,9 @@ impl RpcMessageKind {
             0x0302 => Some(Self::JobExited),
             0x0303 => Some(Self::DebugTrace),
             0x0304 => Some(Self::JobTraceReport),
+            0x0305 => Some(Self::ExecProceed),
+            0x0306 => Some(Self::ExecWaiting),
+            0x0307 => Some(Self::ExecError),
             0x03FF => Some(Self::Disconnect),
             _ => None,
         }
@@ -908,6 +917,22 @@ pub enum JobStatusKind {
 pub struct JobStatusEvent {
     pub job_index: u32,
     pub status: JobStatusKind,
+}
+
+/// Names of the dependencies an `exec` task is still blocked on, sent once the
+/// client has been waiting longer than the warning threshold.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct ExecWaitingEvent {
+    pub tasks: Vec<String>,
+}
+
+/// Reason an `exec` task's requirements can never be satisfied. The client
+/// prints this to stderr and exits without running the command.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct ExecErrorEvent {
+    pub message: String,
 }
 
 #[derive(Jsony, Debug, Clone, Copy, PartialEq, Eq)]

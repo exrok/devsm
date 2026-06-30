@@ -6,7 +6,8 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::{fs::PermissionsExt, net::UnixListener, net::UnixStream};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::rpc::{
@@ -15,6 +16,21 @@ use crate::rpc::{
     SubscriptionFilter, WorkspaceClient,
 };
 use harness::{RpcEvent, RpcSubscriber, TestHarness, cargo_bin_path};
+
+fn spawn_client_process(harness: &TestHarness, args: &[&str]) -> Child {
+    Command::new(cargo_bin_path())
+        .args(args)
+        .current_dir(&harness.temp_dir)
+        .env("DEVSM_SOCKET", &harness.socket_path)
+        .env("DEVSM_DB", "/dev/null")
+        .env("DEVSM_NO_AUTO_SPAWN", "1")
+        .env("DEVSM_CONNECT_TIMEOUT_MS", "5000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn client")
+}
 
 fn run_client_with_timeout(harness: &TestHarness, args: &[&str], timeout: Duration) -> Option<harness::ClientResult> {
     let mut cmd = Command::new(cargo_bin_path());
@@ -67,6 +83,160 @@ fn wait_for_line_count(path: &Path, needle: &str, expected: usize, timeout: Dura
         std::thread::sleep(Duration::from_millis(10));
     }
     false
+}
+
+fn wait_child_with_timeout(mut child: Child, timeout: Duration) -> (Option<harness::ClientResult>, Option<Child>) {
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait().expect("failed to poll child") {
+            Some(status) => break status,
+            None if start.elapsed() >= timeout => return (None, Some(child)),
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        out.read_to_string(&mut stdout).ok();
+    }
+    if let Some(mut err) = child.stderr.take() {
+        err.read_to_string(&mut stderr).ok();
+    }
+
+    (Some(harness::ClientResult { status, stdout, stderr }), None)
+}
+
+mod exec_await_wire {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    use jsony::Jsony;
+    use jsony_value::ValueMap;
+
+    mod unix_path {
+        use super::*;
+        use jsony::{BytesWriter, FromBinary, ToBinary};
+
+        pub fn encode_binary(value: &Path, output: &mut BytesWriter) {
+            value.as_os_str().as_bytes().encode_binary(output);
+        }
+
+        pub fn decode_binary<'a>(decoder: &mut jsony::binary::Decoder<'a>) -> &'a Path {
+            Path::new(OsStr::from_bytes(<&'a [u8]>::decode_binary(decoder)))
+        }
+    }
+
+    #[derive(Jsony, Debug)]
+    #[jsony(Binary)]
+    pub struct RequestMessage<'a> {
+        #[jsony(with = unix_path)]
+        pub cwd: &'a Path,
+        pub request: Request<'a>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Jsony, Debug)]
+    #[jsony(Binary)]
+    pub enum Request<'a> {
+        AttachTui {
+            #[jsony(with = unix_path)]
+            config: &'a Path,
+        },
+        AttachRun {
+            #[jsony(with = unix_path)]
+            config: &'a Path,
+            name: Box<str>,
+            params: ValueMap<'a>,
+            as_test: bool,
+            derive_cache_key: bool,
+        },
+        AttachTests {
+            #[jsony(with = unix_path)]
+            config: &'a Path,
+            filters: bool,
+        },
+        AttachRpc {
+            #[jsony(with = unix_path)]
+            config: &'a Path,
+            subscribe: bool,
+        },
+        AttachLogs {
+            #[jsony(with = unix_path)]
+            config: &'a Path,
+            query: bool,
+        },
+        GetSelfLogs {
+            follow: bool,
+        },
+        ExecAwait {
+            #[jsony(with = unix_path)]
+            config: &'a Path,
+            name: Box<str>,
+            params: ValueMap<'a>,
+        },
+    }
+}
+
+fn connect_exec_await(harness: &TestHarness, task: &str) -> UnixStream {
+    let mut socket = UnixStream::connect(&harness.socket_path).expect("connect exec-await socket");
+    let config = harness.temp_dir.join("devsm.toml");
+    let message = exec_await_wire::RequestMessage {
+        cwd: &harness.temp_dir,
+        request: exec_await_wire::Request::ExecAwait {
+            config: &config,
+            name: task.into(),
+            params: jsony_value::ValueMap::new(),
+        },
+    };
+    socket.write_all(&jsony::to_binary(&message)).expect("send exec-await request");
+    socket
+}
+
+fn wait_for_exec_proceed(socket: &mut UnixStream, timeout: Duration) -> Result<(), String> {
+    let start = Instant::now();
+    let mut state = DecodingState::default();
+    let mut buffer = Vec::with_capacity(256);
+    while start.elapsed() < timeout {
+        socket.set_read_timeout(Some(Duration::from_millis(50))).ok();
+        let mut chunk = [0u8; 256];
+        match socket.read(&mut chunk) {
+            Ok(0) => return Err("daemon closed exec-await socket".to_string()),
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(format!("failed reading exec-await socket: {e}")),
+        }
+
+        loop {
+            match state.decode(&buffer) {
+                DecodeResult::Message { kind: RpcMessageKind::ExecProceed, .. } => return Ok(()),
+                DecodeResult::Message { kind: RpcMessageKind::ExecWaiting, .. } => {}
+                DecodeResult::Message { kind: RpcMessageKind::ExecError, payload, .. } => {
+                    let message = jsony::from_binary::<crate::rpc::ExecErrorEvent>(payload)
+                        .map(|event| event.message)
+                        .unwrap_or_else(|_| "requirements could not be satisfied".to_string());
+                    return Err(message);
+                }
+                DecodeResult::Message { kind, .. } => return Err(format!("unexpected exec-await message: {kind:?}")),
+                DecodeResult::MissingData { .. } => break,
+                DecodeResult::Empty => {
+                    buffer.clear();
+                    break;
+                }
+                DecodeResult::Error(err) => return Err(format!("invalid exec-await response: {err:?}")),
+            }
+        }
+        state.compact(&mut buffer, 4096);
+    }
+    Err("timed out waiting for ExecProceed".to_string())
 }
 
 #[test]
@@ -1713,6 +1883,389 @@ cli.forward-arguments = true
         "forwarded shell args mismatch: {:?}",
         lines
     );
+}
+
+#[test]
+fn exec_requirements_hold_resources_until_exec_process_exits() {
+    let mut harness = TestHarness::new("exec_requirements_hold_resources");
+    let order = harness.temp_dir.join("order.txt");
+    harness.write_config(&format!(
+        r#"
+[action.hold]
+managed = false
+sh = """
+printf 'hold-start\n' >> {order}
+sleep 0.5
+printf 'hold-end\n' >> {order}
+"""
+require = [{{ resource = "serial" }}]
+
+[action.contender]
+sh = "printf 'contender\n' >> {order}"
+require = [{{ resource = "serial" }}]
+"#,
+        order = order.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut holder = spawn_client_process(&harness, &["exec", "hold"]);
+    assert!(wait_for_line_count(&order, "hold-start", 1, Duration::from_secs(5)), "exec task did not start");
+
+    let result = harness.run_client(&["run", "contender"]);
+    assert!(result.success(), "contender failed: stdout={}, stderr={}", result.stdout, result.stderr);
+
+    let status = holder.wait().expect("failed waiting for exec holder");
+    let mut holder_stderr = String::new();
+    if let Some(mut stderr) = holder.stderr.take() {
+        stderr.read_to_string(&mut holder_stderr).ok();
+    }
+    assert!(status.success(), "exec holder failed: {holder_stderr}");
+
+    let content = fs::read_to_string(&order).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["hold-start", "hold-end", "contender"],
+        "resource contender ran while exec process was still active:\n{content}\nserver log:\n{}",
+        harness.server_log()
+    );
+}
+
+#[test]
+fn exec_requirement_service_dependent_is_released_after_exec_process_exits() {
+    let mut harness = TestHarness::new("exec_requirement_service_released");
+    let starts = harness.temp_dir.join("starts.txt");
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+profiles = ["alpha", "beta"]
+sh = """
+printf '%s\n' "$PROFILE_VAL" >> {starts}
+trap 'exit 0' INT TERM
+while true; do sleep 1; done
+"""
+env.PROFILE_VAL = {{ if.profile = "beta", then = "beta", or_else = "alpha" }}
+
+[action.use]
+managed = false
+sh = "sleep 0.2"
+require = ["svc:alpha"]
+"#,
+        starts = starts.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut user = spawn_client_process(&harness, &["exec", "use"]);
+    assert!(wait_for_line_count(&starts, "alpha", 1, Duration::from_secs(5)), "alpha service did not start");
+
+    let status = user.wait().expect("failed waiting for exec user");
+    let mut user_stderr = String::new();
+    if let Some(mut stderr) = user.stderr.take() {
+        stderr.read_to_string(&mut user_stderr).ok();
+    }
+    assert!(status.success(), "exec user failed: {user_stderr}");
+
+    let result = harness.run_client(&["start", "svc:beta"]);
+    assert!(result.success(), "svc:beta submit failed: stdout={}, stderr={}", result.stdout, result.stderr);
+    assert!(
+        wait_for_line_count(&starts, "beta", 1, Duration::from_secs(5)),
+        "beta service did not start after exec process exited; starts:\n{}\nserver log:\n{}",
+        fs::read_to_string(&starts).unwrap_or_default(),
+        harness.server_log()
+    );
+}
+
+#[test]
+fn exec_requirement_duplicate_service_clients_do_not_share_scheduler_gate() {
+    let mut harness = TestHarness::new("exec_requirement_duplicate_service_clients");
+    let release = harness.temp_dir.join("release");
+    let gate_started = harness.temp_dir.join("gate-started");
+    harness.write_config(&format!(
+        r#"
+[action.gate]
+sh = """
+touch {gate_started}
+while [ ! -f {release} ]; do sleep 0.02; done
+"""
+
+[service.remote]
+managed = false
+sh = "sleep 10"
+require = ["gate"]
+"#,
+        gate_started = gate_started.display(),
+        release = release.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut first = connect_exec_await(&harness, "remote");
+    assert!(harness.wait_for_file(&gate_started, Duration::from_secs(5)), "gate dependency did not start");
+    let mut second = connect_exec_await(&harness, "remote");
+
+    fs::write(&release, "").expect("release gate");
+
+    wait_for_exec_proceed(&mut first, Duration::from_secs(5)).unwrap_or_else(|err| {
+        panic!("first exec client should proceed first, got {err}; server log:\n{}", harness.server_log())
+    });
+
+    let second_early = wait_for_exec_proceed(&mut second, Duration::from_millis(200));
+    assert!(
+        second_early.is_err(),
+        "second exec client should wait for the first remote exec to finish before proceeding"
+    );
+
+    drop(first);
+    wait_for_exec_proceed(&mut second, Duration::from_secs(5)).unwrap_or_else(|err| {
+        panic!(
+            "second exec client should proceed after first socket closes, got {err}; server log:\n{}",
+            harness.server_log()
+        )
+    });
+}
+
+#[test]
+fn exec_requirement_dependents_wait_until_exec_gate_proceeds() {
+    let mut harness = TestHarness::new("exec_requirement_dependent_after_proceed");
+    let release = harness.temp_dir.join("release");
+    let gate_started = harness.temp_dir.join("gate-started");
+    let proceed_marker = harness.temp_dir.join("proceeded");
+    let order = harness.temp_dir.join("order.txt");
+    harness.write_config(&format!(
+        r#"
+[action.gate]
+sh = """
+touch {gate_started}
+while [ ! -f {release} ]; do sleep 0.02; done
+"""
+
+[service.remote]
+managed = false
+sh = "sleep 10"
+require = ["gate"]
+
+[action.dependent]
+sh = """
+if [ -f {proceed_marker} ]; then
+  printf 'after-proceed\n' > {order}
+else
+  printf 'before-proceed\n' > {order}
+fi
+"""
+require = ["remote"]
+"#,
+        gate_started = gate_started.display(),
+        release = release.display(),
+        proceed_marker = proceed_marker.display(),
+        order = order.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut exec_socket = connect_exec_await(&harness, "remote");
+    assert!(harness.wait_for_file(&gate_started, Duration::from_secs(5)), "gate dependency did not start");
+    let marker_for_thread = proceed_marker.clone();
+    let proceed_reader = thread::spawn(move || {
+        wait_for_exec_proceed(&mut exec_socket, Duration::from_secs(5)).expect("exec should proceed");
+        fs::write(marker_for_thread, "").expect("write proceed marker");
+    });
+
+    let dependent = spawn_client_process(&harness, &["run", "dependent"]);
+    thread::sleep(Duration::from_millis(100));
+    fs::write(&release, "").expect("release gate");
+
+    let (dependent_result, mut timed_out) = wait_child_with_timeout(dependent, Duration::from_secs(5));
+    if let Some(mut child) = timed_out.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("dependent did not finish; server log:\n{}", harness.server_log());
+    }
+    let dependent_result = dependent_result.expect("dependent result");
+    assert!(dependent_result.success(), "dependent failed: {}", dependent_result.stderr);
+    proceed_reader.join().expect("proceed reader thread panicked");
+
+    let order = fs::read_to_string(&order).unwrap_or_default();
+    assert_eq!(
+        order.trim(),
+        "after-proceed",
+        "dependent ran before daemon released the exec gate; server log:\n{}",
+        harness.server_log()
+    );
+}
+
+#[test]
+fn stop_reports_active_remote_exec_instead_of_already_finished() {
+    let mut harness = TestHarness::new("stop_reports_remote_exec");
+    harness.write_config(
+        r#"
+[action.gate]
+sh = "true"
+
+[action.remote]
+managed = false
+sh = "sleep 10"
+require = ["gate"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut exec_socket = connect_exec_await(&harness, "remote");
+    wait_for_exec_proceed(&mut exec_socket, Duration::from_secs(5))
+        .unwrap_or_else(|err| panic!("remote exec should proceed, got {err}; server log:\n{}", harness.server_log()));
+
+    let result = harness.run_client(&["stop", "remote"]);
+    assert!(result.success(), "stop failed: {}", result.stderr);
+    assert!(
+        !result.stdout.contains("already finished"),
+        "active remote exec was reported as already finished:\n{}",
+        result.stdout
+    );
+    assert!(
+        result.stdout.contains("unmanaged exec"),
+        "stop should explain that active remote execs cannot be terminated by the daemon, got:\n{}",
+        result.stdout
+    );
+}
+
+#[test]
+fn remote_exec_service_does_not_starve_managed_resource_termination() {
+    let mut harness = TestHarness::new("remote_exec_no_starve_managed_resource");
+    let order = harness.temp_dir.join("order.txt");
+    let remote_gate_done = harness.temp_dir.join("remote-gate-done");
+    harness.write_config(&format!(
+        r#"
+[service.remote]
+managed = false
+sh = "sleep 10"
+require = [{{ resource = "R1" }}]
+
+[service.holder]
+sh = """
+printf 'holder-start\n' >> {order}
+trap "printf 'holder-stop\n' >> {order}; exit 0" INT TERM
+while true; do sleep 0.05; done
+"""
+require = [{{ resource = "R2" }}]
+
+[action.remote_gate]
+sh = "touch {remote_gate_done}"
+
+[action.blocked_remote]
+sh = "printf 'remote-action\n' >> {order}"
+require = ["remote_gate", {{ resource = "R1" }}]
+
+[action.needs_holder_resource]
+sh = "printf 'managed-action\n' >> {order}"
+require = [{{ resource = "R2" }}]
+"#,
+        order = order.display(),
+        remote_gate_done = remote_gate_done.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let start_holder = harness.run_client(&["start", "holder"]);
+    assert!(
+        start_holder.success(),
+        "holder service failed to start: stdout={}, stderr={}",
+        start_holder.stdout,
+        start_holder.stderr
+    );
+    assert!(
+        wait_for_line_count(&order, "holder-start", 1, Duration::from_secs(5)),
+        "holder service did not start; server log:\n{}",
+        harness.server_log()
+    );
+
+    let mut remote_socket = connect_exec_await(&harness, "remote");
+    wait_for_exec_proceed(&mut remote_socket, Duration::from_secs(5)).unwrap_or_else(|err| {
+        panic!("remote exec service should proceed, got {err}; server log:\n{}", harness.server_log())
+    });
+
+    let blocked_remote = spawn_client_process(&harness, &["run", "blocked_remote"]);
+    assert!(
+        harness.wait_for_file(&remote_gate_done, Duration::from_secs(5)),
+        "remote blocker was not scheduled before managed waiter; server log:\n{}",
+        harness.server_log()
+    );
+
+    let managed_waiter = spawn_client_process(&harness, &["run", "needs_holder_resource"]);
+    let (managed_result, mut timed_out) = wait_child_with_timeout(managed_waiter, Duration::from_secs(5));
+    if let Some(mut child) = timed_out.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(remote_socket);
+        let (_, mut blocked_timed_out) = wait_child_with_timeout(blocked_remote, Duration::from_secs(1));
+        if let Some(mut child) = blocked_timed_out.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        panic!(
+            "managed resource waiter starved behind unkillable remote exec holder; order:\n{}\nserver log:\n{}",
+            fs::read_to_string(&order).unwrap_or_default(),
+            harness.server_log()
+        );
+    }
+    let managed_result = managed_result.expect("managed waiter result");
+    assert!(
+        managed_result.success(),
+        "managed resource waiter failed: stdout={}, stderr={}\nserver log:\n{}",
+        managed_result.stdout,
+        managed_result.stderr,
+        harness.server_log()
+    );
+
+    let content = fs::read_to_string(&order).unwrap_or_default();
+    assert!(
+        content.lines().any(|line| line == "managed-action"),
+        "managed waiter did not run after holder termination; order:\n{content}\nserver log:\n{}",
+        harness.server_log()
+    );
+
+    drop(remote_socket);
+    let (remote_result, mut remote_timed_out) = wait_child_with_timeout(blocked_remote, Duration::from_secs(5));
+    if let Some(mut child) = remote_timed_out.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("remote-blocked client did not exit after remote socket closed; server log:\n{}", harness.server_log());
+    }
+    assert!(
+        remote_result.expect("remote blocker result").success(),
+        "remote-blocked client failed; server log:\n{}",
+        harness.server_log()
+    );
+}
+
+#[test]
+fn exec_rejects_unmanaged_service_with_ready_condition() {
+    let harness = TestHarness::new("exec_rejects_unmanaged_ready");
+    let ran = harness.temp_dir.join("ran");
+    harness.write_config(&format!(
+        r#"
+[service.remote]
+managed = false
+ready = {{ when = {{ output_contains = "READY" }} }}
+sh = "touch {ran}"
+"#,
+        ran = ran.display(),
+    ));
+
+    let result = harness.run_client(&["exec", "remote"]);
+    assert!(
+        !result.success(),
+        "exec should reject unmanaged service ready config; stdout={}, stderr={}",
+        result.stdout,
+        result.stderr
+    );
+    let combined = format!("{}\n{}", result.stdout, result.stderr);
+    assert!(
+        combined.contains("ready") && combined.contains("managed = false"),
+        "error should explain ready/managed=false incompatibility, got:\n{combined}"
+    );
+    assert!(!ran.exists(), "unmanaged task command ran despite rejected ready config");
 }
 
 #[test]

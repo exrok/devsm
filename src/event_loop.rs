@@ -230,11 +230,20 @@ struct RpcSubscriptions {
 
 enum ClientKind {
     Tui,
-    Run { log_groups: Vec<LogGroup> },
+    Run {
+        log_groups: Vec<LogGroup>,
+    },
     TestRun,
-    Rpc { subscriptions: RpcSubscriptions },
+    Rpc {
+        subscriptions: RpcSubscriptions,
+    },
     SelfLogs,
     Logs,
+    /// A `devsm exec` client blocked until its task's `require` dependencies are
+    /// satisfied. `job` is the remote scheduler entry standing in for the exec.
+    Exec {
+        job: JobIndex,
+    },
 }
 
 struct ClientEntry {
@@ -243,6 +252,18 @@ struct ClientEntry {
     socket: UnixStream,
     kind: ClientKind,
     partial_rpc_read: Option<(DecodingState, Vec<u8>)>,
+}
+
+/// State for a pending `devsm exec` gate. The socket lives in the [`ClientEntry`]
+/// identified by `client_index`; this only tracks the warning deadline.
+struct RemoteExec {
+    client_index: ClientIndex,
+    submitted_at: std::time::Instant,
+    /// Whether the "waiting on …" stderr notice has already been sent.
+    warned: bool,
+    /// The daemon has handed execution to the client and is now holding this job
+    /// active until the inherited socket closes.
+    proceeded: bool,
 }
 
 pub struct WorkspaceEntry {
@@ -260,6 +281,10 @@ struct State {
     request: Arc<MioChannel>,
     timed_ready_count: u32,
     timed_timeout_count: u32,
+    /// Pending `devsm exec` gates, keyed by the remote scheduler job standing in
+    /// for the exec. Reconciled each loop iteration: once the job's requirements
+    /// resolve, the client is told to proceed (or that they can never be met).
+    remote_execs: HashMap<(WorkspaceIndex, JobIndex), RemoteExec>,
     db: crate::db::Db,
     /// Pid → process_index for jobs spawned under ptrace. Empty in steady
     /// state — checked with `is_empty()` in the reap loop to keep the
@@ -566,7 +591,9 @@ impl EventLoop {
 
                 match step {
                     SchedulingStep::Spawn { job_id, job_index, task } => {
-                        if let Err(err) = self.spawn(wsi as WorkspaceIndex, job_id, job_index, task) {
+                        if self.state.remote_execs.contains_key(&(wsi as WorkspaceIndex, job_index)) {
+                            self.start_remote_exec(wsi as WorkspaceIndex, job_index);
+                        } else if let Err(err) = self.spawn(wsi as WorkspaceIndex, job_id, job_index, task) {
                             self.handle_spawn_failure(wsi as WorkspaceIndex, job_id, job_index, err);
                         }
                         continue 'outer;
@@ -681,7 +708,9 @@ impl EventLoop {
                     ws.update_job_status(job_index, JobStatus::Starting);
                 }
                 JobStatus::Starting => (),
-                JobStatus::Running { .. } => bail!("Attempt start already running job"),
+                JobStatus::Running { .. } | JobStatus::RemoteRunning { .. } => {
+                    bail!("Attempt start already running job")
+                }
                 JobStatus::Exited { .. } => bail!("Attempt start already exited job"),
                 JobStatus::Cancelled => return Ok(()),
             }
@@ -854,6 +883,40 @@ impl EventLoop {
         drop(ws);
         self.broadcast_job_exited(workspace_id, public_id, 127, crate::rpc::ExitCause::SpawnFailed);
     }
+
+    /// "Spawn" a remote exec job: its requirements are satisfied, so instead of
+    /// launching a daemon child we acquire its resources and leave it in
+    /// `Starting`. The reconciler tells the waiting client to `exec`, then marks
+    /// it `RemoteRunning`; socket EOF later releases the held requirements.
+    ///
+    /// The daemon never sees the unmanaged command's real exit code: socket EOF
+    /// always records `Exited { status: 0 }`. The job is marked `cache_synthetic`
+    /// so that fabricated success is never written to the persistent cache and is
+    /// never reused as an in-memory cache hit. `Terminated`-predicate dependents
+    /// still treat it as satisfied, which is the documented limit of
+    /// `managed = false`.
+    fn start_remote_exec(&mut self, workspace_id: WorkspaceIndex, job_index: JobIndex) {
+        let Some(workspace) = self.state.workspaces.get(workspace_id as usize) else {
+            return;
+        };
+        let started = {
+            let mut ws = workspace.handle.state.write().unwrap();
+            let Some(job) = ws.jobs.get_mut(job_index) else {
+                return;
+            };
+            if !matches!(job.process_status, JobStatus::Scheduled { .. }) {
+                return;
+            }
+            // Suppress cache writes/reuse: the status:0 recorded on socket EOF is
+            // fabricated, not an observed success. See the doc comment above.
+            job.cache_synthetic = true;
+            ws.update_job_status(job_index, JobStatus::Starting);
+            true
+        };
+        if started {
+            self.broadcast_job_status(workspace_id, job_index, crate::rpc::JobStatusKind::Starting);
+        }
+    }
 }
 
 pub(crate) enum AttachKind {
@@ -862,6 +925,7 @@ pub(crate) enum AttachKind {
     TestRun { filters: Vec<u8> },
     Rpc { subscribe: bool },
     Logs { query: Vec<u8> },
+    Exec { task_name: Box<str>, params: Vec<u8> },
 }
 
 pub(crate) enum ReceivedFds {
@@ -1231,6 +1295,9 @@ impl EventLoop {
                             return false;
                         };
                         self.attach_logs_client(stdin, stdout, socket, ws_index, query);
+                    }
+                    AttachKind::Exec { task_name, params } => {
+                        self.attach_exec_client(socket, ws_index, &task_name, params);
                     }
                 }
 
@@ -1659,6 +1726,162 @@ impl EventLoop {
         }
     }
 
+    /// Attach a `devsm exec` client. The task's `require` graph is scheduled like
+    /// a normal run, but the leaf job is a *remote* entry: instead of spawning a
+    /// process, it merely gates the client. Once its requirements resolve, the
+    /// reconciler ([`Self::poll_remote_execs`]) tells the client to proceed.
+    fn attach_exec_client(&mut self, socket: UnixStream, ws_index: WorkspaceIndex, task_name: &str, params: Vec<u8>) {
+        let params = jsony::from_binary::<ValueMap>(&params).unwrap_or_else(|_| ValueMap::new()).to_owned();
+        let (name, profile) = task_name.rsplit_once(':').unwrap_or((task_name, ""));
+
+        let ws = &self.state.workspaces[ws_index as usize];
+        let result = match ws.handle.submit_exec(name, profile, params) {
+            Ok(result) => result,
+            Err(e) => {
+                Self::send_exec_error(&socket, &e);
+                return;
+            }
+        };
+        let Some((_, job_index)) = result.jobs.first().copied() else {
+            Self::send_exec_error(&socket, "No job created");
+            return;
+        };
+
+        let (client_index, _channel) =
+            self.register_client(socket, ws_index, ClientKind::Exec { job: job_index }, None);
+        self.state.remote_execs.insert(
+            (ws_index, job_index),
+            RemoteExec {
+                client_index: client_index as ClientIndex,
+                submitted_at: crate::clock::now(),
+                warned: false,
+                proceeded: false,
+            },
+        );
+    }
+
+    fn send_exec_message(socket: &UnixStream, encoder: &crate::rpc::Encoder) {
+        let mut s = socket;
+        let _ = std::io::Write::write_all(&mut s, encoder.output());
+    }
+
+    fn send_exec_proceed(socket: &UnixStream) {
+        let mut encoder = crate::rpc::Encoder::new();
+        encoder.encode_empty(RpcMessageKind::ExecProceed, 0);
+        Self::send_exec_message(socket, &encoder);
+    }
+
+    fn send_exec_waiting(socket: &UnixStream, tasks: Vec<String>) {
+        let mut encoder = crate::rpc::Encoder::new();
+        encoder.encode_push(RpcMessageKind::ExecWaiting, &crate::rpc::ExecWaitingEvent { tasks });
+        Self::send_exec_message(socket, &encoder);
+    }
+
+    fn send_exec_error(socket: &UnixStream, message: &str) {
+        let mut encoder = crate::rpc::Encoder::new();
+        encoder.encode_push(RpcMessageKind::ExecError, &crate::rpc::ExecErrorEvent { message: message.to_string() });
+        Self::send_exec_message(socket, &encoder);
+    }
+
+    /// Reconcile pending exec gates against current job state. Run every loop
+    /// iteration (cheap when there are none): a remote job that has reached a
+    /// terminal/active state releases its client; one blocked past the warning
+    /// threshold gets a one-time "waiting on …" notice.
+    fn poll_remote_execs(&mut self) {
+        if self.state.remote_execs.is_empty() {
+            return;
+        }
+        const WARN_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
+        let now = crate::clock::now();
+        let mut settled: Vec<(WorkspaceIndex, JobIndex)> = Vec::new();
+        let mut running_broadcasts: Vec<(WorkspaceIndex, JobIndex)> = Vec::new();
+        let mut wake_scheduler = false;
+
+        for (&(ws_index, job_index), remote) in &mut self.state.remote_execs {
+            let Some(workspace) = self.state.workspaces.get(ws_index as usize) else {
+                settled.push((ws_index, job_index));
+                continue;
+            };
+            let Some(client) = self.clients.get(remote.client_index as usize) else {
+                settled.push((ws_index, job_index));
+                continue;
+            };
+            let socket = &client.socket;
+
+            enum Outcome {
+                Pending(Vec<String>),
+                Proceed,
+                Failed(String),
+                Running,
+            }
+            let outcome = {
+                let state = workspace.handle.state.read().unwrap();
+                match state.jobs.get(job_index).map(|job| &job.process_status) {
+                    None | Some(JobStatus::Cancelled) => {
+                        Outcome::Failed("a required dependency could not be satisfied".to_string())
+                    }
+                    Some(JobStatus::Starting) if remote.proceeded => Outcome::Running,
+                    Some(JobStatus::Starting) => Outcome::Proceed,
+                    Some(JobStatus::RemoteRunning { .. }) if remote.proceeded => Outcome::Running,
+                    Some(JobStatus::RemoteRunning { .. }) => Outcome::Proceed,
+                    Some(JobStatus::Exited { status: 0, .. }) if remote.proceeded => Outcome::Running,
+                    Some(JobStatus::Exited { status: 0, .. }) => Outcome::Proceed,
+                    Some(JobStatus::Exited { .. }) => {
+                        Outcome::Failed("a required dependency could not be satisfied".to_string())
+                    }
+                    // A remote job is gated before it can spawn, so it should
+                    // never actually run; treat that defensively as "go ahead".
+                    Some(JobStatus::Running { .. }) if remote.proceeded => Outcome::Running,
+                    Some(JobStatus::Running { .. }) => Outcome::Proceed,
+                    Some(JobStatus::Scheduled { .. }) => Outcome::Pending(state.pending_dep_names(job_index)),
+                }
+            };
+
+            match outcome {
+                Outcome::Pending(names) => {
+                    if !remote.warned && now.duration_since(remote.submitted_at) >= WARN_AFTER {
+                        remote.warned = true;
+                        Self::send_exec_waiting(socket, names);
+                    }
+                }
+                Outcome::Proceed => {
+                    Self::send_exec_proceed(socket);
+                    remote.proceeded = true;
+                    let marked_running = {
+                        let mut state = workspace.handle.state.write().unwrap();
+                        let ready_state = match state.jobs.get(job_index) {
+                            Some(job) if matches!(job.process_status, JobStatus::Starting) => {
+                                job.task().config().ready.as_ref().map(|_| false)
+                            }
+                            _ => continue,
+                        };
+                        state.update_job_status(job_index, JobStatus::RemoteRunning { ready_state });
+                        true
+                    };
+                    if marked_running {
+                        running_broadcasts.push((ws_index, job_index));
+                        wake_scheduler = true;
+                    }
+                }
+                Outcome::Failed(message) => {
+                    Self::send_exec_error(socket, &message);
+                    settled.push((ws_index, job_index));
+                }
+                Outcome::Running => {}
+            }
+        }
+
+        for key in settled {
+            self.state.remote_execs.remove(&key);
+        }
+        for (ws_index, job_index) in running_broadcasts {
+            self.broadcast_job_status(ws_index, job_index, crate::rpc::JobStatusKind::Running);
+        }
+        if wake_scheduler {
+            self.state.request.wake();
+        }
+    }
+
     fn attach_test_run_client(
         &mut self,
         stdin: File,
@@ -1800,12 +2023,70 @@ impl EventLoop {
         let _ = client.channel.wake();
         let _ = self.state.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
         kvlog::info!("Client terminated", index = client_index as usize, reason = reason.as_str());
+        if let ClientKind::Exec { job } = &client.kind {
+            let (ws_index, job_index) = (client.workspace, *job);
+            self.finish_or_cancel_remote_exec(ws_index, job_index);
+            let _ = self.clients.try_remove(client_index as usize);
+            return;
+        }
         if let ClientKind::Rpc { .. } = &client.kind {
             let Some(_) = self.clients.try_remove(client_index as usize) else {
                 kvlog::debug!("Client already removed", index = client_index as usize);
                 return;
             };
         }
+    }
+
+    /// Drop an exec gate. If the client went away before `ExecProceed`, cancel
+    /// the still-scheduled job. If the client already exec'd, socket EOF marks
+    /// the remote job complete and releases the requirements it held active.
+    fn finish_or_cancel_remote_exec(&mut self, ws_index: WorkspaceIndex, job_index: JobIndex) {
+        let Some(remote) = self.state.remote_execs.remove(&(ws_index, job_index)) else {
+            return;
+        };
+        let Some(workspace) = self.state.workspaces.get(ws_index as usize) else {
+            return;
+        };
+        let public_id = {
+            let mut ws = workspace.handle.state.write().unwrap();
+            match ws.jobs.get(job_index).map(|j| &j.process_status) {
+                Some(JobStatus::Scheduled { .. }) => {
+                    ws.update_job_status(job_index, JobStatus::Cancelled);
+                    None
+                }
+                Some(JobStatus::Starting) if remote.proceeded => ws.update_job_status(
+                    job_index,
+                    JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },
+                ),
+                Some(JobStatus::Starting) => {
+                    ws.update_job_status(job_index, JobStatus::Cancelled);
+                    None
+                }
+                Some(JobStatus::RemoteRunning { .. }) if remote.proceeded => ws.update_job_status(
+                    job_index,
+                    JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },
+                ),
+                // `RemoteRunning` is only reachable after `poll_remote_execs` has
+                // set `proceeded` in the same loop iteration that started it, so
+                // the socket cannot close in the `!proceeded` window. If the loop
+                // ordering ever changes, leaving the job `RemoteRunning` here
+                // would pin its resources and service dependents forever.
+                Some(status @ JobStatus::RemoteRunning { .. }) => {
+                    kvlog::error!(
+                        "Exec socket closed on un-proceeded RemoteRunning job; resources may leak",
+                        ws_index,
+                        job_index,
+                        status = status.name()
+                    );
+                    None
+                }
+                _ => None,
+            }
+        };
+        if let Some(public_id) = public_id {
+            self.broadcast_job_exited(ws_index, public_id, 0, crate::rpc::ExitCause::Unknown);
+        }
+        self.scheduled();
     }
 
     fn client_exited(&mut self, client_index: ClientIndex) {
@@ -1906,6 +2187,7 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
             poll,
             timed_ready_count: 0,
             timed_timeout_count: 0,
+            remote_execs: HashMap::new(),
             db,
             #[cfg(target_os = "linux")]
             traced_root_pids: HashMap::new(),
@@ -1917,7 +2199,10 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
             return;
         }
 
-        let has_timed = job_manager.state.timed_ready_count > 0 || job_manager.state.timed_timeout_count > 0;
+        let has_waiting_remote_exec = job_manager.state.remote_execs.values().any(|remote| !remote.proceeded);
+        let has_timed = job_manager.state.timed_ready_count > 0
+            || job_manager.state.timed_timeout_count > 0
+            || has_waiting_remote_exec;
         let poll_timeout = if crate::clock::is_fuzz() {
             crate::clock::set_wake_needed(has_timed);
             None
@@ -1966,6 +2251,7 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
         }
 
         job_manager.scheduled();
+        job_manager.poll_remote_execs();
         if job_manager.state.timed_ready_count > 0 {
             job_manager.check_ready_timeouts();
         }

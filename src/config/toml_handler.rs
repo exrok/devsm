@@ -443,6 +443,10 @@ fn parse_task<'a>(
         }
     }
 
+    if managed == Some(false) && ready.is_some() {
+        return Err(ctx.report_custom_error("`ready` is not supported with `managed = false`", task_table.as_item()));
+    }
+
     let command = match (cmd, sh) {
         (Some(cmd), None) => CommandExpr::Cmd(cmd),
         (None, Some(sh)) => CommandExpr::Sh(sh),

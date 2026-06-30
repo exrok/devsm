@@ -488,6 +488,7 @@ impl ScheduleRequirement {
                         JobStatus::Scheduled { .. } => RequirementStatus::Pending,
                         JobStatus::Starting => RequirementStatus::Pending,
                         JobStatus::Running { .. } => RequirementStatus::Pending,
+                        JobStatus::RemoteRunning { .. } => RequirementStatus::Pending,
                         JobStatus::Exited { .. } => RequirementStatus::Met,
                         JobStatus::Cancelled => RequirementStatus::Met,
                     },
@@ -495,6 +496,7 @@ impl ScheduleRequirement {
                         JobStatus::Scheduled { .. } => RequirementStatus::Pending,
                         JobStatus::Starting => RequirementStatus::Pending,
                         JobStatus::Running { .. } => RequirementStatus::Pending,
+                        JobStatus::RemoteRunning { .. } => RequirementStatus::Pending,
                         JobStatus::Cancelled => RequirementStatus::Never,
                         JobStatus::Exited { cause: ExitCause::Killed, .. } => RequirementStatus::Never,
                         JobStatus::Exited { status, .. } => {
@@ -509,22 +511,26 @@ impl ScheduleRequirement {
                         JobStatus::Scheduled { .. } => RequirementStatus::Pending,
                         JobStatus::Starting => RequirementStatus::Pending,
                         JobStatus::Cancelled => RequirementStatus::Never,
-                        JobStatus::Running { ready_state, .. } => match ready_state {
-                            None => RequirementStatus::Met,
-                            Some(true) => RequirementStatus::Met,
-                            Some(false) => RequirementStatus::Pending,
-                        },
+                        JobStatus::Running { ready_state, .. } | JobStatus::RemoteRunning { ready_state } => {
+                            match ready_state {
+                                None => RequirementStatus::Met,
+                                Some(true) => RequirementStatus::Met,
+                                Some(false) => RequirementStatus::Pending,
+                            }
+                        }
                         JobStatus::Exited { .. } => RequirementStatus::Never,
                     },
                     JobPredicate::Ready => match &job.process_status {
                         JobStatus::Scheduled { .. } => RequirementStatus::Pending,
                         JobStatus::Starting => RequirementStatus::Pending,
                         JobStatus::Cancelled => RequirementStatus::Met,
-                        JobStatus::Running { ready_state, .. } => match ready_state {
-                            None => RequirementStatus::Met,
-                            Some(true) => RequirementStatus::Met,
-                            Some(false) => RequirementStatus::Pending,
-                        },
+                        JobStatus::Running { ready_state, .. } | JobStatus::RemoteRunning { ready_state } => {
+                            match ready_state {
+                                None => RequirementStatus::Met,
+                                Some(true) => RequirementStatus::Met,
+                                Some(false) => RequirementStatus::Pending,
+                            }
+                        }
                         JobStatus::Exited { .. } => RequirementStatus::Met,
                     },
                 }
@@ -565,6 +571,18 @@ pub enum JobStatus {
         /// Some(true) = ready condition met
         ready_state: Option<bool>,
     },
+    /// An unmanaged `devsm exec` task whose `require` dependencies are satisfied.
+    /// The daemon does not own the process: it holds the job active (keeping
+    /// resources and service dependents pinned) until the client's inherited
+    /// socket EOFs, then records `Exited { status: 0 }` regardless of the real
+    /// exit code. The daemon cannot terminate it, so termination paths only warn.
+    RemoteRunning {
+        /// None = no ready config (always ready)
+        /// Some(false) = waiting for ready condition that the daemon cannot
+        ///               observe, so it stays `false` for the whole exec
+        /// Some(true) = ready condition met (unreachable for unmanaged exec)
+        ready_state: Option<bool>,
+    },
     Exited {
         finished_at: Instant,
         cause: ExitCause,
@@ -579,6 +597,7 @@ impl JobStatus {
             JobStatus::Scheduled { .. } => "Scheduled",
             JobStatus::Starting => "Starting",
             JobStatus::Running { .. } => "Running",
+            JobStatus::RemoteRunning { .. } => "RemoteRunning",
             JobStatus::Exited { .. } => "Exited",
             JobStatus::Cancelled => "Cancelled",
         }
@@ -589,6 +608,7 @@ impl JobStatus {
             JobStatus::Scheduled { .. } => true,
             JobStatus::Starting => true,
             JobStatus::Running { .. } => true,
+            JobStatus::RemoteRunning { .. } => true,
             JobStatus::Exited { .. } => false,
             JobStatus::Cancelled => false,
         }
@@ -600,7 +620,7 @@ impl JobStatus {
         }
     }
     pub fn is_running(&self) -> bool {
-        matches!(self, JobStatus::Running { .. })
+        matches!(self, JobStatus::Running { .. } | JobStatus::RemoteRunning { .. })
     }
 }
 
@@ -1749,15 +1769,15 @@ impl WorkspaceState {
                 continue;
             }
             let job = &self.jobs[job_index];
-            let JobStatus::Running { process_index, .. } = &job.process_status else {
-                continue;
-            };
             if !scan.matches(job.spawn_profile()) {
                 continue;
             }
             outcome
                 .predicates
                 .push(PlannedReq::Task { target: JobRef::Live(job_index), predicate: JobPredicate::Terminated });
+            let JobStatus::Running { process_index, .. } = &job.process_status else {
+                continue;
+            };
             if plan.is_running_terminate_pending(job_index) {
                 continue;
             }
@@ -1943,6 +1963,7 @@ impl WorkspaceState {
             trace,
             Vec::new(),
             Vec::new(),
+            true,
         )?;
         let created = self.apply_plan(plan, workspace_id, channel);
         Ok(Self::resolve_job_ref(job_ref, &created))
@@ -1984,6 +2005,7 @@ impl WorkspaceState {
             trace,
             Vec::new(),
             Vec::new(),
+            true,
         )
     }
 
@@ -2004,6 +2026,7 @@ impl WorkspaceState {
         trace: bool,
         extra_requirements: Vec<PlannedReq>,
         protected_conflict_jobs: Vec<JobRef>,
+        reuse_pending_services: bool,
     ) -> Result<JobRef, String> {
         let profile = {
             let bt = &self.base_tasks[base_task.idx()];
@@ -2018,7 +2041,8 @@ impl WorkspaceState {
         // are already wired to via `JobPredicate::Active` would cascade them into
         // "will never be ready" cancellations. Running services keep their
         // documented "explicit spawn restarts" semantic.
-        if !force_restart && self.base_tasks[base_task.idx()].config.kind == TaskKind::Service {
+        if reuse_pending_services && !force_restart && self.base_tasks[base_task.idx()].config.kind == TaskKind::Service
+        {
             let cache_never = self.base_tasks[base_task.idx()].config.cache.as_ref().is_some_and(|c| c.never);
             if !cache_never {
                 for &ji in self.base_tasks[base_task.idx()].jobs.non_terminal() {
@@ -2487,7 +2511,7 @@ impl WorkspaceState {
             let Some(job) = self.jobs.get(job_index) else { continue };
             match &job.process_status {
                 JobStatus::Scheduled { .. } | JobStatus::Starting => summary.pending += 1,
-                JobStatus::Running { .. } => summary.running += 1,
+                JobStatus::Running { .. } | JobStatus::RemoteRunning { .. } => summary.running += 1,
                 JobStatus::Exited { status, .. } => {
                     if job.cache_synthetic {
                         summary.cached += 1;
@@ -2583,6 +2607,97 @@ impl WorkspaceState {
             }
         }
         None
+    }
+
+    fn exec_service_barriers(
+        &self,
+        plan: &SchedulePlan,
+        base_task: BaseTaskIndex,
+        requested_profile: &str,
+        requested_params: &ValueMap<'static>,
+    ) -> Vec<JobRef> {
+        if self.base_tasks[base_task.idx()].config.kind != TaskKind::Service {
+            return Vec::new();
+        }
+
+        let allow_multiple = self.base_tasks[base_task.idx()].config.allow_multiple;
+        if matches!(allow_multiple, AllowMultiple::True) {
+            return Vec::new();
+        }
+
+        let mut barriers = Vec::new();
+        for &ji in self.base_tasks[base_task.idx()].jobs.non_terminal() {
+            if plan.is_conflict_pending(ji) {
+                continue;
+            }
+            let job = &self.jobs[ji];
+            let same_instance = job.spawn_profile() == requested_profile && job.spawn_params() == requested_params;
+            let conflicting_variant = self.service_variants_conflict(
+                base_task,
+                job.spawn_profile(),
+                job.spawn_params(),
+                requested_profile,
+                requested_params,
+            );
+            if same_instance || conflicting_variant {
+                barriers.push(JobRef::Live(ji));
+            }
+        }
+        for (id, pjob) in plan.active_planned_jobs() {
+            if pjob.base_task != base_task {
+                continue;
+            }
+            let same_instance = pjob.profile == requested_profile && &pjob.params == requested_params;
+            let conflicting_variant = self.service_variants_conflict(
+                base_task,
+                &pjob.profile,
+                &pjob.params,
+                requested_profile,
+                requested_params,
+            );
+            if same_instance || conflicting_variant {
+                barriers.push(JobRef::Planned(id));
+            }
+        }
+        barriers
+    }
+
+    fn spawn_exec_task(
+        &mut self,
+        workspace_id: u32,
+        channel: &MioChannel,
+        name: &str,
+        params: ValueMap,
+        profile: &str,
+    ) -> Result<(BaseTaskIndex, JobIndex), String> {
+        let Some(base_index) = self.base_index_by_name(name) else {
+            return Err(format!("Task '{}' not found", name));
+        };
+        let profile = self.effective_profile_for_task(base_index, profile);
+        let params = params.to_owned();
+        let mut plan = SchedulePlan::default();
+        let protected_conflict_jobs = self.exec_service_barriers(&plan, base_index, &profile, &params);
+        let extra_requirements = protected_conflict_jobs
+            .iter()
+            .copied()
+            .map(|target| PlannedReq::Task { target, predicate: JobPredicate::Terminated })
+            .collect();
+        let job_ref = self.spawn_task_with_extra_requirements_impl(
+            &mut plan,
+            workspace_id,
+            channel,
+            base_index,
+            params,
+            &profile,
+            ScheduleReason::Requested,
+            false,
+            false,
+            extra_requirements,
+            protected_conflict_jobs,
+            false,
+        )?;
+        let created = self.apply_plan(plan, workspace_id, channel);
+        Ok((base_index, Self::resolve_job_ref(job_ref, &created)))
     }
 
     pub fn lookup_and_start_task_with_trace(
@@ -2688,6 +2803,7 @@ impl WorkspaceState {
         let mut jobs_to_cancel = Vec::new();
         let mut killed_count = 0u32;
         let mut cancelled_count = 0u32;
+        let mut unmanaged_count = 0u32;
 
         for job_index in job_indices {
             if !seen.insert(job_index) {
@@ -2707,6 +2823,10 @@ impl WorkspaceState {
                     });
                     killed_count += 1;
                 }
+                JobStatus::RemoteRunning { .. } => {
+                    kvlog::warn!("Cannot terminate unmanaged exec job from daemon", label, name, job_index);
+                    unmanaged_count += 1;
+                }
                 JobStatus::Starting => {
                     kvlog::warn!("Job is in Starting state during termination", label, name, job_index);
                 }
@@ -2723,11 +2843,23 @@ impl WorkspaceState {
             self.update_job_status(job_index, JobStatus::Cancelled);
         }
 
-        match (killed_count, cancelled_count) {
-            (0, 0) => format!("{} '{}' was already finished", label, name),
-            (k, 0) => format!("{} '{}' terminated ({} killed)", label, name, k),
-            (0, c) => format!("{} '{}' cancelled ({} scheduled)", label, name, c),
-            (k, c) => format!("{} '{}' terminated ({} killed, {} cancelled)", label, name, k, c),
+        match (killed_count, cancelled_count, unmanaged_count) {
+            (0, 0, 0) => format!("{} '{}' was already finished", label, name),
+            (0, 0, u) => format!("{} '{}' has {} unmanaged exec still running", label, name, u),
+            (k, 0, 0) => format!("{} '{}' terminated ({} killed)", label, name, k),
+            (0, c, 0) => format!("{} '{}' cancelled ({} scheduled)", label, name, c),
+            (k, c, 0) => format!("{} '{}' terminated ({} killed, {} cancelled)", label, name, k, c),
+            (k, c, u) => {
+                let mut parts = Vec::new();
+                if k != 0 {
+                    parts.push(format!("{} killed", k));
+                }
+                if c != 0 {
+                    parts.push(format!("{} scheduled", c));
+                }
+                parts.push(format!("{} unmanaged exec still running", u));
+                format!("{} '{}' partially handled ({})", label, name, parts.join(", "))
+            }
         }
     }
 
@@ -2811,6 +2943,7 @@ impl WorkspaceState {
         match &job.process_status {
             JobStatus::Scheduled { .. } | JobStatus::Starting => true,
             JobStatus::Running { ready_state, .. } => matches!(ready_state, Some(false)),
+            JobStatus::RemoteRunning { ready_state } => matches!(ready_state, Some(false)),
             JobStatus::Exited { .. } | JobStatus::Cancelled => false,
         }
     }
@@ -2999,7 +3132,7 @@ impl WorkspaceState {
         let captured_public_id = self.jobs.public_id_of(job_index);
 
         let resources_to_acquire: SmallVec<[ResourceIndex; 2]> = match (&self.jobs[job_index].process_status, &status) {
-            (S::Scheduled { after }, S::Starting) => after
+            (S::Scheduled { after }, S::Starting | S::RemoteRunning { .. }) => after
                 .iter()
                 .filter_map(|r| match r {
                     ScheduleRequirement::Resource { id, .. } => Some(*id),
@@ -3013,8 +3146,10 @@ impl WorkspaceState {
             (&self.jobs[job_index].process_status, &status),
             (S::Starting, S::Cancelled)
                 | (S::Running { .. }, S::Cancelled)
+                | (S::RemoteRunning { .. }, S::Cancelled)
                 | (S::Starting, S::Exited { .. })
                 | (S::Running { .. }, S::Exited { .. })
+                | (S::RemoteRunning { .. }, S::Exited { .. })
         );
 
         let job = &mut self.jobs[job_index];
@@ -3037,16 +3172,26 @@ impl WorkspaceState {
             (S::Running { .. }, S::Cancelled) => {
                 jobs_list.set_terminal(job_index);
             }
+            (S::RemoteRunning { .. }, S::Cancelled) => {
+                jobs_list.set_terminal(job_index);
+            }
             (S::Scheduled { .. }, S::Starting) => {
                 jobs_list.set_active(job_index);
             }
+            (S::Scheduled { .. }, S::RemoteRunning { .. }) => {
+                jobs_list.set_active(job_index);
+            }
             (S::Running { .. }, S::Exited { .. }) => {
+                jobs_list.set_terminal(job_index);
+            }
+            (S::RemoteRunning { .. }, S::Exited { .. }) => {
                 jobs_list.set_terminal(job_index);
             }
             (S::Starting, S::Exited { .. }) => {
                 jobs_list.set_terminal(job_index);
             }
             (S::Starting, S::Running { .. }) => {}
+            (S::Starting, S::RemoteRunning { .. }) => {}
             (prev, to) => {
                 let caller = std::panic::Location::caller();
                 kvlog::error!(
@@ -3069,11 +3214,16 @@ impl WorkspaceState {
                 (S::Scheduled { .. }, S::Cancelled)
                 | (S::Starting, S::Cancelled)
                 | (S::Running { .. }, S::Cancelled)
+                | (S::RemoteRunning { .. }, S::Cancelled)
                 | (S::Starting, S::Exited { .. })
-                | (S::Running { .. }, S::Exited { .. }) => {
+                | (S::Running { .. }, S::Exited { .. })
+                | (S::RemoteRunning { .. }, S::Exited { .. }) => {
                     list.set_terminal(job_index);
                 }
                 (S::Scheduled { .. }, S::Starting) => {
+                    list.set_active(job_index);
+                }
+                (S::Scheduled { .. }, S::RemoteRunning { .. }) => {
                     list.set_active(job_index);
                 }
                 _ => {}
@@ -3084,8 +3234,10 @@ impl WorkspaceState {
             (S::Scheduled { .. }, S::Cancelled)
             | (S::Starting, S::Cancelled)
             | (S::Running { .. }, S::Cancelled)
+            | (S::RemoteRunning { .. }, S::Cancelled)
             | (S::Starting, S::Exited { .. })
-            | (S::Running { .. }, S::Exited { .. }) => {
+            | (S::Running { .. }, S::Exited { .. })
+            | (S::RemoteRunning { .. }, S::Exited { .. }) => {
                 self.service_dependents.remove_from_all(job_index);
             }
             _ => {}
@@ -3369,6 +3521,34 @@ impl WorkspaceState {
     /// each pool). Cross-pool contention is intentionally arbitrated by
     /// priority — a high-priority test wins resource over a low-priority
     /// action.
+    /// Names of the task dependencies a still-scheduled job is currently blocked
+    /// on (predicate not yet met). Used to tell a waiting `devsm exec` client
+    /// what it is waiting for. Resource requirements are not included.
+    pub fn pending_dep_names(&self, job_index: JobIndex) -> Vec<String> {
+        let Some(job) = self.jobs.get(job_index) else {
+            return Vec::new();
+        };
+        let JobStatus::Scheduled { after } = &job.process_status else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        for req in after {
+            let ScheduleRequirement::Task { job: dep, .. } = req else {
+                continue;
+            };
+            if !matches!(req.status(self), RequirementStatus::Pending) {
+                continue;
+            }
+            if let Some(dep_job) = self.jobs.get(*dep) {
+                let bti = dep_job.log_group.base_task_index();
+                if let Some(bt) = self.base_tasks.get(bti.idx()) {
+                    names.push(bt.name.to_string());
+                }
+            }
+        }
+        names
+    }
+
     pub fn next_scheduled(&self) -> Scheduled {
         if !self.has_scheduled_task() {
             return Scheduled::None;
@@ -3428,7 +3608,9 @@ impl WorkspaceState {
                     continue;
                 };
                 let blocking_job = &self.jobs[*req_job];
-                if !blocking_job.process_status.is_running() || !self.service_dependents.can_stop(*req_job) {
+                if !matches!(blocking_job.process_status, JobStatus::Running { .. })
+                    || !self.service_dependents.can_stop(*req_job)
+                {
                     continue;
                 }
                 // Resource arbitration is constant for the scheduled job, so check it once a
@@ -3471,7 +3653,7 @@ impl WorkspaceState {
                     }
                     let Some(holder_ji) = self.resources.holder(*id) else { continue };
                     let holder = &self.jobs[holder_ji];
-                    if !holder.process_status.is_running() {
+                    if !matches!(holder.process_status, JobStatus::Running { .. }) {
                         continue;
                     }
                     let bti = holder.log_group.base_task_index();
@@ -3734,6 +3916,7 @@ impl WorkspaceState {
                         false,
                         extra_requirements,
                         protected_conflict_jobs,
+                        true,
                     )?;
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
@@ -4082,6 +4265,7 @@ impl Workspace {
                         task.trace,
                         Vec::new(),
                         Vec::new(),
+                        true,
                     )?,
                 }
             } else {
@@ -4097,6 +4281,7 @@ impl Workspace {
                     task.trace,
                     Vec::new(),
                     Vec::new(),
+                    true,
                 )?
             };
             if let Some(group_name) = entry.group_name {
@@ -4176,6 +4361,14 @@ impl Workspace {
 
     pub fn submit(&self, spec: SpawnSpec) -> Result<SubmitResult, String> {
         self.submit_impl(spec, false)
+    }
+
+    pub fn submit_exec(&self, name: &str, profile: &str, params: ValueMap<'static>) -> Result<SubmitResult, String> {
+        let state = &mut *self.state.write().unwrap();
+        state.refresh_config();
+        state.change_number = state.change_number.wrapping_add(1);
+        let job = state.spawn_exec_task(self.workspace_id, &self.process_channel, name, params, profile)?;
+        Ok(SubmitResult { jobs: vec![job], group_names: Vec::new() })
     }
 
     pub fn submit_start(&self, spec: SpawnSpec) -> Result<SubmitResult, String> {
@@ -4413,6 +4606,13 @@ impl Workspace {
                         process_index: *process_index,
                         exit_cause: ExitCause::Killed,
                     });
+                }
+                JobStatus::RemoteRunning { .. } => {
+                    kvlog::warn!(
+                        "Cannot terminate unmanaged exec job from daemon",
+                        task_name = task_name.as_ref(),
+                        job_index
+                    );
                 }
                 JobStatus::Starting => {
                     kvlog::warn!(

@@ -1433,6 +1433,7 @@ fn job_status_str(status: &crate::workspace::JobStatus) -> &'static str {
         crate::workspace::JobStatus::Scheduled { .. } => "Scheduled",
         crate::workspace::JobStatus::Starting => "Starting",
         crate::workspace::JobStatus::Running { .. } => "Running",
+        crate::workspace::JobStatus::RemoteRunning { .. } => "Running",
         crate::workspace::JobStatus::Exited { .. } => "Exited",
         crate::workspace::JobStatus::Cancelled => "Cancelled",
     }

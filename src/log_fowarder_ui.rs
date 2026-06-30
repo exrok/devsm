@@ -555,7 +555,10 @@ fn group_exit_state(workspace: &Workspace, jobs: &[JobIndex]) -> (bool, Option<i
             continue;
         };
         match &job.process_status {
-            JobStatus::Scheduled { .. } | JobStatus::Starting | JobStatus::Running { .. } => {
+            JobStatus::Scheduled { .. }
+            | JobStatus::Starting
+            | JobStatus::Running { .. }
+            | JobStatus::RemoteRunning { .. } => {
                 all_terminal = false;
             }
             JobStatus::Exited { status, cause, .. } => {

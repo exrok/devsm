@@ -144,6 +144,12 @@ pub enum Request<'a> {
     GetSelfLogs {
         follow: bool,
     },
+    ExecAwait {
+        #[jsony(with = unix_path)]
+        config: &'a Path,
+        name: Box<str>,
+        params: ValueMap<'a>,
+    },
 }
 
 use crate::event_loop::ReceivedFds;
@@ -226,6 +232,16 @@ fn handle_request(
                 socket,
                 workspace_config: config.into(),
                 kind: crate::event_loop::AttachKind::Rpc { subscribe },
+            });
+        }
+        Request::ExecAwait { config, name, params } => {
+            kvlog::info!("Attaching exec-await client");
+            pm.request.send(crate::event_loop::ProcessRequest::AttachClient {
+                stdin: None,
+                stdout: None,
+                socket,
+                workspace_config: config.into(),
+                kind: crate::event_loop::AttachKind::Exec { task_name: name, params: jsony::to_binary(&params) },
             });
         }
         Request::AttachLogs { config, query } => {

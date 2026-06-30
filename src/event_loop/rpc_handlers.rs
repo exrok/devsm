@@ -425,6 +425,8 @@ fn job_state_label(job: &Job) -> &'static str {
         JobStatus::Starting => "starting",
         JobStatus::Running { ready_state: Some(false), .. } => "running (not ready)",
         JobStatus::Running { .. } => "running",
+        JobStatus::RemoteRunning { ready_state: Some(false) } => "running (not ready)",
+        JobStatus::RemoteRunning { .. } => "running",
         JobStatus::Exited { status: 0, cause: ExitCause::Restarted, .. } => "restarted",
         JobStatus::Exited { status, .. } => {
             if *status == 0 {
@@ -439,7 +441,7 @@ fn job_state_label(job: &Job) -> &'static str {
 
 fn job_ready_state(job: &Job) -> Option<bool> {
     match &job.process_status {
-        JobStatus::Running { ready_state, .. } => *ready_state,
+        JobStatus::Running { ready_state, .. } | JobStatus::RemoteRunning { ready_state } => *ready_state,
         _ => None,
     }
 }
@@ -457,7 +459,10 @@ fn job_duration_ms(job: &Job) -> Option<u64> {
     let started = job.started_at;
     let end = match &job.process_status {
         JobStatus::Exited { finished_at, .. } => *finished_at,
-        JobStatus::Running { .. } | JobStatus::Starting | JobStatus::Scheduled { .. } => crate::clock::now(),
+        JobStatus::Running { .. }
+        | JobStatus::RemoteRunning { .. }
+        | JobStatus::Starting
+        | JobStatus::Scheduled { .. } => crate::clock::now(),
         JobStatus::Cancelled => return None,
     };
     end.checked_duration_since(started).map(|d| d.as_millis() as u64)
@@ -785,6 +790,17 @@ fn handle_self_logs_client_read(rpc_reader: &mut RpcClientStream) {
     }
 }
 
+/// An exec client only ever waits; it sends no messages. Draining the stream
+/// here lets EOF surface as a termination reason so the gate is cleaned up.
+fn handle_exec_client_read(rpc_reader: &mut RpcClientStream) {
+    while let Some(message) = rpc_reader.next() {
+        match message.kind {
+            RpcMessageKind::Terminate => rpc_reader.client_requests_termination(),
+            _ => kvlog::error!("Unexpected message kind from exec client", kind = ?message.kind),
+        }
+    }
+}
+
 impl EventLoop {
     pub fn handle_client_rpc_read(&mut self, client_index: ClientIndex) {
         let Some(client) = self.clients.get_mut(client_index as usize) else {
@@ -836,6 +852,7 @@ impl EventLoop {
             ClientKind::TestRun => handle_test_run_client_read(&mut rpc_stream),
             ClientKind::SelfLogs => handle_self_logs_client_read(&mut rpc_stream),
             ClientKind::Logs => handle_logs_client_read(&mut rpc_stream),
+            ClientKind::Exec { .. } => handle_exec_client_read(&mut rpc_stream),
         }
 
         rpc_stream.state.compact(&mut rpc_stream.buffer, 4096);

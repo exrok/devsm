@@ -8,7 +8,7 @@ use kvlog::collector::UninitializedLogPolicy;
 use sendfd::SendWithFd;
 use std::{
     io::{ErrorKind, Read, Write},
-    os::unix::{net::UnixStream, process::CommandExt},
+    os::unix::{io::AsRawFd, net::UnixStream, process::CommandExt},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
@@ -462,6 +462,28 @@ fn connect_or_spawn_daemon() -> std::io::Result<UnixStream> {
 
     command.spawn()?;
     connect_with_retry(default_connect_timeout_ms())
+}
+
+/// Clear `FD_CLOEXEC` so the daemon socket survives into the unmanaged process
+/// after `exec`. The daemon holds the task's requirements active until this
+/// socket EOFs, which it does when the last process holding the fd exits.
+///
+/// This is best-effort: a process that sanitizes its inherited fds (`closefrom`,
+/// many daemonizers) closes the socket early, so the daemon releases the held
+/// requirements while the process is still running. Resources held by an
+/// unmanaged exec are only guaranteed for processes that leave inherited fds
+/// open.
+fn clear_cloexec(fd: &impl AsRawFd) -> std::io::Result<()> {
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+        if flags == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn rpc_ws_command<T: jsony::ToBinary>(
@@ -1312,6 +1334,7 @@ fn exec_task(job: &str, params: jsony_value::ValueMap, trailing_args: &[String])
 
     let params = build_task_params(task_expr, params, trailing_args, None)?;
     let profile = if profile.is_empty() { task_expr.profiles.first().copied().unwrap_or("") } else { profile };
+    let daemon_params = params.clone();
     let env = config::Environment { profile, param: params, vars: task_expr.vars };
     let task = task_expr.eval(&env).map_err(|e| anyhow::anyhow!("Failed to evaluate task: {:?}", e))?;
     let tc = task.config();
@@ -1342,8 +1365,87 @@ fn exec_task(job: &str, params: jsony_value::ValueMap, trailing_args: &[String])
         }
     }
 
+    // Tasks without requirements exec directly, with zero daemon involvement.
+    // When a task does have `require`, the daemon runs those dependencies and
+    // gates this exec until they are satisfied.
+    let _exec_gate = if !tc.require.is_empty() {
+        let socket = await_exec_requirements(job, daemon_params)?;
+        clear_cloexec(&socket)?;
+        Some(socket)
+    } else {
+        None
+    };
+
     let err = command.exec();
     bail!("exec failed: {}", err);
+}
+
+/// Block until the daemon reports that `job`'s `require` dependencies are
+/// satisfied. Returns the daemon socket to hold open across `exec`, or an error
+/// if a dependency can never be met.
+fn await_exec_requirements(job: &str, params: jsony_value::ValueMap) -> anyhow::Result<UnixStream> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+
+    let mut socket = connect_or_spawn_daemon()?;
+    socket.send_with_fd(
+        &jsony::to_binary(&daemon::RequestMessage {
+            cwd: &cwd,
+            request: daemon::Request::ExecAwait { config: &config, name: job.into(), params },
+        }),
+        &[],
+    )?;
+
+    let mut protocol = ClientProtocol::new();
+    let mut read_buf = Vec::with_capacity(256);
+    loop {
+        read_buf.reserve(256);
+        let spare = read_buf.spare_capacity_mut();
+        let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
+
+        match socket.read(read_slice) {
+            Ok(0) => bail!("daemon closed connection before requirements were satisfied"),
+            Ok(n) => {
+                unsafe { read_buf.set_len(read_buf.len() + n) };
+                loop {
+                    match protocol.decode(&read_buf) {
+                        DecodeResult::Message { kind, payload, .. } => match kind {
+                            RpcMessageKind::ExecProceed => return Ok(socket),
+                            RpcMessageKind::ExecWaiting => {
+                                if let Ok(event) = jsony::from_binary::<crate::rpc::ExecWaitingEvent>(payload) {
+                                    if event.tasks.is_empty() {
+                                        eprintln!("Waiting for dependencies...");
+                                    } else {
+                                        eprintln!("Waiting for: {}", event.tasks.join(", "));
+                                    }
+                                }
+                            }
+                            RpcMessageKind::ExecError => {
+                                let message = jsony::from_binary::<crate::rpc::ExecErrorEvent>(payload)
+                                    .map(|e| e.message)
+                                    .unwrap_or_else(|_| "requirements could not be satisfied".to_string());
+                                bail!("{}", message);
+                            }
+                            RpcMessageKind::Disconnect => {
+                                bail!("daemon disconnected before requirements were satisfied");
+                            }
+                            _ => {}
+                        },
+                        DecodeResult::MissingData { .. } => break,
+                        DecodeResult::Empty => {
+                            read_buf.clear();
+                            break;
+                        }
+                        DecodeResult::Error(e) => bail!("daemon sent invalid exec gating response: {:?}", e),
+                    }
+                }
+                protocol.compact(&mut read_buf, 4096);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 fn logs_client(options: cli::LogsOptions) -> anyhow::Result<()> {
