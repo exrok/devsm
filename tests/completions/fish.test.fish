@@ -122,14 +122,21 @@ assert_contains "restart_api" "$reply" "function call: 'restart_api'"
 
 # Namespace + shadowing
 set reply (comp_for "devsm run group.")
-assert_contains "group.all" "$reply" "namespaced: group.all"
+assert_not_contains "group.all" "$reply" "namespaced: unique group.all omitted"
+assert_contains "group.build" "$reply" "namespaced: group.build required by task collision"
 assert_contains "group.logs" "$reply" "namespaced: group.logs (shadowed bare retained)"
 
 set reply (comp_for "devsm run action.")
-assert_contains "action.build" "$reply" "namespaced: action.build"
+assert_contains "action.build" "$reply" "namespaced: action.build required by group collision"
 assert_contains "action.run" "$reply" "namespaced: action.run (bare shadowed by builtin)"
+assert_not_contains "action.api" "$reply" "namespaced: unique action.api omitted"
 
 set reply (comp_for "devsm run ")
+assert_contains "build" "$reply" "duplicate: bare action default retained"
+assert_contains "action.build" "$reply" "duplicate: qualified action retained"
+assert_contains "group.build" "$reply" "duplicate: qualified group retained"
+assert_not_contains "action.api" "$reply" "unique: optional action prefix omitted"
+assert_not_contains "group.all" "$reply" "unique: optional group prefix omitted"
 assert_not_contains "logs" "$reply" "shadow: bare 'logs' runnable suppressed"
 assert_contains "group.logs" "$reply" "shadow: 'group.logs' namespaced still available"
 

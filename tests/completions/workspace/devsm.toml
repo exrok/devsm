@@ -40,6 +40,9 @@ tag = ["slow"]
 
 [group]
 all = ["build", "api"]
+# Duplicate runnable name: bare 'build' resolves to the action, while both
+# qualified forms remain available for disambiguation.
+build = ["api"]
 # Shadowing: group 'logs' collides with builtin command 'logs'. Bare omitted,
 # 'group.logs' kept.
 logs = ["build"]

@@ -188,14 +188,16 @@ assert_contains "server" "$reply" "self_commands: server"
 assert_contains "validate" "$reply" "self_commands: validate"
 assert_contains "complete" "$reply" "self_commands: complete"
 
-# Namespace + shadowing: runnables emits 'action.run' and 'group.logs' even
-# though their bare forms are shadowed (by the builtin 'run' / 'logs' command).
+# Namespace + shadowing: prefixes are emitted only for collisions.
 run_helper _devsm_runnables
 reply="${(j: :)CAPTURED}"
-assert_contains "action.build" "$reply" "namespaced: action.build"
+assert_contains "build" "$reply" "duplicate: bare action default retained"
+assert_contains "action.build" "$reply" "duplicate: qualified action retained"
+assert_contains "group.build" "$reply" "duplicate: qualified group retained"
 assert_contains "action.run" "$reply" "namespaced: action.run (bare shadowed by builtin)"
-assert_contains "group.all" "$reply" "namespaced: group.all"
 assert_contains "group.logs" "$reply" "namespaced: group.logs"
+assert_not_contains "action.api" "$reply" "unique: optional action prefix omitted"
+assert_not_contains "group.all" "$reply" "unique: optional group prefix omitted"
 assert_not_contains "run" "$reply" "shadow: bare 'run' suppressed in runnables (builtin shadow)"
 assert_not_contains "logs" "$reply" "shadow: bare 'logs' suppressed in runnables (builtin shadow)"
 

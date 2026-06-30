@@ -1656,20 +1656,29 @@ fn is_builtin_command_name(name: &str) -> bool {
 }
 
 fn print_task_completions(workspace: &config::WorkspaceConfig<'static>) {
-    for (name, expr) in workspace.tasks {
+    for (index, (name, expr)) in workspace.tasks.iter().enumerate() {
         let preview = expr.command_preview();
         let kind = expr.kind.as_str();
         let bare_visible = !is_builtin_command_name(name);
-        if bare_visible {
+        let duplicate_task = workspace.tasks.iter().filter(|(other, _)| other == name).count() > 1;
+        let conflicts_with_group = workspace.groups.iter().any(|(group, _)| group == name);
+        let needs_prefix = !bare_visible || duplicate_task || conflicts_with_group;
+        let first_with_name = !workspace.tasks[..index].iter().any(|(other, _)| other == name);
+
+        if bare_visible && first_with_name {
             print_completion(name, Some(preview));
         }
-        print_completion(&format!("{kind}.{name}"), Some(preview));
+        if needs_prefix {
+            print_completion(&format!("{kind}.{name}"), Some(preview));
+        }
         if expr.profiles.len() > 1 {
             for profile in expr.profiles {
-                if bare_visible {
+                if bare_visible && first_with_name {
                     print_completion(&format!("{name}:{profile}"), Some(preview));
                 }
-                print_completion(&format!("{kind}.{name}:{profile}"), Some(preview));
+                if needs_prefix {
+                    print_completion(&format!("{kind}.{name}:{profile}"), Some(preview));
+                }
             }
         }
     }
@@ -1683,6 +1692,20 @@ fn group_description(calls: &[config::TaskCall<'_>]) -> String {
         shown.push("…");
     }
     format!("group: {n} runnable{suffix} ({})", shown.join(", "))
+}
+
+fn print_group_completions(workspace: &config::WorkspaceConfig<'static>) {
+    for (name, calls) in workspace.groups {
+        let desc = group_description(calls);
+        let conflicts_with_task = workspace.tasks.iter().any(|(task, _)| task == name);
+        let conflicts_with_builtin = is_builtin_command_name(name);
+        if !conflicts_with_task && !conflicts_with_builtin {
+            print_completion(name, Some(&desc));
+        }
+        if conflicts_with_task || conflicts_with_builtin {
+            print_completion(&format!("group.{name}"), Some(&desc));
+        }
+    }
 }
 
 fn function_description(action: &config::FunctionDefAction<'_>) -> String {
@@ -1779,15 +1802,7 @@ fn print_completions(context: cli::CompleteContext) -> bool {
                 return false;
             };
             print_task_completions(&workspace);
-            for (name, calls) in workspace.groups {
-                let desc = group_description(calls);
-                let task_with_same_name = workspace.tasks.iter().any(|(n, _)| n == name);
-                let bare_visible = !is_builtin_command_name(name) && !task_with_same_name;
-                if bare_visible {
-                    print_completion(name, Some(&desc));
-                }
-                print_completion(&format!("group.{name}"), Some(&desc));
-            }
+            print_group_completions(&workspace);
             true
         }
         cli::CompleteContext::Tests => {
@@ -1880,14 +1895,7 @@ fn print_completions(context: cli::CompleteContext) -> bool {
             let Ok(workspace) = config::load_from_env() else {
                 return false;
             };
-            for (name, calls) in workspace.groups {
-                let desc = group_description(calls);
-                let task_with_same_name = workspace.tasks.iter().any(|(n, _)| n == name);
-                if !task_with_same_name && !is_builtin_command_name(name) {
-                    print_completion(name, Some(&desc));
-                }
-                print_completion(&format!("group.{name}"), Some(&desc));
-            }
+            print_group_completions(&workspace);
             true
         }
         cli::CompleteContext::Functions => {
