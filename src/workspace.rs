@@ -2676,12 +2676,16 @@ impl WorkspaceState {
         let profile = self.effective_profile_for_task(base_index, profile);
         let params = params.to_owned();
         let mut plan = SchedulePlan::default();
-        let protected_conflict_jobs = self.exec_service_barriers(&plan, base_index, &profile, &params);
+        let mut protected_conflict_jobs = self.exec_service_barriers(&plan, base_index, &profile, &params);
         let extra_requirements = protected_conflict_jobs
             .iter()
             .copied()
             .map(|target| PlannedReq::Task { target, predicate: JobPredicate::Terminated })
             .collect();
+        let base_config = &self.base_tasks[base_index.idx()].config;
+        if base_config.kind == TaskKind::Action && base_config.managed == Some(false) {
+            protected_conflict_jobs.extend(self.conflicting_non_terminal_action_jobs(base_index, &profile, &plan));
+        }
         let job_ref = self.spawn_task_with_extra_requirements_impl(
             &mut plan,
             workspace_id,

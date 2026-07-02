@@ -2027,6 +2027,47 @@ require = ["gate"]
 }
 
 #[test]
+fn exec_requirement_duplicate_action_clients_do_not_wait_for_previous_exec() {
+    let mut harness = TestHarness::new("exec_requirement_duplicate_action_clients");
+    let release = harness.temp_dir.join("release");
+    let gate_started = harness.temp_dir.join("gate-started");
+    harness.write_config(&format!(
+        r#"
+[action.gate]
+sh = """
+touch {gate_started}
+while [ ! -f {release} ]; do sleep 0.02; done
+"""
+
+[action.remote]
+managed = false
+sh = "sleep 10"
+require = ["gate"]
+"#,
+        gate_started = gate_started.display(),
+        release = release.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut first = connect_exec_await(&harness, "remote");
+    assert!(harness.wait_for_file(&gate_started, Duration::from_secs(5)), "gate dependency did not start");
+    fs::write(&release, "").expect("release gate");
+
+    wait_for_exec_proceed(&mut first, Duration::from_secs(5)).unwrap_or_else(|err| {
+        panic!("first exec client should proceed, got {err}; server log:\n{}", harness.server_log())
+    });
+
+    let mut second = connect_exec_await(&harness, "remote");
+    wait_for_exec_proceed(&mut second, Duration::from_secs(1)).unwrap_or_else(|err| {
+        panic!(
+            "unmanaged actions should not wait for an older same-action exec, got {err}; server log:\n{}",
+            harness.server_log()
+        )
+    });
+}
+
+#[test]
 fn exec_requirement_dependents_wait_until_exec_gate_proceeds() {
     let mut harness = TestHarness::new("exec_requirement_dependent_after_proceed");
     let release = harness.temp_dir.join("release");
