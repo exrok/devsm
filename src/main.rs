@@ -7,7 +7,7 @@ use anyhow::bail;
 use kvlog::collector::UninitializedLogPolicy;
 use sendfd::SendWithFd;
 use std::{
-    io::{ErrorKind, Read, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     os::unix::{io::AsRawFd, net::UnixStream, process::CommandExt},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
@@ -1423,7 +1423,7 @@ fn await_exec_requirements(job: &str, params: jsony_value::ValueMap) -> anyhow::
                             }
                             RpcMessageKind::ExecError => {
                                 let message = jsony::from_binary::<crate::rpc::ExecErrorEvent>(payload)
-                                    .map(|e| e.message)
+                                    .map(|event| format_exec_error_with_dependency_logs(&cwd, &config, event))
                                     .unwrap_or_else(|_| "requirements could not be satisfied".to_string());
                                 bail!("{}", message);
                             }
@@ -1446,6 +1446,109 @@ fn await_exec_requirements(job: &str, params: jsony_value::ValueMap) -> anyhow::
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+const EXEC_DEPENDENCY_LOG_TAIL_LINES: u32 = 5;
+
+fn format_exec_error_with_dependency_logs(cwd: &Path, config: &Path, event: crate::rpc::ExecErrorEvent) -> String {
+    let mut message = event.message;
+    let Some(failure) = event.failed_dependency else {
+        return message;
+    };
+    let Some(job_index) = failure.job_index else {
+        return message;
+    };
+
+    let preserve_ansi = unsafe { libc::isatty(2) == 1 };
+    match fetch_job_log_tail(cwd, config, job_index, EXEC_DEPENDENCY_LOG_TAIL_LINES, preserve_ansi) {
+        Ok(tail) if !tail.trim().is_empty() => {
+            message.push_str(":\n");
+            message.push_str(tail.trim_end());
+        }
+        Ok(_) | Err(_) => {}
+    }
+
+    message
+}
+
+fn wait_for_attach_logs_done(socket: &mut UnixStream) -> anyhow::Result<()> {
+    let mut protocol = ClientProtocol::new();
+    let mut read_buf = Vec::with_capacity(1024);
+
+    loop {
+        read_buf.reserve(1024);
+        let spare = read_buf.spare_capacity_mut();
+        let read_slice = unsafe { std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len()) };
+
+        match socket.read(read_slice) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                unsafe { read_buf.set_len(read_buf.len() + n) };
+                loop {
+                    match protocol.decode(&read_buf) {
+                        DecodeResult::Message { kind, .. } => match kind {
+                            RpcMessageKind::TerminateAck | RpcMessageKind::Disconnect => return Ok(()),
+                            _ => {}
+                        },
+                        DecodeResult::MissingData { .. } => break,
+                        DecodeResult::Empty => {
+                            read_buf.clear();
+                            break;
+                        }
+                        DecodeResult::Error(e) => bail!("daemon sent invalid logs response: {:?}", e),
+                    }
+                }
+                protocol.compact(&mut read_buf, 4096);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+fn fetch_job_log_tail(
+    cwd: &Path,
+    config: &Path,
+    job_index: u32,
+    lines: u32,
+    preserve_ansi: bool,
+) -> anyhow::Result<String> {
+    let nonce =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default();
+    let capture_path =
+        std::env::temp_dir().join(format!("devsm-exec-dependency-logs-{}-{job_index}-{nonce}.log", std::process::id()));
+    let mut capture_file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&capture_path)?;
+    let output_fd = capture_file.as_raw_fd();
+
+    let result = (|| -> anyhow::Result<String> {
+        let mut socket = connect_or_spawn_daemon()?;
+        let query = daemon::LogsQuery {
+            max_age_secs: None,
+            task_filters: Vec::new(),
+            job_index: Some(job_index),
+            kind_filters: Vec::new(),
+            pattern: "",
+            follow: false,
+            retry: false,
+            oldest: None,
+            newest: Some(lines),
+            without_taskname: false,
+            is_tty: preserve_ansi,
+        };
+
+        socket.send_with_fd(
+            &jsony::to_binary(&daemon::RequestMessage { cwd, request: daemon::Request::AttachLogs { config, query } }),
+            &[0, output_fd],
+        )?;
+        wait_for_attach_logs_done(&mut socket)?;
+
+        let mut tail = String::new();
+        capture_file.seek(SeekFrom::Start(0))?;
+        capture_file.read_to_string(&mut tail)?;
+        Ok(tail)
+    })();
+    let _ = std::fs::remove_file(capture_path);
+    result
 }
 
 fn logs_client(options: cli::LogsOptions) -> anyhow::Result<()> {

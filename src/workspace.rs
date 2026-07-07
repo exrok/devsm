@@ -425,6 +425,9 @@ pub struct Job {
     /// Trace report attached on exit when `trace == true`, consumed by
     /// the log forwarder to send a `JobTraceReport` RPC message.
     pub trace_report: Option<crate::auto_deps::TraceReportPayload>,
+    /// Root cause captured when this scheduled job is cancelled because one of
+    /// its task requirements can never be satisfied.
+    pub dependency_failure: Option<DependencyFailure>,
 }
 
 pub struct ResolvedSpawnSpec {
@@ -455,6 +458,27 @@ pub enum JobPredicate {
     TerminatedNaturallyAndSuccessfully,
     Active,
     Ready,
+}
+
+impl JobPredicate {
+    pub fn name(&self) -> &'static str {
+        match self {
+            JobPredicate::Terminated => "terminated",
+            JobPredicate::TerminatedNaturallyAndSuccessfully => "successful completion",
+            JobPredicate::Active => "active",
+            JobPredicate::Ready => "ready",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DependencyFailure {
+    pub task_name: String,
+    pub job_index: Option<u32>,
+    pub predicate: JobPredicate,
+    pub reason: String,
+    pub exit_code: Option<i32>,
+    pub cause: Option<ExitCause>,
 }
 
 #[derive(Debug)]
@@ -2297,6 +2321,7 @@ impl WorkspaceState {
             action_deps_until_ready,
             trace,
             trace_report: None,
+            dependency_failure: None,
         });
 
         self.base_tasks[base_task.idx()].jobs.push_scheduled(job_index);
@@ -2345,6 +2370,7 @@ impl WorkspaceState {
             action_deps_until_ready: SmallVec::new(),
             trace: false,
             trace_report: None,
+            dependency_failure: None,
         });
 
         self.base_tasks[base_task.idx()].jobs.push_terminated(job_index);
@@ -3551,6 +3577,118 @@ impl WorkspaceState {
             }
         }
         names
+    }
+
+    fn exit_code_for_dependency_failure(status: u32, cause: ExitCause) -> i32 {
+        match cause {
+            ExitCause::Killed | ExitCause::Restarted | ExitCause::ProfileConflict | ExitCause::Timeout => -1,
+            ExitCause::Unknown | ExitCause::SpawnFailed => {
+                if status == u32::MAX {
+                    -1
+                } else {
+                    status as i32
+                }
+            }
+        }
+    }
+
+    fn dependency_status_reason(
+        predicate: &JobPredicate,
+        status: &JobStatus,
+    ) -> (String, Option<i32>, Option<ExitCause>) {
+        match status {
+            JobStatus::Cancelled => {
+                (format!("was cancelled before satisfying the '{}' requirement", predicate.name()), None, None)
+            }
+            JobStatus::Exited { status, cause, .. } => {
+                let code = Self::exit_code_for_dependency_failure(*status, *cause);
+                let code_suffix = if code >= 0 { format!(" (exit code {code})") } else { String::new() };
+                let reason = match cause {
+                    ExitCause::SpawnFailed => format!("failed to spawn{code_suffix}"),
+                    ExitCause::Killed => "was killed".to_string(),
+                    ExitCause::Restarted => "was restarted".to_string(),
+                    ExitCause::ProfileConflict => "stopped because of a profile conflict".to_string(),
+                    ExitCause::Timeout => "timed out".to_string(),
+                    ExitCause::Unknown => match predicate {
+                        JobPredicate::Active => {
+                            format!("exited before becoming active/ready{code_suffix}")
+                        }
+                        JobPredicate::TerminatedNaturallyAndSuccessfully => {
+                            format!("exited unsuccessfully{code_suffix}")
+                        }
+                        JobPredicate::Ready => format!("exited before becoming ready{code_suffix}"),
+                        JobPredicate::Terminated => format!("exited{code_suffix}"),
+                    },
+                };
+                (reason, Some(code), Some(*cause))
+            }
+            other => (
+                format!("is {}, which cannot satisfy the '{}' requirement", other.name(), predicate.name()),
+                None,
+                None,
+            ),
+        }
+    }
+
+    fn dependency_failure_for_requirement(&self, dep: JobIndex, predicate: &JobPredicate) -> DependencyFailure {
+        let job_index = self.jobs.public_id_of(dep);
+        let Some(dep_job) = self.jobs.get(dep) else {
+            return DependencyFailure {
+                task_name: "unknown".to_string(),
+                job_index,
+                predicate: predicate.clone(),
+                reason: "dependency job is no longer available".to_string(),
+                exit_code: None,
+                cause: None,
+            };
+        };
+
+        if let Some(failure) = &dep_job.dependency_failure {
+            return failure.clone();
+        }
+
+        let task_name = self
+            .base_tasks
+            .get(dep_job.log_group.base_task_index().idx())
+            .map(|bt| bt.name.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let (reason, exit_code, cause) = Self::dependency_status_reason(predicate, &dep_job.process_status);
+
+        DependencyFailure { task_name, job_index, predicate: predicate.clone(), reason, exit_code, cause }
+    }
+
+    /// Root cause for a scheduled job whose task requirements can never be met.
+    /// If an immediate dependency was itself cancelled by a deeper dependency,
+    /// the deeper failure is propagated so clients can report the useful cause.
+    pub fn dependency_failure(&self, job_index: JobIndex) -> Option<DependencyFailure> {
+        let job = self.jobs.get(job_index)?;
+        if let Some(failure) = &job.dependency_failure {
+            return Some(failure.clone());
+        }
+        let JobStatus::Scheduled { after } = &job.process_status else {
+            return None;
+        };
+
+        for req in after {
+            let ScheduleRequirement::Task { job: dep, predicate } = req else {
+                continue;
+            };
+            if matches!(req.status(self), RequirementStatus::Never) {
+                return Some(self.dependency_failure_for_requirement(*dep, predicate));
+            }
+        }
+
+        None
+    }
+
+    /// Record the current dependency failure on a job before cancelling it.
+    /// This preserves the root cause for downstream jobs cancelled later.
+    pub fn record_dependency_failure_from_requirements(&mut self, job_index: JobIndex) -> Option<DependencyFailure> {
+        let failure = self.dependency_failure(job_index);
+        if let Some(job) = self.jobs.get_mut(job_index) {
+            job.dependency_failure = failure.clone();
+        }
+        failure
     }
 
     pub fn next_scheduled(&self) -> Scheduled {
@@ -5048,8 +5186,57 @@ mod scheduling_tests {
                 action_deps_until_ready: SmallVec::new(),
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             ScheduleRequirement::Task { job: ji, predicate }.status(&state)
+        }
+
+        #[test]
+        fn dependency_failure_records_failed_requirement_details() {
+            let (mut state, base_task, spec) = fixture();
+            let dep = state.jobs.insert(Job {
+                process_status: JobStatus::Exited {
+                    finished_at: crate::clock::now(),
+                    cause: ExitCause::Unknown,
+                    status: 7,
+                },
+                log_group: LogGroup::new(base_task, 0),
+                started_at: crate::clock::now(),
+                cache_key: String::new(),
+                cache_synthetic: false,
+                spawn: spec.clone(),
+                held_resources: SmallVec::new(),
+                action_deps_until_ready: SmallVec::new(),
+                trace: false,
+                trace_report: None,
+                dependency_failure: None,
+            });
+            let dependent = state.jobs.insert(Job {
+                process_status: JobStatus::Scheduled {
+                    after: vec![ScheduleRequirement::Task {
+                        job: dep,
+                        predicate: JobPredicate::TerminatedNaturallyAndSuccessfully,
+                    }],
+                },
+                log_group: LogGroup::new(base_task, 1),
+                started_at: crate::clock::now(),
+                cache_key: String::new(),
+                cache_synthetic: false,
+                spawn: spec,
+                held_resources: SmallVec::new(),
+                action_deps_until_ready: SmallVec::new(),
+                trace: false,
+                trace_report: None,
+                dependency_failure: None,
+            });
+
+            let failure = state.record_dependency_failure_from_requirements(dependent).expect("failure details");
+            assert_eq!(failure.task_name, "simple_cmd");
+            assert_eq!(failure.job_index, Some(0));
+            assert_eq!(failure.exit_code, Some(7));
+            assert_eq!(failure.cause, Some(ExitCause::Unknown));
+            assert!(failure.reason.contains("exit code 7"));
+            assert!(state.jobs[dependent].dependency_failure.is_some());
         }
 
         #[test]
@@ -5789,6 +5976,7 @@ require = ["sink{next}"]
                 action_deps_until_ready: SmallVec::new(),
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_active(ji);
             state.service_jobs.push_active(ji);
@@ -5819,6 +6007,7 @@ require = ["sink{next}"]
                 action_deps_until_ready: SmallVec::new(),
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
             state.service_jobs.push_scheduled(ji);
@@ -6052,6 +6241,7 @@ require = ["sink{next}"]
                 action_deps_until_ready: SmallVec::new(),
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_active(ji);
             state.action_jobs.push_active(ji);
@@ -6143,6 +6333,7 @@ require = ["sink{next}"]
                 action_deps_until_ready: SmallVec::new(),
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(b);
 
@@ -6182,6 +6373,7 @@ require = ["sink{next}"]
                 action_deps_until_ready: smallvec::smallvec![action_dep],
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             state.base_tasks[service_task.idx()].jobs.push_active(service_job);
             state.service_jobs.push_active(service_job);
@@ -6296,6 +6488,7 @@ require = ["sink{next}"]
                     action_deps_until_ready: SmallVec::new(),
                     trace: false,
                     trace_report: None,
+                    dependency_failure: None,
                 });
                 state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
                 state.action_jobs.push_scheduled(ji);
@@ -6363,6 +6556,7 @@ require = ["sink{next}"]
                 action_deps_until_ready: SmallVec::new(),
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_terminated(seed);
             state.test_jobs.push_terminated(seed);
@@ -6419,6 +6613,7 @@ require = ["sink{next}"]
                 action_deps_until_ready: SmallVec::new(),
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_terminated(seed);
             state.test_jobs.push_terminated(seed);
@@ -6613,6 +6808,7 @@ cmd = ["true"]
                 action_deps_until_ready: SmallVec::new(),
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
             state.action_jobs.push_scheduled(ji);
@@ -6638,6 +6834,7 @@ cmd = ["true"]
                 action_deps_until_ready: SmallVec::new(),
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_active(ji);
             state.service_jobs.push_active(ji);
@@ -6668,6 +6865,7 @@ cmd = ["true"]
                 action_deps_until_ready: SmallVec::new(),
                 trace: false,
                 trace_report: None,
+                dependency_failure: None,
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
             state.service_jobs.push_scheduled(ji);

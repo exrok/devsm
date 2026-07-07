@@ -51,6 +51,7 @@ pub enum LogForwarderFilter {
     All,
     BaseTasks(BaseTaskSet),
     Job(LogGroup),
+    None,
 }
 
 impl LogForwarderConfig {
@@ -69,7 +70,7 @@ impl LogForwarderConfig {
                 Some(ji) => ji,
                 None => {
                     return Self {
-                        filter: LogForwarderFilter::All,
+                        filter: LogForwarderFilter::None,
                         pattern: pattern_lower,
                         case_sensitive,
                         max_age_secs: query.max_age_secs,
@@ -84,7 +85,7 @@ impl LogForwarderConfig {
             };
             let Some(job) = state.jobs.get(job_index) else {
                 return Self {
-                    filter: LogForwarderFilter::All,
+                    filter: LogForwarderFilter::None,
                     pattern: pattern_lower,
                     case_sensitive,
                     max_age_secs: query.max_age_secs,
@@ -321,6 +322,7 @@ fn dump_logs(
         LogForwarderFilter::All => LogFilter::All,
         LogForwarderFilter::BaseTasks(set) => LogFilter::IsInSet(set.clone()),
         LogForwarderFilter::Job(log_group) => LogFilter::IsGroup(*log_group),
+        LogForwarderFilter::None => return Ok(()),
     };
 
     let view = logs.view(filter);
@@ -410,6 +412,7 @@ fn forward_logs_filtered(
         LogForwarderFilter::All => LogFilter::All,
         LogForwarderFilter::BaseTasks(set) => LogFilter::IsInSet(set.clone()),
         LogForwarderFilter::Job(log_group) => LogFilter::IsGroup(*log_group),
+        LogForwarderFilter::None => return Ok(()),
     };
 
     let view = logs.view(filter);

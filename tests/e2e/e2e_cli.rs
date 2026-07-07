@@ -239,6 +239,51 @@ fn wait_for_exec_proceed(socket: &mut UnixStream, timeout: Duration) -> Result<(
     Err("timed out waiting for ExecProceed".to_string())
 }
 
+fn wait_for_exec_error_event(socket: &mut UnixStream, timeout: Duration) -> Result<crate::rpc::ExecErrorEvent, String> {
+    let start = Instant::now();
+    let mut state = DecodingState::default();
+    let mut buffer = Vec::with_capacity(256);
+    while start.elapsed() < timeout {
+        socket.set_read_timeout(Some(Duration::from_millis(50))).ok();
+        let mut chunk = [0u8; 256];
+        match socket.read(&mut chunk) {
+            Ok(0) => return Err("daemon closed exec-await socket".to_string()),
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(format!("failed reading exec-await socket: {e}")),
+        }
+
+        loop {
+            match state.decode(&buffer) {
+                DecodeResult::Message { kind: RpcMessageKind::ExecError, payload, .. } => {
+                    return jsony::from_binary::<crate::rpc::ExecErrorEvent>(payload)
+                        .map_err(|_| "failed to decode ExecError event".to_string());
+                }
+                DecodeResult::Message { kind: RpcMessageKind::ExecWaiting, .. } => {}
+                DecodeResult::Message { kind: RpcMessageKind::ExecProceed, .. } => {
+                    return Err("unexpected ExecProceed".to_string());
+                }
+                DecodeResult::Message { kind, .. } => return Err(format!("unexpected exec-await message: {kind:?}")),
+                DecodeResult::MissingData { .. } => break,
+                DecodeResult::Empty => {
+                    buffer.clear();
+                    break;
+                }
+                DecodeResult::Error(err) => return Err(format!("invalid exec-await response: {err:?}")),
+            }
+        }
+        state.compact(&mut buffer, 4096);
+    }
+    Err("timed out waiting for ExecError".to_string())
+}
+
 #[test]
 fn run_simple_action() {
     let mut harness = TestHarness::new("run_simple");
@@ -1883,6 +1928,156 @@ cli.forward-arguments = true
         "forwarded shell args mismatch: {:?}",
         lines
     );
+}
+
+#[test]
+fn exec_reports_failed_dependency_and_tails_logs() {
+    let mut harness = TestHarness::new("exec_failed_dep_logs");
+    let marker = harness.temp_dir.join("main_ran.txt");
+    harness.write_config(&format!(
+        r#"
+[action.failing_dep]
+sh = """
+printf 'dep line 1\n'
+printf 'dep line 2\n'
+printf 'dep line 3\n'
+printf 'dep line 4\n'
+printf 'dep line 5\n'
+printf 'dep line 6\n'
+exit 7
+"""
+
+[action.main]
+managed = false
+sh = "printf ran > {marker}"
+require = ["failing_dep"]
+"#,
+        marker = marker.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["exec", "main"]);
+    assert!(
+        !result.success(),
+        "exec should fail when dependency fails: stdout={}, stderr={}",
+        result.stdout,
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("required dependency 'failing_dep'"),
+        "stderr should name failed dependency:\n{}",
+        result.stderr
+    );
+    assert!(result.stderr.contains("job #"), "stderr should include failed job id:\n{}", result.stderr);
+    assert!(result.stderr.contains("exit code 7"), "stderr should include exit code:\n{}", result.stderr);
+    assert!(
+        result.stderr.contains("exit code 7):\n"),
+        "stderr should append log tail directly after the dependency error:\n{}",
+        result.stderr
+    );
+    assert!(
+        !result.stderr.contains("Last 5 log lines for dependency job #"),
+        "stderr should not include a separate log tail header:\n{}",
+        result.stderr
+    );
+    assert!(!result.stderr.contains("dep line 1"), "tail should omit older lines:\n{}", result.stderr);
+    for line in 2..=6 {
+        assert!(result.stderr.contains(&format!("dep line {line}")), "missing tailed line {line}:\n{}", result.stderr);
+    }
+    assert!(
+        !result.stderr.contains("hint: devsm logs --job="),
+        "stderr should not include logs hint:\n{}",
+        result.stderr
+    );
+    assert!(!marker.exists(), "main command ran despite failed dependency");
+}
+
+#[test]
+fn exec_error_event_includes_failed_dependency_without_logs() {
+    let mut harness = TestHarness::new("exec_error_event_failed_dep");
+    harness.write_config(
+        r#"
+[action.failing_dep]
+sh = """
+printf 'dep log line\n'
+exit 9
+"""
+
+[action.main]
+managed = false
+sh = "printf should-not-run\n"
+require = ["failing_dep"]
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let mut socket = connect_exec_await(&harness, "main");
+    let event = wait_for_exec_error_event(&mut socket, Duration::from_secs(5)).unwrap_or_else(|err| {
+        panic!("expected structured exec error, got {err}; server log:\n{}", harness.server_log())
+    });
+
+    let failure = event.failed_dependency.expect("ExecError should include failed dependency metadata");
+    assert_eq!(failure.task_name, "failing_dep");
+    assert!(failure.job_index.is_some(), "failed dependency should include public job id");
+    assert_eq!(failure.exit_code, Some(9));
+    assert!(
+        event.message.contains("failing_dep") && event.message.contains("exit code 9"),
+        "message should summarize dependency failure: {}",
+        event.message
+    );
+    assert!(
+        !event.message.contains("dep log line"),
+        "ExecError event must not embed logs; clients should query logs separately"
+    );
+}
+
+#[test]
+fn exec_reports_service_that_exits_before_ready_and_tails_logs() {
+    let mut harness = TestHarness::new("exec_service_before_ready_logs");
+    let marker = harness.temp_dir.join("main_ran.txt");
+    harness.write_config(&format!(
+        r#"
+[service.api]
+sh = """
+printf 'api boot 1\n'
+printf 'api boot 2\n'
+printf 'api boot 3\n'
+exit 3
+"""
+ready = {{ when = {{ output_contains = "API_READY" }} }}
+
+[action.main]
+managed = false
+sh = "printf ran > {marker}"
+require = ["api"]
+"#,
+        marker = marker.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["exec", "main"]);
+    assert!(!result.success(), "exec should fail when service exits before ready");
+    assert!(
+        result.stderr.contains("required dependency 'api'"),
+        "stderr should name service dependency:\n{}",
+        result.stderr
+    );
+    assert!(
+        result.stderr.contains("before becoming active/ready"),
+        "stderr should explain ready/active failure:\n{}",
+        result.stderr
+    );
+    assert!(result.stderr.contains("api boot 1"), "stderr should include service logs:\n{}", result.stderr);
+    assert!(result.stderr.contains("api boot 3"), "stderr should include service logs:\n{}", result.stderr);
+    assert!(
+        !result.stderr.contains("hint: devsm logs --job="),
+        "stderr should not include logs hint:\n{}",
+        result.stderr
+    );
+    assert!(!marker.exists(), "main command ran despite service dependency failure");
 }
 
 #[test]
@@ -3538,6 +3733,31 @@ sh = "echo 'log line one'; echo 'log line two'; echo 'log line three'"
     assert!(result.stdout.contains("log line one"), "logs should contain 'log line one', got: {}", result.stdout);
     assert!(result.stdout.contains("log line two"), "logs should contain 'log line two', got: {}", result.stdout);
     assert!(result.stdout.contains("log line three"), "logs should contain 'log line three', got: {}", result.stdout);
+}
+
+#[test]
+fn logs_unknown_job_does_not_fall_back_to_all_logs() {
+    let mut harness = TestHarness::new("logs_unknown_job");
+    harness.write_config(
+        r#"
+[action.echo_task]
+sh = "echo 'should not appear for unknown job'"
+"#,
+    );
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let result = harness.run_client(&["run", "echo_task"]);
+    assert!(result.success(), "run command failed: {}", result.stderr);
+
+    let result = harness.run_client(&["logs", "--job=999999"]);
+    assert!(result.success(), "logs command failed: {}", result.stderr);
+    assert!(
+        !result.stdout.contains("should not appear for unknown job"),
+        "unknown job filter should not dump all logs:\n{}",
+        result.stdout
+    );
+    assert!(result.stdout.trim().is_empty(), "unknown job filter should produce no logs:\n{}", result.stdout);
 }
 
 #[test]

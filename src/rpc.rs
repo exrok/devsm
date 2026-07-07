@@ -929,10 +929,22 @@ pub struct ExecWaitingEvent {
 
 /// Reason an `exec` task's requirements can never be satisfied. The client
 /// prints this to stderr and exits without running the command.
+#[derive(Jsony, Debug, Clone)]
+#[jsony(Binary)]
+pub struct ExecDependencyFailureEvent {
+    pub task_name: String,
+    pub job_index: Option<u32>,
+    pub predicate: String,
+    pub reason: String,
+    pub exit_code: Option<i32>,
+    pub cause: Option<ExitCause>,
+}
+
 #[derive(Jsony, Debug)]
 #[jsony(Binary)]
 pub struct ExecErrorEvent {
     pub message: String,
+    pub failed_dependency: Option<ExecDependencyFailureEvent>,
 }
 
 #[derive(Jsony, Debug, Clone, Copy, PartialEq, Eq)]

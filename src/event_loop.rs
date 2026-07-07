@@ -601,7 +601,9 @@ impl EventLoop {
                     SchedulingStep::Cancel { job_index } => {
                         kvlog::info!("Scheduled task will never be ready cancelling", job_index);
                         if let Some(ws) = self.state.workspaces.get(wsi) {
-                            ws.handle.state.write().unwrap().update_job_status(job_index, JobStatus::Cancelled);
+                            let mut state = ws.handle.state.write().unwrap();
+                            state.record_dependency_failure_from_requirements(job_index);
+                            state.update_job_status(job_index, JobStatus::Cancelled);
                         }
                         continue 'outer;
                     }
@@ -1738,12 +1740,12 @@ impl EventLoop {
         let result = match ws.handle.submit_exec(name, profile, params) {
             Ok(result) => result,
             Err(e) => {
-                Self::send_exec_error(&socket, &e);
+                Self::send_exec_error_message(&socket, &e);
                 return;
             }
         };
         let Some((_, job_index)) = result.jobs.first().copied() else {
-            Self::send_exec_error(&socket, "No job created");
+            Self::send_exec_error_message(&socket, "No job created");
             return;
         };
 
@@ -1777,10 +1779,64 @@ impl EventLoop {
         Self::send_exec_message(socket, &encoder);
     }
 
-    fn send_exec_error(socket: &UnixStream, message: &str) {
+    fn rpc_exit_cause(cause: ExitCause) -> crate::rpc::ExitCause {
+        match cause {
+            ExitCause::Unknown => crate::rpc::ExitCause::Unknown,
+            ExitCause::Killed => crate::rpc::ExitCause::Killed,
+            ExitCause::Restarted => crate::rpc::ExitCause::Restarted,
+            ExitCause::SpawnFailed => crate::rpc::ExitCause::SpawnFailed,
+            ExitCause::ProfileConflict => crate::rpc::ExitCause::ProfileConflict,
+            ExitCause::Timeout => crate::rpc::ExitCause::Timeout,
+        }
+    }
+
+    fn exec_dependency_failure_event(failure: &workspace::DependencyFailure) -> crate::rpc::ExecDependencyFailureEvent {
+        crate::rpc::ExecDependencyFailureEvent {
+            task_name: failure.task_name.clone(),
+            job_index: failure.job_index,
+            predicate: failure.predicate.name().to_string(),
+            reason: failure.reason.clone(),
+            exit_code: failure.exit_code,
+            cause: failure.cause.map(Self::rpc_exit_cause),
+        }
+    }
+
+    fn exec_dependency_failure_message(failure: &workspace::DependencyFailure) -> String {
+        let job = failure.job_index.map(|id| format!(" (job #{id})")).unwrap_or_default();
+        format!("required dependency '{}'{} could not be satisfied: {}", failure.task_name, job, failure.reason)
+    }
+
+    fn exec_error_event_for_job(
+        state: &WorkspaceState,
+        job_index: JobIndex,
+        fallback: &'static str,
+    ) -> crate::rpc::ExecErrorEvent {
+        if let Some(failure) = state
+            .jobs
+            .get(job_index)
+            .and_then(|job| job.dependency_failure.clone())
+            .or_else(|| state.dependency_failure(job_index))
+        {
+            return crate::rpc::ExecErrorEvent {
+                message: Self::exec_dependency_failure_message(&failure),
+                failed_dependency: Some(Self::exec_dependency_failure_event(&failure)),
+            };
+        }
+
+        crate::rpc::ExecErrorEvent { message: fallback.to_string(), failed_dependency: None }
+    }
+
+    fn send_exec_error(socket: &UnixStream, event: &crate::rpc::ExecErrorEvent) {
         let mut encoder = crate::rpc::Encoder::new();
-        encoder.encode_push(RpcMessageKind::ExecError, &crate::rpc::ExecErrorEvent { message: message.to_string() });
+        encoder.encode_push(RpcMessageKind::ExecError, event);
         Self::send_exec_message(socket, &encoder);
+    }
+
+    fn send_exec_error_message(socket: &UnixStream, message: &str) {
+        Self::send_exec_error(
+            socket,
+            &crate::rpc::ExecErrorEvent { message: message.to_string(), failed_dependency: None },
+        );
     }
 
     /// Reconcile pending exec gates against current job state. Run every loop
@@ -1811,24 +1867,28 @@ impl EventLoop {
             enum Outcome {
                 Pending(Vec<String>),
                 Proceed,
-                Failed(String),
+                Failed(crate::rpc::ExecErrorEvent),
                 Running,
             }
             let outcome = {
                 let state = workspace.handle.state.read().unwrap();
                 match state.jobs.get(job_index).map(|job| &job.process_status) {
-                    None | Some(JobStatus::Cancelled) => {
-                        Outcome::Failed("a required dependency could not be satisfied".to_string())
-                    }
+                    None | Some(JobStatus::Cancelled) => Outcome::Failed(Self::exec_error_event_for_job(
+                        &state,
+                        job_index,
+                        "a required dependency could not be satisfied",
+                    )),
                     Some(JobStatus::Starting) if remote.proceeded => Outcome::Running,
                     Some(JobStatus::Starting) => Outcome::Proceed,
                     Some(JobStatus::RemoteRunning { .. }) if remote.proceeded => Outcome::Running,
                     Some(JobStatus::RemoteRunning { .. }) => Outcome::Proceed,
                     Some(JobStatus::Exited { status: 0, .. }) if remote.proceeded => Outcome::Running,
                     Some(JobStatus::Exited { status: 0, .. }) => Outcome::Proceed,
-                    Some(JobStatus::Exited { .. }) => {
-                        Outcome::Failed("a required dependency could not be satisfied".to_string())
-                    }
+                    Some(JobStatus::Exited { .. }) => Outcome::Failed(Self::exec_error_event_for_job(
+                        &state,
+                        job_index,
+                        "a required dependency could not be satisfied",
+                    )),
                     // A remote job is gated before it can spawn, so it should
                     // never actually run; treat that defensively as "go ahead".
                     Some(JobStatus::Running { .. }) if remote.proceeded => Outcome::Running,
@@ -1863,8 +1923,8 @@ impl EventLoop {
                         wake_scheduler = true;
                     }
                 }
-                Outcome::Failed(message) => {
-                    Self::send_exec_error(socket, &message);
+                Outcome::Failed(event) => {
+                    Self::send_exec_error(socket, &event);
                     settled.push((ws_index, job_index));
                 }
                 Outcome::Running => {}
