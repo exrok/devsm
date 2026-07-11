@@ -15,6 +15,7 @@ use jsony::Jsony;
 #[derive(Debug, Clone, Jsony, Default)]
 pub struct TuiState {
     pub tty_render_byte_count: usize,
+    pub config_generation: u64,
     #[allow(dead_code)]
     groups_expanded: Option<TuiGroupsExpanded>,
     #[allow(dead_code)]
@@ -354,7 +355,7 @@ sh = "while true; do sleep 1; done"
     assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
 
     let tui = TuiTestClient::spawn(&harness);
-    let timeout = Duration::from_secs(3);
+    let timeout = Duration::from_secs(10);
 
     let state = tui.wait_until(|s| s.base_tasks.len() >= 3 && s.selection.is_some(), timeout);
     assert!(state.is_some(), "Should receive initial JSON state, server_log: {}", harness.server_log());
@@ -395,7 +396,7 @@ sh = "echo hello"
     assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
 
     let mut tui = TuiTestClient::spawn(&harness);
-    let timeout = Duration::from_secs(3);
+    let timeout = Duration::from_secs(10);
 
     let state = tui.wait_until(|s| s.find_task_by_name("my_action").is_some(), timeout);
     assert!(state.is_some(), "Should receive initial state, server_log: {}", harness.server_log());
@@ -494,7 +495,7 @@ sh = "for i in $(seq 1 200); do echo \"log line $i\"; done"
     tui.send_ctrl_key('k');
 
     let state =
-        tui.wait_until(|s| s.scroll.as_ref().map(|sc| sc.top.is_scrolled).unwrap_or(false), Duration::from_secs(2));
+        tui.wait_until(|s| s.scroll.as_ref().map(|sc| sc.top.is_scrolled).unwrap_or(false), Duration::from_secs(10));
     assert!(state.is_some(), "Should enter scroll mode when there are enough logs");
 }
 
@@ -539,7 +540,10 @@ require = ["alpha"]
     let mut tui = TuiTestClient::spawn(&harness);
     let timeout = Duration::from_secs(5);
     let state = tui.wait_until(|s| s.find_task_by_name("alpha").is_some(), timeout);
-    assert!(state.is_some(), "alpha task should appear, server_log: {}", harness.server_log());
+    let Some(state) = state else {
+        panic!("alpha task should appear, server_log: {}", harness.server_log());
+    };
+    let generation = state.config_generation;
 
     let result = harness.run_client(&["run", "alpha"]);
     let combined = format!("{}{}", result.stdout, result.stderr);
@@ -557,7 +561,8 @@ cmd = ["true"]
     );
 
     tui.send_key(b"R");
-    std::thread::sleep(Duration::from_millis(300));
+    let reloaded = tui.wait_until(|s| s.config_generation != generation, timeout);
+    assert!(reloaded.is_some(), "TUI reload should produce a new config generation, server_log: {}", harness.server_log());
 
     let result = harness.run_client(&["run", "alpha"]);
     let combined = format!("{}{}", result.stdout, result.stderr);

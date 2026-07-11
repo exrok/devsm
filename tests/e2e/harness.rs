@@ -470,6 +470,23 @@ impl TestAppServer {
         }
     }
 
+    /// Accepts one connection per entry in `names`, returning them in the
+    /// order of `names` regardless of arrival order. Tasks spawned around the
+    /// same scheduling instant connect in scheduler-dependent order, so
+    /// consecutive `accept` calls asserting fixed names are racy.
+    pub fn accept_named<const N: usize>(&self, names: [&str; N], timeout: Duration) -> [TestAppConn; N] {
+        let start = Instant::now();
+        let mut slots: [Option<TestAppConn>; N] = std::array::from_fn(|_| None);
+        for _ in 0..N {
+            let conn = self.accept(timeout.saturating_sub(start.elapsed()));
+            let Some(slot) = (0..N).find(|&i| slots[i].is_none() && names[i] == conn.name()) else {
+                panic!("unexpected test-app connection '{}' while waiting for {:?}", conn.name(), names);
+            };
+            slots[slot] = Some(conn);
+        }
+        slots.map(|conn| conn.unwrap())
+    }
+
     pub fn try_accept(&self, timeout: Duration) -> Option<TestAppConn> {
         self.listener.set_nonblocking(true).unwrap();
         let start = Instant::now();

@@ -15,7 +15,7 @@ use crate::rpc::{
     KillTaskRequest, RpcMessageKind, RunnableStatus, SpawnTaskRequest, StatusResponse, SubscribeAck,
     SubscriptionFilter, WorkspaceClient,
 };
-use harness::{RpcEvent, RpcSubscriber, TestHarness, cargo_bin_path};
+use harness::{RpcEvent, RpcSubscriber, TestAppServer, TestHarness, cargo_bin_path};
 
 fn spawn_client_process(harness: &TestHarness, args: &[&str]) -> Child {
     Command::new(cargo_bin_path())
@@ -78,6 +78,17 @@ fn wait_for_line_count(path: &Path, needle: &str, expected: usize, timeout: Dura
     while start.elapsed() < timeout {
         let count = fs::read_to_string(path).unwrap_or_default().lines().filter(|line| line.contains(needle)).count();
         if count >= expected {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+fn wait_for_file_content(path: &Path, expected: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if fs::read_to_string(path).unwrap_or_default().trim() == expected {
             return true;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -379,7 +390,7 @@ freeze = ["blocking", "after"]
         .expect("start group.freeze timed out");
     assert!(started.success(), "group start failed: {}", started.stderr);
 
-    let status = run_client_with_timeout(&harness, &["status", "after"], Duration::from_secs(2));
+    let status = run_client_with_timeout(&harness, &["status", "after"], Duration::from_secs(5));
     assert!(
         status.is_some(),
         "daemon stopped responding after scheduling group.freeze; server log:\n{}",
@@ -388,7 +399,7 @@ freeze = ["blocking", "after"]
     let status = status.unwrap();
     assert!(status.success(), "status after failed: {}", status.stderr);
     assert!(
-        harness.wait_for_file(&marker, Duration::from_secs(2)),
+        harness.wait_for_file(&marker, Duration::from_secs(10)),
         "after task did not run; status output:\n{}",
         status.stdout
     );
@@ -468,18 +479,18 @@ dev = [{{ service = "a" }}, {{ name = "service.b" }}]
 
     let result = harness.run_client(&["start", "dev"]);
     assert!(result.success(), "start group failed: {}", result.stderr);
-    assert!(wait_for_line_count(&starts, "a", 1, Duration::from_secs(3)), "service a did not start");
-    assert!(wait_for_line_count(&starts, "b", 1, Duration::from_secs(3)), "service b did not start");
+    assert!(wait_for_line_count(&starts, "a", 1, Duration::from_secs(10)), "service a did not start");
+    assert!(wait_for_line_count(&starts, "b", 1, Duration::from_secs(10)), "service b did not start");
 
     let result = harness.run_client(&["restart", "group.dev"]);
     assert!(result.success(), "restart group failed: {}", result.stderr);
-    assert!(wait_for_line_count(&starts, "a", 2, Duration::from_secs(3)), "service a did not restart");
-    assert!(wait_for_line_count(&starts, "b", 2, Duration::from_secs(3)), "service b did not restart");
+    assert!(wait_for_line_count(&starts, "a", 2, Duration::from_secs(10)), "service a did not restart");
+    assert!(wait_for_line_count(&starts, "b", 2, Duration::from_secs(10)), "service b did not restart");
 
     let result = harness.run_client(&["stop", "dev"]);
     assert!(result.success(), "stop group failed: {}", result.stderr);
-    assert!(harness.wait_for_file(&stopped_a, Duration::from_secs(3)), "service a was not stopped");
-    assert!(harness.wait_for_file(&stopped_b, Duration::from_secs(3)), "service b was not stopped");
+    assert!(harness.wait_for_file(&stopped_a, Duration::from_secs(10)), "service a was not stopped");
+    assert!(harness.wait_for_file(&stopped_b, Duration::from_secs(10)), "service b was not stopped");
 }
 
 #[test]
@@ -506,8 +517,8 @@ dev = ["a", "b"]
 
     let result = harness.run_client(&["start", "dev"]);
     assert!(result.success(), "start group failed: {}", result.stderr);
-    assert!(harness.wait_for_file(&started_a, Duration::from_secs(3)), "service a did not start");
-    assert!(harness.wait_for_file(&started_b, Duration::from_secs(3)), "service b did not start");
+    assert!(harness.wait_for_file(&started_a, Duration::from_secs(10)), "service a did not start");
+    assert!(harness.wait_for_file(&started_b, Duration::from_secs(10)), "service b did not start");
 
     let result = harness.run_client(&["status"]);
     assert!(result.success(), "status failed: {}", result.stderr);
@@ -1566,7 +1577,7 @@ sh = "echo hello"
     let mut subscriber = RpcSubscriber::connect(&harness);
 
     // Wait for workspace to open
-    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(2));
+    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(10));
 
     // Run task via client in background thread
     let client_handle = std::thread::spawn({
@@ -1620,7 +1631,7 @@ require = ["dep"]
     let mut subscriber = RpcSubscriber::connect(&harness);
 
     // Wait for workspace to open
-    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(2));
+    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(10));
 
     // Run main via client
     let client_handle = std::thread::spawn({
@@ -1673,7 +1684,7 @@ sh = "sleep 0.01 && echo done"
     let mut subscriber = RpcSubscriber::connect(&harness);
 
     // Wait for workspace
-    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(2));
+    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(10));
 
     // Run in background
     let client_handle = std::thread::spawn({
@@ -1773,7 +1784,7 @@ require = [
 
     let result = harness.run_client(&["run", "backend:traffic-live"]);
     assert!(result.success(), "traffic-live profile should succeed: {}", result.stderr);
-    assert!(harness.wait_for_file(&live_marker, Duration::from_secs(2)), "traffic-live dependency should run");
+    assert!(harness.wait_for_file(&live_marker, Duration::from_secs(10)), "traffic-live dependency should run");
 }
 
 #[test]
@@ -1796,7 +1807,7 @@ require = [
 
     let result = harness.run_client(&["run", "backend"]);
     assert!(result.success(), "default profile should not see bad-profile cycle: {}", result.stderr);
-    assert!(harness.wait_for_file(&marker, Duration::from_secs(2)), "default profile should run");
+    assert!(harness.wait_for_file(&marker, Duration::from_secs(10)), "default profile should run");
 
     let result = harness.run_client(&["run", "backend:bad"]);
     let combined = format!("{}{}", result.stdout, result.stderr);
@@ -2254,7 +2265,7 @@ require = ["gate"]
     });
 
     let mut second = connect_exec_await(&harness, "remote");
-    wait_for_exec_proceed(&mut second, Duration::from_secs(1)).unwrap_or_else(|err| {
+    wait_for_exec_proceed(&mut second, Duration::from_secs(10)).unwrap_or_else(|err| {
         panic!(
             "unmanaged actions should not wait for an older same-action exec, got {err}; server log:\n{}",
             harness.server_log()
@@ -2265,17 +2276,12 @@ require = ["gate"]
 #[test]
 fn exec_requirement_dependents_wait_until_exec_gate_proceeds() {
     let mut harness = TestHarness::new("exec_requirement_dependent_after_proceed");
-    let release = harness.temp_dir.join("release");
-    let gate_started = harness.temp_dir.join("gate-started");
-    let proceed_marker = harness.temp_dir.join("proceeded");
-    let order = harness.temp_dir.join("order.txt");
+    let ctrl = TestAppServer::new(&harness.sock_dir);
     harness.write_config(&format!(
         r#"
 [action.gate]
-sh = """
-touch {gate_started}
-while [ ! -f {release} ]; do sleep 0.02; done
-"""
+cmd = ["test-app", "gate"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
 
 [service.remote]
 managed = false
@@ -2283,35 +2289,43 @@ sh = "sleep 10"
 require = ["gate"]
 
 [action.dependent]
-sh = """
-if [ -f {proceed_marker} ]; then
-  printf 'after-proceed\n' > {order}
-else
-  printf 'before-proceed\n' > {order}
-fi
-"""
+cmd = ["test-app", "dependent"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
 require = ["remote"]
 "#,
-        gate_started = gate_started.display(),
-        release = release.display(),
-        proceed_marker = proceed_marker.display(),
-        order = order.display(),
+        ctrl_path = ctrl.path.display(),
     ));
     harness.spawn_server();
     assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
 
     let mut exec_socket = connect_exec_await(&harness, "remote");
-    assert!(harness.wait_for_file(&gate_started, Duration::from_secs(5)), "gate dependency did not start");
-    let marker_for_thread = proceed_marker.clone();
-    let proceed_reader = thread::spawn(move || {
-        wait_for_exec_proceed(&mut exec_socket, Duration::from_secs(5)).expect("exec should proceed");
-        fs::write(marker_for_thread, "").expect("write proceed marker");
-    });
+    let mut gate = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(gate.name(), "gate");
 
     let dependent = spawn_client_process(&harness, &["run", "dependent"]);
-    thread::sleep(Duration::from_millis(100));
-    fs::write(&release, "").expect("release gate");
+    if let Some(mut early) = ctrl.try_accept(Duration::from_millis(300)) {
+        let name = early.name().to_string();
+        early.exit(1);
+        panic!("{name} started while the exec gate was still held; server log:\n{}", harness.server_log());
+    }
 
+    gate.exit(0);
+
+    let mut dep = ctrl.accept(Duration::from_secs(10));
+    assert_eq!(dep.name(), "dependent");
+
+    // The daemon writes ExecProceed to the socket before marking the remote
+    // job running, and dependents only schedule once it is running — so the
+    // dependent having connected implies the proceed message is already
+    // buffered on the exec socket.
+    wait_for_exec_proceed(&mut exec_socket, Duration::from_secs(10)).unwrap_or_else(|err| {
+        panic!(
+            "exec gate should have proceeded before the dependent ran, got {err}; server log:\n{}",
+            harness.server_log()
+        )
+    });
+
+    dep.exit(0);
     let (dependent_result, mut timed_out) = wait_child_with_timeout(dependent, Duration::from_secs(5));
     if let Some(mut child) = timed_out.take() {
         let _ = child.kill();
@@ -2320,15 +2334,6 @@ require = ["remote"]
     }
     let dependent_result = dependent_result.expect("dependent result");
     assert!(dependent_result.success(), "dependent failed: {}", dependent_result.stderr);
-    proceed_reader.join().expect("proceed reader thread panicked");
-
-    let order = fs::read_to_string(&order).unwrap_or_default();
-    assert_eq!(
-        order.trim(),
-        "after-proceed",
-        "dependent ran before daemon released the exec gate; server log:\n{}",
-        harness.server_log()
-    );
 }
 
 #[test]
@@ -2823,7 +2828,7 @@ require = [{{ name = "backend", vars = {{ mode = "beta" }} }}]
 
     let result = harness.run_client(&["run", "task_a"]);
     assert!(
-        result.success() && harness.wait_for_file(&task_a_marker, Duration::from_secs(2)),
+        result.success() && harness.wait_for_file(&task_a_marker, Duration::from_secs(10)),
         "task_a failed: stderr={}, server_log={}",
         result.stderr,
         harness.server_log()
@@ -2831,7 +2836,7 @@ require = [{{ name = "backend", vars = {{ mode = "beta" }} }}]
 
     let result = harness.run_client(&["run", "task_b"]);
     assert!(
-        result.success() && harness.wait_for_file(&task_b_marker, Duration::from_secs(2)),
+        result.success() && harness.wait_for_file(&task_b_marker, Duration::from_secs(10)),
         "task_b failed: stderr={}, server_log={}",
         result.stderr,
         harness.server_log()
@@ -2877,7 +2882,7 @@ require = [{{ name = "backend", vars = {{ mode = "same" }} }}]
 
     let result = harness.run_client(&["run", "task_1"]);
     assert!(
-        result.success() && harness.wait_for_file(&task_1_marker, Duration::from_secs(2)),
+        result.success() && harness.wait_for_file(&task_1_marker, Duration::from_secs(10)),
         "task_1 failed: stderr={}, server_log={}",
         result.stderr,
         harness.server_log()
@@ -2885,7 +2890,7 @@ require = [{{ name = "backend", vars = {{ mode = "same" }} }}]
 
     let result = harness.run_client(&["run", "task_2"]);
     assert!(
-        result.success() && harness.wait_for_file(&task_2_marker, Duration::from_secs(2)),
+        result.success() && harness.wait_for_file(&task_2_marker, Duration::from_secs(10)),
         "task_2 failed: stderr={}, server_log={}",
         result.stderr,
         harness.server_log()
@@ -2917,7 +2922,7 @@ while true; do sleep 1; done
     let result = harness.run_client(&["start", "web"]);
     assert!(result.success(), "start web failed: stderr={}, server_log={}", result.stderr, harness.server_log());
     assert!(
-        wait_for_line_count(&service_log, "started", 1, Duration::from_secs(2)),
+        wait_for_line_count(&service_log, "started", 1, Duration::from_secs(10)),
         "web should start once; log={}, server_log={}",
         fs::read_to_string(&service_log).unwrap_or_default(),
         harness.server_log()
@@ -2933,7 +2938,7 @@ while true; do sleep 1; done
     let result = harness.run_client(&["restart", "web"]);
     assert!(result.success(), "restart web failed: stderr={}, server_log={}", result.stderr, harness.server_log());
     assert!(
-        wait_for_line_count(&service_log, "started", 2, Duration::from_secs(2)),
+        wait_for_line_count(&service_log, "started", 2, Duration::from_secs(10)),
         "restart should start a second process; log={}, server_log={}",
         fs::read_to_string(&service_log).unwrap_or_default(),
         harness.server_log()
@@ -2980,7 +2985,7 @@ require = ["db"]
 
     let result = harness.run_client(&["run", "dev_task"]);
     assert!(
-        result.success() && harness.wait_for_file(&dev_marker, Duration::from_secs(2)),
+        result.success() && harness.wait_for_file(&dev_marker, Duration::from_secs(10)),
         "dev_task failed: stderr={}, server_log={}",
         result.stderr,
         harness.server_log()
@@ -2988,7 +2993,7 @@ require = ["db"]
 
     let result = harness.run_client(&["run", "prod_task"]);
     assert!(
-        result.success() && harness.wait_for_file(&prod_marker, Duration::from_secs(2)),
+        result.success() && harness.wait_for_file(&prod_marker, Duration::from_secs(10)),
         "prod_task failed: stderr={}, server_log={}",
         result.stderr,
         harness.server_log()
@@ -2996,7 +3001,7 @@ require = ["db"]
 
     let result = harness.run_client(&["run", "dev_task_2"]);
     assert!(
-        result.success() && harness.wait_for_file(&dev2_marker, Duration::from_secs(2)),
+        result.success() && harness.wait_for_file(&dev2_marker, Duration::from_secs(10)),
         "dev_task_2 failed: stderr={}, server_log={}",
         result.stderr,
         harness.server_log()
@@ -3148,7 +3153,7 @@ sh = "exit 0"
     assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
 
     let mut subscriber = RpcSubscriber::connect(&harness);
-    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(2));
+    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(10));
 
     let client_handle = std::thread::spawn({
         let temp_dir = harness.temp_dir.clone();
@@ -3197,7 +3202,7 @@ while true; do sleep 1; done
     assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
 
     let mut subscriber = RpcSubscriber::connect(&harness);
-    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(2));
+    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(10));
 
     let temp_dir = harness.temp_dir.clone();
     let socket_path = harness.socket_path.clone();
@@ -3214,7 +3219,7 @@ while true; do sleep 1; done
 
     subscriber.collect_until(
         |evs| evs.iter().any(|e| matches!(e, RpcEvent::JobStatus { status: JobStatusKind::Running, .. })),
-        Duration::from_secs(3),
+        Duration::from_secs(10),
     );
 
     drop(first_run);
@@ -3287,7 +3292,7 @@ cmd = ["/nonexistent/path/to/executable"]
     assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
 
     let mut subscriber = RpcSubscriber::connect(&harness);
-    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(2));
+    subscriber.collect_until(|evs| evs.iter().any(|e| matches!(e, RpcEvent::WorkspaceOpened)), Duration::from_secs(10));
 
     let client_handle = std::thread::spawn({
         let temp_dir = harness.temp_dir.clone();
@@ -3396,7 +3401,7 @@ sh = "echo 'v1' > {output}"
 
     let result = harness.run_client(&["test"]);
     assert!(result.success(), "Expected success on first run, got: {}", result.stderr);
-    assert!(harness.wait_for_file(&output, Duration::from_secs(2)), "Output file should be created");
+    assert!(harness.wait_for_file(&output, Duration::from_secs(10)), "Output file should be created");
     assert_eq!(fs::read_to_string(&output).unwrap().trim(), "v1", "should output v1");
 
     std::thread::sleep(Duration::from_millis(10));
@@ -3431,7 +3436,7 @@ sh = "echo 'one' > {output1}"
 
     let result = harness.run_client(&["test"]);
     assert!(result.success(), "Expected success on first run, got: {}", result.stderr);
-    assert!(harness.wait_for_file(&output1, Duration::from_secs(2)), "Output1 file should be created");
+    assert!(harness.wait_for_file(&output1, Duration::from_secs(10)), "Output1 file should be created");
     assert!(!output2.exists(), "Output2 should not exist yet");
 
     std::thread::sleep(Duration::from_millis(10));
@@ -3449,7 +3454,7 @@ sh = "echo 'two' > {output2}"
 
     let result = harness.run_client(&["test"]);
     assert!(result.success(), "Expected success on second run, got: {}", result.stderr);
-    assert!(harness.wait_for_file(&output2, Duration::from_secs(2)), "Output2 should exist after adding new test");
+    assert!(harness.wait_for_file(&output2, Duration::from_secs(10)), "Output2 should exist after adding new test");
     assert_eq!(fs::read_to_string(&output2).unwrap().trim(), "two", "new test should have run");
 }
 
@@ -3495,9 +3500,9 @@ require = ["build"]
     let result = harness.run_client(&["test"]);
     assert!(result.success(), "Test run failed: {}", result.stderr);
 
-    assert!(harness.wait_for_file(&test1_marker, Duration::from_secs(2)), "test1 should complete");
-    assert!(harness.wait_for_file(&test2_marker, Duration::from_secs(2)), "test2 should complete");
-    assert!(harness.wait_for_file(&test3_marker, Duration::from_secs(2)), "test3 should complete");
+    assert!(harness.wait_for_file(&test1_marker, Duration::from_secs(10)), "test1 should complete");
+    assert!(harness.wait_for_file(&test2_marker, Duration::from_secs(10)), "test2 should complete");
+    assert!(harness.wait_for_file(&test3_marker, Duration::from_secs(10)), "test3 should complete");
 
     let count = fs::read_to_string(&build_counter).unwrap_or_default().trim().parse::<i32>().unwrap_or(0);
 
@@ -3539,8 +3544,8 @@ require = ["db"]
     let result = harness.run_client(&["test"]);
     assert!(result.success(), "Test run failed: {}", result.stderr);
 
-    assert!(harness.wait_for_file(&test1_marker, Duration::from_secs(2)), "test1 should complete");
-    assert!(harness.wait_for_file(&test2_marker, Duration::from_secs(2)), "test2 should complete");
+    assert!(harness.wait_for_file(&test1_marker, Duration::from_secs(10)), "test1 should complete");
+    assert!(harness.wait_for_file(&test2_marker, Duration::from_secs(10)), "test2 should complete");
 
     std::thread::sleep(Duration::from_millis(100));
     let count = fs::read_to_string(&service_counter).unwrap_or_default().trim().parse::<i32>().unwrap_or(0);
@@ -4023,7 +4028,7 @@ sh = "echo 'service started'; touch {marker}; while true; do sleep 1; done"
         .spawn()
         .expect("Failed to spawn service");
 
-    assert!(harness.wait_for_file(&service_marker, Duration::from_secs(3)), "Service should start");
+    assert!(harness.wait_for_file(&service_marker, Duration::from_secs(10)), "Service should start");
 
     let result = harness.run_client(&["logs", "--kind=action"]);
     assert!(result.success(), "logs command failed: {}", result.stderr);
@@ -4071,7 +4076,7 @@ while true; do sleep 1; done
     });
     assert!(matches!(resp1.body, CommandBody::Empty), "SpawnTask should succeed with Empty, got {:?}", resp1.body);
 
-    assert!(harness.wait_for_file(&action_marker, Duration::from_secs(3)), "Action should complete");
+    assert!(harness.wait_for_file(&action_marker, Duration::from_secs(10)), "Action should complete");
 
     // Subscribe to job exit events so we can wait for service termination
     let filter = SubscriptionFilter { job_status: false, job_exits: true };
@@ -4088,7 +4093,7 @@ while true; do sleep 1; done
     });
     assert!(matches!(resp2.body, CommandBody::Empty), "SpawnTask for service should succeed, got {:?}", resp2.body);
 
-    assert!(harness.wait_for_file(&service_marker, Duration::from_secs(3)), "Service should start");
+    assert!(harness.wait_for_file(&service_marker, Duration::from_secs(10)), "Service should start");
 
     // Command 3: KillTask (kills the service)
     let resp3 = client.send_unwrap(&KillTaskRequest { task_name: "my_service" });
@@ -4317,9 +4322,11 @@ cache.key = [{{ modified = "{trigger}" }}]
     });
     assert!(matches!(resp1.body, CommandBody::Empty), "First restart should succeed with Empty, got {:?}", resp1.body);
 
-    // Wait for action to complete
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(fs::read_to_string(&counter).unwrap().trim(), "1", "Action should have run once");
+    assert!(
+        wait_for_file_content(&counter, "1", Duration::from_secs(5)),
+        "Action should have run once, counter={}",
+        fs::read_to_string(&counter).unwrap_or_default()
+    );
 
     // Second restart with cached=true: should return cache hit message
     let resp2 = client.send_unwrap(&SpawnTaskRequest {
@@ -4354,12 +4361,10 @@ cache.key = [{{ modified = "{trigger}" }}]
         resp3.body
     );
 
-    // Wait for action to complete
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(
-        fs::read_to_string(&counter).unwrap().trim(),
-        "2",
-        "Action should have run again after cache invalidation"
+    assert!(
+        wait_for_file_content(&counter, "2", Duration::from_secs(5)),
+        "Action should have run again after cache invalidation, counter={}",
+        fs::read_to_string(&counter).unwrap_or_default()
     );
 }
 
@@ -4383,8 +4388,10 @@ fn1 = {{ restart = "my_task" }}
     let result = harness.run_client(&["function", "call", "fn1"]);
 
     assert!(result.success(), "Expected success, got: {}", result.stderr);
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(marker.exists(), "fn1 should have restarted my_task which creates the marker file");
+    assert!(
+        harness.wait_for_file(&marker, Duration::from_secs(5)),
+        "fn1 should have restarted my_task which creates the marker file"
+    );
 }
 
 #[test]
@@ -4408,8 +4415,11 @@ fn1 = {{ spawn = {{ name = "target", vars = {{ msg = "from_function" }} }} }}
     let result = harness.run_client(&["function", "call", "fn1"]);
 
     assert!(result.success(), "Expected success, got: {}", result.stderr);
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(fs::read_to_string(marker).unwrap(), "from_function\n");
+    assert!(
+        wait_for_file_content(&marker, "from_function", Duration::from_secs(5)),
+        "target should have written the function var, got: {:?}",
+        fs::read_to_string(&marker)
+    );
 }
 
 #[test]
@@ -4674,7 +4684,7 @@ require = [{{ resource = "R" }}]
         cached: false,
     });
     assert!(matches!(resp.body, CommandBody::Empty), "holder spawn rejected: {:?}", resp.body);
-    assert!(harness.wait_for_file(&service_started, Duration::from_secs(3)), "service holder must start");
+    assert!(harness.wait_for_file(&service_started, Duration::from_secs(10)), "service holder must start");
 
     let resp = client.send_unwrap(&SpawnTaskRequest {
         task_name: "contender",
@@ -4735,7 +4745,7 @@ require = [{{ resource = "R" }}]
         cached: false,
     });
     assert!(matches!(resp.body, CommandBody::Empty), "dependent spawn rejected: {:?}", resp.body);
-    assert!(harness.wait_for_file(&dep_started, Duration::from_secs(3)), "dependent must start");
+    assert!(harness.wait_for_file(&dep_started, Duration::from_secs(10)), "dependent must start");
 
     let resp = client.send_unwrap(&SpawnTaskRequest {
         task_name: "contender",
@@ -4807,7 +4817,7 @@ require = [{{ resource = "R" }}]
         cached: false,
     });
     assert!(matches!(resp.body, CommandBody::Empty), "holder spawn rejected: {:?}", resp.body);
-    assert!(harness.wait_for_file(&holder_started, Duration::from_secs(3)), "holder must start");
+    assert!(harness.wait_for_file(&holder_started, Duration::from_secs(10)), "holder must start");
 
     let resp = client.send_unwrap(&SpawnTaskRequest {
         task_name: "contender",

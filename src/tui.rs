@@ -1454,6 +1454,7 @@ fn output_json_state(workspace: &Workspace, tui: &mut TuiState, tty_render_byte_
     let scroll_state = tui.logs.scroll_state(&ws, workspace);
     let mut message = jsony::object! {
         tty_render_byte_count,
+        config_generation: ws.config.current.id(),
         groups_expanded: {
             services: tui.task_tree.is_group_expanded(MetaGroupKind::Services),
             actions: tui.task_tree.is_group_expanded(MetaGroupKind::Actions),

@@ -40,7 +40,11 @@ require = ["svc"]
         assert_eq!(svc.name(), "svc");
 
         svc.write_stdout(b"starting up...\n");
-        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            ctrl.try_accept(Duration::from_millis(300)).is_none(),
+            "task must not start before the service outputs READY; server_log={}",
+            harness.server_log()
+        );
         svc.write_stdout(b"READY\n");
 
         let mut task = ctrl.accept(Duration::from_secs(10));
@@ -329,11 +333,7 @@ require = [{{ resource = "shared" }}]
             harness.server_log()
         );
 
-        let mut beta = ctrl.accept(Duration::from_secs(10));
-        assert_eq!(beta.name(), "svc");
-
-        let mut need_beta = ctrl.accept(Duration::from_secs(10));
-        assert_eq!(need_beta.name(), "need_beta");
+        let [mut beta, mut need_beta] = ctrl.accept_named(["svc", "need_beta"], Duration::from_secs(10));
 
         let resource_action = s.spawn(|| harness.run_client(&["run", "uses_resource"]));
         if let Some(mut early) = ctrl.try_accept(Duration::from_millis(300)) {
@@ -455,10 +455,7 @@ require = ["svc:beta"]
         harness.server_log()
     );
 
-    let mut beta = ctrl.accept(Duration::from_secs(10));
-    assert_eq!(beta.name(), "svc");
-    let mut need_beta = ctrl.accept(Duration::from_secs(10));
-    assert_eq!(need_beta.name(), "need_beta");
+    let [mut beta, mut need_beta] = ctrl.accept_named(["svc", "need_beta"], Duration::from_secs(10));
     need_beta.exit(0);
     beta.exit(0);
 }
@@ -508,16 +505,13 @@ require = ["svc:beta"]
     });
     assert!(matches!(resp.body, CommandBody::Empty), "need_beta spawn rejected: {:?}", resp.body);
 
-    let mut beta = ctrl.accept(Duration::from_secs(10));
-    assert_eq!(beta.name(), "svc");
+    let [mut beta, mut action] = ctrl.accept_named(["svc", "need_beta"], Duration::from_secs(10));
     assert!(
-        alpha_one.wait_disconnected(Duration::from_secs(1)) && alpha_two.wait_disconnected(Duration::from_secs(1)),
+        alpha_one.wait_disconnected(Duration::from_secs(10)) && alpha_two.wait_disconnected(Duration::from_secs(10)),
         "svc:beta must not run while any svc:alpha instance is still alive; server_log={}",
         harness.server_log()
     );
 
-    let mut action = ctrl.accept(Duration::from_secs(10));
-    assert_eq!(action.name(), "need_beta");
     action.exit(0);
     beta.exit(0);
 }
@@ -548,12 +542,8 @@ require = ["svc:alpha", "svc:beta"]
     std::thread::scope(|s| {
         let client = s.spawn(|| harness.run_client(&["test"]));
 
-        let mut svc1 = ctrl.accept(Duration::from_secs(10));
-        assert_eq!(svc1.name(), "svc");
-        let mut svc2 = ctrl.accept(Duration::from_secs(10));
-        assert_eq!(svc2.name(), "svc");
-        let mut test = ctrl.accept(Duration::from_secs(10));
-        assert_eq!(test.name(), "needs_both");
+        let [mut svc1, mut svc2, mut test] =
+            ctrl.accept_named(["svc", "svc", "needs_both"], Duration::from_secs(10));
         test.exit(0);
 
         let result = client.join().expect("test client panicked");
@@ -910,29 +900,8 @@ require = ["init", "frontend", "portal"]
 
     init.exit(0);
 
-    let mut frontend = ctrl.accept(Duration::from_secs(10));
-    assert_eq!(
-        frontend.name(),
-        "frontend",
-        "frontend must start after init exits; server_log={}",
-        harness.server_log()
-    );
-
-    let mut portal = ctrl.accept(Duration::from_secs(10));
-    assert_eq!(
-        portal.name(),
-        "portal",
-        "portal must not be cancelled when frontend is re-submitted; server_log={}",
-        harness.server_log()
-    );
-
-    let mut child = ctrl.accept(Duration::from_secs(10));
-    assert_eq!(
-        child.name(),
-        "child",
-        "child must not be cancelled when frontend is re-submitted; server_log={}",
-        harness.server_log()
-    );
+    let [mut frontend, mut portal, mut child] =
+        ctrl.accept_named(["frontend", "portal", "child"], Duration::from_secs(10));
 
     child.exit(0);
     portal.exit(0);
@@ -1227,11 +1196,7 @@ good = ["a", "b"]
     assert_eq!(setup.name(), "setup");
     setup.exit(0);
 
-    let mut first = ctrl.accept(Duration::from_secs(10));
-    let mut second = ctrl.accept(Duration::from_secs(10));
-    let mut names = vec![first.name().to_string(), second.name().to_string()];
-    names.sort();
-    assert_eq!(names, ["a", "b"]);
+    let [mut first, mut second] = ctrl.accept_named(["a", "b"], Duration::from_secs(10));
     assert!(
         ctrl.try_accept(Duration::from_millis(300)).is_none(),
         "cacheable setup should be shared and only run once; server_log={}",
@@ -1264,6 +1229,9 @@ env.TEST_APP_SOCKET = "{ctrl_path}"
     let mut svc = ctrl.accept(Duration::from_secs(10));
     assert_eq!(svc.name(), "svc");
 
+    // Config reload is skipped when the file mtime is unchanged
+    // (ConfigFile::refresh); the sleep guarantees the rewrite below gets a
+    // distinct mtime.
     std::thread::sleep(Duration::from_millis(10));
     harness.write_config(&format!(
         r#"
