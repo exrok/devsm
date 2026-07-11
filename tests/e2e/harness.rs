@@ -43,6 +43,7 @@ impl ClientResult {
 /// manages server lifecycle and cleanup.
 pub struct TestHarness {
     pub temp_dir: PathBuf,
+    pub sock_dir: PathBuf,
     pub socket_path: PathBuf,
     #[cfg_attr(not(feature = "fuzz"), allow(dead_code))]
     pub fuzz_socket_path: PathBuf,
@@ -65,12 +66,23 @@ impl TestHarness {
         let temp_dir = std::env::temp_dir().join(format!("devsm_e2e_{}_p{}_{}", test_name, pid, counter));
         let _ = fs::remove_dir_all(&temp_dir);
         fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+        // On macOS temp_dir() sits behind the /var -> /private/var symlink while the
+        // daemon and clients key workspaces by getcwd(), which resolves it. Canonicalize
+        // so paths written into configs and AttachRpc match what the daemon sees.
+        let temp_dir = temp_dir.canonicalize().expect("Failed to canonicalize temp dir");
 
-        let socket_path = temp_dir.join("devsm.socket");
-        let fuzz_socket_path = temp_dir.join("fuzz.socket");
+        // Sockets live in a separate directory without the test name: macOS caps
+        // sockaddr_un paths at 104 bytes and its $TMPDIR alone is ~50, so
+        // temp_dir-based socket paths overflow SUN_LEN for longer test names.
+        let sock_dir = std::env::temp_dir().join(format!("devsm_s{}_{}", pid, counter));
+        let _ = fs::remove_dir_all(&sock_dir);
+        fs::create_dir_all(&sock_dir).expect("Failed to create socket dir");
+
+        let socket_path = sock_dir.join("devsm.socket");
+        let fuzz_socket_path = sock_dir.join("fuzz.socket");
         let server_log_path = temp_dir.join("server.log");
 
-        Self { temp_dir, socket_path, fuzz_socket_path, server_log_path, server: None }
+        Self { temp_dir, sock_dir, socket_path, fuzz_socket_path, server_log_path, server: None }
     }
 
     /// Writes a devsm.toml configuration file.
@@ -248,6 +260,7 @@ impl Drop for TestHarness {
     fn drop(&mut self) {
         terminate_server(&mut self.server);
         let _ = fs::remove_dir_all(&self.temp_dir);
+        let _ = fs::remove_dir_all(&self.sock_dir);
     }
 }
 

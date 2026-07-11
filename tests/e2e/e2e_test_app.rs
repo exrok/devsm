@@ -14,7 +14,7 @@ use crate::rpc::{CommandBody, SpawnTaskRequest, WorkspaceClient};
 #[test]
 fn ready_blocks_dependent() {
     let mut harness = TestHarness::new("ready_blocks_dep");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -64,7 +64,7 @@ require = ["svc"]
 #[test]
 fn ready_deep_dependency_chain() {
     let mut harness = TestHarness::new("ready_deep_chain");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -121,7 +121,7 @@ require = ["api"]
 #[test]
 fn ready_conflict_sequential_profiles() {
     let mut harness = TestHarness::new("ready_conflict_seq");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -190,7 +190,7 @@ require = ["svc:beta"]
 #[test]
 fn ready_service_reuse_across_tests() {
     let mut harness = TestHarness::new("ready_svc_reuse");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -252,7 +252,7 @@ require = ["svc"]
 #[test]
 fn allow_multiple_true_concurrent() {
     let mut harness = TestHarness::new("allow_multi_true");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -290,7 +290,7 @@ allow_multiple = true
 #[test]
 fn queued_profile_conflict_service_keeps_resource_requirements() {
     let mut harness = TestHarness::new("queued_service_resource_require");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -370,7 +370,7 @@ require = [{{ resource = "shared" }}]
 #[test]
 fn queued_replacement_waits_for_new_resource_requirements_before_stopping_current_profile() {
     let mut harness = TestHarness::new("queued_service_waits_new_resource");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -466,7 +466,7 @@ require = ["svc:beta"]
 #[test]
 fn single_profile_queued_requirement_waits_for_all_incompatible_instances() {
     let mut harness = TestHarness::new("single_profile_waits_all");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -525,7 +525,7 @@ require = ["svc:beta"]
 #[test]
 fn test_batch_allows_schedulable_distinct_profile_service_requirements() {
     let mut harness = TestHarness::new("test_batch_distinct_profiles");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -566,7 +566,7 @@ require = ["svc:alpha", "svc:beta"]
 #[test]
 fn test_batch_rejects_unschedulable_same_profile_service_params() {
     let mut harness = TestHarness::new("test_batch_params_conflict");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -610,7 +610,7 @@ require = [
 #[test]
 fn allow_multiple_false_kills_old() {
     let mut harness = TestHarness::new("allow_multi_false");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -643,7 +643,7 @@ allow_multiple = false
 #[test]
 fn allow_multiple_distinct_profiles_different_keeps() {
     let mut harness = TestHarness::new("allow_multi_dp_diff");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -683,7 +683,7 @@ allow_multiple = "distinct_profiles"
 #[test]
 fn allow_multiple_distinct_profiles_same_kills() {
     let mut harness = TestHarness::new("allow_multi_dp_same");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -717,7 +717,7 @@ allow_multiple = "distinct_profiles"
 #[test]
 fn allow_multiple_single_profile_same_coexists() {
     let mut harness = TestHarness::new("allow_multi_sp_same");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -757,7 +757,7 @@ allow_multiple = "single_profile"
 #[test]
 fn allow_multiple_single_profile_different_kills() {
     let mut harness = TestHarness::new("allow_multi_sp_diff");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -791,7 +791,7 @@ allow_multiple = "single_profile"
 #[test]
 fn allow_multiple_true_action_concurrent() {
     let mut harness = TestHarness::new("allow_multi_action");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -841,7 +841,7 @@ allow_multiple = true
 #[test]
 fn group_explicit_service_reuses_scheduled_dependency_job() {
     let mut harness = TestHarness::new("group_reuses_scheduled_dep");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -942,7 +942,7 @@ require = ["init", "frontend", "portal"]
 #[test]
 fn group_uncached_action_requirement_runs_per_service_until_ready() {
     let mut harness = TestHarness::new("group_uncached_action_sequenced");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -1008,7 +1008,7 @@ sequenced = ["a", "b"]
 #[test]
 fn ready_barrier_prevents_resource_eviction_before_service_ready() {
     let mut harness = TestHarness::new("ready_barrier_resource_eviction");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -1077,7 +1077,7 @@ sequenced = ["a", "b"]
 #[test]
 fn group_uncached_action_requirement_continues_after_service_exits_before_ready() {
     let mut harness = TestHarness::new("group_uncached_action_service_exits");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -1140,7 +1140,7 @@ sequenced = ["a", "b"]
 #[test]
 fn group_uncached_action_requirement_continues_after_first_action_failure() {
     let mut harness = TestHarness::new("group_uncached_action_failure_continues");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -1193,7 +1193,7 @@ sequenced = ["a", "b"]
 #[test]
 fn group_cached_action_requirement_coalesces_services() {
     let mut harness = TestHarness::new("group_cached_action_coalesces");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -1245,7 +1245,7 @@ good = ["a", "b"]
 #[test]
 fn restart_eval_failure_keeps_existing_service_running() {
     let mut harness = TestHarness::new("restart_eval_failure_keeps_service");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -1298,7 +1298,7 @@ require = ["bad"]
 #[test]
 fn queued_service_waits_for_dependencies_before_killing_current_profile() {
     let mut harness = TestHarness::new("queued_service_waits_deps");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -1372,7 +1372,7 @@ require = ["svc:beta"]
 #[test]
 fn queued_service_rejects_own_conflicting_service_requirements() {
     let mut harness = TestHarness::new("queued_service_rejects_own_conflicts");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"
@@ -1463,7 +1463,7 @@ require = ["svc:beta"]
 #[test]
 fn pending_service_termination_does_not_starve_independent_jobs() {
     let mut harness = TestHarness::new("pending_term_independent");
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
 
     harness.write_config(&format!(
         r#"

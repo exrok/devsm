@@ -13,7 +13,7 @@ use crate::rpc::ExitCause;
 
 fn setup_fuzz(test_name: &str) -> (TestHarness, TestAppServer) {
     let harness = TestHarness::new(test_name);
-    let ctrl = TestAppServer::new(&harness.temp_dir);
+    let ctrl = TestAppServer::new(&harness.sock_dir);
     (harness, ctrl)
 }
 
