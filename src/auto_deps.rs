@@ -14,8 +14,6 @@
 mod event;
 #[path = "auto_deps/inference.rs"]
 mod inference;
-#[path = "auto_deps/recording.rs"]
-pub mod recording;
 #[path = "auto_deps/toml_writer.rs"]
 mod toml_writer;
 #[path = "auto_deps/tracer.rs"]
