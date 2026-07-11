@@ -605,8 +605,13 @@ pub fn run_many(
             break;
         }
 
-        forward_new_group_logs(&mut stdout, workspace, &log_groups, &task_names, with_taskname, &mut last_log_id)?;
+        // Read exit state before forwarding: the event loop appends a job's
+        // final output to log storage before marking it Exited, so once every
+        // job is observed terminal the forward below is guaranteed to drain
+        // all remaining logs. Forwarding first would race the last job's
+        // append+exit and drop its final output.
         let (group_exited, exit_code, cause) = group_exit_state(workspace, &jobs);
+        forward_new_group_logs(&mut stdout, workspace, &log_groups, &task_names, with_taskname, &mut last_log_id)?;
         if group_exited {
             send_exit_status(
                 &mut encoder,
