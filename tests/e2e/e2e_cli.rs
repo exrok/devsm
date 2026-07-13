@@ -643,6 +643,9 @@ cmd = ["true"]
         while accepted < 3 && started.elapsed() < Duration::from_secs(5) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // macOS inherits O_NONBLOCK from the listener through accept(),
+                    // while this fake daemon uses blocking reads and writes.
+                    stream.set_nonblocking(false).expect("set accepted fake-daemon connection blocking");
                     accepted += 1;
                     let name = read_fake_get_status_name(&mut stream);
                     let body = match name.as_str() {

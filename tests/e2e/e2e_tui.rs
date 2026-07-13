@@ -562,7 +562,11 @@ cmd = ["true"]
 
     tui.send_key(b"R");
     let reloaded = tui.wait_until(|s| s.config_generation != generation, timeout);
-    assert!(reloaded.is_some(), "TUI reload should produce a new config generation, server_log: {}", harness.server_log());
+    assert!(
+        reloaded.is_some(),
+        "TUI reload should produce a new config generation, server_log: {}",
+        harness.server_log()
+    );
 
     let result = harness.run_client(&["run", "alpha"]);
     let combined = format!("{}{}", result.stdout, result.stderr);

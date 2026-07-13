@@ -542,8 +542,7 @@ require = ["svc:alpha", "svc:beta"]
     std::thread::scope(|s| {
         let client = s.spawn(|| harness.run_client(&["test"]));
 
-        let [mut svc1, mut svc2, mut test] =
-            ctrl.accept_named(["svc", "svc", "needs_both"], Duration::from_secs(10));
+        let [mut svc1, mut svc2, mut test] = ctrl.accept_named(["svc", "svc", "needs_both"], Duration::from_secs(10));
         test.exit(0);
 
         let result = client.join().expect("test client panicked");

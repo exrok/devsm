@@ -373,6 +373,9 @@ pub fn worker() -> anyhow::Result<()> {
                     }
                 }
             };
+            // If the listener is ever made nonblocking, call
+            // `socket.set_nonblocking(false)` here before the initial recv_with_fd:
+            // macOS inherits O_NONBLOCK through accept(), whereas Linux does not.
             let mut raw_fds = [0; 2];
             match socket.recv_with_fd(&mut buffer, &mut raw_fds) {
                 Ok((amount, fd_count)) => {

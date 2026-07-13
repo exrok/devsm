@@ -455,6 +455,9 @@ impl TestAppServer {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    // macOS inherits O_NONBLOCK from the listener through accept(),
+                    // while these test connections use blocking reads and writes.
+                    stream.set_nonblocking(false).expect("set accepted test-app connection blocking");
                     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
                     let mut conn = TestAppConn { stream, args: Vec::new() };
                     conn.read_connect();
@@ -493,6 +496,9 @@ impl TestAppServer {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    // macOS inherits O_NONBLOCK from the listener through accept(),
+                    // while these test connections use blocking reads and writes.
+                    stream.set_nonblocking(false).expect("set accepted test-app connection blocking");
                     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
                     let mut conn = TestAppConn { stream, args: Vec::new() };
                     conn.read_connect();
