@@ -37,6 +37,7 @@ managed = true
 # Interactive action scheduled by devsm but attached to the invoking terminal.
 [action.terminal_editor]
 managed = "terminal"
+sticky = true
 cmd = ["interactive-editor", "open"]
 
 # Long-running terminal service. Its output remains exclusively in its terminal.

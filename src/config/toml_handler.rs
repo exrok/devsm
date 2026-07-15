@@ -345,6 +345,7 @@ fn parse_task<'a>(
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
     let mut managed = ExecutionMode::Either;
+    let mut sticky = false;
     let mut hidden = ServiceHidden::Never;
     let mut allow_multiple = AllowMultiple::False;
     let mut cli = CliConfig::DEFAULT;
@@ -406,6 +407,15 @@ fn parse_task<'a>(
                 Value::String(&"terminal") => managed = ExecutionMode::Terminal,
                 _ => return Err(ctx.report_expected_but_found(&"a boolean or the string \"terminal\"", value)),
             },
+            "sticky" => {
+                if kind != TaskKind::Action {
+                    return Err(ctx.report_custom_error("`sticky` is only valid for actions", value));
+                }
+                sticky = match value.value() {
+                    Value::Boolean(&sticky) => sticky,
+                    _ => return Err(ctx.report_expected_but_found(&"a boolean", value)),
+                };
+            }
             "hidden" => {
                 if kind != TaskKind::Service {
                     return Err(ctx.report_custom_error("`hidden` is only valid for services", value));
@@ -449,6 +459,13 @@ fn parse_task<'a>(
         return Err(ctx.report_custom_error("`ready` is not supported with `managed = false`", task_table.as_item()));
     }
 
+    if sticky && managed != ExecutionMode::Terminal {
+        return Err(ctx.report_custom_error(
+            "`sticky = true` requires `managed = \"terminal\"`",
+            task_table.as_item(),
+        ));
+    }
+
     if managed == ExecutionMode::Terminal {
         if ready.is_some() {
             return Err(ctx.report_custom_error(
@@ -488,6 +505,7 @@ fn parse_task<'a>(
         timeout,
         tags: &[],
         managed,
+        sticky,
         hidden,
         allow_multiple,
         cli,
@@ -1224,6 +1242,40 @@ cmd = ["true"]
         assert_eq!(mode("daemon"), ExecutionMode::Daemon);
         assert_eq!(mode("exec"), ExecutionMode::Exec);
         assert_eq!(mode("terminal"), ExecutionMode::Terminal);
+    }
+
+    #[test]
+    fn parses_sticky_terminal_action_and_defaults_other_actions_to_false() {
+        let text = r#"
+[action.editor]
+managed = "terminal"
+sticky = true
+cmd = ["editor"]
+[action.build]
+cmd = ["true"]
+"#;
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "messages: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let sticky = |name| config.tasks.iter().find(|(task, _)| *task == name).unwrap().1.sticky;
+        assert!(sticky("editor"));
+        assert!(!sticky("build"));
+    }
+
+    #[test]
+    fn sticky_requires_a_terminal_action() {
+        for text in [
+            "[action.build]\nsticky = true\ncmd = [\"true\"]\n",
+            "[service.editor]\nmanaged = \"terminal\"\nsticky = true\ncmd = [\"editor\"]\n",
+        ] {
+            let arena = toml_spanner::Arena::new();
+            let bump = Bump::new();
+            let (doc, result) = parse_text(text, &arena, &bump);
+            assert!(result.is_err(), "sticky config unexpectedly accepted: {text}");
+            assert!(collect_messages(&doc).iter().any(|message| message.contains("sticky")));
+        }
     }
 
     #[test]

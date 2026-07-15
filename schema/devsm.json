@@ -536,6 +536,11 @@
           ],
           "description": "Controls execution mode: true = daemon-owned with captured logs, false = direct unmanaged exec, 'terminal' = daemon-scheduled but owned by a devsm run wrapper in a real terminal; terminal output is not captured or available through devsm logs. Omit for default behavior (either allowed)."
         },
+        "sticky": {
+          "type": "boolean",
+          "default": false,
+          "description": "Keep the terminal wrapper attached after the action exits so the action can be started again in the same terminal. Requires managed = 'terminal'."
+        },
         "allow_multiple": {
           "description": "Controls whether multiple instances of this task can run concurrently. false (default): only one instance at a time. true: unlimited concurrent instances. 'distinct_profiles': multiple instances but each must have a different profile. 'single_profile': multiple instances but all must share the same profile.",
           "oneOf": [

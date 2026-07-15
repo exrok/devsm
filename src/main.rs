@@ -1064,6 +1064,7 @@ fn run_client(
         }
         None => bail!("Task not found: {}", name),
     };
+    let sticky = sticky || task_expr.sticky;
     let params = if group.is_some() {
         params
     } else {

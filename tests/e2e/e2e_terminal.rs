@@ -453,13 +453,14 @@ env.TEST_APP_SOCKET = "{}"
 }
 
 #[test]
-fn sticky_terminal_wrapper_relaunches_and_detaches_while_idle() {
-    let mut harness = TestHarness::new("sticky_terminal_relaunch");
+fn sticky_action_config_keeps_terminal_wrapper_attached() {
+    let mut harness = TestHarness::new("sticky_action_config");
     let ctrl = TestAppServer::new(&harness.sock_dir);
     harness.write_config(&format!(
         r#"
 [action.editor]
 managed = "terminal"
+sticky = true
 cmd = ["test-app", "editor"]
 env.TEST_APP_SOCKET = "{}"
 "#,
@@ -467,7 +468,7 @@ env.TEST_APP_SOCKET = "{}"
     ));
     harness.spawn_server();
     let mut subscriber = subscribe(&harness);
-    let mut client = harness.spawn_pty_client(&["run", "--sticky", "editor"]);
+    let mut client = harness.spawn_pty_client(&["run", "editor"]);
     let mut first = ctrl.accept(Duration::from_secs(5));
     first.exit(0);
     wait_for_exit(&mut subscriber, 0);
