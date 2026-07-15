@@ -982,6 +982,16 @@ impl ServiceDependents {
         self.dependents.get(&service).is_none_or(|deps| deps.is_empty())
     }
 
+    fn all_dependents_pending_termination(
+        &self,
+        service: JobIndex,
+        pending: &hashbrown::HashSet<JobIndex>,
+    ) -> bool {
+        self.dependents
+            .get(&service)
+            .is_some_and(|dependents| !dependents.is_empty() && dependents.iter().all(|job| pending.contains(job)))
+    }
+
     #[cfg(test)]
     pub fn dependent_count(&self, service: JobIndex) -> usize {
         self.dependents.get(&service).map_or(0, |deps| deps.len())
@@ -2535,7 +2545,14 @@ impl WorkspaceState {
     /// running conflicts terminated. Returns the created `JobIndex` per planned
     /// job, in plan order, so callers can resolve their [`JobRef`]s.
     fn apply_plan(&mut self, plan: SchedulePlan, workspace_id: u32, channel: &MioChannel) -> Vec<JobIndex> {
-        let SchedulePlan { new_jobs, cancelled_planned, cancel_scheduled, terminate_running, .. } = plan;
+        let SchedulePlan {
+            new_jobs,
+            cancelled_planned,
+            cancel_scheduled,
+            terminate_running,
+            terminate_running_set,
+            ..
+        } = plan;
         let created_any = !new_jobs.is_empty();
         let mut local_to_job: Vec<JobIndex> = Vec::with_capacity(new_jobs.len());
 
@@ -2605,6 +2622,17 @@ impl WorkspaceState {
                 continue;
             };
             if job.log_group != terminate.job_id || *owner != terminate.owner {
+                continue;
+            }
+            let base_task = job.log_group.base_task_index();
+            if self.base_tasks[base_task.idx()].config.kind == TaskKind::Service
+                && self
+                    .service_dependents
+                    .all_dependents_pending_termination(terminate.job, &terminate_running_set)
+            {
+                // Let the scheduler stop the service after this plan's active
+                // dependents have actually exited. This prevents a restarted
+                // client from observing its required service disappear first.
                 continue;
             }
             channel.send(crate::event_loop::ProcessRequest::TerminateJob {

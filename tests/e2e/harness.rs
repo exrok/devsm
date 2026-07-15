@@ -32,6 +32,7 @@ pub struct PtyClientResult {
     pub exit_code: u32,
     pub output: String,
     pub echo_enabled: bool,
+    pub newline_processing_enabled: bool,
 }
 
 pub struct PtyClient {
@@ -42,6 +43,14 @@ pub struct PtyClient {
 }
 
 impl PtyClient {
+    pub fn newline_processing_enabled(&self) -> Option<bool> {
+        self.master.as_raw_fd().and_then(|fd| {
+            let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+            (unsafe { libc::tcgetattr(fd, &mut termios) } == 0)
+                .then_some(termios.c_oflag & libc::OPOST != 0 && termios.c_oflag & libc::ONLCR != 0)
+        })
+    }
+
     pub fn send_input(&mut self, input: &[u8]) {
         self.writer.write_all(input).expect("failed to send PTY input");
         self.writer.flush().expect("failed to flush PTY input");
@@ -92,17 +101,25 @@ impl PtyClient {
                 panic!("PTY client timed out after {timeout:?}; server log:\n{}", server_log());
             }
         };
-        let echo_enabled = master
+        let terminal_flags = master
             .as_raw_fd()
             .and_then(|fd| {
                 let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
-                (unsafe { libc::tcgetattr(fd, &mut termios) } == 0).then_some(termios.c_lflag & libc::ECHO != 0)
+                (unsafe { libc::tcgetattr(fd, &mut termios) } == 0).then_some((
+                    termios.c_lflag & libc::ECHO != 0,
+                    termios.c_oflag & libc::OPOST != 0 && termios.c_oflag & libc::ONLCR != 0,
+                ))
             })
-            .unwrap_or(false);
+            .unwrap_or((false, false));
         drop(writer);
         drop(master);
         let output = output_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
-        PtyClientResult { exit_code: status.exit_code(), output, echo_enabled }
+        PtyClientResult {
+            exit_code: status.exit_code(),
+            output,
+            echo_enabled: terminal_flags.0,
+            newline_processing_enabled: terminal_flags.1,
+        }
     }
 }
 

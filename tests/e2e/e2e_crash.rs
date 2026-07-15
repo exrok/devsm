@@ -10,6 +10,23 @@ use std::time::Duration;
 
 use harness::{TestHarness, cargo_bin_path};
 
+#[test]
+fn daemon_stdout_logging_emits_readiness_message() {
+    let mut harness = TestHarness::new("daemon_stdout_logging");
+    harness.write_config("[action.noop]\ncmd = [\"true\"]\n");
+    harness.spawn_server();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = harness.server_log();
+        if log.contains("RPC Socket bound") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "readiness log was not emitted to stdout:\n{log}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// Spawns a client (detached from any controlling terminal) that attaches to the
 /// test daemon. `extra_env` lets a test inject e.g. the crash-report path.
 fn spawn_detached_client(
@@ -40,6 +57,38 @@ fn spawn_detached_client(
         });
     }
     cmd.spawn().expect("Failed to spawn client")
+}
+
+#[test]
+fn tui_daemon_disconnect_restores_newline_processing_before_reporting() {
+    let mut harness = TestHarness::new("tui_disconnect_termios");
+    harness.write_config("[action.noop]\ncmd = [\"true\"]\n");
+    harness.spawn_server();
+    let client = harness.spawn_pty_client(&[]);
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if client.newline_processing_enabled() == Some(false) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "TUI did not enter raw output mode");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let server_pid = harness.server.as_ref().expect("server running").id() as i32;
+    unsafe {
+        libc::kill(server_pid, libc::SIGKILL);
+    }
+
+    let result = client.wait(Duration::from_secs(5), || harness.server_log());
+    assert_ne!(result.exit_code, 0, "TUI should fail when its daemon disappears");
+    assert!(result.output.contains("daemon became unreachable"), "missing disconnect diagnostic: {}", result.output);
+    assert!(result.echo_enabled, "disconnect cleanup did not restore terminal echo");
+    assert!(
+        result.newline_processing_enabled,
+        "disconnect cleanup left OPOST/ONLCR disabled; diagnostic output:\n{}",
+        result.output
+    );
 }
 
 /// When the daemon dies abruptly (here: SIGKILL) while a client is attached, the

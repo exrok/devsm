@@ -96,9 +96,9 @@ fn main() {
         cli::Command::Server => {
             self_log::install_daemon_panic_hook();
             let _log_guard = if std::env::var("DEVSM_LOG_STDOUT").as_deref() == Ok("1") {
-                None
+                kvlog::collector::init_stdout_logger()
             } else {
-                Some(self_log::init_daemon_logging())
+                self_log::init_daemon_logging()
             };
             if let Err(err) = daemon::worker() {
                 kvlog::error!("Daemon terminated with error", ?err);
@@ -954,6 +954,10 @@ fn reset_terminal_to_canonical() {
         if libc::tcgetattr(0, &mut termios) == 0 {
             termios.c_lflag |= libc::ICANON | libc::ECHO | libc::ISIG;
             termios.c_iflag |= libc::ICRNL;
+            // Raw TUI mode disables output post-processing. Without restoring
+            // these flags, newlines printed by the crash diagnostic do not
+            // return the cursor to column zero, producing stair-stepped text.
+            termios.c_oflag |= libc::OPOST | libc::ONLCR;
             libc::tcsetattr(0, libc::TCSANOW, &termios);
         }
     }

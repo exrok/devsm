@@ -712,6 +712,57 @@ require = ["setup"]
 }
 
 #[test]
+fn restarting_terminal_root_stops_it_before_restarting_required_service() {
+    let mut harness = TestHarness::new("terminal_restart_dependency_shutdown_order");
+    let ctrl = TestAppServer::new(&harness.sock_dir);
+    harness.write_config(&format!(
+        r#"
+[service.backend]
+cmd = ["test-app", "backend"]
+env.TEST_APP_SOCKET = "{socket}"
+cache.never = true
+
+[action.editor]
+managed = "terminal"
+sticky = true
+cmd = ["test-app", "editor"]
+env.TEST_APP_SOCKET = "{socket}"
+require = ["backend"]
+"#,
+        socket = ctrl.path.display()
+    ));
+    harness.spawn_server();
+    let mut wrapper = harness.spawn_pty_client(&["run", "editor"]);
+    let [mut backend, mut editor] = ctrl.accept_named(["backend", "editor"], Duration::from_secs(5));
+
+    let restarted = harness.run_client(&["restart", "editor"]);
+    assert!(restarted.success(), "restart failed: {}\n{}", restarted.stderr, harness.server_log());
+    assert!(editor.wait_disconnected(Duration::from_secs(5)), "terminal child was not stopped");
+    assert!(
+        !backend.is_disconnected(),
+        "required service exited before its terminal dependent; server log:\n{}",
+        harness.server_log()
+    );
+    assert!(backend.wait_disconnected(Duration::from_secs(5)), "required service was not restarted");
+
+    let [_replacement_backend, mut replacement_editor] =
+        ctrl.accept_named(["backend", "editor"], Duration::from_secs(5));
+    replacement_editor.exit(0);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = harness.run_client(&["status", "editor"]);
+        if status.stdout.contains("idle wrapper attached") {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "terminal wrapper did not become idle: {}", status.stdout);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    wrapper.send_ctrl_c();
+    let result = wrapper.wait(Duration::from_secs(5), || harness.server_log());
+    assert_eq!(result.exit_code, 0, "PTY output:\n{}", result.output);
+}
+
+#[test]
 fn failed_requirement_releases_the_waiting_terminal_wrapper() {
     let mut harness = TestHarness::new("terminal_failed_requirement_releases_wrapper");
     harness.write_config(
