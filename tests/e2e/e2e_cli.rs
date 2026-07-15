@@ -582,6 +582,7 @@ fn fake_status(name: &str, kind: &str, state: &str, job_id: Option<u32>) -> Runn
         exit_code: None,
         exit_cause: None,
         ready: None,
+        terminal_attached: false,
         blocked_on: Vec::new(),
         profile: None,
         spawn_params: None,

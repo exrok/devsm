@@ -150,6 +150,14 @@ pub enum Request<'a> {
         name: Box<str>,
         params: ValueMap<'a>,
     },
+    AttachTerminal {
+        #[jsony(with = unix_path)]
+        config: &'a Path,
+        name: Box<str>,
+        params: ValueMap<'a>,
+        sticky: bool,
+        wrapper_process_group: i32,
+    },
 }
 
 use crate::event_loop::ReceivedFds;
@@ -208,6 +216,23 @@ fn handle_request(
                     params: jsony::to_binary(&params),
                     as_test,
                     derive_cache_key,
+                },
+            });
+        }
+        Request::AttachTerminal { config, name, params, sticky, wrapper_process_group } => {
+            let ReceivedFds::None = fds else {
+                bail!("AttachTerminal does not accept file descriptors");
+            };
+            pm.request.send(crate::event_loop::ProcessRequest::AttachClient {
+                stdin: None,
+                stdout: None,
+                socket,
+                workspace_config: config.into(),
+                kind: crate::event_loop::AttachKind::Terminal {
+                    task_name: name,
+                    params: jsony::to_binary(&params),
+                    sticky,
+                    wrapper_process_group,
                 },
             });
         }
@@ -331,6 +356,13 @@ pub fn worker() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(socket);
     let listener = UnixListener::bind(socket).context("Failed to bind daemon socket")?;
     kvlog::info!("RPC Socket bound", path = socket);
+    if let Some(fd) = std::env::var_os("DEVSM_TEST_READY_FD").and_then(|fd| fd.to_str()?.parse::<i32>().ok()) {
+        let byte = [1u8];
+        unsafe {
+            libc::write(fd, byte.as_ptr().cast(), byte.len());
+            libc::close(fd);
+        }
+    }
     let listener_fd = listener.as_raw_fd();
 
     let mut buffer = [0u8; 4096 * 16];

@@ -8,7 +8,7 @@ use crate::{
 };
 
 fn task_is_visible(bt: &BaseTask) -> bool {
-    if bt.removed || bt.config.managed == Some(false) {
+    if bt.removed || bt.config.managed == crate::config::ExecutionMode::Exec {
         return false;
     }
     match bt.config.kind {
@@ -646,6 +646,9 @@ impl TaskTreeState {
                     if active > 0 {
                         rem = rem.fmt(out, format_args!("{active}"));
                     }
+                    if task.idle_terminal_harnesses > 0 {
+                        rem = rem.with(substyle).text(out, " terminal-idle");
+                    }
                 }
                 PrimaryEntry::MetaGroup(kind) => {
                     let status = self.meta_group_status(ws, kind);
@@ -772,4 +775,19 @@ fn get_bound_function(ws: &WorkspaceState, bti: BaseTaskIndex) -> Option<&str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_tasks_are_visible_but_exec_tasks_are_hidden() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("schema/devsm.example-big.toml");
+        let ws = WorkspaceState::new(path).expect("load example config");
+        let terminal = ws.lookup_name("terminal_editor").expect("terminal action");
+        let exec = ws.lookup_name("full_basic").expect("exec action");
+        assert!(task_is_visible(&ws.base_tasks[terminal.idx()]));
+        assert!(!task_is_visible(&ws.base_tasks[exec.idx()]));
+    }
 }

@@ -449,6 +449,7 @@ complete -c devsm -n '__fish_devsm_using_command restart; and __fish_devsm_compl
 complete -c devsm -n '__fish_devsm_using_implicit_task; and __fish_devsm_completing_profile' -xa '(__fish_devsm_profiles_for_token)'
 
 # Start/restart command options
+complete -c devsm -n '__fish_devsm_using_command run; and not __fish_devsm_has_task' -l sticky -d 'Keep a terminal-task wrapper attached after exit'
 complete -c devsm -n '__fish_devsm_using_command start' -l cached -d 'Only start if not cached'
 complete -c devsm -n '__fish_devsm_using_command restart' -l cached -d 'Only restart if not cached'
 

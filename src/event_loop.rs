@@ -1,6 +1,6 @@
 use crate::rpc;
 use crate::rpc::{CommandBody, DecodingState, RpcMessageKind};
-use crate::workspace::{self, ExitCause, JobIndex, JobStatus, Workspace, WorkspaceState};
+use crate::workspace::{self, ExitCause, JobIndex, JobStatus, ProcessOwner, Workspace, WorkspaceState};
 use crate::{
     config::{Command, TaskConfigRc, TaskKind},
     line_width::{Segment, apply_raw_display_mode_vt_to_style, write_kept_bytes},
@@ -18,7 +18,7 @@ use std::{
     fs::File,
     os::{
         fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd},
-        unix::{net::UnixStream, process::CommandExt},
+        unix::{ffi::OsStrExt, net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
     process::{Child, Stdio},
@@ -38,6 +38,7 @@ pub(crate) enum Pipe {
 mod rpc_handlers;
 
 type WorkspaceIndex = u32;
+pub(crate) const PROCESS_KILL_ESCALATION: std::time::Duration = std::time::Duration::from_secs(20);
 /// Tracks ready condition checking for a service process.
 pub(crate) struct ReadyChecker {
     /// String to search for in output (ANSI stripped).
@@ -244,6 +245,44 @@ enum ClientKind {
     Exec {
         job: JobIndex,
     },
+    TerminalHarness {
+        harness_id: workspace::HarnessId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalHarnessAvailability {
+    Reserved,
+    Starting,
+    Running,
+    Idle,
+    Detaching,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalRunBinding {
+    job: JobIndex,
+    run_token: workspace::RunToken,
+}
+
+/// All mutable lifecycle facts for a terminal wrapper. Keeping them in one
+/// value makes invalid cross-field combinations visible and ensures the event
+/// loop is the sole authority for ownership transitions.
+struct TerminalHarnessState {
+    binding: Option<TerminalRunBinding>,
+    phase: TerminalHarnessAvailability,
+    replacement: Option<TerminalRunBinding>,
+    pending_exit_cause: Option<ExitCause>,
+    process_group: Option<libc::pid_t>,
+}
+
+struct TerminalHarness {
+    workspace: WorkspaceIndex,
+    client_index: ClientIndex,
+    base_task: workspace::BaseTaskIndex,
+    sticky: bool,
+    wrapper_process_group: libc::pid_t,
+    state: TerminalHarnessState,
 }
 
 struct ClientEntry {
@@ -252,6 +291,9 @@ struct ClientEntry {
     socket: UnixStream,
     kind: ClientKind,
     partial_rpc_read: Option<(DecodingState, Vec<u8>)>,
+    outbound: Vec<u8>,
+    outbound_offset: usize,
+    wake_process_group_after_flush: Option<libc::pid_t>,
 }
 
 /// State for a pending `devsm exec` gate. The socket lives in the [`ClientEntry`]
@@ -285,6 +327,9 @@ struct State {
     /// for the exec. Reconciled each loop iteration: once the job's requirements
     /// resolve, the client is told to proceed (or that they can never be met).
     remote_execs: HashMap<(WorkspaceIndex, JobIndex), RemoteExec>,
+    terminal_harnesses: HashMap<workspace::HarnessId, TerminalHarness>,
+    next_harness_id: workspace::HarnessId,
+    next_run_token: workspace::RunToken,
     db: crate::db::Db,
     /// Pid → process_index for jobs spawned under ptrace. Empty in steady
     /// state — checked with `is_empty()` in the reap loop to keep the
@@ -318,10 +363,11 @@ pub(crate) enum ReadResult {
     OtherError(std::io::ErrorKind),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SocketTerminationReason {
     Eof,
     ReadError,
+    WriteError,
     ProtocolError,
     ClientRequestedTerminate,
 }
@@ -331,6 +377,7 @@ impl SocketTerminationReason {
         match self {
             Self::Eof => "socket_eof",
             Self::ReadError => "socket_read_error",
+            Self::WriteError => "socket_write_error",
             Self::ProtocolError => "protocol_error",
             Self::ClientRequestedTerminate => "client_requested_terminate",
         }
@@ -370,6 +417,23 @@ pub(crate) fn try_read(fd: RawFd, buffer: &mut Vec<u8>) -> ReadResult {
     }
 }
 
+fn drain_outbound_with(
+    outbound: &[u8],
+    offset: &mut usize,
+    mut write: impl FnMut(&[u8]) -> std::io::Result<usize>,
+) -> std::io::Result<bool> {
+    while *offset < outbound.len() {
+        match write(&outbound[*offset..]) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "socket write returned zero")),
+            Ok(written) => *offset += written,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
 /// Which class of pending service termination [`EventLoop::request_service_termination`]
 /// should look for: one freeing a queued service, or one freeing a resource.
 enum TerminationKind {
@@ -380,7 +444,12 @@ enum TerminationKind {
 /// One workspace's decision for a single scheduling pass, computed while holding
 /// the workspace read lock and acted on after it is released.
 enum SchedulingStep {
-    Spawn { job_id: LogGroup, job_index: JobIndex, task: TaskConfigRc },
+    Spawn {
+        job_id: LogGroup,
+        job_index: JobIndex,
+        task: TaskConfigRc,
+        target: workspace::ExecutionTarget,
+    },
     Cancel { job_index: JobIndex },
     Idle,
 }
@@ -530,16 +599,11 @@ impl EventLoop {
         };
         let job = &state.jobs[service_to_kill];
         let job_id = job.log_group;
-        let JobStatus::Running { process_index, .. } = job.process_status else {
+        let JobStatus::Running { owner, .. } = job.process_status else {
             return;
         };
         drop(state);
-
-        if let Some(process) = self.state.processes.get_mut(process_index)
-            && process.log_group == job_id
-        {
-            process.request_termination(exit_cause);
-        }
+        self.handle_request(ProcessRequest::TerminateJob { job_id, owner, exit_cause });
     }
 
     pub(crate) fn scheduled(&mut self) {
@@ -582,7 +646,12 @@ impl EventLoop {
                     match state.next_scheduled() {
                         workspace::Scheduled::Ready(job_index) => {
                             let job = &state.jobs[job_index];
-                            SchedulingStep::Spawn { job_id: job.log_group, job_index, task: job.task().clone() }
+                            SchedulingStep::Spawn {
+                                job_id: job.log_group,
+                                job_index,
+                                task: job.task().clone(),
+                                target: job.execution_target,
+                            }
                         }
                         workspace::Scheduled::Never(job_index) => SchedulingStep::Cancel { job_index },
                         workspace::Scheduled::None => SchedulingStep::Idle,
@@ -590,9 +659,51 @@ impl EventLoop {
                 };
 
                 match step {
-                    SchedulingStep::Spawn { job_id, job_index, task } => {
+                    SchedulingStep::Spawn { job_id, job_index, task, target } => {
                         if self.state.remote_execs.contains_key(&(wsi as WorkspaceIndex, job_index)) {
                             self.start_remote_exec(wsi as WorkspaceIndex, job_index);
+                        } else if let workspace::ExecutionTarget::Terminal { harness_id, run_token } = target {
+                            if let Err(err) = self.start_terminal_job(
+                                wsi as WorkspaceIndex,
+                                job_id,
+                                job_index,
+                                task,
+                                harness_id,
+                                run_token,
+                            ) {
+                                let bound = self
+                                    .state
+                                    .terminal_harnesses
+                                    .get(&harness_id)
+                                    .and_then(|harness| harness.state.binding)
+                                    .is_some_and(|binding| binding.job == job_index && binding.run_token == run_token);
+                                if bound {
+                                    if let Some(client_index) = self
+                                        .state
+                                        .terminal_harnesses
+                                        .get(&harness_id)
+                                        .map(|harness| harness.client_index)
+                                    {
+                                        let mut encoder = crate::rpc::Encoder::new();
+                                        encoder.encode_push(
+                                            RpcMessageKind::TerminalError,
+                                            &crate::rpc::TerminalErrorEvent {
+                                                message: format!("failed to deliver terminal launch: {err:#}").into(),
+                                            },
+                                        );
+                                        let _ = self.queue_client_output(client_index, encoder.output());
+                                    }
+                                    self.terminal_spawn_failed(
+                                        harness_id,
+                                        crate::rpc::TerminalSpawnFailedEvent {
+                                            run_token,
+                                            message: format!("failed to deliver terminal launch: {err:#}").into(),
+                                        },
+                                    );
+                                } else {
+                                    self.handle_spawn_failure(wsi as WorkspaceIndex, job_id, job_index, err);
+                                }
+                            }
                         } else if let Err(err) = self.spawn(wsi as WorkspaceIndex, job_id, job_index, task) {
                             self.handle_spawn_failure(wsi as WorkspaceIndex, job_id, job_index, err);
                         }
@@ -600,10 +711,29 @@ impl EventLoop {
                     }
                     SchedulingStep::Cancel { job_index } => {
                         kvlog::info!("Scheduled task will never be ready cancelling", job_index);
-                        if let Some(ws) = self.state.workspaces.get(wsi) {
+                        let terminal_cancellation = if let Some(ws) = self.state.workspaces.get(wsi) {
                             let mut state = ws.handle.state.write().unwrap();
-                            state.record_dependency_failure_from_requirements(job_index);
+                            let target = state.jobs.get(job_index).map(|job| job.execution_target);
+                            let message = state
+                                .record_dependency_failure_from_requirements(job_index)
+                                .as_ref()
+                                .map(Self::exec_dependency_failure_message)
+                                .unwrap_or_else(|| {
+                                    "Terminal task was cancelled because its requirements could not be satisfied"
+                                        .to_string()
+                                });
                             state.update_job_status(job_index, JobStatus::Cancelled);
+                            match target {
+                                Some(workspace::ExecutionTarget::Terminal { harness_id, run_token }) => {
+                                    Some((harness_id, run_token, message))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some((harness_id, run_token, message)) = terminal_cancellation {
+                            self.cancel_terminal_reservation(harness_id, run_token, Some(message));
                         }
                         continue 'outer;
                     }
@@ -676,7 +806,6 @@ impl EventLoop {
     }
 
     fn check_kill_escalation(&mut self) {
-        const SIGKILL_ESCALATION_SECS: u64 = 20;
         let now = crate::clock::now();
 
         for (_index, process) in &mut self.state.processes {
@@ -684,7 +813,7 @@ impl EventLoop {
                 continue;
             };
 
-            if now.duration_since(kill_sent_at).as_secs() < SIGKILL_ESCALATION_SECS {
+            if now.duration_since(kill_sent_at) < PROCESS_KILL_ESCALATION {
                 continue;
             }
 
@@ -858,7 +987,10 @@ impl EventLoop {
         });
         {
             let mut ws = workspace.handle.state.write().unwrap();
-            ws.update_job_status(job_index, JobStatus::Running { process_index, ready_state });
+            ws.update_job_status(
+                job_index,
+                JobStatus::Running { owner: ProcessOwner::Daemon { process_index }, ready_state },
+            );
         }
         self.broadcast_job_status(workspace_index, job_index, crate::rpc::JobStatusKind::Running);
         Ok(())
@@ -928,6 +1060,7 @@ pub(crate) enum AttachKind {
     Rpc { subscribe: bool },
     Logs { query: Vec<u8> },
     Exec { task_name: Box<str>, params: Vec<u8> },
+    Terminal { task_name: Box<str>, params: Vec<u8>, sticky: bool, wrapper_process_group: libc::pid_t },
 }
 
 pub(crate) enum ReceivedFds {
@@ -956,9 +1089,18 @@ pub(crate) enum ProcessRequest {
     },
     TerminateJob {
         job_id: LogGroup,
-        process_index: usize,
+        owner: ProcessOwner,
         exit_cause: ExitCause,
     },
+    TerminalControl {
+        workspace_id: WorkspaceIndex,
+        task_name: Box<str>,
+        profile: Box<str>,
+        params: ValueMap<'static>,
+        restart: bool,
+        response: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
+    ReconcileTerminalHarnesses { workspace_id: WorkspaceIndex },
     ClientExited {
         index: usize,
     },
@@ -1211,7 +1353,42 @@ fn wait_for_clipboard_process(child: &mut Child, text: &str) -> std::io::Result<
 impl EventLoop {
     fn handle_request(&mut self, req: ProcessRequest) -> bool {
         match req {
-            ProcessRequest::TerminateJob { job_id, process_index, exit_cause } => {
+            ProcessRequest::TerminateJob { job_id, owner, exit_cause } => {
+                if let ProcessOwner::Terminal { harness_id, run_token } = owner {
+                    if self.cancel_terminal_reservation(harness_id, run_token, None) {
+                        return false;
+                    }
+                    let Some(harness) = self.state.terminal_harnesses.get_mut(&harness_id) else {
+                        kvlog::warn!("TerminateJob: terminal harness missing", harness_id, run_token);
+                        return false;
+                    };
+                    let expected = harness.state.binding.map(|binding| binding.run_token);
+                    if expected != Some(run_token) {
+                        kvlog::warn!("TerminateJob: stale terminal run token", harness_id, run_token);
+                        return false;
+                    }
+                    harness.state.pending_exit_cause = Some(exit_cause);
+                    let client_index = harness.client_index;
+                    let replacement_pending = harness.state.replacement.is_some();
+                    let wrapper_process_group = harness.wrapper_process_group;
+                    let mut encoder = crate::rpc::Encoder::new();
+                    encoder.encode_push(
+                        RpcMessageKind::TerminalStop,
+                        &crate::rpc::TerminalStopEvent {
+                            run_token,
+                            cause: Self::rpc_exit_cause(exit_cause),
+                            replacement_pending,
+                        },
+                    );
+                    if let Err(error) =
+                        self.queue_client_output_and_wake(client_index, encoder.output(), wrapper_process_group)
+                    {
+                        kvlog::warn!("Failed to queue terminal stop", harness_id, %error);
+                        self.terminate_client(client_index, SocketTerminationReason::WriteError);
+                    }
+                    return false;
+                }
+                let ProcessOwner::Daemon { process_index } = owner else { unreachable!() };
                 let Some(process) = self.state.processes.get_mut(process_index) else {
                     kvlog::warn!(
                         "TerminateJob: process not found in slab",
@@ -1231,6 +1408,28 @@ impl EventLoop {
                     return false;
                 }
                 process.request_termination(exit_cause);
+                false
+            }
+            ProcessRequest::TerminalControl { workspace_id, task_name, profile, params, restart, response } => {
+                let params = jsony::to_binary(&params);
+                let payload = jsony::to_binary(&crate::rpc::SpawnTaskRequest {
+                    task_name: &task_name,
+                    profile: &profile,
+                    params: &params,
+                    as_test: false,
+                    cached: false,
+                });
+                let kind = if restart { RpcMessageKind::RestartTask } else { RpcMessageKind::StartTask };
+                let result = match self.terminal_control_rpc(workspace_id, kind, &payload) {
+                    Some(CommandBody::Empty | CommandBody::Message(_)) => Ok(()),
+                    Some(CommandBody::Error(error)) => Err(error.into()),
+                    None => Err(format!("Task '{}' is no longer configured with managed = \"terminal\"", task_name)),
+                };
+                let _ = response.send(result);
+                false
+            }
+            ProcessRequest::ReconcileTerminalHarnesses { workspace_id } => {
+                self.reconcile_idle_terminal_harnesses(workspace_id);
                 false
             }
             ProcessRequest::AttachClient { stdin, stdout, socket, workspace_config, kind } => {
@@ -1300,6 +1499,16 @@ impl EventLoop {
                     }
                     AttachKind::Exec { task_name, params } => {
                         self.attach_exec_client(socket, ws_index, &task_name, params);
+                    }
+                    AttachKind::Terminal { task_name, params, sticky, wrapper_process_group } => {
+                        self.attach_terminal_client(
+                            socket,
+                            ws_index,
+                            &task_name,
+                            params,
+                            sticky,
+                            wrapper_process_group,
+                        );
                     }
                 }
 
@@ -1638,10 +1847,114 @@ impl EventLoop {
             Interest::READABLE,
         );
         let _ = socket.set_nonblocking(true);
-        let client_entry =
-            ClientEntry { channel: channel.clone(), workspace: ws_index, socket, kind, partial_rpc_read };
+        let client_entry = ClientEntry {
+            channel: channel.clone(),
+            workspace: ws_index,
+            socket,
+            kind,
+            partial_rpc_read,
+            outbound: Vec::new(),
+            outbound_offset: 0,
+            wake_process_group_after_flush: None,
+        };
         let index = self.clients.insert(client_entry);
         (index, channel)
+    }
+
+    fn validate_outbound_frames(bytes: &[u8]) -> std::io::Result<()> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if bytes.len() - offset < crate::rpc::HEAD_SIZE {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated RPC frame"));
+            }
+            let header: &[u8; crate::rpc::HEAD_SIZE] = bytes[offset..offset + crate::rpc::HEAD_SIZE]
+                .try_into()
+                .expect("header length checked");
+            let head = crate::rpc::Head::from_bytes(header)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid RPC frame: {error:?}")))?;
+            let payload = head.ws_len as usize + head.len as usize;
+            if payload > crate::rpc::DEFAULT_MAX_PAYLOAD {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("RPC payload is {payload} bytes; maximum is {}", crate::rpc::DEFAULT_MAX_PAYLOAD),
+                ));
+            }
+            let frame_len = crate::rpc::HEAD_SIZE + payload;
+            if bytes.len() - offset < frame_len {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated RPC payload"));
+            }
+            offset += frame_len;
+        }
+        Ok(())
+    }
+
+    fn set_client_interest(&mut self, client_index: ClientIndex, writable: bool) -> std::io::Result<()> {
+        let Some(client) = self.clients.get_mut(client_index as usize) else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "client disconnected"));
+        };
+        let interest = if writable { Interest::READABLE.add(Interest::WRITABLE) } else { Interest::READABLE };
+        self.state.poll.registry().reregister(
+            &mut SourceFd(&client.socket.as_raw_fd()),
+            TokenHandle::Client(client_index).into(),
+            interest,
+        )
+    }
+
+    fn queue_client_output(&mut self, client_index: ClientIndex, bytes: &[u8]) -> std::io::Result<()> {
+        self.queue_client_output_inner(client_index, bytes, None)
+    }
+
+    fn queue_client_output_and_wake(
+        &mut self,
+        client_index: ClientIndex,
+        bytes: &[u8],
+        process_group: libc::pid_t,
+    ) -> std::io::Result<()> {
+        self.queue_client_output_inner(client_index, bytes, Some(process_group))
+    }
+
+    fn queue_client_output_inner(
+        &mut self,
+        client_index: ClientIndex,
+        bytes: &[u8],
+        wake_process_group_after_flush: Option<libc::pid_t>,
+    ) -> std::io::Result<()> {
+        Self::validate_outbound_frames(bytes)?;
+        let Some(client) = self.clients.get_mut(client_index as usize) else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "client disconnected"));
+        };
+        if client.outbound_offset == client.outbound.len() {
+            client.outbound.clear();
+            client.outbound_offset = 0;
+        }
+        client.outbound.extend_from_slice(bytes);
+        if wake_process_group_after_flush.is_some() {
+            client.wake_process_group_after_flush = wake_process_group_after_flush;
+        }
+        self.set_client_interest(client_index, true)?;
+        self.flush_client_output(client_index)
+    }
+
+    fn flush_client_output(&mut self, client_index: ClientIndex) -> std::io::Result<()> {
+        let wake_process_group = {
+            let Some(client) = self.clients.get_mut(client_index as usize) else {
+                return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "client disconnected"));
+            };
+            let fd = client.socket.as_raw_fd();
+            if !drain_outbound_with(&client.outbound, &mut client.outbound_offset, |bytes| {
+                let result = unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), bytes.len()) };
+                if result < 0 { Err(std::io::Error::last_os_error()) } else { Ok(result as usize) }
+            })? {
+                return Ok(());
+            }
+            client.outbound.clear();
+            client.outbound_offset = 0;
+            client.wake_process_group_after_flush.take()
+        };
+        if let Some(process_group) = wake_process_group {
+            unsafe { libc::kill(-process_group, libc::SIGCONT) };
+        }
+        self.set_client_interest(client_index, false)
     }
 
     fn attach_tui_client(&mut self, stdin: File, stdout: File, socket: UnixStream, ws_index: WorkspaceIndex) {
@@ -1762,6 +2075,580 @@ impl EventLoop {
         );
     }
 
+    fn attach_terminal_client(
+        &mut self,
+        socket: UnixStream,
+        ws_index: WorkspaceIndex,
+        task_name: &str,
+        params: Vec<u8>,
+        sticky: bool,
+        wrapper_process_group: libc::pid_t,
+    ) {
+        let params = jsony::from_binary::<ValueMap>(&params).unwrap_or_else(|_| ValueMap::new()).to_owned();
+        let (name, profile) = task_name.rsplit_once(':').unwrap_or((task_name, ""));
+        let harness_id = self.state.next_harness_id;
+        self.state.next_harness_id = self.state.next_harness_id.wrapping_add(1).max(1);
+        let run_token = self.state.next_run_token;
+        self.state.next_run_token = self.state.next_run_token.wrapping_add(1).max(1);
+
+        let (client_index, _) =
+            self.register_client(socket, ws_index, ClientKind::TerminalHarness { harness_id }, None);
+        if wrapper_process_group <= 0 {
+            let mut encoder = crate::rpc::Encoder::new();
+            encoder.encode_push(
+                RpcMessageKind::TerminalError,
+                &crate::rpc::TerminalErrorEvent { message: "terminal wrapper reported an invalid process group".into() },
+            );
+            let _ = self.queue_client_output(client_index as ClientIndex, encoder.output());
+            return;
+        }
+        let ws = &self.state.workspaces[ws_index as usize];
+        let result = match ws.handle.submit_terminal(name, profile, params, harness_id, run_token, false) {
+            Ok(result) => result,
+            Err(message) => {
+                let mut encoder = crate::rpc::Encoder::new();
+                encoder.encode_push(
+                    RpcMessageKind::TerminalError,
+                    &crate::rpc::TerminalErrorEvent { message: message.into() },
+                );
+                let _ = self.queue_client_output(client_index as ClientIndex, encoder.output());
+                return;
+            }
+        };
+        let Some((base_task, job)) = result.jobs.first().copied() else {
+            return;
+        };
+        let waiting = ws.handle.state().pending_dep_names(job);
+        self.state.terminal_harnesses.insert(
+            harness_id,
+            TerminalHarness {
+                workspace: ws_index,
+                client_index: client_index as ClientIndex,
+                base_task,
+                sticky,
+                wrapper_process_group,
+                state: TerminalHarnessState {
+                    binding: Some(TerminalRunBinding { job, run_token }),
+                    phase: TerminalHarnessAvailability::Reserved,
+                    replacement: None,
+                    pending_exit_cause: None,
+                    process_group: None,
+                },
+            },
+        );
+        self.broadcast_job_status(ws_index, job, crate::rpc::JobStatusKind::Scheduled);
+        let mut encoder = crate::rpc::Encoder::new();
+        encoder.encode_empty(RpcMessageKind::TerminalAttached, 0);
+        if !waiting.is_empty() {
+            encoder.encode_push(
+                RpcMessageKind::TerminalWaiting,
+                &crate::rpc::TerminalWaitingEvent { tasks: waiting },
+            );
+        }
+        if let Err(error) = self.queue_client_output(client_index as ClientIndex, encoder.output()) {
+            kvlog::warn!("Failed to queue terminal attachment", harness_id, %error);
+            self.terminate_client(client_index as ClientIndex, SocketTerminationReason::WriteError);
+        }
+    }
+
+    fn start_terminal_job(
+        &mut self,
+        workspace_id: WorkspaceIndex,
+        job_id: LogGroup,
+        job_index: JobIndex,
+        task: TaskConfigRc,
+        harness_id: workspace::HarnessId,
+        run_token: workspace::RunToken,
+    ) -> anyhow::Result<()> {
+        let binding = TerminalRunBinding { job: job_index, run_token };
+        let client_index = {
+            let harness = self.state.terminal_harnesses.get_mut(&harness_id).context("terminal wrapper disconnected")?;
+            if harness.workspace != workspace_id {
+                bail!("terminal wrapper belongs to another workspace");
+            }
+            if harness.state.replacement == Some(binding) {
+                harness.state.binding = Some(binding);
+                harness.state.replacement = None;
+                harness.state.pending_exit_cause = None;
+                harness.state.process_group = None;
+            } else if harness.state.binding != Some(binding) {
+                bail!("terminal wrapper reservation no longer matches scheduled job");
+            }
+            harness.client_index
+        };
+        let workspace = &self.state.workspaces[workspace_id as usize];
+        let tc = task.config();
+        let pwd = {
+            let mut ws = workspace.handle.state.write().unwrap();
+            match ws.jobs.get(job_index).map(|job| &job.process_status) {
+                Some(JobStatus::Scheduled { .. }) => {
+                    ws.update_job_status(job_index, JobStatus::Starting);
+                }
+                Some(JobStatus::Starting) => {}
+                Some(JobStatus::Cancelled) => return Ok(()),
+                _ => bail!("attempted terminal start for non-scheduled job"),
+            }
+            ws.config.current.base_path().join(tc.pwd)
+        };
+        let command = match &tc.command {
+            Command::Cmd(args) => crate::rpc::TerminalCommand::Cmd(args.iter().map(|arg| (*arg).into()).collect()),
+            Command::Sh { script, args } => crate::rpc::TerminalCommand::Sh {
+                script: (*script).into(),
+                args: args.iter().map(|arg| (*arg).into()).collect(),
+            },
+        };
+        let event = crate::rpc::TerminalStartEvent {
+            run_token,
+            pwd: pwd.as_os_str().as_bytes().to_vec(),
+            command,
+            env: tc.envvar.iter().map(|(key, value)| ((*key).into(), (*value).into())).collect(),
+        };
+        let mut encoder = crate::rpc::Encoder::new();
+        encoder.encode_push(RpcMessageKind::TerminalStart, &event);
+        self.queue_client_output(client_index, encoder.output())?;
+        let harness = self.state.terminal_harnesses.get_mut(&harness_id).context("terminal wrapper disconnected")?;
+        if harness.state.binding != Some(binding) {
+            bail!("terminal wrapper reservation changed while queuing launch");
+        }
+        harness.state.phase = TerminalHarnessAvailability::Starting;
+        if let Some(workspace) = self.state.workspaces.get_mut(workspace_id as usize) {
+            const NOTE: &str = "output is attached to its terminal";
+            workspace.line_writer.push_line(NOTE, NOTE.len() as u32, job_id, Style::default());
+        }
+        self.broadcast_job_status(workspace_id, job_index, crate::rpc::JobStatusKind::Starting);
+        Ok(())
+    }
+
+    fn terminal_started(&mut self, harness_id: workspace::HarnessId, event: crate::rpc::TerminalRunEvent) {
+        let Some(harness) = self.state.terminal_harnesses.get_mut(&harness_id) else { return };
+        let Some(binding) = harness.state.binding else { return };
+        if binding.run_token != event.run_token || harness.state.phase != TerminalHarnessAvailability::Starting {
+            kvlog::warn!("Ignoring stale TerminalStarted", harness_id, run_token = event.run_token);
+            return;
+        }
+        if event.process_group <= 0 {
+            let client_index = harness.client_index;
+            kvlog::warn!("Terminal harness reported invalid process group", harness_id, process_group = event.process_group);
+            self.terminate_client(client_index, SocketTerminationReason::ProtocolError);
+            return;
+        }
+        let job_index = binding.job;
+        let ws_index = harness.workspace;
+        let Some(workspace) = self.state.workspaces.get(ws_index as usize) else { return };
+        let mut state = workspace.handle.state.write().unwrap();
+        if !matches!(state.jobs.get(job_index).map(|job| &job.process_status), Some(JobStatus::Starting)) {
+            return;
+        }
+        state.update_job_status(
+            job_index,
+            JobStatus::Running {
+                owner: ProcessOwner::Terminal { harness_id, run_token: event.run_token },
+                ready_state: None,
+            },
+        );
+        harness.state.phase = TerminalHarnessAvailability::Running;
+        harness.state.process_group = Some(event.process_group);
+        drop(state);
+        self.broadcast_job_status(ws_index, job_index, crate::rpc::JobStatusKind::Running);
+        self.scheduled();
+    }
+
+    fn terminal_spawn_failed(
+        &mut self,
+        harness_id: workspace::HarnessId,
+        event: crate::rpc::TerminalSpawnFailedEvent,
+    ) {
+        let Some(harness) = self.state.terminal_harnesses.get_mut(&harness_id) else { return };
+        let Some(binding) = harness.state.binding else { return };
+        if binding.run_token != event.run_token {
+            kvlog::warn!("Ignoring stale TerminalSpawnFailed", harness_id, run_token = event.run_token);
+            return;
+        }
+        kvlog::error!("Terminal child failed to spawn", harness_id, error = &*event.message);
+        harness.state.binding = None;
+        let job_index = binding.job;
+        let ws_index = harness.workspace;
+        harness.state.pending_exit_cause = None;
+        harness.state.process_group = None;
+        harness.state.phase = if harness.state.replacement.is_some() {
+            TerminalHarnessAvailability::Reserved
+        } else {
+            TerminalHarnessAvailability::Idle
+        };
+        let Some(workspace) = self.state.workspaces.get(ws_index as usize) else { return };
+        let public_id = workspace
+            .handle
+            .state
+            .write()
+            .unwrap()
+            .update_job_status(
+                job_index,
+                JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::SpawnFailed, status: 127 },
+            )
+            .unwrap_or(0);
+        self.broadcast_job_exited(ws_index, public_id, 127, crate::rpc::ExitCause::SpawnFailed);
+        self.reconcile_idle_terminal_harnesses(ws_index);
+        self.finish_terminal_run(harness_id);
+        self.scheduled();
+    }
+
+    fn terminal_exited(&mut self, harness_id: workspace::HarnessId, event: crate::rpc::TerminalExitedEvent) {
+        let Some(harness) = self.state.terminal_harnesses.get_mut(&harness_id) else { return };
+        let Some(binding) = harness.state.binding else { return };
+        if binding.run_token != event.run_token {
+            kvlog::warn!("Ignoring stale TerminalExited", harness_id, run_token = event.run_token);
+            return;
+        }
+        harness.state.binding = None;
+        let job_index = binding.job;
+        let ws_index = harness.workspace;
+        let cause = harness.state.pending_exit_cause.take().unwrap_or(ExitCause::Unknown);
+        harness.state.process_group = None;
+        harness.state.phase = if harness.state.replacement.is_some() {
+            TerminalHarnessAvailability::Reserved
+        } else {
+            TerminalHarnessAvailability::Idle
+        };
+        let status = event.exit_code.max(0) as u32;
+        let Some(workspace) = self.state.workspaces.get(ws_index as usize) else { return };
+        let public_id = workspace
+            .handle
+            .state
+            .write()
+            .unwrap()
+            .update_job_status(
+                job_index,
+                JobStatus::Exited { finished_at: crate::clock::now(), cause, status },
+            )
+            .unwrap_or(0);
+        self.broadcast_job_exited(ws_index, public_id, event.exit_code, Self::rpc_exit_cause(cause));
+        self.reconcile_idle_terminal_harnesses(ws_index);
+        self.finish_terminal_run(harness_id);
+        self.scheduled();
+    }
+
+    fn finish_terminal_run(&mut self, harness_id: workspace::HarnessId) {
+        let Some(harness) = self.state.terminal_harnesses.get(&harness_id) else { return };
+        if harness.state.phase != TerminalHarnessAvailability::Idle
+            || harness.sticky
+            || harness.state.replacement.is_some()
+        {
+            return;
+        }
+        let client_index = harness.client_index;
+        let mut encoder = crate::rpc::Encoder::new();
+        encoder.encode_empty(RpcMessageKind::TerminalDetached, 0);
+        if let Err(error) = self.queue_client_output(client_index, encoder.output()) {
+            kvlog::warn!("Failed to queue terminal detach", harness_id, %error);
+            self.terminate_client(client_index, SocketTerminationReason::WriteError);
+        }
+    }
+
+    /// Release a terminal job that was cancelled before its child started.
+    /// Reservations can live in either `binding` (the initial run) or
+    /// `replacement` (a restart waiting for the prior run and dependencies).
+    fn cancel_terminal_reservation(
+        &mut self,
+        harness_id: workspace::HarnessId,
+        run_token: workspace::RunToken,
+        error_message: Option<String>,
+    ) -> bool {
+        let (workspace_id, client_index, sticky, wrapper_process_group, became_idle) = {
+            let Some(harness) = self.state.terminal_harnesses.get_mut(&harness_id) else {
+                return false;
+            };
+
+            let replacement_matches = harness
+                .state
+                .replacement
+                .is_some_and(|binding| binding.run_token == run_token);
+            let reserved_binding_matches = harness.state.phase == TerminalHarnessAvailability::Reserved
+                && harness.state.binding.is_some_and(|binding| binding.run_token == run_token);
+            if replacement_matches {
+                harness.state.replacement = None;
+            } else if reserved_binding_matches {
+                harness.state.binding = None;
+                harness.state.pending_exit_cause = None;
+                harness.state.process_group = None;
+            } else {
+                return false;
+            }
+
+            let became_idle = harness.state.binding.is_none() && harness.state.replacement.is_none();
+            if became_idle {
+                harness.state.phase = TerminalHarnessAvailability::Idle;
+            } else if harness.state.binding.is_none() {
+                harness.state.phase = TerminalHarnessAvailability::Reserved;
+            }
+            (
+                harness.workspace,
+                harness.client_index,
+                harness.sticky,
+                harness.wrapper_process_group,
+                became_idle,
+            )
+        };
+
+        if became_idle {
+            let mut encoder = crate::rpc::Encoder::new();
+            if let Some(message) = error_message {
+                encoder.encode_push(
+                    RpcMessageKind::TerminalError,
+                    &crate::rpc::TerminalErrorEvent { message: message.into() },
+                );
+                encoder.encode_empty(RpcMessageKind::TerminalDetached, 0);
+            } else if !sticky {
+                encoder.encode_empty(RpcMessageKind::TerminalDetached, 0);
+            }
+            if encoder.output().is_empty() {
+                unsafe { libc::kill(-wrapper_process_group, libc::SIGCONT) };
+            } else if let Err(error) =
+                self.queue_client_output_and_wake(client_index, encoder.output(), wrapper_process_group)
+            {
+                kvlog::warn!("Failed to queue terminal cancellation", harness_id, %error);
+                self.terminate_client(client_index, SocketTerminationReason::WriteError);
+            }
+        }
+        self.reconcile_idle_terminal_harnesses(workspace_id);
+        true
+    }
+
+    fn terminal_detach(&mut self, harness_id: workspace::HarnessId) {
+        let Some(harness) = self.state.terminal_harnesses.get(&harness_id) else { return };
+        match harness.state.phase {
+            TerminalHarnessAvailability::Reserved | TerminalHarnessAvailability::Starting => {
+                let client_index = harness.client_index;
+                self.terminate_client(client_index, SocketTerminationReason::ClientRequestedTerminate);
+                return;
+            }
+            TerminalHarnessAvailability::Idle => {}
+            TerminalHarnessAvailability::Running | TerminalHarnessAvailability::Detaching => {
+                kvlog::warn!("Terminal harness attempted detach while active", harness_id);
+                return;
+            }
+        }
+        let client_index = harness.client_index;
+        let harness = self.state.terminal_harnesses.remove(&harness_id).expect("terminal harness disappeared");
+        self.rebuild_idle_terminal_cache(harness.workspace);
+        self.terminate_client(client_index, SocketTerminationReason::ClientRequestedTerminate);
+    }
+
+    /// Refresh the workspace generation and detach idle wrappers whose task no
+    /// longer has the same kind and terminal execution mode. Active jobs keep
+    /// their resolved generation and are intentionally left alone.
+    fn reconcile_idle_terminal_harnesses(&mut self, ws_index: WorkspaceIndex) {
+        let Some(workspace) = self.state.workspaces.get(ws_index as usize) else { return };
+        workspace.handle.refresh_config_if_changed();
+        let invalid: Vec<_> = {
+            let state = workspace.handle.state();
+            self.state
+                .terminal_harnesses
+                .iter()
+                .filter_map(|(&id, harness)| {
+                    if harness.workspace != ws_index
+                        || !harness.sticky
+                        || harness.state.phase != TerminalHarnessAvailability::Idle
+                    {
+                        return None;
+                    }
+                    let task = state.base_tasks.get(harness.base_task.idx());
+                    let compatible = task.is_some_and(|task| {
+                        !task.removed && task.config.managed == crate::config::ExecutionMode::Terminal
+                    });
+                    (!compatible).then(|| {
+                        let name = task.map_or_else(|| "<removed>".into(), |task| task.name.clone());
+                        (id, harness.client_index, harness.wrapper_process_group, name)
+                    })
+                })
+                .collect()
+        };
+        for (harness_id, client_index, wrapper_process_group, task_name) in invalid {
+            if let Some(harness) = self.state.terminal_harnesses.get_mut(&harness_id) {
+                harness.state.phase = TerminalHarnessAvailability::Detaching;
+            }
+            let mut encoder = crate::rpc::Encoder::new();
+            encoder.encode_push(
+                RpcMessageKind::TerminalError,
+                &crate::rpc::TerminalErrorEvent {
+                    message: format!(
+                        "Terminal wrapper for '{}' detached because the task was removed or is no longer terminal-managed",
+                        task_name
+                    )
+                    .into(),
+                },
+            );
+            encoder.encode_empty(RpcMessageKind::TerminalDetached, 0);
+            if let Err(error) =
+                self.queue_client_output_and_wake(client_index, encoder.output(), wrapper_process_group)
+            {
+                kvlog::warn!("Failed to queue incompatible terminal detach", harness_id, %error);
+                self.terminate_client(client_index, SocketTerminationReason::WriteError);
+            }
+            kvlog::info!("Detaching incompatible idle terminal harness after config reload", harness_id);
+        }
+        self.rebuild_idle_terminal_cache(ws_index);
+    }
+
+    fn rebuild_idle_terminal_cache(&self, ws_index: WorkspaceIndex) {
+        let Some(workspace) = self.state.workspaces.get(ws_index as usize) else { return };
+        let mut state = workspace.handle.state.write().unwrap();
+        for task in &mut state.base_tasks {
+            task.idle_terminal_harnesses = 0;
+        }
+        for harness in self.state.terminal_harnesses.values() {
+            if harness.workspace != ws_index
+                || !harness.sticky
+                || harness.state.phase != TerminalHarnessAvailability::Idle
+            {
+                continue;
+            }
+            let Some(task) = state.base_tasks.get_mut(harness.base_task.idx()) else { continue };
+            if !task.removed && task.config.managed == crate::config::ExecutionMode::Terminal {
+                task.idle_terminal_harnesses += 1;
+            }
+        }
+    }
+
+    fn terminal_control_rpc(
+        &mut self,
+        ws_index: WorkspaceIndex,
+        kind: RpcMessageKind,
+        payload: &[u8],
+    ) -> Option<CommandBody> {
+        if !matches!(kind, RpcMessageKind::StartTask | RpcMessageKind::RestartTask) {
+            return None;
+        }
+        let req = match jsony::from_binary::<crate::rpc::SpawnTaskRequest>(payload) {
+            Ok(req) => req,
+            Err(_) => return Some(CommandBody::Error("Invalid request payload".into())),
+        };
+        let params = jsony::from_binary::<ValueMap>(req.params).unwrap_or_else(|_| ValueMap::new()).to_owned();
+        let workspace = &self.state.workspaces[ws_index as usize];
+        workspace.handle.refresh_config_if_changed();
+        let (base_task, profile, already_active, active_owner) = {
+            let state = workspace.handle.state.write().unwrap();
+            let Some(base_task) = state.lookup_name(req.task_name) else {
+                return None;
+            };
+            if state.base_tasks[base_task.idx()].config.managed != crate::config::ExecutionMode::Terminal {
+                return None;
+            }
+            if req.as_test || req.cached {
+                return Some(CommandBody::Error(
+                    "terminal tasks do not support --as-test or cached start/restart".into(),
+                ));
+            }
+            let profile = if req.profile.is_empty() {
+                state.base_tasks[base_task.idx()].config.profiles.first().copied().unwrap_or("").to_string()
+            } else {
+                req.profile.to_string()
+            };
+            let mut already_active = false;
+            let mut active_owner = None;
+            for &job_index in state.base_tasks[base_task.idx()].jobs.non_terminal().iter().rev() {
+                let job = &state.jobs[job_index];
+                if job.spawn_profile() != profile || job.spawn_params() != &params {
+                    continue;
+                }
+                already_active = true;
+                match (&job.process_status, job.execution_target) {
+                    (JobStatus::Running { owner: owner @ ProcessOwner::Terminal { .. }, .. }, _) => {
+                        active_owner = Some((job_index, *owner));
+                    }
+                    (
+                        JobStatus::Scheduled { .. } | JobStatus::Starting,
+                        workspace::ExecutionTarget::Terminal { harness_id, run_token },
+                    ) => {
+                        active_owner = Some((job_index, ProcessOwner::Terminal { harness_id, run_token }));
+                    }
+                    _ => {}
+                }
+                break;
+            }
+            (base_task, profile, already_active, active_owner)
+        };
+
+        if kind == RpcMessageKind::StartTask && already_active {
+            return Some(CommandBody::Message(format!("Task '{}' is already active", req.task_name).into()));
+        }
+
+        let (harness_id, replacing) = if kind == RpcMessageKind::RestartTask {
+            let Some((_, ProcessOwner::Terminal { harness_id, .. })) = active_owner else {
+                return Some(CommandBody::Error(
+                    format!(
+                        "Cannot restart terminal task '{}': no compatible running terminal wrapper exists.\n\
+                         Start it with: devsm run {}",
+                        req.task_name, req.task_name
+                    )
+                    .into(),
+                ));
+            };
+            (harness_id, true)
+        } else {
+            let candidate = self
+                .state
+                .terminal_harnesses
+                .iter()
+                .filter(|(_, harness)| {
+                    harness.workspace == ws_index
+                        && harness.base_task == base_task
+                        && harness.sticky
+                        && harness.state.phase == TerminalHarnessAvailability::Idle
+                })
+                .map(|(id, _)| *id)
+                .min();
+            let Some(harness_id) = candidate else {
+                return Some(CommandBody::Error(
+                    format!(
+                        "Cannot start terminal task '{}': no compatible idle sticky wrapper exists.\n\
+                         Attach one with: devsm run --sticky {}",
+                        req.task_name, req.task_name
+                    )
+                    .into(),
+                ));
+            };
+            (harness_id, false)
+        };
+
+        let run_token = self.state.next_run_token;
+        self.state.next_run_token = self.state.next_run_token.wrapping_add(1).max(1);
+        if replacing
+            && self
+                .state
+                .terminal_harnesses
+                .get(&harness_id)
+                .is_some_and(|harness| harness.state.replacement.is_some())
+        {
+            return Some(CommandBody::Error(
+                format!("Cannot restart terminal task '{}': a replacement is already pending", req.task_name).into(),
+            ));
+        }
+        let result = workspace
+            .handle
+            .submit_terminal(req.task_name, &profile, params, harness_id, run_token, replacing);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => return Some(CommandBody::Error(error.into())),
+        };
+        let Some((_, job_index)) = result.jobs.first().copied() else {
+            return Some(CommandBody::Error("No terminal job was created".into()));
+        };
+        if let Some(harness) = self.state.terminal_harnesses.get_mut(&harness_id) {
+            let binding = TerminalRunBinding { job: job_index, run_token };
+            if replacing {
+                harness.state.replacement = Some(binding);
+            } else {
+                harness.state.binding = Some(binding);
+                harness.state.phase = TerminalHarnessAvailability::Reserved;
+                harness.state.pending_exit_cause = None;
+                harness.state.process_group = None;
+            }
+        }
+        self.rebuild_idle_terminal_cache(ws_index);
+        self.broadcast_job_status(ws_index, job_index, crate::rpc::JobStatusKind::Scheduled);
+        Some(CommandBody::Empty)
+    }
+
     fn send_exec_message(socket: &UnixStream, encoder: &crate::rpc::Encoder) {
         let mut s = socket;
         let _ = std::io::Write::write_all(&mut s, encoder.output());
@@ -1798,12 +2685,20 @@ impl EventLoop {
             reason: failure.reason.clone(),
             exit_code: failure.exit_code,
             cause: failure.cause.map(Self::rpc_exit_cause),
+            terminal: failure.terminal,
+            suggested_invocation: failure.suggested_invocation.clone(),
         }
     }
 
     fn exec_dependency_failure_message(failure: &workspace::DependencyFailure) -> String {
         let job = failure.job_index.map(|id| format!(" (job #{id})")).unwrap_or_default();
-        format!("required dependency '{}'{} could not be satisfied: {}", failure.task_name, job, failure.reason)
+        let mut message =
+            format!("required dependency '{}'{} could not be satisfied: {}", failure.task_name, job, failure.reason);
+        if let Some(command) = &failure.suggested_invocation {
+            message.push_str("\n\nStart it in another terminal, then retry:\n    ");
+            message.push_str(command);
+        }
+        message
     }
 
     fn exec_error_event_for_job(
@@ -2076,6 +2971,74 @@ impl EventLoop {
     }
 
     fn terminate_client(&mut self, client_index: ClientIndex, reason: SocketTerminationReason) {
+        let terminal_harness = match self.clients.get(client_index as usize).map(|client| &client.kind) {
+            Some(ClientKind::TerminalHarness { harness_id }) => Some(*harness_id),
+            _ => None,
+        };
+        if let Some(harness_id) = terminal_harness {
+            let Some(client) = self.clients.try_remove(client_index as usize) else { return };
+            let _ = self.state.poll.registry().deregister(&mut SourceFd(&client.socket.as_raw_fd()));
+            client.channel.set_terminated();
+            let harness = self.state.terminal_harnesses.remove(&harness_id);
+            if let Some(harness) = harness {
+                if reason != SocketTerminationReason::ClientRequestedTerminate
+                    && let Some(process_group) = harness.state.process_group
+                {
+                    // Wrapper authority is gone. Kill the reported child group
+                    // before releasing scheduler resources or publishing exit.
+                    unsafe { libc::kill(-process_group, libc::SIGKILL) };
+                }
+                let bindings = [harness.state.binding, harness.state.replacement];
+                for binding in bindings.into_iter().flatten() {
+                    let Some(workspace) = self.state.workspaces.get(harness.workspace as usize) else { continue };
+                    let transition = {
+                    let mut state = workspace.handle.state.write().unwrap();
+                    match state.jobs.get(binding.job).map(|job| &job.process_status) {
+                        Some(JobStatus::Scheduled { .. }) => {
+                            state.update_job_status(binding.job, JobStatus::Cancelled);
+                            None
+                        }
+                        Some(JobStatus::Starting) => state
+                            .update_job_status(
+                                binding.job,
+                                JobStatus::Exited {
+                                    finished_at: crate::clock::now(),
+                                    cause: ExitCause::SpawnFailed,
+                                    status: 127,
+                                },
+                            )
+                            .map(|id| (id, 127)),
+                        Some(JobStatus::Running {
+                            owner: ProcessOwner::Terminal { harness_id: owner_id, run_token },
+                            ..
+                        }) if *owner_id == harness_id && *run_token == binding.run_token => state
+                            .update_job_status(
+                                binding.job,
+                                JobStatus::Exited {
+                                    finished_at: crate::clock::now(),
+                                    cause: ExitCause::SpawnFailed,
+                                    status: 1,
+                                },
+                            )
+                            .map(|id| (id, 1)),
+                        _ => None,
+                    }
+                    };
+                    if let Some((public_id, status)) = transition {
+                        self.broadcast_job_exited(
+                            harness.workspace,
+                            public_id,
+                            status,
+                            crate::rpc::ExitCause::SpawnFailed,
+                        );
+                    }
+                }
+                self.rebuild_idle_terminal_cache(harness.workspace);
+            }
+            kvlog::info!("Terminal harness disconnected", harness_id, reason = reason.as_str());
+            self.scheduled();
+            return;
+        }
         let Some(client) = self.clients.get(client_index as usize) else {
             return;
         };
@@ -2248,6 +3211,9 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
             timed_ready_count: 0,
             timed_timeout_count: 0,
             remote_execs: HashMap::new(),
+            terminal_harnesses: HashMap::new(),
+            next_harness_id: 1,
+            next_run_token: 1,
             db,
             #[cfg(target_os = "linux")]
             traced_root_pids: HashMap::new(),
@@ -2305,7 +3271,16 @@ pub(crate) fn process_worker(request: Arc<MioChannel>, poll: Poll) {
                     }
                 }
                 TokenHandle::Client(index) => {
-                    job_manager.handle_client_rpc_read(index);
+                    if event.is_writable()
+                        && let Err(error) = job_manager.flush_client_output(index)
+                    {
+                        kvlog::warn!("Client socket write failed", index, %error);
+                        job_manager.terminate_client(index, SocketTerminationReason::WriteError);
+                        continue;
+                    }
+                    if event.is_readable() && job_manager.clients.contains(index as usize) {
+                        job_manager.handle_client_rpc_read(index);
+                    }
                 }
             }
         }
@@ -2568,5 +3543,47 @@ mod tests {
 
         let still_alive = unsafe { libc::kill(pid, 0) == 0 };
         assert!(!still_alive, "untracked child process should have been killed and reaped");
+    }
+
+    #[test]
+    fn outbound_writer_preserves_partial_progress_across_would_block() {
+        let payload = b"abcdef";
+        let mut offset = 0;
+        let mut calls = 0;
+        let drained = drain_outbound_with(payload, &mut offset, |bytes| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert_eq!(bytes, b"abcdef");
+                    Ok(2)
+                }
+                2 => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+                _ => unreachable!(),
+            }
+        })
+        .unwrap();
+        assert!(!drained);
+        assert_eq!(offset, 2);
+
+        let drained = drain_outbound_with(payload, &mut offset, |bytes| {
+            assert_eq!(bytes, b"cdef");
+            Ok(bytes.len())
+        })
+        .unwrap();
+        assert!(drained);
+        assert_eq!(offset, payload.len());
+    }
+
+    #[test]
+    fn outbound_frame_validation_rejects_oversized_payloads() {
+        let head = crate::rpc::Head {
+            magic: crate::rpc::MAGIC,
+            kind: RpcMessageKind::TerminalStart as u16,
+            one_shot: false,
+            correlation: 0,
+            ws_len: 0,
+            len: (crate::rpc::DEFAULT_MAX_PAYLOAD + 1) as u32,
+        };
+        assert!(EventLoop::validate_outbound_frames(&head.as_bytes()).is_err());
     }
 }

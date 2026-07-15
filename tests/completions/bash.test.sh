@@ -56,6 +56,10 @@ assert_contains "all" "$reply" "run: group 'all'"
 assert_contains "api:dev" "$reply" "run: profile variant 'api:dev'"
 assert_contains "api:release" "$reply" "run: profile variant 'api:release'"
 
+drive "devsm run --"
+reply="${COMPREPLY[*]:-}"
+assert_contains "--sticky" "$reply" "run options: --sticky"
+
 drive "devsm exec "
 reply="${COMPREPLY[*]:-}"
 assert_contains "build" "$reply" "exec: 'build'"

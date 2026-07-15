@@ -72,7 +72,7 @@ impl TaskLauncherState {
             .base_tasks
             .iter()
             .enumerate()
-            .filter(|(_, bt)| !bt.removed && bt.config.managed != Some(false))
+            .filter(|(_, bt)| !bt.removed && bt.config.managed != crate::config::ExecutionMode::Exec)
             .map(|(i, bt)| TaskInfo {
                 bti: BaseTaskIndex(i as u32),
                 name: bt.name.clone(),
@@ -114,7 +114,7 @@ impl TaskLauncherState {
             .base_tasks
             .iter()
             .enumerate()
-            .filter(|(_, bt)| !bt.removed && bt.config.managed != Some(false))
+            .filter(|(_, bt)| !bt.removed && bt.config.managed != crate::config::ExecutionMode::Exec)
             .map(|(i, bt)| TaskInfo {
                 bti: BaseTaskIndex(i as u32),
                 name: bt.name.clone(),

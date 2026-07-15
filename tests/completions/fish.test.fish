@@ -87,6 +87,9 @@ assert_contains "api" "$reply" "run: 'api'"
 assert_contains "all" "$reply" "run: group 'all'"
 assert_contains "api:dev" "$reply" "run: profile variant 'api:dev'"
 
+set reply (comp_for "devsm run --")
+assert_contains "--sticky" "$reply" "run options: --sticky"
+
 set reply (comp_for "devsm exec ")
 assert_contains "build" "$reply" "exec: 'build'"
 assert_not_contains "all" "$reply" "exec: NO group 'all'"

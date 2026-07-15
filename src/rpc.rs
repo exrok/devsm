@@ -151,6 +151,11 @@ pub enum RpcMessageKind {
     StartTask = 0x011C,
     RestartTask = 0x011D,
     GetStatus = 0x011E,
+    AttachTerminal = 0x011F,
+    TerminalStarted = 0x0122,
+    TerminalSpawnFailed = 0x0123,
+    TerminalExited = 0x0124,
+    TerminalDetach = 0x0125,
 
     // Legacy responses
     OpenWorkspaceAck = 0x0200,
@@ -173,6 +178,12 @@ pub enum RpcMessageKind {
     ExecProceed = 0x0305,
     ExecWaiting = 0x0306,
     ExecError = 0x0307,
+    TerminalAttached = 0x0308,
+    TerminalStart = 0x0309,
+    TerminalStop = 0x030A,
+    TerminalError = 0x030B,
+    TerminalDetached = 0x030C,
+    TerminalWaiting = 0x030D,
     Disconnect = 0x03FF,
 }
 
@@ -202,6 +213,11 @@ impl RpcMessageKind {
             0x011C => Some(Self::StartTask),
             0x011D => Some(Self::RestartTask),
             0x011E => Some(Self::GetStatus),
+            0x011F => Some(Self::AttachTerminal),
+            0x0122 => Some(Self::TerminalStarted),
+            0x0123 => Some(Self::TerminalSpawnFailed),
+            0x0124 => Some(Self::TerminalExited),
+            0x0125 => Some(Self::TerminalDetach),
             0x0200 => Some(Self::OpenWorkspaceAck),
             0x0201 => Some(Self::SubscribeAck),
             0x0203 => Some(Self::RunTaskAck),
@@ -215,6 +231,12 @@ impl RpcMessageKind {
             0x0305 => Some(Self::ExecProceed),
             0x0306 => Some(Self::ExecWaiting),
             0x0307 => Some(Self::ExecError),
+            0x0308 => Some(Self::TerminalAttached),
+            0x0309 => Some(Self::TerminalStart),
+            0x030A => Some(Self::TerminalStop),
+            0x030B => Some(Self::TerminalError),
+            0x030C => Some(Self::TerminalDetached),
+            0x030D => Some(Self::TerminalWaiting),
             0x03FF => Some(Self::Disconnect),
             _ => None,
         }
@@ -938,6 +960,8 @@ pub struct ExecDependencyFailureEvent {
     pub reason: String,
     pub exit_code: Option<i32>,
     pub cause: Option<ExitCause>,
+    pub terminal: bool,
+    pub suggested_invocation: Option<String>,
 }
 
 #[derive(Jsony, Debug)]
@@ -965,6 +989,67 @@ pub struct JobExitedEvent {
     pub job_index: u32,
     pub exit_code: i32,
     pub cause: ExitCause,
+}
+
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub enum TerminalCommand {
+    Cmd(Vec<Box<str>>),
+    Sh { script: Box<str>, args: Vec<Box<str>> },
+}
+
+/// Fully resolved, generation-stable command sent to a terminal harness.
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct TerminalStartEvent {
+    pub run_token: u64,
+    /// Raw Unix path bytes; paths need not be UTF-8.
+    pub pwd: Vec<u8>,
+    pub command: TerminalCommand,
+    pub env: Vec<(Box<str>, Box<str>)>,
+}
+
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct TerminalStopEvent {
+    pub run_token: u64,
+    pub cause: ExitCause,
+    pub replacement_pending: bool,
+}
+
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct TerminalRunEvent {
+    pub run_token: u64,
+    /// Process group created for the terminal child. The daemon records this
+    /// independently so it can kill the group if wrapper authority vanishes.
+    pub process_group: i32,
+}
+
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct TerminalSpawnFailedEvent {
+    pub run_token: u64,
+    pub message: Box<str>,
+}
+
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct TerminalExitedEvent {
+    pub run_token: u64,
+    pub exit_code: i32,
+}
+
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct TerminalErrorEvent {
+    pub message: Box<str>,
+}
+
+#[derive(Jsony, Debug)]
+#[jsony(Binary)]
+pub struct TerminalWaitingEvent {
+    pub tasks: Vec<String>,
 }
 
 /// Inferred-deps report shipped to the run client when a `--derive-cache-key`
@@ -1326,6 +1411,8 @@ pub struct RunnableStatus {
     pub exit_code: Option<i32>,
     pub exit_cause: Option<Box<str>>,
     pub ready: Option<bool>,
+    /// An idle sticky terminal wrapper is available for `devsm start`.
+    pub terminal_attached: bool,
     pub blocked_on: Vec<Box<str>>,
     pub profile: Option<Box<str>>,
     pub spawn_params: Option<Box<str>>,
@@ -1609,8 +1696,8 @@ pub fn encode_attach_rpc(cwd: &std::path::Path, config: &std::path::Path, subscr
     let cwd_bytes = cwd.as_os_str().as_bytes();
     cwd_bytes.encode_binary(&mut out);
 
-    // Encode Request enum discriminant (AttachRpc = variant index 3)
-    // Note: variant indices are: AttachTui=0, AttachRun=1, AttachTests=2, AttachRpc=3, AttachLogs=4, GetSelfLogs=5
+    // Encode Request enum discriminant (AttachRpc = variant index 3).
+    // Keep this compatibility encoder synchronized with daemon::Request.
     out.push(3);
 
     // Encode AttachRpc fields:

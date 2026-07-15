@@ -3,7 +3,7 @@ use std::time::Duration;
 use toml_spanner::{Context, Document, Failed, Item, Table, Value};
 
 use crate::config::{
-    Alias, AllowMultiple, CacheConfig, CacheKeyInput, CliAutocomplete, CliConfig, CommandExpr, FunctionDef,
+    Alias, AllowMultiple, CacheConfig, CacheKeyInput, CliAutocomplete, CliConfig, CommandExpr, ExecutionMode, FunctionDef,
     FunctionDefAction, If, Predicate, ReadyConfig, ReadyPredicate, Requirement, RequirementExpr, RequirementListExpr,
     ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, TimeoutConfig,
     TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
@@ -344,7 +344,7 @@ fn parse_task<'a>(
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
     let mut sh: Option<StringExpr> = None;
-    let mut managed: Option<bool> = None;
+    let mut managed = ExecutionMode::Either;
     let mut hidden = ServiceHidden::Never;
     let mut allow_multiple = AllowMultiple::False;
     let mut cli = CliConfig::DEFAULT;
@@ -401,8 +401,10 @@ fn parse_task<'a>(
             }
             "timeout" => timeout = Some(parse_timeout_config(value, ctx)?),
             "managed" => match value.value() {
-                Value::Boolean(&b) => managed = Some(b),
-                _ => return Err(ctx.report_expected_but_found(&"a boolean", value)),
+                Value::Boolean(true) => managed = ExecutionMode::Daemon,
+                Value::Boolean(false) => managed = ExecutionMode::Exec,
+                Value::String(&"terminal") => managed = ExecutionMode::Terminal,
+                _ => return Err(ctx.report_expected_but_found(&"a boolean or the string \"terminal\"", value)),
             },
             "hidden" => {
                 if kind != TaskKind::Service {
@@ -443,8 +445,23 @@ fn parse_task<'a>(
         }
     }
 
-    if managed == Some(false) && ready.is_some() {
+    if managed == ExecutionMode::Exec && ready.is_some() {
         return Err(ctx.report_custom_error("`ready` is not supported with `managed = false`", task_table.as_item()));
+    }
+
+    if managed == ExecutionMode::Terminal {
+        if ready.is_some() {
+            return Err(ctx.report_custom_error(
+                "`ready` is not supported with `managed = \"terminal\"` because terminal output is not captured",
+                task_table.as_item(),
+            ));
+        }
+        if timeout.as_ref().is_some_and(|timeout| timeout.when.is_some() || timeout.conditional.is_some() || timeout.idle.is_some() || timeout.max.is_some()) {
+            return Err(ctx.report_custom_error(
+                "`timeout` is not supported with `managed = \"terminal\"` in this release",
+                task_table.as_item(),
+            ));
+        }
     }
 
     let command = match (cmd, sh) {
@@ -1180,6 +1197,62 @@ mod test {
         let (name, task) = &config.tasks[0];
         assert_eq!(*name, "test");
         assert_eq!(task.kind, TaskKind::Action);
+    }
+
+    #[test]
+    fn parses_all_execution_modes_and_legacy_default() {
+        let text = r#"
+[action.either]
+cmd = ["true"]
+[action.daemon]
+managed = true
+cmd = ["true"]
+[action.exec]
+managed = false
+cmd = ["true"]
+[action.terminal]
+managed = "terminal"
+cmd = ["true"]
+"#;
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "messages: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let mode = |name| config.tasks.iter().find(|(task, _)| *task == name).unwrap().1.managed;
+        assert_eq!(mode("either"), ExecutionMode::Either);
+        assert_eq!(mode("daemon"), ExecutionMode::Daemon);
+        assert_eq!(mode("exec"), ExecutionMode::Exec);
+        assert_eq!(mode("terminal"), ExecutionMode::Terminal);
+    }
+
+    #[test]
+    fn terminal_mode_rejects_output_dependent_configuration() {
+        for field in [
+            "ready = { when = { output_contains = \"ready\" } }",
+            "timeout = \"1s\"",
+            "timeout = { when = { output_contains = \"done\" }, conditional = \"1s\" }",
+            "timeout = { idle = \"1s\" }",
+            "timeout = { max = \"1s\" }",
+        ] {
+            let text = format!("[service.editor]\nmanaged = \"terminal\"\ncmd = [\"true\"]\n{field}\n");
+            let arena = toml_spanner::Arena::new();
+            let bump = Bump::new();
+            let (doc, result) = parse_text(&text, &arena, &bump);
+            assert!(result.is_err(), "terminal config unexpectedly accepted {field}");
+            assert!(collect_messages(&doc).iter().any(|message| message.contains("terminal")));
+        }
+    }
+
+    #[test]
+    fn invalid_managed_string_reports_boolean_or_terminal() {
+        let text = "[action.bad]\nmanaged = \"pty\"\ncmd = [\"true\"]\n";
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_err());
+        let messages = collect_messages(&doc).join("\n");
+        assert!(messages.contains("boolean") && messages.contains("terminal"), "messages: {messages}");
     }
 
     #[test]

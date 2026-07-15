@@ -428,6 +428,25 @@ pub struct Job {
     /// Root cause captured when this scheduled job is cancelled because one of
     /// its task requirements can never be satisfied.
     pub dependency_failure: Option<DependencyFailure>,
+    /// Where the scheduled child must be launched. This is fixed before the
+    /// scheduler can observe the job and therefore belongs to the plan/job,
+    /// not to mutable process state.
+    pub execution_target: ExecutionTarget,
+}
+
+pub type HarnessId = u64;
+pub type RunToken = u64;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionTarget {
+    Daemon,
+    Terminal { harness_id: HarnessId, run_token: RunToken },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessOwner {
+    Daemon { process_index: usize },
+    Terminal { harness_id: HarnessId, run_token: RunToken },
 }
 
 pub struct ResolvedSpawnSpec {
@@ -479,6 +498,8 @@ pub struct DependencyFailure {
     pub reason: String,
     pub exit_code: Option<i32>,
     pub cause: Option<ExitCause>,
+    pub terminal: bool,
+    pub suggested_invocation: Option<String>,
 }
 
 #[derive(Debug)]
@@ -589,7 +610,7 @@ pub enum JobStatus {
     },
     Starting,
     Running {
-        process_index: usize,
+        owner: ProcessOwner,
         /// None = no ready config (always ready)
         /// Some(false) = waiting for ready condition
         /// Some(true) = ready condition met
@@ -765,6 +786,7 @@ impl LatestConfig {
                 spawn_counter: 0,
                 last_profile: None,
                 has_run_this_session: false,
+                idle_terminal_harnesses: 0,
             });
         }
         for (derived_index, derived) in self.current.derived_tests.iter().enumerate() {
@@ -787,6 +809,7 @@ impl LatestConfig {
                 spawn_counter: 0,
                 last_profile: None,
                 has_run_this_session: false,
+                idle_terminal_harnesses: 0,
             });
         }
 
@@ -846,6 +869,9 @@ pub struct BaseTask {
     /// Whether this service has been run at least once this session.
     /// Used for `hidden = "until_ran"` visibility.
     pub has_run_this_session: bool,
+    /// Sticky terminal wrappers currently idle and compatible with this task.
+    /// These are execution slots, not jobs, and satisfy no requirements.
+    pub idle_terminal_harnesses: u32,
 }
 
 impl BaseTask {
@@ -1190,6 +1216,10 @@ struct PlannedJob {
     action_deps_until_ready: Vec<JobRef>,
     reason: ScheduleReason,
     trace: bool,
+    /// Immutable launch ownership captured before the plan becomes visible to
+    /// the scheduler. Dependency jobs remain daemon-owned; only an explicitly
+    /// attached terminal root uses a terminal target.
+    execution_target: ExecutionTarget,
     /// Marks a synthetic terminal cached-success job (uses `cache_key`).
     synthetic_cached: bool,
 }
@@ -1199,6 +1229,7 @@ struct PlannedJob {
 /// then applied in one infallible pass by [`WorkspaceState::apply_plan`].
 #[derive(Default)]
 struct SchedulePlan {
+    requested_root: Option<String>,
     new_jobs: Vec<PlannedJob>,
     cancelled_planned: hashbrown::HashSet<usize>,
     cancel_scheduled: Vec<JobIndex>,
@@ -1207,10 +1238,91 @@ struct SchedulePlan {
     terminate_running_set: hashbrown::HashSet<JobIndex>,
 }
 
+#[derive(Debug)]
+pub enum ScheduleError {
+    Message(String),
+    TerminalTaskNotRunning {
+        requested_root: String,
+        required_task: String,
+        effective_profile: String,
+        requirement_variables: ValueMap<'static>,
+    },
+}
+
+impl From<String> for ScheduleError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<ScheduleError> for String {
+    fn from(error: ScheduleError) -> Self {
+        error.to_string()
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/' | b'@'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn terminal_suggested_invocation(task_name: &str, profile: &str, variables: &ValueMap<'_>) -> String {
+    let task = if profile.is_empty() { task_name.to_string() } else { format!("{task_name}:{profile}") };
+    if variables.entries().is_empty() {
+        return format!("devsm {}", shell_quote(&task));
+    }
+    let mut command = String::from("devsm run");
+    for (key, value) in variables.entries() {
+        command.push_str(" --");
+        command.push_str(key);
+        command.push('=');
+        command.push_str(&shell_quote(&jsony::to_json(value)));
+    }
+    command.push(' ');
+    command.push_str(&shell_quote(&task));
+    command
+}
+
+impl ScheduleError {
+    pub fn suggested_invocation(&self) -> Option<String> {
+        let Self::TerminalTaskNotRunning {
+            required_task,
+            effective_profile,
+            requirement_variables,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(terminal_suggested_invocation(required_task, effective_profile, requirement_variables))
+    }
+}
+
+impl std::fmt::Display for ScheduleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::TerminalTaskNotRunning { requested_root, required_task, .. } => write!(
+                formatter,
+                "Cannot start '{requested_root}': required terminal task '{required_task}' is not running.\n\n\
+                 Start it in another terminal, then retry:\n    {}",
+                self.suggested_invocation().expect("terminal scheduling error has a suggestion")
+            ),
+        }
+    }
+}
+
 struct TerminatePlan {
     job: JobIndex,
     job_id: LogGroup,
-    process_index: usize,
+    owner: ProcessOwner,
     exit_cause: ExitCause,
 }
 
@@ -1573,6 +1685,7 @@ impl WorkspaceState {
                 spawn_counter: 0,
                 last_profile: None,
                 has_run_this_session: false,
+                idle_terminal_harnesses: 0,
             });
             self.name_map.insert("~cargo".into(), NameEntry { task: TaskEntry::Action(index), test: None });
             return Some(index);
@@ -1799,8 +1912,12 @@ impl WorkspaceState {
             outcome
                 .predicates
                 .push(PlannedReq::Task { target: JobRef::Live(job_index), predicate: JobPredicate::Terminated });
-            let JobStatus::Running { process_index, .. } = &job.process_status else {
-                continue;
+            let owner = match (&job.process_status, job.execution_target) {
+                (JobStatus::Running { owner, .. }, _) => *owner,
+                (JobStatus::Starting, ExecutionTarget::Terminal { harness_id, run_token }) => {
+                    ProcessOwner::Terminal { harness_id, run_token }
+                }
+                _ => continue,
             };
             if plan.is_running_terminate_pending(job_index) {
                 continue;
@@ -1808,7 +1925,7 @@ impl WorkspaceState {
             outcome.terminate_running.push(TerminatePlan {
                 job: job_index,
                 job_id: job.log_group,
-                process_index: *process_index,
+                owner,
                 exit_cause: ExitCause::Restarted,
             });
         }
@@ -2116,6 +2233,7 @@ impl WorkspaceState {
             action_deps_until_ready,
             reason,
             trace,
+            execution_target: ExecutionTarget::Daemon,
             synthetic_cached: false,
         }))
     }
@@ -2255,6 +2373,7 @@ impl WorkspaceState {
             action_deps_until_ready,
             reason: ScheduleReason::ProfileConflict,
             trace: false,
+            execution_target: ExecutionTarget::Daemon,
             synthetic_cached: false,
         }))
     }
@@ -2271,6 +2390,7 @@ impl WorkspaceState {
         _workspace_id: u32,
         reason: ScheduleReason,
         trace: bool,
+        execution_target: ExecutionTarget,
     ) -> JobIndex {
         let (task_name, task_kind, job_id) = {
             let bt = &mut self.base_tasks[base_task.idx()];
@@ -2322,6 +2442,7 @@ impl WorkspaceState {
             trace,
             trace_report: None,
             dependency_failure: None,
+            execution_target,
         });
 
         self.base_tasks[base_task.idx()].jobs.push_scheduled(job_index);
@@ -2371,6 +2492,7 @@ impl WorkspaceState {
             trace: false,
             trace_report: None,
             dependency_failure: None,
+            execution_target: ExecutionTarget::Daemon,
         });
 
         self.base_tasks[base_task.idx()].jobs.push_terminated(job_index);
@@ -2428,6 +2550,7 @@ impl WorkspaceState {
                 action_deps_until_ready: _,
                 reason,
                 trace,
+                execution_target,
                 synthetic_cached,
             } = planned;
             let job_index = if synthetic_cached {
@@ -2445,6 +2568,7 @@ impl WorkspaceState {
                     workspace_id,
                     reason,
                     trace,
+                    execution_target,
                 )
             };
             local_to_job.push(job_index);
@@ -2465,20 +2589,27 @@ impl WorkspaceState {
             if !matches!(job.process_status, JobStatus::Scheduled { .. }) {
                 continue;
             }
+            if let ExecutionTarget::Terminal { harness_id, run_token } = job.execution_target {
+                channel.send(crate::event_loop::ProcessRequest::TerminateJob {
+                    job_id: job.log_group,
+                    owner: ProcessOwner::Terminal { harness_id, run_token },
+                    exit_cause: ExitCause::Killed,
+                });
+            }
             self.update_job_status(job_index, JobStatus::Cancelled);
         }
 
         for terminate in terminate_running {
             let Some(job) = self.jobs.get(terminate.job) else { continue };
-            let JobStatus::Running { process_index, .. } = &job.process_status else {
+            let JobStatus::Running { owner, .. } = &job.process_status else {
                 continue;
             };
-            if job.log_group != terminate.job_id || *process_index != terminate.process_index {
+            if job.log_group != terminate.job_id || *owner != terminate.owner {
                 continue;
             }
             channel.send(crate::event_loop::ProcessRequest::TerminateJob {
                 job_id: terminate.job_id,
-                process_index: terminate.process_index,
+                owner: terminate.owner,
                 exit_cause: terminate.exit_cause,
             });
         }
@@ -2585,6 +2716,12 @@ impl WorkspaceState {
         let Some(base_index) = self.base_index_by_name(name) else {
             return Err(format!("Task '{}' not found", name));
         };
+        if self.base_tasks[base_index.idx()].config.managed == crate::config::ExecutionMode::Terminal {
+            return Err(format!(
+                "Terminal task '{}' requires an attached terminal wrapper.\nUse 'devsm run {}' instead.",
+                name, name
+            ));
+        }
         self.change_number = self.change_number.wrapping_add(1);
         let job_index = self.spawn_task(
             workspace_id,
@@ -2699,6 +2836,9 @@ impl WorkspaceState {
         let Some(base_index) = self.base_index_by_name(name) else {
             return Err(format!("Task '{}' not found", name));
         };
+        if self.base_tasks[base_index.idx()].config.managed == crate::config::ExecutionMode::Terminal {
+            return Err(format!("Terminal task '{}' cannot use unmanaged exec; use 'devsm run {}'", name, name));
+        }
         let profile = self.effective_profile_for_task(base_index, profile);
         let params = params.to_owned();
         let mut plan = SchedulePlan::default();
@@ -2709,7 +2849,7 @@ impl WorkspaceState {
             .map(|target| PlannedReq::Task { target, predicate: JobPredicate::Terminated })
             .collect();
         let base_config = &self.base_tasks[base_index.idx()].config;
-        if base_config.kind == TaskKind::Action && base_config.managed == Some(false) {
+        if base_config.kind == TaskKind::Action && base_config.managed == crate::config::ExecutionMode::Exec {
             protected_conflict_jobs.extend(self.conflicting_non_terminal_action_jobs(base_index, &profile, &plan));
         }
         let job_ref = self.spawn_task_with_extra_requirements_impl(
@@ -2742,6 +2882,12 @@ impl WorkspaceState {
         let Some(base_index) = self.base_index_by_name(name) else {
             return Err(format!("Task '{}' not found", name));
         };
+        if self.base_tasks[base_index.idx()].config.managed == crate::config::ExecutionMode::Terminal {
+            return Err(format!(
+                "Terminal task '{}' requires a compatible idle wrapper.\nAttach one with: devsm run --sticky {}",
+                name, name
+            ));
+        }
         let profile = self.effective_profile_for_task(base_index, profile);
         let params = params.to_owned();
 
@@ -2844,11 +2990,11 @@ impl WorkspaceState {
             }
             let job = &self.jobs[job_index];
             match &job.process_status {
-                JobStatus::Running { process_index, .. } => {
-                    kvlog::info!("Terminating running job", label, name, job_index, process_index);
+                JobStatus::Running { owner, .. } => {
+                    kvlog::info!("Terminating running job", label, name, job_index, owner = ?owner);
                     channel.send(crate::event_loop::ProcessRequest::TerminateJob {
                         job_id: job.log_group,
-                        process_index: *process_index,
+                        owner: *owner,
                         exit_cause: ExitCause::Killed,
                     });
                     killed_count += 1;
@@ -2858,10 +3004,27 @@ impl WorkspaceState {
                     unmanaged_count += 1;
                 }
                 JobStatus::Starting => {
-                    kvlog::warn!("Job is in Starting state during termination", label, name, job_index);
+                    if let ExecutionTarget::Terminal { harness_id, run_token } = job.execution_target {
+                        kvlog::info!("Terminating terminal job while spawn is starting", label, name, job_index);
+                        channel.send(crate::event_loop::ProcessRequest::TerminateJob {
+                            job_id: job.log_group,
+                            owner: ProcessOwner::Terminal { harness_id, run_token },
+                            exit_cause: ExitCause::Killed,
+                        });
+                        killed_count += 1;
+                    } else {
+                        kvlog::warn!("Job is in Starting state during termination", label, name, job_index);
+                    }
                 }
                 JobStatus::Scheduled { .. } => {
                     kvlog::info!("Cancelling scheduled job", label, name, job_index);
+                    if let ExecutionTarget::Terminal { harness_id, run_token } = job.execution_target {
+                        channel.send(crate::event_loop::ProcessRequest::TerminateJob {
+                            job_id: job.log_group,
+                            owner: ProcessOwner::Terminal { harness_id, run_token },
+                            exit_cause: ExitCause::Killed,
+                        });
+                    }
                     jobs_to_cancel.push(job_index);
                     cancelled_count += 1;
                 }
@@ -3640,6 +3803,8 @@ impl WorkspaceState {
                 reason: "dependency job is no longer available".to_string(),
                 exit_code: None,
                 cause: None,
+                terminal: false,
+                suggested_invocation: None,
             };
         };
 
@@ -3647,14 +3812,27 @@ impl WorkspaceState {
             return failure.clone();
         }
 
-        let task_name = self
-            .base_tasks
-            .get(dep_job.log_group.base_task_index().idx())
-            .map(|bt| bt.name.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        let base_task = self.base_tasks.get(dep_job.log_group.base_task_index().idx());
+        let task_name = base_task.map(|bt| bt.name.to_string()).unwrap_or_else(|| "unknown".to_string());
+        // Management mode belongs to the dependency's captured generation.
+        // Reloading the current task must not rewrite diagnostics for a job
+        // that was already scheduled or running.
+        let terminal = matches!(dep_job.execution_target, ExecutionTarget::Terminal { .. });
+        let suggested_invocation = terminal.then(|| {
+            terminal_suggested_invocation(&task_name, dep_job.spawn_profile(), dep_job.spawn_params())
+        });
         let (reason, exit_code, cause) = Self::dependency_status_reason(predicate, &dep_job.process_status);
 
-        DependencyFailure { task_name, job_index, predicate: predicate.clone(), reason, exit_code, cause }
+        DependencyFailure {
+            task_name,
+            job_index,
+            predicate: predicate.clone(),
+            reason,
+            exit_code,
+            cause,
+            terminal,
+            suggested_invocation,
+        }
     }
 
     /// Root cause for a scheduled job whose task requirements can never be met.
@@ -3944,7 +4122,7 @@ impl WorkspaceState {
         workspace_id: u32,
         channel: &MioChannel,
         batch: &mut SpawnBatch<T>,
-    ) -> Result<(), String> {
+    ) -> Result<(), ScheduleError> {
         let reqs: Vec<_> = batch
             .pending_requirements_ordered()
             .map(|(key, req)| (key.clone(), req.base_task, req.profile.clone(), req.params.clone()))
@@ -3956,6 +4134,10 @@ impl WorkspaceState {
             }
 
             let dep_config = &self.base_tasks[base_task.idx()].config;
+            let terminal_mode = dep_config.managed == crate::config::ExecutionMode::Terminal;
+            let required_name = self.base_tasks[base_task.idx()].name.to_string();
+            let effective_profile = self.effective_profile_for_task(base_task, &profile);
+            let root = plan.requested_root.as_deref().unwrap_or("requested task");
 
             match dep_config.kind {
                 TaskKind::Action => {
@@ -4022,7 +4204,28 @@ impl WorkspaceState {
                         continue;
                     }
 
-                    let effective_profile = self.effective_profile_for_task(base_task, &profile);
+
+                    // Terminal actions that are already in flight are ordinary
+                    // scheduler dependencies even when they have no cache
+                    // configuration. A requirement may wait for them, but must
+                    // never create a terminal launch.
+                    if terminal_mode {
+                        if let Some(&ji) = self.base_tasks[base_task.idx()].jobs.non_terminal().iter().rev().find(|&&ji| {
+                            !plan.is_conflict_pending(ji)
+                                && self.jobs[ji].spawn_profile() == effective_profile
+                                && self.jobs[ji].spawn_params() == &params
+                        }) {
+                            batch.mark_resolved(key, ResolvedRequirement::Pending(JobRef::Live(ji)));
+                            continue;
+                        }
+                        return Err(ScheduleError::TerminalTaskNotRunning {
+                            requested_root: root.to_string(),
+                            required_task: required_name,
+                            effective_profile,
+                            requirement_variables: params,
+                        });
+                    }
+
                     let ready_barriers = self.action_output_ready_barriers(base_task, &effective_profile, plan);
                     let mut protected_conflict_jobs = self.action_jobs_protected_by_ready_barriers(
                         base_task,
@@ -4059,7 +4262,8 @@ impl WorkspaceState {
                         extra_requirements,
                         protected_conflict_jobs,
                         true,
-                    )?;
+                    )
+                    .map_err(ScheduleError::Message)?;
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Service => {
@@ -4072,6 +4276,14 @@ impl WorkspaceState {
                                 continue;
                             }
                             ServiceCompatibility::Conflict { running_jobs, running_profiles, requested_profile } => {
+                                if terminal_mode {
+                                    return Err(ScheduleError::TerminalTaskNotRunning {
+                                        requested_root: root.to_string(),
+                                        required_task: required_name,
+                                        effective_profile,
+                                        requirement_variables: params,
+                                    });
+                                }
                                 kvlog::warn!(
                                     "Service profile conflict, queuing",
                                     ?base_task,
@@ -4086,12 +4298,22 @@ impl WorkspaceState {
                                     params,
                                     &profile,
                                     running_jobs,
-                                )?;
+                                )
+                                .map_err(ScheduleError::Message)?;
                                 batch.mark_resolved(key, ResolvedRequirement::Pending(queued_job));
                                 continue;
                             }
                             ServiceCompatibility::Available => {}
                         }
+                    }
+
+                    if terminal_mode {
+                        return Err(ScheduleError::TerminalTaskNotRunning {
+                            requested_root: root.to_string(),
+                            required_task: required_name,
+                            effective_profile,
+                            requirement_variables: params,
+                        });
                     }
 
                     let new_job = self.spawn_task_tracked(
@@ -4104,7 +4326,8 @@ impl WorkspaceState {
                         ScheduleReason::Dependency,
                         false,
                         false,
-                    )?;
+                    )
+                    .map_err(ScheduleError::Message)?;
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Test => {
@@ -4251,6 +4474,7 @@ impl WorkspaceState {
                 action_deps_until_ready: Vec::new(),
                 reason: ScheduleReason::TestRun,
                 trace: false,
+                execution_target: ExecutionTarget::Daemon,
                 synthetic_cached: false,
             });
 
@@ -4364,11 +4588,40 @@ struct SpawnPlanEntry {
 }
 
 impl Workspace {
+    pub fn reconcile_terminal_harnesses(&self) {
+        self.process_channel
+            .send(crate::event_loop::ProcessRequest::ReconcileTerminalHarnesses { workspace_id: self.workspace_id });
+    }
+
+    pub fn terminal_control(
+        &self,
+        name: &str,
+        profile: &str,
+        params: ValueMap<'static>,
+        restart: bool,
+    ) -> Result<(), String> {
+        let (response, receive) = std::sync::mpsc::sync_channel(1);
+        self.process_channel
+            .try_send(crate::event_loop::ProcessRequest::TerminalControl {
+                workspace_id: self.workspace_id,
+                task_name: name.into(),
+                profile: profile.into(),
+                params,
+                restart,
+                response,
+            })
+            .map_err(|error| format!("Failed to request terminal task control: {error}"))?;
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|_| "Timed out waiting for terminal task control".to_string())?
+    }
+
     fn spawn_plan_transactional(
         &self,
         state: &mut WorkspaceState,
         entries: Vec<SpawnPlanEntry>,
         start: bool,
+        terminal_target: Option<ExecutionTarget>,
     ) -> Result<(Vec<(BaseTaskIndex, JobIndex)>, hashbrown::HashMap<String, Vec<JobIndex>>), String> {
         for entry in &entries {
             let Some(base_index) = state.base_index_by_name(&entry.task.name) else {
@@ -4379,6 +4632,7 @@ impl Workspace {
         }
 
         let mut sched = SchedulePlan::default();
+        sched.requested_root = entries.first().map(|entry| entry.task.name.clone());
         let mut job_refs: Vec<(BaseTaskIndex, JobRef)> = Vec::new();
         let mut group_refs: Vec<(String, JobRef)> = Vec::new();
 
@@ -4423,9 +4677,18 @@ impl Workspace {
                     task.trace,
                     Vec::new(),
                     Vec::new(),
-                    true,
-                )?
+                    terminal_target.is_none(),
+                    )?
             };
+            if let Some(target) = terminal_target {
+                match job_ref {
+                    JobRef::Planned(id) => sched.new_jobs[id].execution_target = target,
+                    JobRef::Live(job_index) if state.jobs[job_index].execution_target == target => {}
+                    JobRef::Live(_) => {
+                        return Err("terminal root reused a job owned by a different wrapper".to_string());
+                    }
+                }
+            }
             if let Some(group_name) = entry.group_name {
                 group_refs.push((group_name, job_ref));
             }
@@ -4447,7 +4710,12 @@ impl Workspace {
         Ok((jobs, group_job_indices))
     }
 
-    fn submit_impl(&self, spec: SpawnSpec, start: bool) -> Result<SubmitResult, String> {
+    fn submit_impl(
+        &self,
+        spec: SpawnSpec,
+        start: bool,
+        terminal_target: Option<ExecutionTarget>,
+    ) -> Result<SubmitResult, String> {
         let state = &mut *self.state.write().unwrap();
         state.refresh_config();
         state.change_number = state.change_number.wrapping_add(1);
@@ -4457,6 +4725,21 @@ impl Workspace {
         for task in spec.tasks {
             let explicit_group = WorkspaceState::is_explicit_group_reference(&task.name);
             if !explicit_group && state.base_index_by_name(&task.name).is_some() {
+                let base = state.base_index_by_name(&task.name).expect("checked above");
+                let mode = state.base_tasks[base.idx()].config.managed;
+                match (mode, terminal_target) {
+                    (crate::config::ExecutionMode::Terminal, None) => {
+                        return Err(format!(
+                            "Terminal task '{}' requires an attached terminal wrapper.\nUse 'devsm run {}' instead.",
+                            task.name, task.name
+                        ));
+                    }
+                    (crate::config::ExecutionMode::Terminal, Some(_)) => {}
+                    (_, Some(_)) => {
+                        return Err(format!("Task '{}' is not configured with managed = \"terminal\"", task.name));
+                    }
+                    (_, None) => {}
+                }
                 plan.push(SpawnPlanEntry { group_name: None, task });
                 continue;
             }
@@ -4477,11 +4760,22 @@ impl Workspace {
                 group_names.push(group_name.clone());
             }
             for group_task in group_tasks {
+                if let Some(base) = state.base_index_by_name(&group_task.name)
+                    && state.base_tasks[base.idx()].config.managed == crate::config::ExecutionMode::Terminal
+                {
+                    return Err(format!(
+                        "Group '{}' contains terminal task '{}', which must be run separately with 'devsm run {}'.",
+                        group_name, group_task.name, group_task.name
+                    ));
+                }
                 plan.push(SpawnPlanEntry { group_name: Some(group_name.clone()), task: group_task });
             }
         }
 
-        let (jobs, group_job_indices) = self.spawn_plan_transactional(state, plan, start)?;
+        if terminal_target.is_some() && (plan.len() != 1 || !group_names.is_empty()) {
+            return Err("Terminal wrappers can attach to exactly one task, not a group".to_string());
+        }
+        let (jobs, group_job_indices) = self.spawn_plan_transactional(state, plan, start, terminal_target)?;
 
         for group_name in &group_names {
             if let Some(job_indices) = group_job_indices.get(group_name) {
@@ -4502,7 +4796,23 @@ impl Workspace {
     }
 
     pub fn submit(&self, spec: SpawnSpec) -> Result<SubmitResult, String> {
-        self.submit_impl(spec, false)
+        self.submit_impl(spec, false, None)
+    }
+
+    pub fn submit_terminal(
+        &self,
+        name: &str,
+        profile: &str,
+        params: ValueMap<'static>,
+        harness_id: HarnessId,
+        run_token: RunToken,
+        force_restart: bool,
+    ) -> Result<SubmitResult, String> {
+        self.submit_impl(
+            SpawnSpec::task(name, profile, params, force_restart),
+            false,
+            Some(ExecutionTarget::Terminal { harness_id, run_token }),
+        )
     }
 
     pub fn submit_exec(&self, name: &str, profile: &str, params: ValueMap<'static>) -> Result<SubmitResult, String> {
@@ -4514,7 +4824,7 @@ impl Workspace {
     }
 
     pub fn submit_start(&self, spec: SpawnSpec) -> Result<SubmitResult, String> {
-        self.submit_impl(spec, true)
+        self.submit_impl(spec, true, None)
     }
 
     pub fn call_function(&self, name: &str) -> Result<Option<FunctionGlobalAction>, String> {
@@ -4558,6 +4868,16 @@ impl Workspace {
                 state.lookup_and_terminate_task(&self.process_channel, task)?;
             }
             FunctionDefAction::Spawn { tasks } => {
+                for task in *tasks {
+                    if let Some(base) = state.lookup_name(&task.name)
+                        && state.base_tasks[base.idx()].config.managed == crate::config::ExecutionMode::Terminal
+                    {
+                        return Err(format!(
+                            "Function '{}' contains terminal task '{}', which must be run from its terminal wrapper",
+                            name, &*task.name
+                        ));
+                    }
+                }
                 let plan = tasks
                     .iter()
                     .map(|task_call| SpawnPlanEntry {
@@ -4571,7 +4891,7 @@ impl Workspace {
                         },
                     })
                     .collect();
-                self.spawn_plan_transactional(state, plan, false)?;
+                self.spawn_plan_transactional(state, plan, false, None)?;
             }
             FunctionDefAction::RestartSelected => {
                 return Ok(Some(FunctionGlobalAction::RestartSelected));
@@ -4741,11 +5061,11 @@ impl Workspace {
         for job_index in job_indices {
             let job = &state.jobs[job_index];
             match &job.process_status {
-                JobStatus::Running { process_index, .. } => {
-                    kvlog::info!("Terminating running job", task_name = task_name.as_ref(), job_index, process_index);
+                JobStatus::Running { owner, .. } => {
+                    kvlog::info!("Terminating running job", task_name = task_name.as_ref(), job_index, owner = ?owner);
                     self.process_channel.send(crate::event_loop::ProcessRequest::TerminateJob {
                         job_id: job.log_group,
-                        process_index: *process_index,
+                        owner: *owner,
                         exit_cause: ExitCause::Killed,
                     });
                 }
@@ -4757,14 +5077,34 @@ impl Workspace {
                     );
                 }
                 JobStatus::Starting => {
-                    kvlog::warn!(
-                        "Job is in Starting state during termination (spawn in progress)",
-                        task_name = task_name.as_ref(),
-                        job_index
-                    );
+                    if let ExecutionTarget::Terminal { harness_id, run_token } = job.execution_target {
+                        kvlog::info!(
+                            "Terminating terminal job while spawn is starting",
+                            task_name = task_name.as_ref(),
+                            job_index
+                        );
+                        self.process_channel.send(crate::event_loop::ProcessRequest::TerminateJob {
+                            job_id: job.log_group,
+                            owner: ProcessOwner::Terminal { harness_id, run_token },
+                            exit_cause: ExitCause::Killed,
+                        });
+                    } else {
+                        kvlog::warn!(
+                            "Job is in Starting state during termination (spawn in progress)",
+                            task_name = task_name.as_ref(),
+                            job_index
+                        );
+                    }
                 }
                 JobStatus::Scheduled { .. } => {
                     kvlog::info!("Cancelling scheduled job", task_name = task_name.as_ref(), job_index);
+                    if let ExecutionTarget::Terminal { harness_id, run_token } = job.execution_target {
+                        self.process_channel.send(crate::event_loop::ProcessRequest::TerminateJob {
+                            job_id: job.log_group,
+                            owner: ProcessOwner::Terminal { harness_id, run_token },
+                            exit_cause: ExitCause::Killed,
+                        });
+                    }
                     jobs_to_cancel.push(job_index);
                 }
                 JobStatus::Exited { .. } | JobStatus::Cancelled => {}
@@ -5112,7 +5452,7 @@ mod scheduling_tests {
     fn test_job_status_is_pending_completion() {
         assert!(JobStatus::Scheduled { after: vec![] }.is_pending_completion());
         assert!(JobStatus::Starting.is_pending_completion());
-        assert!(JobStatus::Running { process_index: 0, ready_state: None }.is_pending_completion());
+        assert!(JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None }.is_pending_completion());
         assert!(
             !JobStatus::Exited { finished_at: Instant::now(), cause: ExitCause::Unknown, status: 0 }
                 .is_pending_completion()
@@ -5124,7 +5464,7 @@ mod scheduling_tests {
     fn test_job_status_is_successful_completion() {
         assert!(!JobStatus::Scheduled { after: vec![] }.is_successful_completion());
         assert!(!JobStatus::Starting.is_successful_completion());
-        assert!(!JobStatus::Running { process_index: 0, ready_state: None }.is_successful_completion());
+        assert!(!JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None }.is_successful_completion());
         assert!(!JobStatus::Cancelled.is_successful_completion());
 
         assert!(
@@ -5187,6 +5527,7 @@ mod scheduling_tests {
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             ScheduleRequirement::Task { job: ji, predicate }.status(&state)
         }
@@ -5210,6 +5551,7 @@ mod scheduling_tests {
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             let dependent = state.jobs.insert(Job {
                 process_status: JobStatus::Scheduled {
@@ -5228,6 +5570,7 @@ mod scheduling_tests {
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
 
             let failure = state.record_dependency_failure_from_requirements(dependent).expect("failure details");
@@ -5242,11 +5585,11 @@ mod scheduling_tests {
         #[test]
         fn ready_predicate_is_met_when_service_is_ready_or_terminal() {
             assert!(matches!(
-                status_for(JobPredicate::Ready, JobStatus::Running { process_index: 0, ready_state: None }),
+                status_for(JobPredicate::Ready, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None }),
                 RequirementStatus::Met
             ));
             assert!(matches!(
-                status_for(JobPredicate::Ready, JobStatus::Running { process_index: 0, ready_state: Some(true) }),
+                status_for(JobPredicate::Ready, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: Some(true) }),
                 RequirementStatus::Met
             ));
             assert!(matches!(
@@ -5267,7 +5610,7 @@ mod scheduling_tests {
             ));
             assert!(matches!(status_for(JobPredicate::Ready, JobStatus::Starting), RequirementStatus::Pending));
             assert!(matches!(
-                status_for(JobPredicate::Ready, JobStatus::Running { process_index: 0, ready_state: Some(false) }),
+                status_for(JobPredicate::Ready, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: Some(false) }),
                 RequirementStatus::Pending
             ));
         }
@@ -5966,7 +6309,7 @@ require = ["sink{next}"]
             state.base_tasks[base_task.idx()].spawn_counter =
                 state.base_tasks[base_task.idx()].spawn_counter.wrapping_add(1);
             let ji = state.jobs.insert(Job {
-                process_status: JobStatus::Running { process_index: pc, ready_state: None },
+                process_status: JobStatus::Running { owner: ProcessOwner::Daemon { process_index: pc }, ready_state: None },
                 log_group: LogGroup::new(base_task, pc),
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
@@ -5977,6 +6320,7 @@ require = ["sink{next}"]
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             state.base_tasks[base_task.idx()].jobs.push_active(ji);
             state.service_jobs.push_active(ji);
@@ -6008,6 +6352,7 @@ require = ["sink{next}"]
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
             state.service_jobs.push_scheduled(ji);
@@ -6110,6 +6455,7 @@ require = ["sink{next}"]
                 action_deps_until_ready: Vec::new(),
                 reason: ScheduleReason::Dependency,
                 trace: false,
+                execution_target: ExecutionTarget::Daemon,
                 synthetic_cached: false,
             });
 
@@ -6128,7 +6474,7 @@ require = ["sink{next}"]
             let base_task = state.lookup_name("simple_service").unwrap();
             let running = insert_running_service(&mut state, base_task, "", ValueMap::new());
             let job = &state.jobs[running];
-            let JobStatus::Running { process_index, .. } = job.process_status else {
+            let JobStatus::Running { owner, .. } = job.process_status else {
                 panic!("expected running service");
             };
 
@@ -6136,7 +6482,7 @@ require = ["sink{next}"]
             plan.record_terminate_running(TerminatePlan {
                 job: running,
                 job_id: job.log_group,
-                process_index,
+                owner,
                 exit_cause: ExitCause::Restarted,
             });
 
@@ -6242,6 +6588,7 @@ require = ["sink{next}"]
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             state.base_tasks[base_task.idx()].jobs.push_active(ji);
             state.action_jobs.push_active(ji);
@@ -6252,7 +6599,7 @@ require = ["sink{next}"]
             // Match the real spawn_task flow: Starting → Running → Exited.
             // The (Starting, Exited) direct transition is not modelled by
             // the global kind-list and would leak stale entries there.
-            state.update_job_status(ji, JobStatus::Running { process_index: 0, ready_state: None });
+            state.update_job_status(ji, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None });
             state.update_job_status(
                 ji,
                 JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status },
@@ -6334,6 +6681,7 @@ require = ["sink{next}"]
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(b);
 
@@ -6363,7 +6711,7 @@ require = ["sink{next}"]
                 .expect("eval service");
             let service_spec = state.cache_spawn_spec(service_task, "", ValueMap::new(), task);
             let service_job = state.jobs.insert(Job {
-                process_status: JobStatus::Running { process_index: 0, ready_state: Some(false) },
+                process_status: JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: Some(false) },
                 log_group: LogGroup::new(service_task, 0),
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
@@ -6374,6 +6722,7 @@ require = ["sink{next}"]
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             state.base_tasks[service_task.idx()].jobs.push_active(service_job);
             state.service_jobs.push_active(service_job);
@@ -6489,6 +6838,7 @@ require = ["sink{next}"]
                     trace: false,
                     trace_report: None,
                     dependency_failure: None,
+                    execution_target: ExecutionTarget::Daemon,
                 });
                 state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
                 state.action_jobs.push_scheduled(ji);
@@ -6557,6 +6907,7 @@ require = ["sink{next}"]
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             state.base_tasks[base_task.idx()].jobs.push_terminated(seed);
             state.test_jobs.push_terminated(seed);
@@ -6614,6 +6965,7 @@ require = ["sink{next}"]
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             state.base_tasks[base_task.idx()].jobs.push_terminated(seed);
             state.test_jobs.push_terminated(seed);
@@ -6677,7 +7029,7 @@ cmd = ["true"]
             ];
 
             let (jobs, group_jobs) = workspace
-                .spawn_plan_transactional(&mut state, entries, false)
+                .spawn_plan_transactional(&mut state, entries, false, None)
                 .expect("transactional spawn should succeed");
 
             assert!(
@@ -6711,7 +7063,7 @@ cmd = ["true"]
             let c_public_id = state.jobs.public_id_of(c).expect("c must be live before transition");
 
             state.max_job_history = 1;
-            state.update_job_status(c, JobStatus::Running { process_index: 0, ready_state: None });
+            state.update_job_status(c, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None });
             let returned = state.update_job_status(
                 c,
                 JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },
@@ -6809,6 +7161,7 @@ cmd = ["true"]
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
             state.action_jobs.push_scheduled(ji);
@@ -6824,7 +7177,7 @@ cmd = ["true"]
             let pc = bt.spawn_counter as usize;
             bt.spawn_counter = bt.spawn_counter.wrapping_add(1);
             let ji = state.jobs.insert(Job {
-                process_status: JobStatus::Running { process_index: pc, ready_state: None },
+                process_status: JobStatus::Running { owner: ProcessOwner::Daemon { process_index: pc }, ready_state: None },
                 log_group: LogGroup::new(base_task, pc),
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
@@ -6835,6 +7188,7 @@ cmd = ["true"]
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             state.base_tasks[base_task.idx()].jobs.push_active(ji);
             state.service_jobs.push_active(ji);
@@ -6866,6 +7220,7 @@ cmd = ["true"]
                 trace: false,
                 trace_report: None,
                 dependency_failure: None,
+                execution_target: ExecutionTarget::Daemon,
             });
             state.base_tasks[base_task.idx()].jobs.push_scheduled(ji);
             state.service_jobs.push_scheduled(ji);
@@ -6908,7 +7263,7 @@ cmd = ["true"]
             let ji = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(id, 0)]);
 
             state.update_job_status(ji, JobStatus::Starting);
-            state.update_job_status(ji, JobStatus::Running { process_index: 0, ready_state: None });
+            state.update_job_status(ji, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None });
             state.update_job_status(
                 ji,
                 JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },
@@ -6960,7 +7315,7 @@ cmd = ["true"]
                 other => panic!("expected None while resource is held, got {other:?}"),
             }
 
-            state.update_job_status(first, JobStatus::Running { process_index: 0, ready_state: None });
+            state.update_job_status(first, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None });
             state.update_job_status(
                 first,
                 JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },

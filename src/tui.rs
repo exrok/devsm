@@ -127,7 +127,7 @@ impl StatusMessage {
     }
 
     fn is_visible(&self) -> bool {
-        let duration = if self.is_error { Duration::from_millis(800) } else { Duration::from_millis(600) };
+        let duration = if self.is_error { Duration::from_secs(8) } else { Duration::from_millis(600) };
         self.created_at.elapsed() < duration
     }
 }
@@ -797,8 +797,14 @@ fn process_key(
                 LauncherAction::Start { base_task, profile, params } => {
                     let name = ws.spawn_name_for(base_task);
                     let task_kind = ws.base_tasks[base_task.idx()].config.kind;
+                    let terminal = ws.base_tasks[base_task.idx()].config.managed == crate::config::ExecutionMode::Terminal;
                     drop(ws);
-                    match workspace.submit(SpawnSpec::task(&name, &profile, params, false)) {
+                    let result = if terminal {
+                        workspace.terminal_control(&name, &profile, params, false).map(|_| ())
+                    } else {
+                        workspace.submit(SpawnSpec::task(&name, &profile, params, false)).map(|_| ())
+                    };
+                    match result {
                         Ok(_) => {
                             tui.status_message = Some(StatusMessage::info("Task Spawned"));
                         }
@@ -1003,8 +1009,15 @@ fn dispatch_command(
                     LauncherAction::Start { base_task, profile, params } => {
                         let name = ws.spawn_name_for(base_task);
                         let task_kind = ws.base_tasks[base_task.idx()].config.kind;
+                        let terminal =
+                            ws.base_tasks[base_task.idx()].config.managed == crate::config::ExecutionMode::Terminal;
                         drop(ws);
-                        if let Err(err) = workspace.submit(SpawnSpec::task(&name, &profile, params, false)) {
+                        let result = if terminal {
+                            workspace.terminal_control(&name, &profile, params, false).map(|_| ())
+                        } else {
+                            workspace.submit(SpawnSpec::task(&name, &profile, params, false)).map(|_| ())
+                        };
+                        if let Err(err) = result {
                             kvlog::warn!("StartSelection submit failed", name, ?task_kind, profile, err);
                             tui.status_message = Some(StatusMessage::error(format!("Start failed: {}", err)));
                         }
@@ -1313,20 +1326,31 @@ fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {
     };
     let name = ws.spawn_name_for(base_task);
     let task_kind = ws.base_tasks[base_task.idx()].config.kind;
+    let terminal = ws.base_tasks[base_task.idx()].config.managed == crate::config::ExecutionMode::Terminal;
     drop(ws);
-    match workspace.submit(SpawnSpec::task(&name, &profile, params, true)) {
-        Ok(result) => {
-            if had_job_selected {
+    if terminal {
+        match workspace.terminal_control(&name, &profile, params, true) {
+            Ok(()) => tui.status_message = Some(StatusMessage::info("Task Restarted")),
+            Err(err) => {
+                kvlog::warn!("Terminal task restart failed", name, ?task_kind, profile, err);
+                tui.status_message = Some(StatusMessage::error(format!("Restart failed: {}", err)));
+            }
+        }
+    } else {
+        match workspace.submit(SpawnSpec::task(&name, &profile, params, true)) {
+            Ok(result) => {
+                if had_job_selected {
                 if let Some(&(_, ji)) = result.jobs.first() {
                     let ws = workspace.state();
                     tui.task_tree.select_job(ji, &ws);
                 }
             }
             tui.status_message = Some(StatusMessage::info("Task Restarted"));
-        }
-        Err(err) => {
-            kvlog::warn!("Task restart submit failed", name, ?task_kind, profile, err);
-            tui.status_message = Some(StatusMessage::error(format!("Restart failed: {}", err)));
+            }
+            Err(err) => {
+                kvlog::warn!("Task restart submit failed", name, ?task_kind, profile, err);
+                tui.status_message = Some(StatusMessage::error(format!("Restart failed: {}", err)));
+            }
         }
     }
 }
@@ -1598,6 +1622,7 @@ fn attempt_config_reload(
     }
 
     if errors.is_empty() {
+        workspace.reconcile_terminal_harnesses();
         tui.overlay = FocusOverlap::None;
         tui.status_message = Some(StatusMessage::info("Config Reloaded"));
     } else {

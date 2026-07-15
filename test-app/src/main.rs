@@ -26,6 +26,14 @@ const WRITE_STDERR: u16 = 0x03;
 const EXIT: u16 = 0x04;
 
 fn main() {
+    if env::args().any(|arg| arg == "--read-stdin-before-connect") {
+        let mut byte = [0u8; 1];
+        if let Err(error) = std::io::stdin().read_exact(&mut byte) {
+            eprintln!("read stdin: {error}");
+            process::exit(1);
+        }
+    }
+
     let socket_path = env::var_os("TEST_APP_SOCKET").unwrap_or_else(|| {
         eprintln!("TEST_APP_SOCKET environment variable not set");
         process::exit(1);

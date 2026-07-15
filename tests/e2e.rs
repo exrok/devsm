@@ -11,6 +11,8 @@ mod e2e_fuzz_time;
 mod e2e_test_app;
 #[path = "e2e/e2e_tui.rs"]
 mod e2e_tui;
+#[path = "e2e/e2e_terminal.rs"]
+mod e2e_terminal;
 #[path = "e2e/harness.rs"]
 mod harness;
 #[path = "../src/rpc.rs"]

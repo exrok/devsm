@@ -120,7 +120,14 @@ pub enum Command<'a> {
     Start { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
     Restart { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
     Exec { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String] },
-    Run { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String], as_test: bool, derive_cache_key: bool },
+    Run {
+        job: &'a str,
+        value_map: ValueMap<'a>,
+        trailing_args: &'a [String],
+        as_test: bool,
+        derive_cache_key: bool,
+        sticky: bool,
+    },
     Auto { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String] },
     Stop { job: &'a str },
     Status { name: Option<&'a str> },
@@ -375,6 +382,7 @@ fn parse_exec<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
 fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
     let mut as_test = false;
     let mut derive_cache_key = false;
+    let mut sticky = false;
     let mut job = None;
     let mut value_map = ValueMap::new();
 
@@ -386,6 +394,9 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
             }
             Component::Long("derive-cache-key") => {
                 derive_cache_key = true;
+            }
+            Component::Long("sticky") => {
+                sticky = true;
             }
             Component::Long(key) => {
                 let Some(val) = parser.next_value() else {
@@ -422,7 +433,7 @@ fn parse_run<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
         bail!("Missing name of job");
     };
 
-    Ok(Command::Run { job, value_map, trailing_args: parser.rest(), as_test, derive_cache_key })
+    Ok(Command::Run { job, value_map, trailing_args: parser.rest(), as_test, derive_cache_key, sticky })
 }
 
 /// Parse validate command arguments.
@@ -1039,7 +1050,7 @@ mod tests {
     fn parse_run_captures_trailing_args_raw() {
         let args = args(&["run", "list", "-al", "/tmp", "--color=auto"]);
         let (_, command) = parse(&args).unwrap();
-        let Command::Run { job, value_map, trailing_args, as_test, derive_cache_key } = command else {
+        let Command::Run { job, value_map, trailing_args, as_test, derive_cache_key, .. } = command else {
             panic!("expected run command");
         };
         assert_eq!(job, "list");
@@ -1050,10 +1061,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_run_reserves_sticky_before_task() {
+        let args = vec!["run".to_string(), "--sticky".to_string(), "editor".to_string()];
+        let (_, command) = parse(&args).unwrap();
+        let Command::Run { job, sticky, .. } = command else { panic!("expected run") };
+        assert_eq!(job, "editor");
+        assert!(sticky);
+    }
+
+    #[test]
     fn parse_run_keeps_prefix_options_and_vars() {
         let args = args(&["run", "--derive-cache-key", "--limit=5", "build", "--release"]);
         let (_, command) = parse(&args).unwrap();
-        let Command::Run { job, value_map, trailing_args, as_test, derive_cache_key } = command else {
+        let Command::Run { job, value_map, trailing_args, as_test, derive_cache_key, .. } = command else {
             panic!("expected run command");
         };
         assert_eq!(job, "build");

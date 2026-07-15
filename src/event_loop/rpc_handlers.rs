@@ -548,6 +548,7 @@ fn base_runnable_status(state: &WsState, bti: BaseTaskIndex) -> rpc::RunnableSta
         exit_code: None,
         exit_cause: None,
         ready: None,
+        terminal_attached: bt.idle_terminal_harnesses > 0,
         blocked_on: Vec::new(),
         profile: None,
         spawn_params: None,
@@ -755,6 +756,7 @@ fn handle_rpc_get_status(ws: &mut WorkspaceEntry, payload: &[u8]) -> CommandBody
                 exit_code: None,
                 exit_cause: None,
                 ready: None,
+                terminal_attached: false,
                 blocked_on: Vec::new(),
                 profile: None,
                 spawn_params: None,
@@ -803,6 +805,13 @@ fn handle_exec_client_read(rpc_reader: &mut RpcClientStream) {
 
 impl EventLoop {
     pub fn handle_client_rpc_read(&mut self, client_index: ClientIndex) {
+        if matches!(
+            self.clients.get(client_index as usize).map(|client| &client.kind),
+            Some(ClientKind::TerminalHarness { .. })
+        ) {
+            self.handle_terminal_socket_read(client_index);
+            return;
+        }
         let Some(client) = self.clients.get_mut(client_index as usize) else {
             kvlog::error!("Read for missing client", index = client_index as usize);
             return;
@@ -853,6 +862,7 @@ impl EventLoop {
             ClientKind::SelfLogs => handle_self_logs_client_read(&mut rpc_stream),
             ClientKind::Logs => handle_logs_client_read(&mut rpc_stream),
             ClientKind::Exec { .. } => handle_exec_client_read(&mut rpc_stream),
+            ClientKind::TerminalHarness { .. } => unreachable!("handled before borrowing client"),
         }
 
         rpc_stream.state.compact(&mut rpc_stream.buffer, 4096);
@@ -893,12 +903,29 @@ impl EventLoop {
             Ok(idx) => idx,
             Err(e) => return Err(RpcError { socket, error: e, correlation }),
         };
+        self.reconcile_idle_terminal_harnesses(ws_index);
 
         // Handle attach commands
         let socket = match self.try_handle_attach(socket, fds, kind, ws_index, payload, correlation)? {
             AttachOutcome::Attached => return Ok(RpcOutcome::Attached),
             AttachOutcome::NotAttach(socket) => socket,
         };
+
+        if let Some(body) = self.terminal_control_rpc(ws_index, kind, payload) {
+            let mut encoder = rpc::Encoder::new();
+            encoder.encode_response(
+                RpcMessageKind::CommandAck,
+                correlation,
+                &rpc::CommandResponse { workspace_id: ws_index, body },
+            );
+            let register = if one_shot {
+                None
+            } else {
+                let partial = if remaining.is_empty() { None } else { Some((DecodingState::default(), remaining)) };
+                Some((ws_index, partial))
+            };
+            return Ok(RpcOutcome::Respond { socket, encoder, register });
+        }
 
         // Handle regular RPC commands with ResponseToken pattern
         let mut encoder = rpc::Encoder::new();
@@ -1040,6 +1067,69 @@ impl EventLoop {
                 Ok(AttachOutcome::Attached)
             }
             _ => Ok(AttachOutcome::NotAttach(socket)),
+        }
+    }
+
+    fn handle_terminal_socket_read(&mut self, client_index: ClientIndex) {
+        enum Event {
+            Started(crate::rpc::TerminalRunEvent),
+            SpawnFailed(crate::rpc::TerminalSpawnFailedEvent),
+            Exited(crate::rpc::TerminalExitedEvent),
+            Detach,
+        }
+
+        let (events, termination) = {
+            let Some(client) = self.clients.get_mut(client_index as usize) else { return };
+            let mut stream = client.rpc_stream(&mut self.buffer_pool, client_index);
+            let mut events = Vec::new();
+            while let Some(message) = stream.next() {
+                match message.kind {
+                    RpcMessageKind::TerminalStarted => {
+                        if let Ok(event) = jsony::from_binary(message.payload) {
+                            events.push(Event::Started(event));
+                        }
+                    }
+                    RpcMessageKind::TerminalSpawnFailed => {
+                        if let Ok(event) = jsony::from_binary(message.payload) {
+                            events.push(Event::SpawnFailed(event));
+                        }
+                    }
+                    RpcMessageKind::TerminalExited => {
+                        if let Ok(event) = jsony::from_binary(message.payload) {
+                            events.push(Event::Exited(event));
+                        }
+                    }
+                    RpcMessageKind::TerminalDetach => events.push(Event::Detach),
+                    _ => {
+                        kvlog::warn!("Unexpected terminal harness message", kind = ?message.kind, client_index);
+                        stream.termination_reason = Some(SocketTerminationReason::ProtocolError);
+                    }
+                }
+            }
+            stream.state.compact(&mut stream.buffer, 4096);
+            let termination = stream.termination_reason;
+            if stream.buffer.is_empty() {
+                self.buffer_pool.push(stream.buffer);
+            } else {
+                client.partial_rpc_read = Some((stream.state, stream.buffer));
+            }
+            (events, termination)
+        };
+
+        let harness_id = match self.clients.get(client_index as usize).map(|client| &client.kind) {
+            Some(ClientKind::TerminalHarness { harness_id }) => *harness_id,
+            _ => return,
+        };
+        for event in events {
+            match event {
+                Event::Started(event) => self.terminal_started(harness_id, event),
+                Event::SpawnFailed(event) => self.terminal_spawn_failed(harness_id, event),
+                Event::Exited(event) => self.terminal_exited(harness_id, event),
+                Event::Detach => self.terminal_detach(harness_id),
+            }
+        }
+        if let Some(reason) = termination {
+            self.terminate_client(client_index, reason);
         }
     }
 }

@@ -110,6 +110,15 @@ run_helper() {
 
 print "== zsh completion tests =="
 
+typeset generated_completion="$($DEVSM_BIN completions zsh)"
+(( TEST_COUNT++ ))
+if [[ "$generated_completion" == *"--sticky"* ]]; then
+    print "  ok: run options include --sticky"
+else
+    (( TEST_FAILURES++ ))
+    print "  FAIL: run options missing --sticky"
+fi
+
 # Verify the major helpers exist.
 for fn in _devsm _devsm_commands _devsm_runnables _devsm_tasks_only _devsm_tests \
           _devsm_kinds _devsm_functions _devsm_self_commands _devsm_get_resources \

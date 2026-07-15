@@ -150,6 +150,25 @@ pub enum TaskKind {
     Test,
 }
 
+/// Where a task's child process may be executed.
+///
+/// The explicit enum is intentionally carried by parsed configuration and
+/// scheduling code so launch routing cannot accidentally conflate a remotely
+/// owned terminal process with the legacy unmanaged exec path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// No `managed` field: either the daemon (`run`) or direct `exec` is valid.
+    #[default]
+    Either,
+    /// Legacy `managed = true`: the daemon owns and captures the process.
+    Daemon,
+    /// Legacy `managed = false`: the client replaces itself with the process.
+    Exec,
+    /// `managed = "terminal"`: a terminal harness owns the process while the
+    /// daemon remains authoritative for its scheduler lifecycle.
+    Terminal,
+}
+
 impl TaskKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -512,11 +531,8 @@ pub struct TaskConfigExpr<'a> {
     pub timeout: Option<TimeoutConfig<'a>>,
     /// Tags for test filtering. Empty for non-test tasks.
     pub tags: &'a [&'a str],
-    /// Controls how the task can be executed:
-    /// - `None`: default behavior, can use either `run` or `exec`
-    /// - `Some(true)`: must use `run` (through daemon), for tasks with complex dependencies
-    /// - `Some(false)`: must use `exec` (direct execution), for interactive commands
-    pub managed: Option<bool>,
+    /// Controls where the task process is executed.
+    pub managed: ExecutionMode,
     /// Controls when this service is visible in the task list.
     /// Only meaningful for services; ignored for actions and tests.
     pub hidden: ServiceHidden,
@@ -563,7 +579,7 @@ impl TestConfigExpr<'static> {
             ready: None,
             timeout: self.timeout.clone(),
             tags: self.tags,
-            managed: None,
+            managed: ExecutionMode::Either,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
             cli: self.cli,
@@ -588,7 +604,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         ready: None,
         timeout: None,
         tags: &[],
-        managed: None,
+        managed: ExecutionMode::Either,
         hidden: ServiceHidden::Never,
         allow_multiple: AllowMultiple::False,
         cli: CliConfig::DEFAULT,
@@ -640,7 +656,7 @@ impl ConfigGeneration {
                     ready: None,
                     timeout: config.timeout.clone(),
                     tags: config.tags,
-                    managed: None,
+                    managed: ExecutionMode::Either,
                     hidden: ServiceHidden::Never,
                     allow_multiple: AllowMultiple::False,
                     cli: config.cli,
@@ -1297,7 +1313,7 @@ mod tests {
             ready: None,
             timeout: None,
             tags: &[],
-            managed: None,
+            managed: ExecutionMode::Either,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
             cli: CliConfig::DEFAULT,
@@ -1327,7 +1343,7 @@ mod tests {
             ready: None,
             timeout: None,
             tags: &[],
-            managed: None,
+            managed: ExecutionMode::Either,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
             cli: CliConfig::DEFAULT,
@@ -1374,7 +1390,7 @@ mod tests {
             ready: None,
             timeout: None,
             tags: &[],
-            managed: None,
+            managed: ExecutionMode::Either,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
             cli: CliConfig::DEFAULT,
@@ -1406,7 +1422,7 @@ mod tests {
             ready: None,
             timeout: None,
             tags: &[],
-            managed: None,
+            managed: ExecutionMode::Either,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
             cli: CliConfig::DEFAULT,
@@ -1439,7 +1455,7 @@ mod tests {
             ready: None,
             timeout: None,
             tags: &[],
-            managed: None,
+            managed: ExecutionMode::Either,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
             cli: CliConfig { forward_arguments: true, autocomplete: CliAutocomplete::Forward },
@@ -1466,7 +1482,7 @@ mod tests {
             ready: None,
             timeout: None,
             tags: &[],
-            managed: None,
+            managed: ExecutionMode::Either,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
             cli: CliConfig::DEFAULT,
@@ -1484,7 +1500,7 @@ mod tests {
             ready: None,
             timeout: None,
             tags: &[],
-            managed: None,
+            managed: ExecutionMode::Either,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
             cli: CliConfig { forward_arguments: true, autocomplete: CliAutocomplete::Forward },
@@ -1515,7 +1531,7 @@ mod tests {
             ready: None,
             timeout: None,
             tags: &[],
-            managed: None,
+            managed: ExecutionMode::Either,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
             cli: CliConfig::DEFAULT,
@@ -1544,7 +1560,7 @@ mod tests {
             ready: None,
             timeout: None,
             tags: &[],
-            managed: None,
+            managed: ExecutionMode::Either,
             hidden: ServiceHidden::Never,
             allow_multiple: AllowMultiple::False,
             cli: CliConfig::DEFAULT,

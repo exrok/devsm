@@ -34,6 +34,16 @@ managed = false
 cmd = ["ls", { var = "dir" }]
 managed = true
 
+# Interactive action scheduled by devsm but attached to the invoking terminal.
+[action.terminal_editor]
+managed = "terminal"
+cmd = ["interactive-editor", "open"]
+
+# Long-running terminal service. Its output remains exclusively in its terminal.
+[service.terminal_editor_server]
+managed = "terminal"
+cmd = ["interactive-editor", "serve"]
+
 # Action forwarding CLI tokens into a list variable
 [action.with_forwarded_args]
 cmd = ["ls", { var = "args" }]

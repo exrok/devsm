@@ -2,12 +2,14 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 
 use std::os::unix::net::UnixListener;
 
@@ -24,6 +26,84 @@ pub struct ClientResult {
     #[allow(dead_code)]
     pub stdout: String,
     pub stderr: String,
+}
+
+pub struct PtyClientResult {
+    pub exit_code: u32,
+    pub output: String,
+    pub echo_enabled: bool,
+}
+
+pub struct PtyClient {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    output_rx: std::sync::mpsc::Receiver<String>,
+}
+
+impl PtyClient {
+    pub fn send_input(&mut self, input: &[u8]) {
+        self.writer.write_all(input).expect("failed to send PTY input");
+        self.writer.flush().expect("failed to flush PTY input");
+    }
+
+    pub fn send_ctrl_c(&mut self) {
+        self.send_input(&[3]);
+    }
+
+    pub fn send_ctrl_z(&mut self) {
+        self.send_input(&[26]);
+    }
+
+    pub fn kill_wrapper(&mut self) {
+        self.child.kill().expect("failed to kill PTY wrapper");
+    }
+
+    pub fn signal_wrapper(&self, signal: i32) {
+        let pid = self.child.process_id().expect("PTY wrapper has no process id") as i32;
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0, "failed to signal PTY wrapper");
+    }
+
+    pub fn wait_wrapper_stopped(&self, timeout: Duration) {
+        let pid = self.child.process_id().expect("PTY wrapper has no process id") as i32;
+        let (status_tx, status_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut status = 0;
+            let result = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
+            let _ = status_tx.send((result, status));
+        });
+        let (result, status) = status_rx.recv_timeout(timeout).expect("PTY wrapper did not stop before timeout");
+        assert!(result >= 0, "failed to inspect PTY wrapper state: {}", std::io::Error::last_os_error());
+        assert!(result == pid && libc::WIFSTOPPED(status), "PTY wrapper changed to an unexpected state");
+    }
+
+    pub fn wait(self, timeout: Duration, server_log: impl FnOnce() -> String) -> PtyClientResult {
+        let PtyClient { mut child, writer, master, output_rx } = self;
+        let mut killer = child.clone_killer();
+        let (status_tx, status_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = status_tx.send(child.wait());
+        });
+        let status = match status_rx.recv_timeout(timeout) {
+            Ok(status) => status.expect("failed to wait for PTY client"),
+            Err(_) => {
+                let _ = killer.kill();
+                let _ = status_rx.recv_timeout(Duration::from_secs(2));
+                panic!("PTY client timed out after {timeout:?}; server log:\n{}", server_log());
+            }
+        };
+        let echo_enabled = master
+            .as_raw_fd()
+            .and_then(|fd| {
+                let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+                (unsafe { libc::tcgetattr(fd, &mut termios) } == 0).then_some(termios.c_lflag & libc::ECHO != 0)
+            })
+            .unwrap_or(false);
+        drop(writer);
+        drop(master);
+        let output = output_rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+        PtyClientResult { exit_code: status.exit_code(), output, echo_enabled }
+    }
 }
 
 impl ClientResult {
@@ -107,6 +187,7 @@ impl TestHarness {
     fn spawn_server_with_db_path(&mut self, db_path: &Path) -> &mut Self {
         let log_file = fs::File::create(&self.server_log_path).expect("Failed to create server log");
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
+        let (mut ready_reader, ready_writer) = readiness_pipe();
 
         let server = Command::new(cargo_bin_path())
             .args(["self", "server"])
@@ -114,11 +195,15 @@ impl TestHarness {
             .env("DEVSM_SOCKET", &self.socket_path)
             .env("DEVSM_DB", db_path)
             .env("DEVSM_LOG_STDOUT", "1")
+            .env("DEVSM_TEST_READY_FD", ready_writer.as_raw_fd().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err))
             .spawn()
             .expect("Failed to spawn server");
+        drop(ready_writer);
+        let mut ready = [0u8; 1];
+        ready_reader.read_exact(&mut ready).expect("daemon exited before binding its socket");
 
         self.server = Some(server);
         self
@@ -134,6 +219,7 @@ impl TestHarness {
     pub fn spawn_server_from(&mut self, cwd: &PathBuf) -> &mut Self {
         let log_file = fs::File::create(&self.server_log_path).expect("Failed to create server log");
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
+        let (mut ready_reader, ready_writer) = readiness_pipe();
 
         let server = Command::new(cargo_bin_path())
             .args(["self", "server"])
@@ -141,11 +227,15 @@ impl TestHarness {
             .env("DEVSM_SOCKET", &self.socket_path)
             .env("DEVSM_DB", "/dev/null")
             .env("DEVSM_LOG_STDOUT", "1")
+            .env("DEVSM_TEST_READY_FD", ready_writer.as_raw_fd().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_file_err))
             .spawn()
             .expect("Failed to spawn server");
+        drop(ready_writer);
+        let mut ready = [0u8; 1];
+        ready_reader.read_exact(&mut ready).expect("daemon exited before binding its socket");
 
         self.server = Some(server);
         self
@@ -226,6 +316,72 @@ impl TestHarness {
         ClientResult { status, stdout, stderr }
     }
 
+    /// Runs a client as the session leader of a real PTY. This is used for
+    /// terminal-harness tests; ordinary pipe-based helpers cannot exercise
+    /// controlling-terminal foreground groups or termios restoration.
+    pub fn spawn_pty_client(&self, args: &[&str]) -> PtyClient {
+        let mut command = CommandBuilder::new(cargo_bin_path());
+        command.args(args);
+        command.cwd(&self.temp_dir);
+        command.env("DEVSM_SOCKET", &self.socket_path);
+        command.env("DEVSM_DB", "/dev/null");
+        command.env("DEVSM_NO_AUTO_SPAWN", "1");
+        command.env("DEVSM_CONNECT_TIMEOUT_MS", "5000");
+
+        self.spawn_pty_command(command)
+    }
+
+    /// Spawn devsm beneath a monitor-mode shell. Unlike the ordinary PTY
+    /// helper, this keeps a parent process group in the PTY session so Ctrl-Z
+    /// exercises real, non-orphaned shell job control.
+    pub fn spawn_job_controlled_pty_client(&self, control_socket: &Path, args: &[&str]) -> PtyClient {
+        fn shell_quote(value: &str) -> String {
+            format!("'{}'", value.replace('\'', "'\"'\"'"))
+        }
+
+        let mut invocation = shell_quote(cargo_bin_path().to_string_lossy().as_ref());
+        for arg in args {
+            invocation.push(' ');
+            invocation.push_str(&shell_quote(arg));
+        }
+        let script = format!(
+            "set -m\n{invocation}\nwrapper=$(jobs -p %1)\ntest-app wrapper-stopped\nwait -f \"$wrapper\" 2>/dev/null\nexit $?"
+        );
+        let mut command = CommandBuilder::new("/bin/bash");
+        command.args(["--noprofile", "--norc", "-c", &script]);
+        command.cwd(&self.temp_dir);
+        command.env("TEST_APP_SOCKET", control_socket);
+        command.env("DEVSM_SOCKET", &self.socket_path);
+        command.env("DEVSM_DB", "/dev/null");
+        command.env("DEVSM_NO_AUTO_SPAWN", "1");
+        command.env("DEVSM_CONNECT_TIMEOUT_MS", "5000");
+
+        self.spawn_pty_command(command)
+    }
+
+    fn spawn_pty_command(&self, command: CommandBuilder) -> PtyClient {
+        let pair = NativePtySystem::default()
+            .openpty(PtySize { rows: 24, cols: 100, pixel_width: 0, pixel_height: 0 })
+            .expect("failed to open PTY");
+
+        let child = pair.slave.spawn_command(command).expect("failed to spawn PTY client");
+        drop(pair.slave);
+        let writer = pair.master.take_writer().expect("failed to open PTY writer");
+        let mut reader = pair.master.try_clone_reader().expect("failed to clone PTY reader");
+        let (output_tx, output_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut output = String::new();
+            let _ = reader.read_to_string(&mut output);
+            let _ = output_tx.send(output);
+        });
+
+        PtyClient { child, writer, master: pair.master, output_rx }
+    }
+
+    pub fn run_pty_client(&self, args: &[&str], timeout: Duration) -> PtyClientResult {
+        self.spawn_pty_client(args).wait(timeout, || self.server_log())
+    }
+
     /// Waits for the socket file to exist, with timeout.
     pub fn wait_for_socket(&self, timeout: Duration) -> bool {
         let start = Instant::now();
@@ -254,6 +410,12 @@ impl TestHarness {
         }
         false
     }
+}
+
+fn readiness_pipe() -> (fs::File, fs::File) {
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "failed to create daemon readiness pipe");
+    unsafe { (fs::File::from_raw_fd(fds[0]), fs::File::from_raw_fd(fds[1])) }
 }
 
 impl Drop for TestHarness {
@@ -450,27 +612,13 @@ impl TestAppServer {
     }
 
     pub fn accept(&self, timeout: Duration) -> TestAppConn {
-        self.listener.set_nonblocking(true).unwrap();
-        let start = Instant::now();
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    // macOS inherits O_NONBLOCK from the listener through accept(),
-                    // while these test connections use blocking reads and writes.
-                    stream.set_nonblocking(false).expect("set accepted test-app connection blocking");
-                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                    let mut conn = TestAppConn { stream, args: Vec::new() };
-                    conn.read_connect();
-                    return conn;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => panic!("accept error: {e}"),
-            }
-            if start.elapsed() >= timeout {
-                panic!("Timed out waiting for test-app connection");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert!(wait_readable(self.listener.as_raw_fd(), timeout), "Timed out waiting for test-app connection");
+        let (stream, _) = self.listener.accept().unwrap_or_else(|error| panic!("accept error: {error}"));
+        stream.set_nonblocking(false).expect("set accepted test-app connection blocking");
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        let mut conn = TestAppConn { stream, args: Vec::new() };
+        conn.read_connect();
+        conn
     }
 
     /// Accepts one connection per entry in `names`, returning them in the
@@ -491,27 +639,10 @@ impl TestAppServer {
     }
 
     pub fn try_accept(&self, timeout: Duration) -> Option<TestAppConn> {
-        self.listener.set_nonblocking(true).unwrap();
-        let start = Instant::now();
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    // macOS inherits O_NONBLOCK from the listener through accept(),
-                    // while these test connections use blocking reads and writes.
-                    stream.set_nonblocking(false).expect("set accepted test-app connection blocking");
-                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-                    let mut conn = TestAppConn { stream, args: Vec::new() };
-                    conn.read_connect();
-                    return Some(conn);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => panic!("accept error: {e}"),
-            }
-            if start.elapsed() >= timeout {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        if !wait_readable(self.listener.as_raw_fd(), timeout) {
+            return None;
         }
+        Some(self.accept(Duration::ZERO))
     }
 }
 
@@ -578,14 +709,7 @@ impl TestAppConn {
     }
 
     pub fn wait_disconnected(&mut self, timeout: Duration) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < timeout {
-            if self.is_disconnected() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        false
+        wait_readable(self.stream.as_raw_fd(), timeout) && self.is_disconnected()
     }
 
     pub fn is_disconnected(&mut self) -> bool {
@@ -612,6 +736,20 @@ impl TestAppConn {
             | std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::UnexpectedEof => true,
             _ => true,
+        }
+    }
+}
+
+fn wait_readable(fd: std::os::fd::RawFd, timeout: Duration) -> bool {
+    let mut descriptor = libc::pollfd { fd, events: libc::POLLIN | libc::POLLHUP | libc::POLLERR, revents: 0 };
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+    loop {
+        let result = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if result >= 0 {
+            return result > 0;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
         }
     }
 }

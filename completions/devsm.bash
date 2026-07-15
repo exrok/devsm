@@ -364,6 +364,10 @@ _devsm() {
         run)
             __devsm_find_task "$_devsm_cmd_idx"
             if [[ -z "$_devsm_task_idx" ]]; then
+                if [[ "$_devsm_cur" == -* ]]; then
+                    mapfile -t COMPREPLY < <(compgen -W "--sticky --as-test --derive-cache-key" -- "$_devsm_cur")
+                    return
+                fi
                 if [[ "$_devsm_cur" == *:* ]]; then
                     __devsm_complete_profiles "${_devsm_cur%%:*}"
                 else

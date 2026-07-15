@@ -33,6 +33,7 @@ _devsm() {
         case $line[1] in
             (run)
                 _arguments "${_arguments_options[@]}" : \
+                    '--sticky[Keep a terminal-task wrapper attached after exit]' \
                     ':task:_devsm_runnables' \
                     '*::arg:_devsm_task_args' \
                     && ret=0

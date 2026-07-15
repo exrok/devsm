@@ -45,6 +45,7 @@ mod scroll_view;
 mod searcher;
 mod self_log;
 mod test_summary_ui;
+mod terminal_harness;
 mod tui;
 mod user_config;
 mod validate;
@@ -127,9 +128,9 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Run { job, value_map, trailing_args, as_test, derive_cache_key } => {
+        cli::Command::Run { job, value_map, trailing_args, as_test, derive_cache_key, sticky } => {
             let log_guard = self_log::init_client_logging();
-            match run_client(job, value_map, trailing_args, as_test, derive_cache_key) {
+            match run_client(job, value_map, trailing_args, as_test, derive_cache_key, sticky) {
                 Ok(code) => {
                     drop(log_guard);
                     std::process::exit(code);
@@ -720,6 +721,9 @@ fn print_runnable_summary(prefix: &str, r: &rpc::RunnableStatus) {
     if let Some(ready) = r.ready {
         println!("{prefix}  Ready:    {}", if ready { "yes" } else { "no" });
     }
+    if r.terminal_attached {
+        println!("{prefix}  Terminal: idle wrapper attached");
+    }
     if !r.blocked_on.is_empty() {
         println!("{prefix}  Blocked on:");
         for dep in &r.blocked_on {
@@ -1013,6 +1017,7 @@ fn run_client(
     trailing_args: &[String],
     mut as_test: bool,
     mut derive_cache_key: bool,
+    sticky: bool,
 ) -> anyhow::Result<i32> {
     reset_terminal_to_canonical();
 
@@ -1036,6 +1041,17 @@ fn run_client(
         }
         if derive_cache_key {
             bail!("Group '{}' cannot be run with --derive-cache-key", group_name);
+        }
+        if sticky {
+            bail!("Group '{}' cannot be run with --sticky", group_name);
+        }
+        if let Some(task_name) = group_terminal_task(&workspace_config, group_name) {
+            bail!(
+                "Group '{}' contains terminal task '{}', which must be run in its own terminal with 'devsm run {}'.",
+                group_name,
+                task_name,
+                task_name
+            );
         }
     }
 
@@ -1062,7 +1078,7 @@ fn run_client(
     if name != "~cargo"
         && !as_test
         && let Some((_, expr)) = resolved
-        && expr.managed == Some(false)
+        && expr.managed == config::ExecutionMode::Exec
     {
         bail!(
             "Task '{}' has managed = false and must be run with exec.\n\
@@ -1070,6 +1086,23 @@ fn run_client(
             name,
             &job
         );
+    }
+
+    if sticky && task_expr.managed != config::ExecutionMode::Terminal {
+        bail!("--sticky is only supported for tasks with managed = \"terminal\"");
+    }
+    if sticky && (as_test || derive_cache_key) {
+        bail!("--sticky cannot be combined with --as-test or --derive-cache-key");
+    }
+
+    if task_expr.managed == config::ExecutionMode::Terminal {
+        if as_test {
+            bail!("terminal tasks cannot be run as tests");
+        }
+        if derive_cache_key {
+            bail!("--derive-cache-key is not supported for terminal tasks");
+        }
+        return terminal_harness::terminal_run_client(&config, &cwd, &job, params, sticky);
     }
 
     setup_signal_handler(libc::SIGTERM, term_handler)?;
@@ -1179,12 +1212,12 @@ fn auto_task_command(job: &str, params: jsony_value::ValueMap, trailing_args: &[
     if name != "~cargo"
         && !is_explicit_group_reference(name)
         && let Some((_, expr)) = resolve_name_in_config(&workspace_config, name)
-        && expr.managed == Some(false)
+        && expr.managed == config::ExecutionMode::Exec
     {
         return exec_task(job, params, trailing_args).map(|()| 0);
     }
 
-    run_client(job, params, trailing_args, false, false)
+    run_client(job, params, trailing_args, false, false, false)
 }
 
 /// Apply an inferred-deps report received from the daemon to the user's
@@ -1301,6 +1334,40 @@ fn resolve_group_in_config(config: &config::WorkspaceConfig<'static>, name: &str
     config.groups.iter().find(|(group, _)| *group == short).map(|(group, _)| *group)
 }
 
+fn group_terminal_task(
+    config: &config::WorkspaceConfig<'static>,
+    group_name: &str,
+) -> Option<&'static str> {
+    fn visit(
+        config: &config::WorkspaceConfig<'static>,
+        group_name: &str,
+        visiting: &mut std::collections::HashSet<&'static str>,
+    ) -> Option<&'static str> {
+        let (canonical_name, calls) = config.groups.iter().find(|(name, _)| *name == group_name)?;
+        if !visiting.insert(canonical_name) {
+            return None;
+        }
+        for call in *calls {
+            let name: &'static str = &call.name;
+            if let Some((_, task)) = resolve_name_in_config(config, name) {
+                if task.managed == config::ExecutionMode::Terminal {
+                    return Some(name);
+                }
+                continue;
+            }
+            if let Some(nested) = resolve_group_in_config(config, name)
+                && let Some(task) = visit(config, nested, visiting)
+            {
+                return Some(task);
+            }
+        }
+        visiting.remove(canonical_name);
+        None
+    }
+
+    visit(config, group_name, &mut std::collections::HashSet::new())
+}
+
 /// Executes a task directly, bypassing the daemon and ignoring dependencies.
 fn exec_task(job: &str, params: jsony_value::ValueMap, trailing_args: &[String]) -> anyhow::Result<()> {
     let workspace_config = config::load_from_env()?;
@@ -1323,10 +1390,17 @@ fn exec_task(job: &str, params: jsony_value::ValueMap, trailing_args: &[String])
         }
     };
 
-    if task_expr.managed == Some(true) {
+    if task_expr.managed == config::ExecutionMode::Daemon {
         bail!(
             "Task '{}' has managed = true and must be run through the daemon.\n\
              Use 'devsm run {}' instead.",
+            name,
+            job
+        );
+    }
+    if task_expr.managed == config::ExecutionMode::Terminal {
+        bail!(
+            "Task '{}' has managed = \"terminal\" and must be run in a terminal wrapper.\nUse 'devsm run {}' instead.",
             name,
             job
         );
@@ -1455,6 +1529,9 @@ fn format_exec_error_with_dependency_logs(cwd: &Path, config: &Path, event: crat
     let Some(failure) = event.failed_dependency else {
         return message;
     };
+    if failure.terminal {
+        return message;
+    }
     let Some(job_index) = failure.job_index else {
         return message;
     };
@@ -2065,6 +2142,7 @@ Run a job and display its output.
 Options:
   --as-test             Run the job as part of a test group
   --derive-cache-key    Trace and write cache.key into devsm.toml
+  --sticky              Keep a terminal-task wrapper attached after exit
   -h, --help            Print this help message
 
 Job parameters may be passed before <job> as --key=value flags or JSON.
@@ -2320,7 +2398,7 @@ Usage: devsm [OPTIONS] [COMMAND]
 
 Commands:
   (default)          Launch the TUI interface (or workspace selector if not in a workspace)
-  <task> [args]      Run a task by name; uses exec automatically for managed = false
+  <task> [args]      Run a task by name; selects exec or a terminal wrapper when configured
   global             Open global workspace selector
   run <job>          Run a job and display its output
                      --derive-cache-key: trace and write cache.key into devsm.toml
