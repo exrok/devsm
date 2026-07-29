@@ -378,11 +378,10 @@ env.TEST_APP_SOCKET = "{}"
     ));
     harness.spawn_server();
     let mut wrapper = harness.spawn_job_controlled_pty_client(&ctrl.path, &["run", "editor"]);
-    let mut editor = ctrl.accept(Duration::from_secs(5));
+    let mut editor = ctrl.accept_expected("editor", Duration::from_secs(5));
 
     wrapper.send_ctrl_z();
-    let mut stopped_event = ctrl.accept(Duration::from_secs(5));
-    assert_eq!(stopped_event.name(), "wrapper-stopped");
+    let mut stopped_event = ctrl.accept_expected("wrapper-stopped", Duration::from_secs(5));
     let stopped = harness.run_client(&["stop", "editor"]);
     assert!(stopped.success(), "stop failed: {}\n{}", stopped.stderr, harness.server_log());
     assert!(editor.wait_disconnected(Duration::from_secs(5)), "Ctrl-Z-stopped child was not terminated");

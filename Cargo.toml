@@ -55,3 +55,9 @@ debug = 1
 [features]
 fuzz = []
 mimalloc = ["dep:mimalloc"]
+
+[lints.clippy]
+question_mark = "allow" # Try expansion introduces code bloat
+needless_range_loop = "allow" # Often the suggested alternative generates more code bloat and worse performance
+needless_borrows_for_generic_args = "allow" # Consistently using the borrow can reduce monomorphic code bloat 
+

@@ -348,24 +348,14 @@ impl TestHarness {
         self.spawn_pty_command(command)
     }
 
-    /// Spawn devsm beneath a monitor-mode shell. Unlike the ordinary PTY
-    /// helper, this keeps a parent process group in the PTY session so Ctrl-Z
-    /// exercises real, non-orphaned shell job control.
+    /// Spawn devsm beneath test-app's job-control monitor. Unlike the ordinary
+    /// PTY helper, this keeps a parent process group in the PTY session so
+    /// Ctrl-Z exercises real, non-orphaned job control.
     pub fn spawn_job_controlled_pty_client(&self, control_socket: &Path, args: &[&str]) -> PtyClient {
-        fn shell_quote(value: &str) -> String {
-            format!("'{}'", value.replace('\'', "'\"'\"'"))
-        }
-
-        let mut invocation = shell_quote(cargo_bin_path().to_string_lossy().as_ref());
-        for arg in args {
-            invocation.push(' ');
-            invocation.push_str(&shell_quote(arg));
-        }
-        let script = format!(
-            "set -m\n{invocation}\nwrapper=$(jobs -p %1)\ntest-app wrapper-stopped\nwait -f \"$wrapper\" 2>/dev/null\nexit $?"
-        );
-        let mut command = CommandBuilder::new("/bin/bash");
-        command.args(["--noprofile", "--norc", "-c", &script]);
+        let mut command = CommandBuilder::new(cargo_bin_path().with_file_name("test-app"));
+        command.arg("--job-control-monitor");
+        command.arg(cargo_bin_path());
+        command.args(args);
         command.cwd(&self.temp_dir);
         command.env("TEST_APP_SOCKET", control_socket);
         command.env("DEVSM_SOCKET", &self.socket_path);
@@ -628,6 +618,7 @@ impl TestAppServer {
         Self { listener, path }
     }
 
+    #[track_caller]
     pub fn accept(&self, timeout: Duration) -> TestAppConn {
         assert!(wait_readable(self.listener.as_raw_fd(), timeout), "Timed out waiting for test-app connection");
         let (stream, _) = self.listener.accept().unwrap_or_else(|error| panic!("accept error: {error}"));
@@ -635,6 +626,17 @@ impl TestAppServer {
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         let mut conn = TestAppConn { stream, args: Vec::new() };
         conn.read_connect();
+        conn
+    }
+
+    #[track_caller]
+    pub fn accept_expected(&self, name: &str, timeout: Duration) -> TestAppConn {
+        assert!(
+            wait_readable(self.listener.as_raw_fd(), timeout),
+            "Timed out waiting for test-app connection '{name}'"
+        );
+        let conn = self.accept(Duration::ZERO);
+        assert_eq!(conn.name(), name, "unexpected test-app connection while waiting for '{name}'");
         conn
     }
 

@@ -231,6 +231,7 @@ impl CacheKeyHasherPosix {
     }
 
     #[inline]
+    #[allow(clippy::unnecessary_cast)]
     fn dirent_ino(entry: &libc::dirent) -> u64 {
         #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))]
         {
