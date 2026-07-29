@@ -834,13 +834,12 @@ impl EventLoop {
                     );
                     response.finish(result);
                 }
+                let output = encoder.output().to_vec();
 
                 let Some(client) = self.clients.get_mut(client_index as usize) else {
                     kvlog::error!("Write for missing client", index = client_index as usize);
                     return;
                 };
-
-                let _ = client.socket.write_all(encoder.output());
 
                 rpc_stream.state.compact(&mut rpc_stream.buffer, 4096);
 
@@ -852,6 +851,13 @@ impl EventLoop {
                     self.buffer_pool.push(rpc_stream.buffer);
                 } else {
                     client.partial_rpc_read = Some((rpc_stream.state, rpc_stream.buffer));
+                }
+
+                if !output.is_empty()
+                    && let Err(error) = self.queue_client_output(client_index, &output)
+                {
+                    kvlog::warn!("Failed to queue RPC response", index = client_index as usize, %error);
+                    self.terminate_client(client_index, SocketTerminationReason::WriteError);
                 }
 
                 return;

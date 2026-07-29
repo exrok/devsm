@@ -2934,8 +2934,11 @@ impl EventLoop {
             0,
             &crate::rpc::OpenWorkspaceResponse { success: true, error: None },
         );
-        let client = &mut self.clients[client_index];
-        let _ = client.socket.write_all(encoder.output());
+        if let Err(error) = self.queue_client_output(client_index as ClientIndex, encoder.output()) {
+            kvlog::warn!("Failed to queue RPC attachment response", workspace = ws_index, %error);
+            self.terminate_client(client_index as ClientIndex, SocketTerminationReason::WriteError);
+            return;
+        }
 
         kvlog::info!("RPC client attached", workspace = ws_index, subscribe);
     }
@@ -3139,15 +3142,22 @@ impl EventLoop {
         encoder.encode_push(RpcMessageKind::JobStatus, &event);
         let output = encoder.output();
 
-        for (_, client) in &mut self.clients {
-            if client.workspace != ws_index {
-                continue;
+        let subscribers: Vec<ClientIndex> = self
+            .clients
+            .iter()
+            .filter_map(|(index, client)| {
+                if client.workspace != ws_index {
+                    return None;
+                }
+                let ClientKind::Rpc { subscriptions } = &client.kind else { return None };
+                subscriptions.job_status.then_some(index as ClientIndex)
+            })
+            .collect();
+        for client_index in subscribers {
+            if let Err(error) = self.queue_client_output(client_index, output) {
+                kvlog::warn!("Failed to queue RPC job status", index = client_index as usize, %error);
+                self.terminate_client(client_index, SocketTerminationReason::WriteError);
             }
-            let ClientKind::Rpc { subscriptions } = &client.kind else { continue };
-            if !subscriptions.job_status {
-                continue;
-            }
-            let _ = client.socket.write_all(output);
         }
     }
 
@@ -3163,15 +3173,22 @@ impl EventLoop {
         encoder.encode_push(RpcMessageKind::JobExited, &event);
         let output = encoder.output();
 
-        for (_, client) in &mut self.clients {
-            if client.workspace != ws_index {
-                continue;
+        let subscribers: Vec<ClientIndex> = self
+            .clients
+            .iter()
+            .filter_map(|(index, client)| {
+                if client.workspace != ws_index {
+                    return None;
+                }
+                let ClientKind::Rpc { subscriptions } = &client.kind else { return None };
+                subscriptions.job_exits.then_some(index as ClientIndex)
+            })
+            .collect();
+        for client_index in subscribers {
+            if let Err(error) = self.queue_client_output(client_index, output) {
+                kvlog::warn!("Failed to queue RPC job exit", index = client_index as usize, %error);
+                self.terminate_client(client_index, SocketTerminationReason::WriteError);
             }
-            let ClientKind::Rpc { subscriptions } = &client.kind else { continue };
-            if !subscriptions.job_exits {
-                continue;
-            }
-            let _ = client.socket.write_all(output);
         }
     }
 
@@ -3186,12 +3203,19 @@ impl EventLoop {
         encoder.encode_push(RpcMessageKind::DebugTrace, &event);
         let output = encoder.output();
 
-        for (_, client) in &mut self.clients {
-            if client.workspace != ws_index {
-                continue;
+        let subscribers: Vec<ClientIndex> = self
+            .clients
+            .iter()
+            .filter_map(|(index, client)| {
+                (client.workspace == ws_index && matches!(client.kind, ClientKind::Rpc { .. }))
+                    .then_some(index as ClientIndex)
+            })
+            .collect();
+        for client_index in subscribers {
+            if let Err(error) = self.queue_client_output(client_index, output) {
+                kvlog::warn!("Failed to queue RPC debug trace", index = client_index as usize, %error);
+                self.terminate_client(client_index, SocketTerminationReason::WriteError);
             }
-            let ClientKind::Rpc { .. } = &client.kind else { continue };
-            let _ = client.socket.write_all(output);
         }
     }
 }

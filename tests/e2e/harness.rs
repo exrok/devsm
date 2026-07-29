@@ -218,17 +218,15 @@ impl TestHarness {
             .stderr(Stdio::from(log_file_err))
             .spawn()
             .expect("Failed to spawn server");
-        drop(ready_writer);
-        let mut ready = [0u8; 1];
-        ready_reader.read_exact(&mut ready).expect("daemon exited before binding its socket");
-
         self.server = Some(server);
+        drop(ready_writer);
+        self.wait_for_server_ready(&mut ready_reader).unwrap_or_else(|message| panic!("{message}"));
         self
     }
 
     /// Stops the test server if it is running.
     pub fn stop_server(&mut self) {
-        terminate_server(&mut self.server);
+        let _ = terminate_server(&mut self.server);
         let _ = fs::remove_file(&self.socket_path);
     }
 
@@ -250,12 +248,27 @@ impl TestHarness {
             .stderr(Stdio::from(log_file_err))
             .spawn()
             .expect("Failed to spawn server");
-        drop(ready_writer);
-        let mut ready = [0u8; 1];
-        ready_reader.read_exact(&mut ready).expect("daemon exited before binding its socket");
-
         self.server = Some(server);
+        drop(ready_writer);
+        self.wait_for_server_ready(&mut ready_reader).unwrap_or_else(|message| panic!("{message}"));
+
         self
+    }
+
+    fn wait_for_server_ready(&mut self, ready_reader: &mut fs::File) -> Result<(), String> {
+        let mut ready = [0u8; 1];
+        if let Err(error) = ready_reader.read_exact(&mut ready) {
+            let status = terminate_server(&mut self.server);
+            return Err(format!(
+                "daemon exited before binding its socket\n  readiness error: {error}\n  status: {status:?}\n  server log:\n{}",
+                self.server_log(),
+            ));
+        }
+        if ready != [1] {
+            let status = terminate_server(&mut self.server);
+            return Err(format!("daemon sent an invalid readiness byte: {ready:?}\n  status: {status:?}"));
+        }
+        Ok(())
     }
 
     /// Spawns the server with fuzz time enabled.
@@ -427,26 +440,48 @@ fn readiness_pipe() -> (fs::File, fs::File) {
 
 impl Drop for TestHarness {
     fn drop(&mut self) {
-        terminate_server(&mut self.server);
+        let _ = terminate_server(&mut self.server);
         let _ = fs::remove_dir_all(&self.temp_dir);
         let _ = fs::remove_dir_all(&self.sock_dir);
     }
 }
 
-fn terminate_server(server: &mut Option<Child>) {
+fn terminate_server(server: &mut Option<Child>) -> Option<ExitStatus> {
     if let Some(mut server) = server.take() {
         let pid = server.id() as i32;
         unsafe {
             libc::kill(pid, libc::SIGTERM);
         }
         for _ in 0..50 {
-            if let Ok(Some(_)) = server.try_wait() {
-                break;
+            if let Ok(Some(status)) = server.try_wait() {
+                return Some(status);
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = server.kill();
-        let _ = server.wait();
+        return server.wait().ok();
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readiness_eof_reports_daemon_log_and_cleans_up_child() {
+        let mut harness = TestHarness::new("readiness_eof");
+        fs::write(&harness.server_log_path, "bind failed: operation not permitted\n").unwrap();
+        let (mut ready_reader, ready_writer) = readiness_pipe();
+        let server = Command::new("/bin/sh").args(["-c", "exit 23"]).spawn().unwrap();
+        harness.server = Some(server);
+        drop(ready_writer);
+
+        let error = harness.wait_for_server_ready(&mut ready_reader).unwrap_err();
+
+        assert!(error.contains("failed to fill whole buffer"), "{error}");
+        assert!(error.contains("bind failed: operation not permitted"), "{error}");
+        assert!(harness.server.is_none(), "failed startup child should be reaped");
     }
 }
 
