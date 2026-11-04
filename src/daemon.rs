@@ -4,6 +4,7 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
+            fs::{FileTypeExt, OpenOptionsExt},
             io::FromRawFd,
             net::{UnixListener, UnixStream},
         },
@@ -349,12 +350,55 @@ fn handle_rpc_connection(pm: &ProcessManagerHandle, socket: UnixStream, buffer: 
     });
 }
 
+/// Hold the lock for the listener's entire lifetime. Never unlink the lock file:
+/// replacing its inode would let another daemon acquire a different lock.
+fn bind_daemon_socket(socket: &Path) -> anyhow::Result<(UnixListener, File)> {
+    let mut lock_path = socket.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let ownership = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(lock_path)
+        .context("Failed to open daemon socket lock")?;
+    // Rust opens files with CLOEXEC, so tasks cannot keep ownership alive after
+    // the daemon exits. The kernel also releases this lock on SIGKILL/crashes.
+    if unsafe { libc::flock(ownership.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("Daemon socket is already owned");
+    }
+
+    let listener = match UnixListener::bind(socket) {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == ErrorKind::AddrInUse => {
+            // A pre-locking version may already own this socket. Only reclaim a
+            // socket with no listener, and never remove a regular file/symlink.
+            if !std::fs::symlink_metadata(socket)?.file_type().is_socket() {
+                bail!("Daemon socket path exists and is not a socket: {}", socket.display());
+            }
+            match UnixStream::connect(socket) {
+                Ok(_) => bail!("A daemon is already listening on {}", socket.display()),
+                Err(err) if err.kind() == ErrorKind::ConnectionRefused || err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err).context("Failed to check existing daemon socket"),
+            }
+            match std::fs::remove_file(socket) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err).context("Failed to remove stale daemon socket"),
+            }
+            UnixListener::bind(socket).context("Failed to bind daemon socket")?
+        }
+        Err(err) => return Err(err).context("Failed to bind daemon socket"),
+    };
+    Ok((listener, ownership))
+}
+
 pub fn worker() -> anyhow::Result<()> {
     kvlog::info!("Daemon Starting");
 
     let socket = socket_path();
-    let _ = std::fs::remove_file(socket);
-    let listener = UnixListener::bind(socket).context("Failed to bind daemon socket")?;
+    let (listener, _socket_ownership) = bind_daemon_socket(Path::new(socket))?;
     kvlog::info!("RPC Socket bound", path = socket);
     if let Some(fd) = std::env::var_os("DEVSM_TEST_READY_FD").and_then(|fd| fd.to_str()?.parse::<i32>().ok()) {
         let byte = [1u8];
@@ -440,4 +484,72 @@ pub fn worker() -> anyhow::Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Fixture(std::path::PathBuf);
+
+    impl Fixture {
+        fn new() -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!("dsm_lock_{}_{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn socket(&self) -> std::path::PathBuf {
+            self.0.join("socket")
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn daemon_socket_has_one_owner_and_recovers_after_owner_exit() {
+        let fixture = Fixture::new();
+        let socket = fixture.socket();
+        let (listener, ownership) = bind_daemon_socket(&socket).unwrap();
+        assert!(bind_daemon_socket(&socket).is_err());
+        assert!(UnixStream::connect(&socket).is_ok());
+        let fd_flags = unsafe { libc::fcntl(ownership.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+        drop(listener);
+        assert!(bind_daemon_socket(&socket).is_err(), "ownership lasts until the daemon releases its lock");
+        drop(ownership);
+        assert!(socket.exists(), "the old socket should be stale");
+        let (_listener, _ownership) = bind_daemon_socket(&socket).unwrap();
+        assert!(UnixStream::connect(&socket).is_ok());
+    }
+
+    #[test]
+    fn daemon_socket_does_not_replace_a_legacy_listener() {
+        let fixture = Fixture::new();
+        let socket = fixture.socket();
+        let legacy = UnixListener::bind(&socket).unwrap();
+        assert!(bind_daemon_socket(&socket).is_err());
+        let _client = UnixStream::connect(&socket).unwrap();
+        legacy.set_nonblocking(true).unwrap();
+        assert!(legacy.accept().is_ok());
+    }
+
+    #[test]
+    fn daemon_socket_does_not_remove_files_or_symlinks() {
+        let fixture = Fixture::new();
+        let socket = fixture.socket();
+        std::fs::write(&socket, "keep").unwrap();
+        assert!(bind_daemon_socket(&socket).is_err());
+        assert_eq!(std::fs::read_to_string(&socket).unwrap(), "keep");
+        std::fs::remove_file(&socket).unwrap();
+        std::os::unix::fs::symlink("missing", &socket).unwrap();
+        assert!(bind_daemon_socket(&socket).is_err());
+        assert_eq!(std::fs::read_link(&socket).unwrap(), Path::new("missing"));
+    }
 }

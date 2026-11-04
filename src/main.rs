@@ -2671,6 +2671,7 @@ Complete Contexts:
 
 Environment Variables:
   DEVSM_SOCKET           Custom socket path
+  DEVSM_DB               Database and cache location (/dev/null disables persistence)
   DEVSM_NO_AUTO_SPAWN    Disable daemon auto-spawn (set to 1)
   DEVSM_LOG_STDOUT       Log daemon to stdout (set to 1)
 "
