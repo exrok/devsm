@@ -467,7 +467,12 @@ mod tests {
     }
 
     fn task_call(name: &'static str) -> Requirement<'static> {
-        Requirement::Task(TaskCall { name: Alias::new(name), profile: None, vars: ValueMap::new() })
+        Requirement::Task(TaskCall {
+            name: Alias::new(name),
+            profile: None,
+            vars: ValueMap::new(),
+            wait: Default::default(),
+        })
     }
 
     fn resource(name: &'static str) -> Requirement<'static> {

@@ -4,7 +4,8 @@ use toml_spanner::{Context, Document, Failed, Item, Table, Value};
 
 use crate::config::{
     Alias, AllowMultiple, CacheConfig, CacheKeyInput, CliAutocomplete, CliConfig, CommandExpr, ExecutionMode, FunctionDef,
-    FunctionDefAction, If, Predicate, ReadyConfig, ReadyPredicate, Requirement, RequirementExpr, RequirementListExpr,
+    FunctionDefAction, If, Predicate, ReadyConfig, ReadyPredicate, RequireWait, Requirement, RequirementExpr,
+    RequirementListExpr,
     ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, TimeoutConfig,
     TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
 };
@@ -753,10 +754,10 @@ fn parse_requirement_branch<'a>(
 
 fn parse_requirement<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Requirement<'a>, Failed> {
     match value.value() {
-        Value::String(_) => Ok(Requirement::Task(parse_task_call(alloc, value, ctx)?)),
-        Value::Array(_) => Ok(Requirement::Task(parse_task_call(alloc, value, ctx)?)),
+        Value::String(_) => Ok(Requirement::Task(parse_task_call(alloc, value, TaskCallSite::Require, ctx)?)),
+        Value::Array(_) => Ok(Requirement::Task(parse_task_call(alloc, value, TaskCallSite::Require, ctx)?)),
         Value::Table(table) if table.get("resource").is_some() => parse_resource_entry(table, value, ctx),
-        Value::Table(_) => Ok(Requirement::Task(parse_task_call(alloc, value, ctx)?)),
+        Value::Table(_) => Ok(Requirement::Task(parse_task_call(alloc, value, TaskCallSite::Require, ctx)?)),
         _ => Err(ctx.report_expected_but_found(&"a string, task-call table, or `{ resource = \"...\" }` table", value)),
     }
 }
@@ -862,11 +863,25 @@ fn parse_task_call_vars<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<j
     Ok(vars)
 }
 
-fn parse_task_call<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<TaskCall<'a>, Failed> {
+/// Where a task call appears, which decides the keys it accepts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskCallSite {
+    /// An entry in `require`, which may also set `wait`.
+    Require,
+    /// A group member or function spawn target.
+    Launch,
+}
+
+fn parse_task_call<'a>(
+    alloc: &'a Bump,
+    value: &Item<'a>,
+    site: TaskCallSite,
+    ctx: &mut Context<'a>,
+) -> Result<TaskCall<'a>, Failed> {
     match value.value() {
         Value::String(&s) => {
             let (name, profile) = split_task_call_name(s);
-            Ok(TaskCall { name: Alias(name), profile, vars: jsony_value::ValueMap::new() })
+            Ok(TaskCall { name: Alias(name), profile, vars: jsony_value::ValueMap::new(), wait: RequireWait::Satisfied })
         }
         Value::Array(_) => Err(ctx.report_custom_error(
             "task call arrays are no longer supported; use { name = \"...\", vars = { ... } }",
@@ -876,9 +891,16 @@ fn parse_task_call<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>)
             let mut selector: Option<&'a str> = None;
             let mut profile: Option<&'a str> = None;
             let mut vars = jsony_value::ValueMap::new();
+            let mut wait = RequireWait::Satisfied;
 
             for (key, val) in table {
                 match key.name {
+                    "wait" if site == TaskCallSite::Require => {
+                        let Value::Boolean(&waits) = val.value() else {
+                            return Err(ctx.report_expected_but_found(&"a boolean", val));
+                        };
+                        wait = if waits { RequireWait::Satisfied } else { RequireWait::Concurrent };
+                    }
                     "name" => {
                         if selector.is_some() {
                             return Err(ctx.report_custom_error(
@@ -903,6 +925,12 @@ fn parse_task_call<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>)
                     "args" => {
                         return Err(ctx.report_custom_error("task call uses `vars`, not `args`", val));
                     }
+                    _ if site == TaskCallSite::Require => {
+                        return Err(ctx.report_custom_error(
+                            "unknown key on task call (expected `name`, `action`, `service`, `test`, `profile`, `vars`, or `wait`)",
+                            val,
+                        ));
+                    }
                     _ => {
                         return Err(ctx.report_custom_error(
                             "unknown key on task call (expected `name`, `action`, `service`, `test`, `profile`, or `vars`)",
@@ -924,7 +952,7 @@ fn parse_task_call<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>)
                 return Err(ctx.report_custom_error("task call profile specified both inline and in `profile`", value));
             }
 
-            Ok(TaskCall { name: Alias(name), profile: profile.or(inline_profile), vars })
+            Ok(TaskCall { name: Alias(name), profile: profile.or(inline_profile), vars, wait })
         }
         _ => Err(ctx.report_expected_but_found(&"a string or task-call table", value)),
     }
@@ -947,12 +975,12 @@ fn parse_function_action<'a>(
                     Value::Array(arr) => {
                         let mut calls = bumpalo::collections::Vec::new_in(alloc);
                         for item in arr {
-                            calls.push(parse_task_call(alloc, item, ctx)?);
+                            calls.push(parse_task_call(alloc, item, TaskCallSite::Launch, ctx)?);
                         }
                         calls.into_bump_slice()
                     }
                     Value::String(_) | Value::Table(_) => {
-                        std::slice::from_ref(alloc.alloc(parse_task_call(alloc, val, ctx)?))
+                        std::slice::from_ref(alloc.alloc(parse_task_call(alloc, val, TaskCallSite::Launch, ctx)?))
                     }
                     _ => return Err(ctx.report_expected_but_found(&"a string, task-call table, or array", val)),
                 };
@@ -1094,7 +1122,7 @@ fn parse_root<'a>(
                     let group_array = group_value.require_array(ctx)?;
                     let mut calls = bumpalo::collections::Vec::new_in(alloc);
                     for item in group_array {
-                        calls.push(parse_task_call(alloc, item, ctx)?);
+                        calls.push(parse_task_call(alloc, item, TaskCallSite::Launch, ctx)?);
                     }
                     groups_vec.push((name.name, calls.into_bump_slice()));
                 }
@@ -1836,5 +1864,45 @@ require = [
             "expected duplicate-resource message, got: {:?}",
             messages
         );
+    }
+
+    #[test]
+    fn require_wait_flag_parses_and_defaults_to_satisfied() {
+        let text = r#"
+[service.db]
+cmd = ["db"]
+[service.api]
+cmd = ["api"]
+require = ["db", { service = "db", wait = false }, { name = "db", wait = true }]
+"#;
+        let arena = toml_spanner::Arena::new();
+        let bump = Bump::new();
+        let (doc, result) = parse_text(text, &arena, &bump);
+        assert!(result.is_ok(), "messages: {:?}", collect_messages(&doc));
+        let config = result.unwrap();
+        let (_, api) = config.tasks.iter().find(|(name, _)| *name == "api").unwrap();
+        let waits: Vec<RequireWait> = api
+            .require
+            .iter()
+            .map(|expr| {
+                let RequirementExpr::Requirement(Requirement::Task(call)) = expr else { panic!("task call") };
+                call.wait
+            })
+            .collect();
+        assert_eq!(waits, [RequireWait::Satisfied, RequireWait::Concurrent, RequireWait::Satisfied]);
+    }
+
+    #[test]
+    fn require_wait_flag_rejected_outside_require_and_when_not_boolean() {
+        let cases = [
+            "[service.db]\ncmd = [\"db\"]\n[group]\ndev = [{ name = \"db\", wait = false }]\n",
+            "[service.db]\ncmd = [\"db\"]\n[service.api]\ncmd = [\"api\"]\nrequire = [{ name = \"db\", wait = \"no\" }]\n",
+        ];
+        for text in cases {
+            let arena = toml_spanner::Arena::new();
+            let bump = Bump::new();
+            let (_doc, result) = parse_text(text, &arena, &bump);
+            assert!(result.is_err(), "expected parse failure for: {text}");
+        }
     }
 }

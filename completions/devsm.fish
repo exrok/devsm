@@ -47,7 +47,7 @@ end
 
 function __fish_devsm_is_builtin_command
     switch $argv[1]
-        case global run exec start restart restart-selected stop status test rerun-tests logs get function self completions
+        case global run exec start restart restart-selected wait stop status test rerun-tests logs get function self completions
             return 0
     end
     return 1
@@ -417,6 +417,7 @@ complete -c devsm -n __fish_devsm_needs_command -a 'exec' -d 'Execute task direc
 complete -c devsm -n __fish_devsm_needs_command -a 'start' -d 'Start a task via daemon'
 complete -c devsm -n __fish_devsm_needs_command -a 'restart' -d 'Restart a task via daemon'
 complete -c devsm -n __fish_devsm_needs_command -a 'restart-selected' -d 'Restart selected task in TUI'
+complete -c devsm -n __fish_devsm_needs_command -a 'wait' -d 'Block until tasks or groups are ready'
 complete -c devsm -n __fish_devsm_needs_command -a 'stop' -d 'Terminate a running task'
 complete -c devsm -n __fish_devsm_needs_command -a 'status' -d 'Show active tasks or task/group status'
 complete -c devsm -n __fish_devsm_needs_command -a 'test' -d 'Run tests with optional filters'
@@ -452,6 +453,12 @@ complete -c devsm -n '__fish_devsm_using_implicit_task; and __fish_devsm_complet
 complete -c devsm -n '__fish_devsm_using_command run; and not __fish_devsm_has_task' -l sticky -d 'Keep a terminal-task wrapper attached after exit'
 complete -c devsm -n '__fish_devsm_using_command start' -l cached -d 'Only start if not cached'
 complete -c devsm -n '__fish_devsm_using_command restart' -l cached -d 'Only restart if not cached'
+complete -c devsm -n '__fish_devsm_using_command start; or __fish_devsm_using_command restart' -l wait -d 'Block until the job is ready'
+complete -c devsm -n '__fish_devsm_using_command start; or __fish_devsm_using_command restart' -l wait-timeout -x -d 'Block until ready, failing after DURATION'
+
+# Wait command
+complete -c devsm -n '__fish_devsm_using_command wait' -xa '(__fish_devsm_runnables)'
+complete -c devsm -n '__fish_devsm_using_command wait' -l timeout -x -d 'Fail if not ready after DURATION'
 
 # Test command
 function __fish_devsm_test_tag_filters

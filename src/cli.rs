@@ -107,6 +107,13 @@ fn parse_no_args<'a>(
     Ok(command)
 }
 
+/// Options controlling how long a client blocks until jobs become ready.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WaitOptions {
+    /// Give up after this long; `None` waits until every job is ready or fails.
+    pub timeout: Option<std::time::Duration>,
+}
+
 pub struct GlobalArguments<'a> {
     pub from: Option<&'a str>,
 }
@@ -117,8 +124,9 @@ pub enum Command<'a> {
     Global,
     Server,
     RestartSelected,
-    Start { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
-    Restart { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool },
+    Start { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool, wait: Option<WaitOptions> },
+    Restart { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool, wait: Option<WaitOptions> },
+    Wait { names: Vec<&'a str>, options: WaitOptions },
     Exec { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String] },
     Run {
         job: &'a str,
@@ -150,6 +158,7 @@ pub enum HelpTopic {
     Start,
     Restart,
     RestartSelected,
+    Wait,
     Stop,
     Status,
     Test,
@@ -319,6 +328,7 @@ pub fn parse_run_trailing_params<'a>(
 fn parse_daemon_task<'a>(parser: &mut ArgParser<'a>, restart: bool) -> anyhow::Result<Command<'a>> {
     let mut as_test = false;
     let mut cached = false;
+    let mut wait = None;
     let mut job = None;
     let mut value_map = ValueMap::new();
     let help_topic = if restart { HelpTopic::Restart } else { HelpTopic::Start };
@@ -328,6 +338,15 @@ fn parse_daemon_task<'a>(parser: &mut ArgParser<'a>, restart: bool) -> anyhow::R
             Component::Long("help") => return Ok(Command::Help(help_topic)),
             Component::Long("as-test") => as_test = true,
             Component::Long("cached") => cached = true,
+            Component::Long("wait") => {
+                wait.get_or_insert(WaitOptions::default());
+            }
+            Component::Long("wait-timeout") => {
+                let Some(val) = parser.next_value() else {
+                    bail!("Flag --wait-timeout requires a value (use --wait-timeout=DURATION)");
+                };
+                wait = Some(WaitOptions { timeout: Some(parse_wait_timeout(val)?) });
+            }
             Component::Long(key) => {
                 let Some(val) = parser.next_value() else {
                     bail!("Flag --{} requires a value (use --{}=value)", key, key);
@@ -363,10 +382,41 @@ fn parse_daemon_task<'a>(parser: &mut ArgParser<'a>, restart: bool) -> anyhow::R
     };
 
     if restart {
-        Ok(Command::Restart { job, value_map, as_test, cached })
+        Ok(Command::Restart { job, value_map, as_test, cached, wait })
     } else {
-        Ok(Command::Start { job, value_map, as_test, cached })
+        Ok(Command::Start { job, value_map, as_test, cached, wait })
     }
+}
+
+fn parse_wait_timeout(value: &str) -> anyhow::Result<std::time::Duration> {
+    let secs = crate::config::parse_duration(value).map_err(|err| anyhow::anyhow!("Invalid timeout {value:?}: {err}"))?;
+    Ok(std::time::Duration::from_secs_f64(secs))
+}
+
+fn parse_wait<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
+    let mut names = Vec::new();
+    let mut options = WaitOptions::default();
+    while let Some(component) = parser.next() {
+        if is_help(&component) {
+            return Ok(Command::Help(HelpTopic::Wait));
+        }
+        match component {
+            Component::Long("timeout") => {
+                let Some(val) = parser.next_value() else {
+                    bail!("Flag --timeout requires a value (use --timeout=DURATION)");
+                };
+                options.timeout = Some(parse_wait_timeout(val)?);
+            }
+            Component::Long(long) => bail!("Unknown flag --{} in wait command", long),
+            Component::Flags(flags) => bail!("Unknown flag -{} in wait command", flags),
+            Component::Term(name) => names.push(name),
+            Component::Value(val) => bail!("Unexpected value: {:?}", val),
+        }
+    }
+    if names.is_empty() {
+        bail!("wait requires at least one task or group name");
+    }
+    Ok(Command::Wait { names, options })
 }
 
 fn parse_exec<'a>(parser: &mut ArgParser<'a>) -> anyhow::Result<Command<'a>> {
@@ -838,6 +888,7 @@ pub fn parse<'a>(args: &'a [String]) -> anyhow::Result<(GlobalArguments<'a>, Com
                 }
                 "start" => break 'command parse_daemon_task(&mut parser, false)?,
                 "restart" => break 'command parse_daemon_task(&mut parser, true)?,
+                "wait" => break 'command parse_wait(&mut parser)?,
                 "exec" => break 'command parse_exec(&mut parser)?,
                 "run" => break 'command parse_run(&mut parser)?,
                 "stop" => {
@@ -1161,6 +1212,7 @@ mod tests {
             (&["start", "--help"][..], HelpTopic::Start),
             (&["restart", "--help"][..], HelpTopic::Restart),
             (&["restart-selected", "--help"][..], HelpTopic::RestartSelected),
+            (&["wait", "--help"][..], HelpTopic::Wait),
             (&["stop", "--help"][..], HelpTopic::Stop),
             (&["status", "--help"][..], HelpTopic::Status),
             (&["test", "--help"][..], HelpTopic::Test),
@@ -1190,6 +1242,47 @@ mod tests {
             };
             assert_eq!(topic, expected, "args: {values:?}");
         }
+    }
+
+    #[test]
+    fn parse_start_wait_flags_are_not_params() {
+        let cli_args = args(&["start", "--wait", "group.dev"]);
+        let (_, command) = parse(&cli_args).unwrap();
+        let Command::Start { job, value_map, wait: Some(wait), .. } = command else {
+            panic!("expected start command with wait");
+        };
+        assert_eq!(job, "group.dev");
+        assert!(value_map.entries().is_empty());
+        assert_eq!(wait.timeout, None);
+
+        let cli_args = args(&["restart", "--wait-timeout=2m", "api", "--port=80"]);
+        let (_, command) = parse(&cli_args).unwrap();
+        let Command::Restart { job, value_map, wait: Some(wait), .. } = command else {
+            panic!("expected restart command with wait");
+        };
+        assert_eq!(job, "api");
+        assert_eq!(value_map.entries().len(), 1);
+        assert_eq!(wait.timeout, Some(std::time::Duration::from_secs(120)));
+
+        let cli_args = args(&["start", "api"]);
+        let (_, command) = parse(&cli_args).unwrap();
+        let Command::Start { wait: None, .. } = command else {
+            panic!("expected start command without wait");
+        };
+    }
+
+    #[test]
+    fn parse_wait_names_and_timeout() {
+        let cli_args = args(&["wait", "backend", "group.sim", "--timeout=30"]);
+        let (_, command) = parse(&cli_args).unwrap();
+        let Command::Wait { names, options } = command else {
+            panic!("expected wait command");
+        };
+        assert_eq!(names, ["backend", "group.sim"]);
+        assert_eq!(options.timeout, Some(std::time::Duration::from_secs(30)));
+
+        assert!(parse(&args(&["wait"])).is_err());
+        assert!(parse(&args(&["wait", "backend", "--port=1"])).is_err());
     }
 
     #[test]

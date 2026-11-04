@@ -1,10 +1,10 @@
 use super::*;
 use crate::config::Command as ConfigCommand;
-use crate::config::Requirement;
+use crate::config::{RequireWait, Requirement};
 use crate::rpc::DecodeResult;
 use crate::rpc::DecodingState;
 use crate::workspace::{
-    BaseTaskIndex, FunctionGlobalAction, Job, JobIndex, ScheduleRequirement, SpawnSpec, WorkspaceState as WsState,
+    BaseTaskIndex, FunctionGlobalAction, Job, JobIndex, JobPredicate, ScheduleRequirement, SpawnSpec, WorkspaceState as WsState,
 };
 use jsony_value::ValueMap;
 
@@ -508,6 +508,7 @@ fn blockers_for_scheduled(state: &WsState, after: &[ScheduleRequirement]) -> Vec
     let mut out = Vec::new();
     for req in after {
         match req {
+            ScheduleRequirement::Task { predicate: JobPredicate::Concurrent, .. } => {}
             ScheduleRequirement::Task { job: ji, predicate } => {
                 let Some(blocking_job) = state.jobs.get(*ji) else {
                     continue;
@@ -606,10 +607,14 @@ fn render_requirement(requirement: &Requirement<'_>) -> Box<str> {
     match requirement {
         Requirement::Task(call) => {
             let p = call.profile.unwrap_or("");
+            let wait = match call.wait {
+                RequireWait::Satisfied => "",
+                RequireWait::Concurrent => " (wait = false)",
+            };
             if p.is_empty() {
-                format!("task {}", &*call.name).into()
+                format!("task {}{wait}", &*call.name).into()
             } else {
-                format!("task {}:{}", &*call.name, p).into()
+                format!("task {}:{}{wait}", &*call.name, p).into()
             }
         }
         Requirement::Resource { name, priority } => format!("resource {name} (priority {priority})").into(),

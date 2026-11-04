@@ -47,6 +47,20 @@ pub struct TaskCall<'a> {
     pub profile: Option<&'a str>,
     /// todo this leaks when bump allows because ValueMap allocates globally
     pub vars: ValueMap<'a>,
+    /// Only meaningful inside `require`; groups and functions ignore it.
+    pub wait: RequireWait,
+}
+
+/// Whether a dependent waits on a required task before it starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequireWait {
+    /// Wait until the requirement is satisfied: a service is running and
+    /// ready, an action exited successfully.
+    #[default]
+    Satisfied,
+    /// Start the requirement but run the dependent alongside it immediately
+    /// (`wait = false`), for tasks that tolerate out-of-order initialization.
+    Concurrent,
 }
 
 /// A single entry in a `require` slice. Tasks declare dependencies on either
@@ -918,7 +932,12 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
 fn clone_requirement_for_eval<'a>(req: &Requirement<'static>) -> Requirement<'a> {
     match req {
         Requirement::Task(call) => {
-            Requirement::Task(TaskCall { name: Alias(call.name.0), profile: call.profile, vars: call.vars.clone() })
+            Requirement::Task(TaskCall {
+            name: Alias(call.name.0),
+            profile: call.profile,
+            vars: call.vars.clone(),
+            wait: call.wait,
+        })
         }
         Requirement::Resource { name, priority } => Requirement::Resource { name, priority: *priority },
     }

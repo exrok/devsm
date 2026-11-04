@@ -5,10 +5,10 @@ use crate::harness;
 use std::fs;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
-use harness::{TestHarness, cargo_bin_path};
+use harness::{TestHarness, devsm_command};
 
 #[test]
 fn daemon_stdout_logging_emits_readiness_message() {
@@ -34,7 +34,7 @@ fn spawn_detached_client(
     args: &[&str],
     extra_env: &[(&str, &std::path::Path)],
 ) -> std::process::Child {
-    let mut cmd = Command::new(cargo_bin_path());
+    let mut cmd = devsm_command();
     cmd.args(args)
         .current_dir(&harness.temp_dir)
         .env("DEVSM_SOCKET", &harness.socket_path)
@@ -149,7 +149,7 @@ fn daemon_panic_writes_plain_text_crash_report() {
     // buffer is active and its decoded contents land in the report.
     let log_file = fs::File::create(&harness.server_log_path).expect("create server log");
     let log_err = log_file.try_clone().expect("clone server log");
-    let server = Command::new(cargo_bin_path())
+    let server = devsm_command()
         .args(["self", "server"])
         .current_dir(&harness.temp_dir)
         .env("DEVSM_SOCKET", &harness.socket_path)

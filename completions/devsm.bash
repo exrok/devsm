@@ -24,7 +24,7 @@ __devsm_resolve_words() {
 
 __devsm_is_builtin_command() {
     case "$1" in
-        global|run|exec|start|restart|restart-selected|stop|status|test|rerun-tests|logs|get|function|self|completions) return 0 ;;
+        global|run|exec|start|restart|restart-selected|wait|stop|status|test|rerun-tests|logs|get|function|self|completions) return 0 ;;
     esac
     return 1
 }
@@ -348,9 +348,21 @@ _devsm() {
             fi
             return
             ;;
+        wait)
+            if [[ "$_devsm_cur" == -* ]]; then
+                mapfile -t COMPREPLY < <(compgen -W "--timeout=" -- "$_devsm_cur")
+            else
+                __devsm_complete_runnables
+            fi
+            return
+            ;;
         start|restart)
             __devsm_find_task "$_devsm_cmd_idx"
             if [[ -z "$_devsm_task_idx" ]]; then
+                if [[ "$_devsm_cur" == -* ]]; then
+                    mapfile -t COMPREPLY < <(compgen -W "--wait --wait-timeout= --cached --as-test" -- "$_devsm_cur")
+                    return
+                fi
                 if [[ "$_devsm_cur" == *:* ]]; then
                     __devsm_complete_profiles "${_devsm_cur%%:*}"
                 else

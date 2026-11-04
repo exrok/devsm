@@ -294,6 +294,14 @@ info = "The ultimate test action with every possible field (sh)"
 [service.simple_service]
 cmd = ["./server"]
 
+# Service that starts alongside its dependency instead of waiting for it to be ready
+[service.service_no_wait_require]
+cmd = ["./client"]
+require = [
+    { service = "simple_service", wait = false },
+    { name = "with_require_simple", wait = true },
+]
+
 # Minimal service with sh
 [service.simple_service_sh]
 sh = "python -m http.server 8000"

@@ -6,6 +6,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::ffi::{OsStr, OsString};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -206,7 +208,7 @@ impl TestHarness {
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
         let (mut ready_reader, ready_writer) = readiness_pipe();
 
-        let server = Command::new(cargo_bin_path())
+        let server = devsm_command()
             .args(["self", "server"])
             .current_dir(&self.temp_dir)
             .env("DEVSM_SOCKET", &self.socket_path)
@@ -236,7 +238,7 @@ impl TestHarness {
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
         let (mut ready_reader, ready_writer) = readiness_pipe();
 
-        let server = Command::new(cargo_bin_path())
+        let server = devsm_command()
             .args(["self", "server"])
             .current_dir(cwd)
             .env("DEVSM_SOCKET", &self.socket_path)
@@ -280,7 +282,7 @@ impl TestHarness {
         let log_file = fs::File::create(&self.server_log_path).expect("Failed to create server log");
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
-        let server = Command::new(cargo_bin_path())
+        let server = devsm_command()
             .args(["self", "server"])
             .current_dir(&self.temp_dir)
             .env("DEVSM_SOCKET", &self.socket_path)
@@ -318,7 +320,7 @@ impl TestHarness {
     /// Uses piped stdin (not null) to prevent the server from detaching early.
     /// The server polls on stdin and detaches if it gets EOF.
     pub fn run_client(&self, args: &[&str]) -> ClientResult {
-        let mut cmd = Command::new(cargo_bin_path());
+        let mut cmd = devsm_command();
         cmd.args(args)
             .current_dir(&self.temp_dir)
             .env("DEVSM_SOCKET", &self.socket_path)
@@ -351,6 +353,7 @@ impl TestHarness {
     /// controlling-terminal foreground groups or termios restoration.
     pub fn spawn_pty_client(&self, args: &[&str]) -> PtyClient {
         let mut command = CommandBuilder::new(cargo_bin_path());
+        command.env("PATH", test_path());
         command.args(args);
         command.cwd(&self.temp_dir);
         command.env("DEVSM_SOCKET", &self.socket_path);
@@ -365,7 +368,8 @@ impl TestHarness {
     /// PTY helper, this keeps a parent process group in the PTY session so
     /// Ctrl-Z exercises real, non-orphaned job control.
     pub fn spawn_job_controlled_pty_client(&self, control_socket: &Path, args: &[&str]) -> PtyClient {
-        let mut command = CommandBuilder::new(cargo_bin_path().with_file_name("test-app"));
+        let mut command = CommandBuilder::new(test_app_path());
+        command.env("PATH", test_path());
         command.arg("--job-control-monitor");
         command.arg(cargo_bin_path());
         command.args(args);
@@ -629,6 +633,46 @@ impl RpcSubscriber {
 /// devsm test action) can overwrite with a non-fuzz build.
 pub fn cargo_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_devsm"))
+}
+
+/// A `Command` for the devsm binary under test with [`test_path`] as `PATH`,
+/// so task configs (and the daemon's children) resolve `test-app` by name.
+pub fn devsm_command() -> Command {
+    let mut command = Command::new(cargo_bin_path());
+    command.env("PATH", test_path());
+    command
+}
+
+/// `test-app` built from this checkout, next to the devsm binary under test.
+///
+/// `cargo test` does not build other workspace members, so this builds it
+/// once per test process. Otherwise tests either fail to find it or silently
+/// run whatever stale `test-app` happens to be on the system `PATH`.
+pub fn test_app_path() -> &'static Path {
+    static TEST_APP: OnceLock<PathBuf> = OnceLock::new();
+    TEST_APP.get_or_init(|| {
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let status = Command::new(cargo)
+            .args(["build", "--quiet", "-p", "test-app"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .status()
+            .expect("failed to run `cargo build -p test-app`");
+        assert!(status.success(), "`cargo build -p test-app` failed: {status}");
+        let path = cargo_bin_path().with_file_name("test-app");
+        assert!(path.exists(), "test-app was not built at {}", path.display());
+        path
+    })
+}
+
+/// The inherited `PATH` with the directory of [`test_app_path`] first.
+pub fn test_path() -> &'static OsStr {
+    static PATH: OnceLock<OsString> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let test_app_dir = test_app_path().parent().expect("test-app has a parent directory").to_path_buf();
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = std::iter::once(test_app_dir).chain(std::env::split_paths(&inherited));
+        std::env::join_paths(dirs).expect("PATH entries are joinable")
+    })
 }
 
 // ── test-app protocol ──────────────────────────────────────────────────────

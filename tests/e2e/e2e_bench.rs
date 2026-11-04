@@ -8,10 +8,10 @@
 //! log view re-renders.
 
 use crate::e2e_tui::{BenchMetrics, TuiState, TuiTestClient};
-use crate::harness::{TestHarness, cargo_bin_path};
+use crate::harness::{TestHarness, devsm_command};
 
 use std::fs;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 const PLAIN_LOG_GEN: &str =
@@ -43,7 +43,7 @@ impl BenchHarness {
         let log_file = fs::File::create(&harness.server_log_path).expect("Failed to create server log");
         let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
-        let server = Command::new(cargo_bin_path())
+        let server = devsm_command()
             .args(["self", "server"])
             .env("DEVSM_SOCKET", &harness.socket_path)
             .env("DEVSM_LOG_STDOUT", "1")

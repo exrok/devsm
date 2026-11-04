@@ -15,10 +15,10 @@ use crate::rpc::{
     KillTaskRequest, RpcMessageKind, RunnableStatus, SpawnTaskRequest, StatusResponse, SubscribeAck,
     SubscriptionFilter, WorkspaceClient,
 };
-use harness::{RpcEvent, RpcSubscriber, TestAppServer, TestHarness, cargo_bin_path};
+use harness::{RpcEvent, RpcSubscriber, TestAppServer, TestHarness, devsm_command};
 
 fn spawn_client_process(harness: &TestHarness, args: &[&str]) -> Child {
-    Command::new(cargo_bin_path())
+    devsm_command()
         .args(args)
         .current_dir(&harness.temp_dir)
         .env("DEVSM_SOCKET", &harness.socket_path)
@@ -33,7 +33,7 @@ fn spawn_client_process(harness: &TestHarness, args: &[&str]) -> Child {
 }
 
 fn run_client_with_timeout(harness: &TestHarness, args: &[&str], timeout: Duration) -> Option<harness::ClientResult> {
-    let mut cmd = Command::new(cargo_bin_path());
+    let mut cmd = devsm_command();
     cmd.args(args)
         .current_dir(&harness.temp_dir)
         .env("DEVSM_SOCKET", &harness.socket_path)
@@ -954,7 +954,7 @@ require = ["dep"]
         let temp_dir = harness.temp_dir.clone();
         let socket_path = harness.socket_path.clone();
         move || {
-            Command::new(cargo_bin_path())
+            devsm_command()
                 .args(["run", "main"])
                 .current_dir(&temp_dir)
                 .env("DEVSM_SOCKET", &socket_path)
@@ -1588,7 +1588,7 @@ sh = "echo hello"
         let temp_dir = harness.temp_dir.clone();
         let socket_path = harness.socket_path.clone();
         move || {
-            Command::new(cargo_bin_path())
+            devsm_command()
                 .args(["run", "task"])
                 .current_dir(&temp_dir)
                 .env("DEVSM_SOCKET", &socket_path)
@@ -1642,7 +1642,7 @@ require = ["dep"]
         let temp_dir = harness.temp_dir.clone();
         let socket_path = harness.socket_path.clone();
         move || {
-            Command::new(cargo_bin_path())
+            devsm_command()
                 .args(["run", "main"])
                 .current_dir(&temp_dir)
                 .env("DEVSM_SOCKET", &socket_path)
@@ -1695,7 +1695,7 @@ sh = "sleep 0.01 && echo done"
         let temp_dir = harness.temp_dir.clone();
         let socket_path = harness.socket_path.clone();
         move || {
-            Command::new(cargo_bin_path())
+            devsm_command()
                 .args(["run", "slow_task"])
                 .current_dir(&temp_dir)
                 .env("DEVSM_SOCKET", &socket_path)
@@ -3163,7 +3163,7 @@ sh = "exit 0"
         let temp_dir = harness.temp_dir.clone();
         let socket_path = harness.socket_path.clone();
         move || {
-            Command::new(cargo_bin_path())
+            devsm_command()
                 .args(["run", "natural_exit"])
                 .current_dir(&temp_dir)
                 .env("DEVSM_SOCKET", &socket_path)
@@ -3210,7 +3210,7 @@ while true; do sleep 1; done
 
     let temp_dir = harness.temp_dir.clone();
     let socket_path = harness.socket_path.clone();
-    let first_run = Command::new(cargo_bin_path())
+    let first_run = devsm_command()
         .args(["run", "backend"])
         .current_dir(&temp_dir)
         .env("DEVSM_SOCKET", &socket_path)
@@ -3230,7 +3230,7 @@ while true; do sleep 1; done
 
     let temp_dir = harness.temp_dir.clone();
     let socket_path = harness.socket_path.clone();
-    let _second_run = Command::new(cargo_bin_path())
+    let _second_run = devsm_command()
         .args(["run", "backend"])
         .current_dir(&temp_dir)
         .env("DEVSM_SOCKET", &socket_path)
@@ -3302,7 +3302,7 @@ cmd = ["/nonexistent/path/to/executable"]
         let temp_dir = harness.temp_dir.clone();
         let socket_path = harness.socket_path.clone();
         move || {
-            Command::new(cargo_bin_path())
+            devsm_command()
                 .args(["run", "bad_exe"])
                 .current_dir(&temp_dir)
                 .env("DEVSM_SOCKET", &socket_path)
@@ -3974,7 +3974,7 @@ sh = "echo 'delayed message'"
 
     let temp_dir = harness.temp_dir.clone();
     let socket_path = harness.socket_path.clone();
-    let mut logs_child = Command::new(cargo_bin_path())
+    let mut logs_child = devsm_command()
         .args(["logs", "--follow", "--task=delayed_output"])
         .current_dir(&temp_dir)
         .env("DEVSM_SOCKET", &socket_path)
@@ -4021,7 +4021,7 @@ sh = "echo 'service started'; touch {marker}; while true; do sleep 1; done"
 
     let temp_dir = harness.temp_dir.clone();
     let socket_path = harness.socket_path.clone();
-    let _service = Command::new(cargo_bin_path())
+    let _service = devsm_command()
         .args(["run", "my_service"])
         .current_dir(&temp_dir)
         .env("DEVSM_SOCKET", &socket_path)
@@ -5073,7 +5073,7 @@ require = ["action.dep", "service.svc"]
     );
 
     let config_path = harness.temp_dir.join("devsm.toml");
-    let result = Command::new(cargo_bin_path())
+    let result = devsm_command()
         .args(["self", "validate"])
         .arg(&config_path)
         .arg("--skip-path-checks")
@@ -5108,7 +5108,7 @@ require = [
     );
 
     let config_path = harness.temp_dir.join("devsm.toml");
-    let result = Command::new(cargo_bin_path())
+    let result = devsm_command()
         .args(["self", "validate"])
         .arg(&config_path)
         .arg("--skip-path-checks")
@@ -5147,7 +5147,7 @@ require = ["backend:live"]
     );
 
     let config_path = harness.temp_dir.join("devsm.toml");
-    let result = Command::new(cargo_bin_path())
+    let result = devsm_command()
         .args(["self", "validate"])
         .arg(&config_path)
         .arg("--skip-path-checks")
@@ -5182,7 +5182,7 @@ require = [
     );
 
     let config_path = harness.temp_dir.join("devsm.toml");
-    let result = Command::new(cargo_bin_path())
+    let result = devsm_command()
         .args(["self", "validate"])
         .arg(&config_path)
         .arg("--skip-path-checks")

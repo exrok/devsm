@@ -1499,3 +1499,203 @@ env.TEST_APP_SOCKET = "{ctrl_path}"
     assert_eq!(wants_r.name(), "wants_r");
     wants_r.exit(0);
 }
+
+/// `start --wait` on a group returns only once every member is ready: a service
+/// with a ready check after it matches, one without as soon as it runs.
+#[test]
+fn start_wait_blocks_until_group_ready() {
+    let mut harness = TestHarness::new("start_wait_group");
+    let ctrl = TestAppServer::new(&harness.sock_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "READY" }} }}
+
+[service.plain]
+cmd = ["test-app", "plain"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+
+[group]
+dev = ["svc", "plain"]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let (client_result, _conns) = std::thread::scope(|s| {
+        let handle = s.spawn(|| harness.run_client(&["start", "--wait", "group.dev"]));
+
+        let [mut svc, plain] = ctrl.accept_named(["svc", "plain"], Duration::from_secs(10));
+        assert!(!handle.is_finished(), "start --wait returned before svc was ready");
+        svc.write_stdout(b"READY\n");
+
+        (handle.join().expect("client thread panicked"), (svc, plain))
+    });
+
+    assert!(
+        client_result.success(),
+        "start --wait should succeed: stdout={}, stderr={}, server_log={}",
+        client_result.stdout,
+        client_result.stderr,
+        harness.server_log()
+    );
+    assert!(client_result.stderr.contains("Waiting for:"), "stderr={}", client_result.stderr);
+    assert!(client_result.stdout.contains("service.svc"), "stdout={}", client_result.stdout);
+    assert!(client_result.stdout.contains("service.plain"), "stdout={}", client_result.stdout);
+}
+
+/// A service that exits before becoming ready fails the wait immediately and
+/// surfaces its log tail, instead of waiting out a timeout.
+#[test]
+fn start_wait_fails_fast_when_service_exits() {
+    let mut harness = TestHarness::new("start_wait_exit");
+    let ctrl = TestAppServer::new(&harness.sock_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "READY" }} }}
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let client_result = std::thread::scope(|s| {
+        let handle = s.spawn(|| harness.run_client(&["start", "--wait", "svc"]));
+
+        let mut svc = ctrl.accept_expected("svc", Duration::from_secs(10));
+        svc.write_stdout(b"port already in use\n");
+        svc.exit(3);
+
+        handle.join().expect("client thread panicked")
+    });
+
+    assert!(!client_result.success(), "start --wait should fail: stdout={}", client_result.stdout);
+    assert!(client_result.stderr.contains("service.svc failed while waiting"), "stderr={}", client_result.stderr);
+    assert!(client_result.stderr.contains("port already in use"), "stderr={}", client_result.stderr);
+}
+
+/// `wait` never starts anything: a task with no job fails right away, and a
+/// still-unready service honours `--timeout`.
+#[test]
+fn wait_fails_for_unstarted_and_times_out() {
+    let mut harness = TestHarness::new("wait_unstarted_timeout");
+    let ctrl = TestAppServer::new(&harness.sock_dir);
+
+    harness.write_config(&format!(
+        r#"
+[service.svc]
+cmd = ["test-app", "svc"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "READY" }} }}
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let unstarted = harness.run_client(&["wait", "svc"]);
+    assert!(!unstarted.success(), "wait on unstarted task should fail");
+    assert!(unstarted.stderr.contains("has not been started"), "stderr={}", unstarted.stderr);
+
+    let started = harness.run_client(&["start", "svc"]);
+    assert!(started.success(), "start should succeed: stderr={}", started.stderr);
+    let _svc = ctrl.accept_expected("svc", Duration::from_secs(10));
+
+    let timed_out = harness.run_client(&["wait", "svc", "--timeout=300ms"]);
+    assert!(!timed_out.success(), "wait should time out while svc is not ready");
+    assert!(timed_out.stderr.contains("timed out"), "stderr={}", timed_out.stderr);
+}
+
+/// `wait = false` starts the dependent immediately: it neither waits for the
+/// dependency's ready check nor for the dependency's own requirements.
+#[test]
+fn no_wait_require_starts_dependent_alongside_dependency() {
+    let mut harness = TestHarness::new("no_wait_require_parallel");
+    let ctrl = TestAppServer::new(&harness.sock_dir);
+
+    harness.write_config(&format!(
+        r#"
+[action.setup]
+cmd = ["test-app", "setup"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+
+[service.db]
+cmd = ["test-app", "db"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+ready = {{ when = {{ output_contains = "READY" }} }}
+require = ["setup"]
+
+[service.api]
+cmd = ["test-app", "api"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = [{{ service = "db", wait = false }}]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let started = harness.run_client(&["start", "api"]);
+    assert!(started.success(), "start should succeed: stderr={}", started.stderr);
+
+    let [mut setup, _api] = ctrl.accept_named(["setup", "api"], Duration::from_secs(10));
+    setup.exit(0);
+    let mut db = ctrl.accept_expected("db", Duration::from_secs(10));
+    db.write_stdout(b"READY\n");
+
+    let ready = harness.run_client(&["wait", "api", "db", "--timeout=10s"]);
+    assert!(ready.success(), "api and db should both be up: stderr={}", ready.stderr);
+
+    let status = harness.run_client(&["status", "api"]);
+    assert!(status.stdout.contains("task service.db (wait = false)"), "status={}", status.stdout);
+}
+
+/// A `wait = false` dependency that can never start does not cancel the
+/// dependent, unlike a waited-on service requirement.
+#[test]
+fn no_wait_require_dependency_failure_does_not_cancel_dependent() {
+    let mut harness = TestHarness::new("no_wait_require_failure");
+    let ctrl = TestAppServer::new(&harness.sock_dir);
+
+    harness.write_config(&format!(
+        r#"
+[action.setup]
+cmd = ["test-app", "setup"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+
+[service.db]
+cmd = ["test-app", "db"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = ["setup"]
+
+[service.api]
+cmd = ["test-app", "api"]
+env.TEST_APP_SOCKET = "{ctrl_path}"
+require = [{{ service = "db", wait = false }}]
+"#,
+        ctrl_path = ctrl.path.display(),
+    ));
+    harness.spawn_server();
+    assert!(harness.wait_for_socket(Duration::from_secs(5)), "Server socket not created");
+
+    let started = harness.run_client(&["start", "api"]);
+    assert!(started.success(), "start should succeed: stderr={}", started.stderr);
+
+    let [mut setup, _api] = ctrl.accept_named(["setup", "api"], Duration::from_secs(10));
+    setup.exit(1);
+
+    let db_wait = harness.run_client(&["wait", "db", "--timeout=10s"]);
+    assert!(!db_wait.success(), "db should be cancelled after setup fails");
+    assert!(db_wait.stderr.contains("cancelled"), "stderr={}", db_wait.stderr);
+
+    let api_wait = harness.run_client(&["wait", "api", "--timeout=10s"]);
+    assert!(api_wait.success(), "api must keep running: stderr={} server_log={}", api_wait.stderr, harness.server_log());
+}

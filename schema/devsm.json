@@ -195,10 +195,68 @@
         }
       ]
     },
+    "requireTaskCall": {
+      "description": "Task dependency: simple name, name:profile, or an object with vars and wait",
+      "oneOf": [
+        {
+          "type": "string",
+          "description": "Task name, optionally with profile (e.g., 'build' or 'build:release')"
+        },
+        {
+          "type": "object",
+          "description": "Task call object with optional profile and vars",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string",
+              "description": "Task name, optionally with profile or kind prefix"
+            },
+            "action": {
+              "type": "string",
+              "description": "Action task name"
+            },
+            "service": {
+              "type": "string",
+              "description": "Service task name"
+            },
+            "test": {
+              "type": "string",
+              "description": "Test task name"
+            },
+            "profile": {
+              "type": "string",
+              "description": "Profile to use for the task"
+            },
+            "wait": {
+              "type": "boolean",
+              "default": true,
+              "description": "Whether this task waits for the dependency before starting. true (default): wait until a service is running and ready, or an action exited successfully. false: start the dependency but run this task alongside it immediately, for tasks that tolerate out-of-order initialization"
+            },
+            "vars": {
+              "type": "object",
+              "description": "Variables to pass to the task",
+              "additionalProperties": {
+                "oneOf": [
+                  { "type": "string" },
+                  { "type": "integer" },
+                  { "type": "boolean" }
+                ]
+              }
+            }
+          },
+          "oneOf": [
+            { "required": ["name"] },
+            { "required": ["action"] },
+            { "required": ["service"] },
+            { "required": ["test"] }
+          ]
+        }
+      ]
+    },
     "requirement": {
       "description": "Either a task call or a named external resource that the scheduler serializes",
       "oneOf": [
-        { "$ref": "#/definitions/taskCall" },
+        { "$ref": "#/definitions/requireTaskCall" },
         {
           "type": "object",
           "description": "Exclusive resource lock. While one task holds the resource, others declaring the same name wait. Priority resolves contention; ties break FIFO.",

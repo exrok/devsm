@@ -4,11 +4,11 @@ use crate::harness;
 
 use std::fs;
 use std::io::Write;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-use harness::{TestHarness, cargo_bin_path};
+use harness::{TestHarness, devsm_command};
 use jsony::Jsony;
 
 /// State parsed from TUI JSON output stream.
@@ -185,7 +185,7 @@ mod kitty {
 
 impl TuiTestClient {
     pub fn spawn(harness: &TestHarness) -> Self {
-        let mut child = Command::new(cargo_bin_path())
+        let mut child = devsm_command()
             .current_dir(&harness.temp_dir)
             .env("DEVSM_SOCKET", &harness.socket_path)
             .env("DEVSM_NO_AUTO_SPAWN", "1")
@@ -271,7 +271,7 @@ sh = "while true; do sleep 1; done"
     let log_file = fs::File::create(&harness.server_log_path).expect("Failed to create server log");
     let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
-    let server = Command::new(cargo_bin_path())
+    let server = devsm_command()
         .args(["self", "server"])
         .env("DEVSM_SOCKET", &harness.socket_path)
         .env("DEVSM_LOG_STDOUT", "1")
@@ -340,7 +340,7 @@ sh = "while true; do sleep 1; done"
     let log_file = fs::File::create(&harness.server_log_path).expect("Failed to create server log");
     let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
-    let server = Command::new(cargo_bin_path())
+    let server = devsm_command()
         .args(["self", "server"])
         .env("DEVSM_SOCKET", &harness.socket_path)
         .env("DEVSM_LOG_STDOUT", "1")
@@ -381,7 +381,7 @@ sh = "echo hello"
     let log_file = fs::File::create(&harness.server_log_path).expect("Failed to create server log");
     let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
-    let server = Command::new(cargo_bin_path())
+    let server = devsm_command()
         .args(["self", "server"])
         .env("DEVSM_SOCKET", &harness.socket_path)
         .env("DEVSM_LOG_STDOUT", "1")
@@ -429,7 +429,7 @@ sh = "for i in $(seq 1 200); do echo \"log line $i\"; done"
     let log_file = fs::File::create(&harness.server_log_path).expect("Failed to create server log");
     let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
-    let server = Command::new(cargo_bin_path())
+    let server = devsm_command()
         .args(["self", "server"])
         .env("DEVSM_SOCKET", &harness.socket_path)
         .env("DEVSM_LOG_STDOUT", "1")
@@ -522,7 +522,7 @@ require = ["alpha"]
     let log_file = fs::File::create(&harness.server_log_path).expect("Failed to create server log");
     let log_file_err = log_file.try_clone().expect("Failed to clone log file");
 
-    let server = Command::new(cargo_bin_path())
+    let server = devsm_command()
         .args(["self", "server"])
         .current_dir(&harness.temp_dir)
         .env("DEVSM_SOCKET", &harness.socket_path)

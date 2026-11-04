@@ -477,6 +477,9 @@ pub enum JobPredicate {
     TerminatedNaturallyAndSuccessfully,
     Active,
     Ready,
+    /// Always met: a `wait = false` requirement is spawned alongside the
+    /// dependent but never delays or cancels it.
+    Concurrent,
 }
 
 impl JobPredicate {
@@ -486,6 +489,20 @@ impl JobPredicate {
             JobPredicate::TerminatedNaturallyAndSuccessfully => "successful completion",
             JobPredicate::Active => "active",
             JobPredicate::Ready => "ready",
+            JobPredicate::Concurrent => "concurrent",
+        }
+    }
+
+    /// The predicate a dependent's `require` entry imposes on a task of `kind`,
+    /// or `None` when such a task cannot be required.
+    fn for_requirement(kind: TaskKind, wait: crate::config::RequireWait) -> Option<JobPredicate> {
+        match (kind, wait) {
+            (TaskKind::Test, _) => None,
+            (_, crate::config::RequireWait::Concurrent) => Some(JobPredicate::Concurrent),
+            (TaskKind::Action, crate::config::RequireWait::Satisfied) => {
+                Some(JobPredicate::TerminatedNaturallyAndSuccessfully)
+            }
+            (TaskKind::Service, crate::config::RequireWait::Satisfied) => Some(JobPredicate::Active),
         }
     }
 }
@@ -578,6 +595,7 @@ impl ScheduleRequirement {
                         }
                         JobStatus::Exited { .. } => RequirementStatus::Met,
                     },
+                    JobPredicate::Concurrent => RequirementStatus::Met,
                 }
             }
         }
@@ -2308,10 +2326,9 @@ impl WorkspaceState {
                         continue;
                     };
 
-                    let predicate = match self.base_tasks[dep_base_task.idx()].config.kind {
-                        TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
-                        TaskKind::Service => JobPredicate::Active,
-                        TaskKind::Test => continue,
+                    let kind = self.base_tasks[dep_base_task.idx()].config.kind;
+                    let Some(predicate) = JobPredicate::for_requirement(kind, dep_call.wait) else {
+                        continue;
                     };
 
                     let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());
@@ -2437,6 +2454,11 @@ impl WorkspaceState {
             .iter()
             .filter_map(|req| match req {
                 ScheduleRequirement::Task { job, predicate: JobPredicate::Active } => Some(*job),
+                ScheduleRequirement::Task { job, predicate: JobPredicate::Concurrent } => {
+                    let dep_job = self.jobs.get(*job)?;
+                    let dep_kind = self.base_tasks[dep_job.log_group.base_task_index().idx()].config.kind;
+                    (dep_kind == TaskKind::Service).then_some(*job)
+                }
                 _ => None,
             })
             .collect();
@@ -3808,7 +3830,7 @@ impl WorkspaceState {
                             format!("exited unsuccessfully{code_suffix}")
                         }
                         JobPredicate::Ready => format!("exited before becoming ready{code_suffix}"),
-                        JobPredicate::Terminated => format!("exited{code_suffix}"),
+                        JobPredicate::Terminated | JobPredicate::Concurrent => format!("exited{code_suffix}"),
                     },
                 };
                 (reason, Some(code), Some(*cause))
@@ -4442,10 +4464,8 @@ impl WorkspaceState {
                         };
                         let dep_config = &self.base_tasks[dep_base_task.idx()].config;
 
-                        let predicate = match dep_config.kind {
-                            TaskKind::Action => JobPredicate::TerminatedNaturallyAndSuccessfully,
-                            TaskKind::Service => JobPredicate::Active,
-                            TaskKind::Test => continue,
+                        let Some(predicate) = JobPredicate::for_requirement(dep_config.kind, tc.wait) else {
+                            continue;
                         };
 
                         let key = batch.add_requirement(dep_base_task, dep_profile, dep_params, predicate.clone());

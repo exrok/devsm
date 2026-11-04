@@ -47,8 +47,16 @@ _devsm() {
             (start|restart)
                 _arguments "${_arguments_options[@]}" : \
                     '--cached[Skip restart if task has cache support and key matches]' \
+                    '--wait[Block until the job is ready]' \
+                    '--wait-timeout=[Block until ready, failing after DURATION]:duration:' \
                     ':task:_devsm_runnables' \
                     '*::arg:_devsm_vars_only' \
+                    && ret=0
+                ;;
+            (wait)
+                _arguments "${_arguments_options[@]}" : \
+                    '--timeout=[Fail if not ready after DURATION]:duration:' \
+                    '*:task:_devsm_runnables' \
                     && ret=0
                 ;;
             (stop)
@@ -187,6 +195,7 @@ _devsm_commands() {
         'start:Start a task via daemon'
         'restart:Restart a task via daemon'
         'restart-selected:Restart selected task in TUI'
+        'wait:Block until tasks or groups are ready'
         'stop:Terminate a running task'
         'status:Show active tasks or task/group status'
         'test:Run tests with optional filters'

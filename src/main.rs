@@ -110,14 +110,20 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        cli::Command::Start { job, value_map, as_test, cached } => {
-            if let Err(err) = start_task_command(job, value_map, as_test, cached) {
+        cli::Command::Start { job, value_map, as_test, cached, wait } => {
+            if let Err(err) = start_task_command(job, value_map, as_test, cached, wait) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
         }
-        cli::Command::Restart { job, value_map, as_test, cached } => {
-            if let Err(err) = restart_task_command(job, value_map, as_test, cached) {
+        cli::Command::Restart { job, value_map, as_test, cached, wait } => {
+            if let Err(err) = restart_task_command(job, value_map, as_test, cached, wait) {
+                eprintln!("error: {}", err);
+                std::process::exit(1);
+            }
+        }
+        cli::Command::Wait { names, options } => {
+            if let Err(err) = wait_command(&names, options) {
                 eprintln!("error: {}", err);
                 std::process::exit(1);
             }
@@ -548,18 +554,14 @@ fn restart_selected_command() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn start_task_command(job: &str, value_map: jsony_value::ValueMap, as_test: bool, cached: bool) -> anyhow::Result<()> {
-    let cwd = std::env::current_dir()?;
-    let config = config::find_config_path_from(&cwd)
-        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
-
-    let (task_name, profile) = job.rsplit_once(':').unwrap_or((job, ""));
-    let params_bytes = jsony::to_binary(&value_map);
-
-    let workspace = WorkspaceRef::Path { config: &config };
-    let req = rpc::SpawnTaskRequest { task_name, profile, params: &params_bytes, as_test, cached };
-    let response = rpc_ws_command(RpcMessageKind::StartTask, &workspace, &req)?;
-    handle_command_response(response)
+fn start_task_command(
+    job: &str,
+    value_map: jsony_value::ValueMap,
+    as_test: bool,
+    cached: bool,
+    wait: Option<cli::WaitOptions>,
+) -> anyhow::Result<()> {
+    spawn_task_command(RpcMessageKind::StartTask, job, value_map, as_test, cached, wait)
 }
 
 fn restart_task_command(
@@ -567,6 +569,18 @@ fn restart_task_command(
     value_map: jsony_value::ValueMap,
     as_test: bool,
     cached: bool,
+    wait: Option<cli::WaitOptions>,
+) -> anyhow::Result<()> {
+    spawn_task_command(RpcMessageKind::RestartTask, job, value_map, as_test, cached, wait)
+}
+
+fn spawn_task_command(
+    kind: RpcMessageKind,
+    job: &str,
+    value_map: jsony_value::ValueMap,
+    as_test: bool,
+    cached: bool,
+    wait: Option<cli::WaitOptions>,
 ) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
     let config = config::find_config_path_from(&cwd)
@@ -577,8 +591,146 @@ fn restart_task_command(
 
     let workspace = WorkspaceRef::Path { config: &config };
     let req = rpc::SpawnTaskRequest { task_name, profile, params: &params_bytes, as_test, cached };
-    let response = rpc_ws_command(RpcMessageKind::RestartTask, &workspace, &req)?;
-    handle_command_response(response)
+    let response = rpc_ws_command(kind, &workspace, &req)?;
+    let never_run = match &response.body {
+        CommandBody::Message(_) => NeverRun::Satisfied,
+        _ => NeverRun::Failure,
+    };
+    handle_command_response(response)?;
+
+    let Some(options) = wait else {
+        return Ok(());
+    };
+    wait_until_ready(&cwd, &config, &[task_name], options, never_run)
+}
+
+fn wait_command(names: &[&str], options: cli::WaitOptions) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir()?;
+    let config = config::find_config_path_from(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("Cannot find devsm.toml in current or parent directories"))?;
+    let names: Vec<&str> = names.iter().map(|name| name.rsplit_once(':').map_or(*name, |(name, _)| name)).collect();
+    wait_until_ready(&cwd, &config, &names, options, NeverRun::Failure)
+}
+
+/// How `wait_until_ready` treats a task that has no job at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NeverRun {
+    /// The start request was answered without spawning (cache hit), so a
+    /// missing job means there is nothing to wait for.
+    Satisfied,
+    Failure,
+}
+
+enum Readiness {
+    Ready,
+    Pending,
+    Failed(String),
+}
+
+/// Mirrors the scheduler's `require` semantics: a service must be running and
+/// past its ready check, anything else must have exited successfully.
+fn runnable_readiness(r: &rpc::RunnableStatus, never_run: NeverRun) -> Readiness {
+    let state = r.state.as_ref();
+    if state == "scheduled" || state == "starting" {
+        return Readiness::Pending;
+    }
+    if state.starts_with("running") {
+        if r.ready == Some(false) {
+            return Readiness::Pending;
+        }
+        return Readiness::Ready;
+    }
+    if state == "exited (success)" && r.kind.as_ref() != "service" {
+        return Readiness::Ready;
+    }
+    if state == "never run" {
+        if never_run == NeverRun::Satisfied {
+            return Readiness::Ready;
+        }
+        return Readiness::Failed("has not been started".into());
+    }
+    let mut reason = state.to_string();
+    if let Some(code) = r.exit_code {
+        reason.push_str(&format!(", code {code}"));
+    }
+    if let Some(cause) = r.exit_cause.as_deref() {
+        reason.push_str(&format!(", {cause}"));
+    }
+    Readiness::Failed(reason)
+}
+
+fn wait_until_ready(
+    cwd: &Path,
+    config: &Path,
+    names: &[&str],
+    options: cli::WaitOptions,
+    never_run: NeverRun,
+) -> anyhow::Result<()> {
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    const FAILURE_LOG_TAIL_LINES: u32 = 20;
+
+    let started = Instant::now();
+    let workspace = WorkspaceRef::Path { config };
+    let mut last_report = String::new();
+    loop {
+        let mut runnables = Vec::new();
+        for name in names {
+            let req = rpc::GetStatusRequest { name };
+            let response = rpc_ws_command(RpcMessageKind::GetStatus, &workspace, &req)?;
+            let msg = match response.body {
+                CommandBody::Message(msg) => msg,
+                CommandBody::Error(err) => bail!("{err}"),
+                CommandBody::Empty => bail!("empty status response for '{name}'"),
+            };
+            let parsed: rpc::StatusResponse =
+                jsony::from_json(&msg).map_err(|e| anyhow::anyhow!("Failed to decode status response: {e:?}"))?;
+            match parsed {
+                rpc::StatusResponse::Task(r) => runnables.push(r),
+                rpc::StatusResponse::Group(g) => runnables.extend(g.runnables),
+                rpc::StatusResponse::Global(_) => bail!("'{name}' is not a task or group"),
+            }
+        }
+
+        let mut pending = Vec::new();
+        for r in &runnables {
+            match runnable_readiness(r, never_run) {
+                Readiness::Ready => {}
+                Readiness::Pending => pending.push(format!("{}.{} ({})", r.kind, r.name, r.state)),
+                Readiness::Failed(reason) => {
+                    let mut message = format!("{}.{} failed while waiting: {reason}", r.kind, r.name);
+                    if let Some(job_id) = r.last_job_id {
+                        let preserve_ansi = unsafe { libc::isatty(2) == 1 };
+                        if let Ok(tail) =
+                            fetch_job_log_tail(cwd, config, job_id, FAILURE_LOG_TAIL_LINES, preserve_ansi)
+                            && !tail.trim().is_empty()
+                        {
+                            message.push_str(&format!("\nLast log lines of job #{job_id}:\n"));
+                            message.push_str(tail.trim_end());
+                        }
+                    }
+                    bail!("{message}");
+                }
+            }
+        }
+
+        if pending.is_empty() {
+            let ready: Vec<String> = runnables.iter().map(|r| format!("{}.{}", r.kind, r.name)).collect();
+            println!("Ready: {}", ready.join(", "));
+            return Ok(());
+        }
+
+        let report = pending.join(", ");
+        if let Some(timeout) = options.timeout
+            && started.elapsed() >= timeout
+        {
+            bail!("timed out after {} waiting for: {report}", format_duration_ms(timeout.as_millis() as u64));
+        }
+        if report != last_report {
+            eprintln!("Waiting for: {report}");
+            last_report = report;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 fn kill_task_command(job: &str) -> anyhow::Result<()> {
@@ -1828,6 +1980,7 @@ fn is_builtin_command_name(name: &str) -> bool {
             | "start"
             | "restart"
             | "restart-selected"
+            | "wait"
             | "stop"
             | "status"
             | "test"
@@ -2173,7 +2326,13 @@ Start a job via the daemon without restarting an active matching job.
 Options:
   --as-test             Run the job as part of a test group
   --cached              Skip start if cache support says the job is current
+  --wait                Block until the job (or every job in the group) is ready;
+                        see `devsm wait --help`
+  --wait-timeout=DUR    Like --wait, but fail after DUR (30s, 5m, 1h)
   -h, --help            Print this help message
+
+Example:
+  devsm start --wait group.dev && ./run-integration-tests.sh
 "
         ),
         cli::HelpTopic::Restart => print!(
@@ -2185,7 +2344,35 @@ Restart a job via the daemon.
 Options:
   --as-test             Run the job as part of a test group
   --cached              Skip restart if cache support says the job is current
+  --wait                Block until the restarted job is ready;
+                        see `devsm wait --help`
+  --wait-timeout=DUR    Like --wait, but fail after DUR (30s, 5m, 1h)
   -h, --help            Print this help message
+"
+        ),
+        cli::HelpTopic::Wait => print!(
+            "\
+Usage: devsm wait [OPTIONS] <name>...
+
+Block until every named task, and every task in each named group, is ready.
+Ready means what a dependent's `require` waits for:
+  service               running and past its `ready` check (if it has one)
+  action / test         exited successfully
+
+Exits 0 once everything is ready. Exits 1 as soon as anything can no longer
+become ready (a service exits, an action fails, a job is cancelled, or the task
+was never started), printing the tail of the failing job's log. Progress is
+reported on stderr.
+
+To start and wait in one step use `devsm start --wait <name>`.
+
+Options:
+  --timeout=DUR         Fail if not ready after DUR (30s, 5m, 1h)
+  -h, --help            Print this help message
+
+Examples:
+  devsm start --wait group.dev
+  devsm wait backend frontend --timeout=10m
 "
         ),
         cli::HelpTopic::RestartSelected => print!(
@@ -2410,6 +2597,8 @@ Commands:
   exec <job>         Execute a task directly, bypassing the daemon
   start <job>        Start a job via the daemon without restarting an active matching job
   restart <job>      Restart a job via the daemon
+                     --wait: with start/restart, block until the job is ready
+  wait <name>...     Block until tasks/groups are ready (fails fast on exit)
   restart-selected   Restart the currently selected task in TUI
   stop <task>        Terminate a running task (by name or index)
   status [name]      Show active tasks, or status of a task/group
