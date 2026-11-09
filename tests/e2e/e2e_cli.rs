@@ -5127,6 +5127,49 @@ require = [
 }
 
 #[test]
+fn validate_checks_all_require_expression_forms() {
+    let harness = TestHarness::new("validate_require_forms");
+    for kind in ["action", "service", "test"] {
+        for (target, error) in [
+            ("missing", Some("required task 'missing' does not exist")),
+            ("dep:missing", Some("required task 'dep' does not have profile 'missing'")),
+            ("dep:debug", None),
+        ] {
+            for require in [
+                format!("\"{target}\""),
+                format!("[\"{target}\"]"),
+                format!("{{ name = \"{target}\" }}"),
+                format!("{{ if.option.infra = \"docker\", then = \"{target}\" }}"),
+                format!("{{ if.option.infra = \"docker\", then = \"dep\", else = \"{target}\" }}"),
+                format!(
+                    "{{ if.option.infra = \"docker\", then = \"dep\", or_else = [{{ if.option.infra = \"native\", then = {{ name = \"{target}\" }} }}] }}"
+                ),
+            ] {
+                harness.write_config(&format!(
+                    r#"
+[option.infra]
+choices = ["docker", "native"]
+default = "docker"
+[action.dep]
+cmd = "true"
+profiles = ["debug"]
+[{kind}.user]
+cmd = "true"
+require = {require}
+"#
+                ));
+                let result = harness.run_client(&["self", "validate", "--skip-path-checks", "devsm.toml"]);
+                assert_eq!(result.success(), error.is_none(), "{kind}: {require}\n{}", result.stderr);
+                if let Some(error) = error {
+                    assert!(result.stderr.contains(error), "{kind}: {require}\n{}", result.stderr);
+                    assert!(result.stderr.contains("referenced here"), "missing source label: {}", result.stderr);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn validate_accepts_implicitly_profiled_conditional_require() {
     let harness = TestHarness::new("validate_inferred_conditional_profile");
     harness.write_config(

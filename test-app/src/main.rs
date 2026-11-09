@@ -176,9 +176,7 @@ fn run_controller(args: Vec<String>) -> i32 {
                 let _ = std::io::stderr().flush();
             }
             EXIT => {
-                return payload
-                    .split_first_chunk::<4>()
-                    .map_or(0, |(bytes, _)| i32::from_le_bytes(*bytes));
+                return payload.split_first_chunk::<4>().map_or(0, |(bytes, _)| i32::from_le_bytes(*bytes));
             }
             other => {
                 eprintln!("unknown kind: {other:#06x}");

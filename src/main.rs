@@ -44,8 +44,8 @@ mod rpc;
 mod scroll_view;
 mod searcher;
 mod self_log;
-mod test_summary_ui;
 mod terminal_harness;
+mod test_summary_ui;
 mod tui;
 mod user_config;
 mod validate;
@@ -700,8 +700,7 @@ fn wait_until_ready(
                     let mut message = format!("{}.{} failed while waiting: {reason}", r.kind, r.name);
                     if let Some(job_id) = r.last_job_id {
                         let preserve_ansi = unsafe { libc::isatty(2) == 1 };
-                        if let Ok(tail) =
-                            fetch_job_log_tail(cwd, config, job_id, FAILURE_LOG_TAIL_LINES, preserve_ansi)
+                        if let Ok(tail) = fetch_job_log_tail(cwd, config, job_id, FAILURE_LOG_TAIL_LINES, preserve_ansi)
                             && !tail.trim().is_empty()
                         {
                             message.push_str(&format!("\nLast log lines of job #{job_id}:\n"));
@@ -1491,10 +1490,7 @@ fn resolve_group_in_config(config: &config::WorkspaceConfig<'static>, name: &str
     config.groups.iter().find(|(group, _)| *group == short).map(|(group, _)| *group)
 }
 
-fn group_terminal_task(
-    config: &config::WorkspaceConfig<'static>,
-    group_name: &str,
-) -> Option<&'static str> {
+fn group_terminal_task(config: &config::WorkspaceConfig<'static>, group_name: &str) -> Option<&'static str> {
     fn visit(
         config: &config::WorkspaceConfig<'static>,
         group_name: &str,
@@ -1566,7 +1562,8 @@ fn exec_task(job: &str, params: jsony_value::ValueMap, trailing_args: &[String])
     let params = build_task_params(task_expr, params, trailing_args, None)?;
     let profile = if profile.is_empty() { task_expr.profiles.first().copied().unwrap_or("") } else { profile };
     let daemon_params = params.clone();
-    let env = config::Environment { profile, param: params, vars: task_expr.vars };
+    let env =
+        config::Environment { profile, param: params, vars: task_expr.vars, options: workspace_config.option_values };
     let task = task_expr.eval(&env).map_err(|e| anyhow::anyhow!("Failed to evaluate task: {:?}", e))?;
     let tc = task.config();
 
@@ -2104,7 +2101,12 @@ fn forward_completion_spec(
     let (expr, profile) = resolve_completion_task_expr(workspace, task)?;
     let prefix = expr.autocomplete_forward_prefix()?;
     let profile = if profile.is_empty() { expr.profiles.first().copied().unwrap_or("") } else { profile };
-    let env = config::Environment { profile, param: jsony_value::ValueMap::new(), vars: expr.vars };
+    let env = config::Environment {
+        profile,
+        param: jsony_value::ValueMap::new(),
+        vars: expr.vars,
+        options: workspace.option_values,
+    };
     let pwd = expr.eval_pwd(&env).ok()?;
     Some((workspace.base_path.join(pwd), prefix))
 }

@@ -16,7 +16,18 @@ use jsony_value::{Value, ValueMap, ValueRef};
 
 use crate::diagnostic::{Diagnostic, emit_diagnostic, render_diagnostic, toml_error_to_diagnostic};
 
+pub mod options;
 pub mod toml_handler;
+use options::referenced_option_values;
+
+pub type OptionValues<'a> = &'a [(&'a str, &'a str)];
+
+#[derive(Debug)]
+pub struct OptionConfig<'a> {
+    pub choices: &'a [&'a str],
+    pub default: Option<&'a str>,
+    pub info: &'a str,
+}
 
 pub fn emit_config_error(file_name: &str, content: &str, diagnostic: &Diagnostic) {
     emit_diagnostic(file_name, content, diagnostic);
@@ -103,14 +114,14 @@ impl<'a> RequirementExpr<'a> {
         }
     }
 
-    pub fn eval_for_profile_append(&self, profile: &str, out: &mut Vec<Requirement<'a>>) {
+    pub fn eval_for_profile_append(&self, profile: &str, options: OptionValues<'_>, out: &mut Vec<Requirement<'a>>) {
         match self {
             RequirementExpr::Requirement(req) => out.push(req.clone()),
             RequirementExpr::If(if_expr) => {
-                if if_expr.cond.eval_profile(profile) {
-                    if_expr.then.eval_for_profile_append(profile, out);
+                if if_expr.cond.matches(profile, options) {
+                    if_expr.then.eval_for_profile_append(profile, options, out);
                 } else if let Some(or_else) = &if_expr.or_else {
-                    or_else.eval_for_profile_append(profile, out);
+                    or_else.eval_for_profile_append(profile, options, out);
                 }
             }
         }
@@ -137,9 +148,9 @@ impl<'a> RequirementListExpr<'a> {
         }
     }
 
-    pub fn eval_for_profile_append(&self, profile: &str, out: &mut Vec<Requirement<'a>>) {
+    pub fn eval_for_profile_append(&self, profile: &str, options: OptionValues<'_>, out: &mut Vec<Requirement<'a>>) {
         for item in self.items {
-            item.eval_for_profile_append(profile, out);
+            item.eval_for_profile_append(profile, options, out);
         }
     }
 
@@ -282,6 +293,12 @@ pub struct ReadyConfig<'a> {
     pub timeout: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+pub enum ReadyExpr<'a> {
+    OutputContains { pattern: StringExpr<'a>, timeout: Option<f64> },
+    If(&'a If<'a, ReadyExpr<'a>>),
+}
+
 /// Predicate determining when a timeout condition triggers.
 /// Reuses the same predicates as ReadyPredicate.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -394,6 +411,8 @@ pub struct TaskConfig<'a> {
     pub cache: Option<CacheConfig<'a>>,
     pub ready: Option<ReadyConfig<'a>>,
     pub timeout: Option<TimeoutConfig<'a>>,
+    /// Only the options referenced by this task, fixed at evaluation time.
+    pub option_values: OptionValues<'a>,
 }
 
 pub fn find_config_path_from(path: &Path) -> Option<PathBuf> {
@@ -453,7 +472,8 @@ pub fn load_workspace_config_from_path(
     }
 
     match result {
-        Ok(value) => {
+        Ok(mut value) => {
+            options::emit_warnings(&options::load_local_options(config_path, &mut value, bump)?);
             kvlog::info!("Workspace config loaded", path = config_path.as_os_str().as_bytes(), elapsed);
             Ok(value)
         }
@@ -500,7 +520,8 @@ pub fn load_workspace_config_capturing(
     }
 
     match result {
-        Ok(value) => {
+        Ok(mut value) => {
+            options::emit_warnings(&options::load_local_options(config_path, &mut value, bump)?);
             kvlog::info!("Workspace config loaded", path = config_path.as_os_str().as_bytes(), elapsed);
             Ok(value)
         }
@@ -521,6 +542,8 @@ pub struct WorkspaceConfig<'a> {
     pub groups: &'a [(&'a str, &'a [TaskCall<'a>])],
     /// Saved function definitions (fn1, fn2).
     pub functions: &'a [FunctionDef<'a>],
+    pub options: &'a [(&'a str, OptionConfig<'a>)],
+    pub option_values: OptionValues<'a>,
 }
 
 #[derive(Debug, Clone)]
@@ -540,7 +563,8 @@ pub struct TaskConfigExpr<'a> {
     envvar: &'a [(&'a str, StringExpr<'a>)],
     pub require: &'a [RequirementExpr<'a>],
     pub cache: Option<CacheConfig<'a>>,
-    pub ready: Option<ReadyConfig<'a>>,
+    pub ready: Option<ReadyExpr<'a>>,
+    pub referenced_options: &'a [&'a str],
     /// Timeout configuration for the task.
     pub timeout: Option<TimeoutConfig<'a>>,
     /// Tags for test filtering. Empty for non-test tasks.
@@ -570,6 +594,7 @@ pub struct TestConfigExpr<'a> {
     pub require: &'a [RequirementExpr<'a>],
     pub tags: &'a [&'a str],
     pub cache: Option<CacheConfig<'a>>,
+    pub referenced_options: &'a [&'a str],
     /// Timeout configuration for the test.
     pub timeout: Option<TimeoutConfig<'a>>,
     /// Per-test command-line behavior.
@@ -593,6 +618,7 @@ impl TestConfigExpr<'static> {
             require: self.require,
             cache: self.cache.clone(),
             ready: None,
+            referenced_options: self.referenced_options,
             timeout: self.timeout.clone(),
             tags: self.tags,
             managed: ExecutionMode::Either,
@@ -619,6 +645,7 @@ pub static CARGO_AUTO_EXPR: TaskConfigExpr<'static> = {
         require: EMPTY_REQUIREMENT_EXPRS,
         cache: None,
         ready: None,
+        referenced_options: &[],
         timeout: None,
         tags: &[],
         managed: ExecutionMode::Either,
@@ -672,6 +699,7 @@ impl ConfigGeneration {
                     require: config.require,
                     cache: config.cache.clone(),
                     ready: None,
+                    referenced_options: config.referenced_options,
                     timeout: config.timeout.clone(),
                     tags: config.tags,
                     managed: ExecutionMode::Either,
@@ -758,7 +786,27 @@ impl TaskConfigSource {
     }
 
     pub fn eval(&self, env: &Environment) -> Result<TaskConfigRc, EvalError> {
-        self.expr().eval_with_generation(env, self.generation())
+        let generation = self.generation();
+        let env = Environment {
+            profile: env.profile,
+            param: env.param.clone(),
+            vars: env.vars,
+            options: generation.as_ref().map_or(env.options, |g| g.workspace().option_values),
+        };
+        self.expr().eval_with_generation(&env, generation.clone())
+    }
+
+    pub fn option_values(&self) -> OptionValues<'_> {
+        match self {
+            Self::Static(_) => &[],
+            Self::WorkspaceTask { generation, .. } | Self::DerivedTest { generation, .. } => {
+                generation.workspace().option_values
+            }
+        }
+    }
+
+    pub fn cache_option_values(&self) -> Vec<(&str, &str)> {
+        referenced_option_values(self.referenced_options, self.option_values())
     }
 }
 
@@ -791,7 +839,8 @@ pub fn load_workspace_generation_capturing(
     drop(doc);
 
     match result {
-        Ok(value) => {
+        Ok(mut value) => {
+            options::emit_warnings(&options::load_local_options(config_path, &mut value, &parse_bump)?);
             let workspace = unsafe { std::mem::transmute::<WorkspaceConfig<'_>, WorkspaceConfig<'static>>(value) };
             kvlog::info!("Workspace config loaded", path = config_path.as_os_str().as_bytes(), elapsed);
             Ok(ConfigGeneration::new(content, toml_arena, parse_bump, base_path, workspace))
@@ -809,6 +858,7 @@ pub struct Environment<'a> {
     pub profile: &'a str,
     pub param: jsony_value::ValueMap<'a>,
     pub vars: &'a [(&'a str, VarMeta<'a>)],
+    pub options: OptionValues<'a>,
 }
 
 fn get_var_default<'a>(vars: &[(&str, VarMeta<'a>)], name: &str) -> Option<&'a str> {
@@ -913,15 +963,24 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
             command,
             require: RequirementListExpr { items: self.require }.bump_eval(env, bump)?,
             cache: self.cache.clone(),
-            ready: self.ready.clone(),
+            ready: self.ready.as_ref().map(|ready| ready.bump_eval(env, bump)).transpose()?.flatten(),
             timeout: self.timeout.clone(),
+            option_values: bump.alloc_slice_copy(
+                &referenced_option_values(self.referenced_options, env.options)
+                    .into_iter()
+                    .map(|(name, value)| (&*bump.alloc_str(name), &*bump.alloc_str(value)))
+                    .collect::<Vec<_>>(),
+            ),
             envvar: if self.envvar.is_empty() {
                 &[]
             } else {
                 let mut result = bumpalo::collections::Vec::new_in(bump);
                 for (key, value_expr) in self.envvar.iter() {
-                    let value = value_expr.bump_eval(env, bump)?;
-                    result.push((*key, value));
+                    match value_expr.bump_eval(env, bump) {
+                        Ok(value) => result.push((*key, value)),
+                        Err(EvalError::EmptyBranch) => {}
+                        Err(error) => return Err(error),
+                    }
                 }
                 result.into_bump_slice()
             },
@@ -931,14 +990,12 @@ impl<'a> BumpEval<'a> for TaskConfigExpr<'static> {
 
 fn clone_requirement_for_eval<'a>(req: &Requirement<'static>) -> Requirement<'a> {
     match req {
-        Requirement::Task(call) => {
-            Requirement::Task(TaskCall {
+        Requirement::Task(call) => Requirement::Task(TaskCall {
             name: Alias(call.name.0),
             profile: call.profile,
             vars: call.vars.clone(),
             wait: call.wait,
-        })
-        }
+        }),
         Requirement::Resource { name, priority } => Requirement::Resource { name, priority: *priority },
     }
 }
@@ -1096,22 +1153,25 @@ fn eval_append_str<'a>(
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum Predicate<'a> {
     Profile(&'a str),
+    Option { name: &'a str, value: &'a str },
 }
 impl<'a> Predicate<'a> {
     fn visit_profiles(&self, f: &mut impl FnMut(&'a str)) {
         match self {
             Predicate::Profile(p) => f(p),
+            Predicate::Option { .. } => {}
         }
     }
 
-    fn eval_profile(&self, profile: &str) -> bool {
+    fn matches(&self, profile: &str, options: OptionValues<'_>) -> bool {
         match self {
             Predicate::Profile(p) => *p == profile,
+            Predicate::Option { name, value } => options.iter().any(|(n, v)| n == name && v == value),
         }
     }
 
     fn eval(&self, env: &Environment) -> bool {
-        self.eval_profile(env.profile)
+        self.matches(env.profile, env.options)
     }
 }
 
@@ -1131,16 +1191,12 @@ pub enum StringExpr<'a> {
 impl<'a, T: BumpEval<'a>> BumpEval<'a> for If<'a, T> {
     type Object = T::Object;
     fn bump_eval(&self, env: &Environment, bump: &'a Bump) -> Result<Self::Object, EvalError> {
-        match &self.cond {
-            Predicate::Profile(p) => {
-                if *p == env.profile {
-                    self.then.bump_eval(env, bump)
-                } else if let Some(or_else) = &self.or_else {
-                    or_else.bump_eval(env, bump)
-                } else {
-                    Err(EvalError::EmptyBranch)
-                }
-            }
+        if self.cond.eval(env) {
+            self.then.bump_eval(env, bump)
+        } else if let Some(or_else) = &self.or_else {
+            or_else.bump_eval(env, bump)
+        } else {
+            Err(EvalError::EmptyBranch)
         }
     }
 }
@@ -1197,6 +1253,18 @@ fn collect_string_list_expr_vars(expr: &StringListExpr<'static>, out: &mut Vec<&
     }
 }
 
+fn collect_ready_expr_vars(expr: &ReadyExpr<'static>, out: &mut Vec<&'static str>) {
+    match expr {
+        ReadyExpr::OutputContains { pattern, .. } => collect_string_expr_vars(pattern, out),
+        ReadyExpr::If(branch) => {
+            collect_ready_expr_vars(&branch.then, out);
+            if let Some(other) = &branch.or_else {
+                collect_ready_expr_vars(other, out);
+            }
+        }
+    }
+}
+
 impl TaskConfigExpr<'static> {
     /// Collects all variable names referenced in this task configuration.
     ///
@@ -1219,6 +1287,9 @@ impl TaskConfigExpr<'static> {
         }
         for (_key, value_expr) in self.envvar {
             collect_string_expr_vars(value_expr, &mut out);
+        }
+        if let Some(ready) = &self.ready {
+            collect_ready_expr_vars(ready, &mut out);
         }
         out
     }
@@ -1335,6 +1406,7 @@ mod tests {
             require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
+            referenced_options: &[],
             timeout: None,
             tags: &[],
             managed: ExecutionMode::Either,
@@ -1366,6 +1438,7 @@ mod tests {
             require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
+            referenced_options: &[],
             timeout: None,
             tags: &[],
             managed: ExecutionMode::Either,
@@ -1383,7 +1456,7 @@ mod tests {
     #[test]
     fn special_var_profile_resolves_in_string_expr() {
         let bump = Bump::new();
-        let env = Environment { profile: "production", param: ValueMap::new(), vars: &[] };
+        let env = Environment { profile: "production", param: ValueMap::new(), vars: &[], options: &[] };
         let expr = StringExpr::Var("$profile");
         let result = expr.bump_eval(&env, &bump).unwrap();
         assert_eq!(result, "production");
@@ -1392,7 +1465,7 @@ mod tests {
     #[test]
     fn special_var_profile_resolves_in_string_list_expr() {
         let bump = Bump::new();
-        let env = Environment { profile: "staging", param: ValueMap::new(), vars: &[] };
+        let env = Environment { profile: "staging", param: ValueMap::new(), vars: &[], options: &[] };
         let expr = StringListExpr::List(&[StringListExpr::Literal("echo"), StringListExpr::Var("$profile")]);
         let result = expr.bump_eval(&env, &bump).unwrap();
         assert_eq!(result, &["echo", "staging"]);
@@ -1414,6 +1487,7 @@ mod tests {
             require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
+            referenced_options: &[],
             timeout: None,
             tags: &[],
             managed: ExecutionMode::Either,
@@ -1447,6 +1521,7 @@ mod tests {
             require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
+            referenced_options: &[],
             timeout: None,
             tags: &[],
             managed: ExecutionMode::Either,
@@ -1459,7 +1534,7 @@ mod tests {
 
         let param =
             jsony::from_json::<ValueMap>(r#"{ "mapvar": { "nested": "value" } }"#).expect("valid params").to_owned();
-        let env = Environment { profile: "", param, vars: &[] };
+        let env = Environment { profile: "", param, vars: &[], options: &[] };
 
         assert!(TEST_EXPR.eval(&env).is_err(), "expected eval error, got Ok");
     }
@@ -1481,6 +1556,7 @@ mod tests {
             require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
+            referenced_options: &[],
             timeout: None,
             tags: &[],
             managed: ExecutionMode::Either,
@@ -1509,6 +1585,7 @@ mod tests {
             require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
+            referenced_options: &[],
             timeout: None,
             tags: &[],
             managed: ExecutionMode::Either,
@@ -1528,6 +1605,7 @@ mod tests {
             require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
+            referenced_options: &[],
             timeout: None,
             tags: &[],
             managed: ExecutionMode::Either,
@@ -1560,6 +1638,7 @@ mod tests {
             require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
+            referenced_options: &[],
             timeout: None,
             tags: &[],
             managed: ExecutionMode::Either,
@@ -1590,6 +1669,7 @@ mod tests {
             require: EMPTY_REQUIREMENT_EXPRS,
             cache: None,
             ready: None,
+            referenced_options: &[],
             timeout: None,
             tags: &[],
             managed: ExecutionMode::Either,

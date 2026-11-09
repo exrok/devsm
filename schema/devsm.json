@@ -5,6 +5,14 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
+    "option": {
+      "type": "object",
+      "description": "Workspace options selected in devsm.local.toml, falling back to their defaults",
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z0-9_]+$": { "$ref": "#/definitions/optionConfig" }
+      }
+    },
     "action": {
       "type": "object",
       "description": "Actions are one-time tasks that run to completion",
@@ -46,6 +54,24 @@
     }
   },
   "definitions": {
+    "optionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["choices"],
+      "properties": {
+        "choices": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        },
+        "default": {
+          "type": "string",
+          "description": "Default choice; without one, devsm.local.toml must select a value"
+        },
+        "info": { "type": "string", "description": "Help text for this option" }
+      }
+    },
     "stringExpr": {
       "description": "A string expression: literal string, variable reference, or conditional",
       "oneOf": [
@@ -88,6 +114,9 @@
         "or_else": {
           "$ref": "#/definitions/stringExpr",
           "description": "Value if condition is false (optional)"
+        },
+        "else": {
+          "$ref": "#/definitions/stringExpr"
         }
       }
     },
@@ -127,6 +156,9 @@
         "or_else": {
           "$ref": "#/definitions/stringListExpr",
           "description": "Value if condition is false (optional)"
+        },
+        "else": {
+          "$ref": "#/definitions/stringListExpr"
         }
       }
     },
@@ -134,11 +166,21 @@
       "type": "object",
       "description": "Condition predicate",
       "additionalProperties": false,
-      "required": ["profile"],
+      "oneOf": [{ "required": ["profile"] }, { "required": ["option"] }],
       "properties": {
         "profile": {
           "type": "string",
           "description": "Profile name to match against"
+        },
+        "option": {
+          "type": "object",
+          "description": "Compare one declared workspace option against one of its choices",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[a-z0-9_]+$": { "type": "string" }
+          }
         }
       }
     },
@@ -307,6 +349,9 @@
         "or_else": {
           "$ref": "#/definitions/requirementBranch",
           "description": "Requirement(s) if condition is false"
+        },
+        "else": {
+          "$ref": "#/definitions/requirementBranch"
         }
       }
     },
@@ -407,14 +452,31 @@
       "type": "object",
       "description": "Predicate determining when a service is ready",
       "additionalProperties": false,
+      "required": ["output_contains"],
       "properties": {
         "output_contains": {
-          "type": "string",
+          "$ref": "#/definitions/stringExpr",
           "description": "Ready when output contains this string (ANSI codes ignored)"
         }
       }
     },
     "readyConfig": {
+      "oneOf": [
+        { "$ref": "#/definitions/readyCondition" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["if", "then"],
+          "properties": {
+            "if": { "$ref": "#/definitions/predicate" },
+            "then": { "$ref": "#/definitions/readyConfig" },
+            "else": { "$ref": "#/definitions/readyConfig" },
+            "or_else": { "$ref": "#/definitions/readyConfig" }
+          }
+        }
+      ]
+    },
+    "readyCondition": {
       "type": "object",
       "description": "Ready condition configuration for services",
       "additionalProperties": false,
@@ -425,9 +487,11 @@
           "description": "Predicate determining when the service is ready"
         },
         "timeout": {
-          "type": "number",
-          "minimum": 0,
-          "description": "Timeout in seconds for ready condition"
+          "oneOf": [
+            { "type": "number", "minimum": 0 },
+            { "type": "string" }
+          ],
+          "description": "Timeout in seconds or a duration string for ready condition"
         }
       }
     },
@@ -569,11 +633,8 @@
           "description": "Environment variables"
         },
         "require": {
-          "type": "array",
-          "description": "Task dependencies that must complete before this task runs",
-          "items": {
-            "$ref": "#/definitions/requirement"
-          }
+          "$ref": "#/definitions/requirementBranch",
+          "description": "Task dependencies that must complete before this task runs"
         },
         "cache": {
           "$ref": "#/definitions/cacheConfig",
@@ -654,11 +715,8 @@
           "description": "Environment variables"
         },
         "require": {
-          "type": "array",
-          "description": "Task dependencies that must be active/running",
-          "items": {
-            "$ref": "#/definitions/requirement"
-          }
+          "$ref": "#/definitions/requirementBranch",
+          "description": "Task dependencies that must be active/running"
         },
         "ready": {
           "$ref": "#/definitions/readyConfig",
@@ -736,11 +794,8 @@
           "description": "Environment variables"
         },
         "require": {
-          "type": "array",
-          "description": "Task dependencies that must complete before this test runs",
-          "items": {
-            "$ref": "#/definitions/requirement"
-          }
+          "$ref": "#/definitions/requirementBranch",
+          "description": "Task dependencies that must complete before this test runs"
         },
         "tag": {
           "description": "Tags for filtering tests",

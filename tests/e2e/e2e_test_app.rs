@@ -1697,5 +1697,10 @@ require = [{{ service = "db", wait = false }}]
     assert!(db_wait.stderr.contains("cancelled"), "stderr={}", db_wait.stderr);
 
     let api_wait = harness.run_client(&["wait", "api", "--timeout=10s"]);
-    assert!(api_wait.success(), "api must keep running: stderr={} server_log={}", api_wait.stderr, harness.server_log());
+    assert!(
+        api_wait.success(),
+        "api must keep running: stderr={} server_log={}",
+        api_wait.stderr,
+        harness.server_log()
+    );
 }

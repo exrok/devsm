@@ -445,6 +445,7 @@ struct StatusBarData {
     status_message: Option<(String, bool)>,
     test_summary: Option<crate::workspace::TestGroupSummary>,
     chain_label: Option<String>,
+    option_text: String,
 }
 
 fn render_status_bar(frame: &mut Buffer, rect: Rect, data: &StatusBarData) {
@@ -511,6 +512,8 @@ fn render_status_bar(frame: &mut Buffer, rect: Rect, data: &StatusBarData) {
         let msg_text = format!(" {} ", text);
         let fg_color = if *is_error { AnsiColor::Salmon } else { AnsiColor::Grey[14] };
         r.with(AnsiColor::Grey[4].with_fg(fg_color)).text(frame, &msg_text);
+    } else if !data.option_text.is_empty() {
+        r.with(AnsiColor::Grey[4].with_fg(AnsiColor::Grey[20])).fmt(frame, format_args!(" {} ", data.option_text));
     }
 }
 
@@ -607,6 +610,15 @@ fn build_status_bar_data(tui: &TuiState, workspace: &Workspace, keybinds: &Keybi
         status_message,
         test_summary,
         chain_label: chain_info,
+        option_text: ws
+            .config
+            .current
+            .workspace()
+            .option_values
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" "),
     }
 }
 
@@ -797,7 +809,8 @@ fn process_key(
                 LauncherAction::Start { base_task, profile, params } => {
                     let name = ws.spawn_name_for(base_task);
                     let task_kind = ws.base_tasks[base_task.idx()].config.kind;
-                    let terminal = ws.base_tasks[base_task.idx()].config.managed == crate::config::ExecutionMode::Terminal;
+                    let terminal =
+                        ws.base_tasks[base_task.idx()].config.managed == crate::config::ExecutionMode::Terminal;
                     drop(ws);
                     let result = if terminal {
                         workspace.terminal_control(&name, &profile, params, false).map(|_| ())
@@ -1340,12 +1353,12 @@ fn restart_selected_task(tui: &mut TuiState, workspace: &Workspace) {
         match workspace.submit(SpawnSpec::task(&name, &profile, params, true)) {
             Ok(result) => {
                 if had_job_selected {
-                if let Some(&(_, ji)) = result.jobs.first() {
-                    let ws = workspace.state();
-                    tui.task_tree.select_job(ji, &ws);
+                    if let Some(&(_, ji)) = result.jobs.first() {
+                        let ws = workspace.state();
+                        tui.task_tree.select_job(ji, &ws);
+                    }
                 }
-            }
-            tui.status_message = Some(StatusMessage::info("Task Restarted"));
+                tui.status_message = Some(StatusMessage::info("Task Restarted"));
             }
             Err(err) => {
                 kvlog::warn!("Task restart submit failed", name, ?task_kind, profile, err);

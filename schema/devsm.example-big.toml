@@ -1,5 +1,31 @@
 # The following config is used for validating the json schema.
 
+# Override per checkout with [option] infra = "native" in devsm.local.toml.
+[option.infra]
+choices = ["docker", "native"]
+default = "docker"
+info = "native requires postgres, initdb, psql and mosquitto on PATH"
+
+[service.optional_postgres]
+cmd = { if.option.infra = "docker", then = ["docker", "run", "--rm", "postgres:17"], else = ["postgres"] }
+env.PGDATA = { if.option.infra = "native", then = "./data/postgres" }
+require = { if.option.infra = "native", then = "optional_initdb" }
+ready = { if.option.infra = "native", then = { when.output_contains = "ready to accept connections" } }
+
+[service.optional_mqtt]
+cmd = { if.option.infra = "docker", then = ["docker", "run", "--rm", "eclipse-mosquitto:2"], else = ["mosquitto"] }
+ready.when.output_contains = { if.option.infra = "docker", then = "running", else = "running" }
+ready.timeout = "30s"
+
+[action.optional_initdb]
+cmd = ["initdb", "-D", "./data/postgres"]
+cache = {}
+
+[action.optional_schema]
+cmd = { if.option.infra = "docker", then = ["docker", "exec", "dev_pg", "psql"], else = ["psql"] }
+require = [{ if.option.infra = "docker", then = "optional_postgres", else = ["optional_postgres", "optional_mqtt"] }]
+cache = {}
+
 [function]
 f1 = { kill = "full_basic" }
 f2 = { spawn = [{ name = "with_var", vars = { dir = "/tmp/" } }, "multiline_sh"] }

@@ -2,29 +2,39 @@ use bumpalo::Bump;
 use std::time::Duration;
 use toml_spanner::{Context, Document, Failed, Item, Table, Value};
 
+use crate::config::options::VisitOptions;
+
 use crate::config::{
-    Alias, AllowMultiple, CacheConfig, CacheKeyInput, CliAutocomplete, CliConfig, CommandExpr, ExecutionMode, FunctionDef,
-    FunctionDefAction, If, Predicate, ReadyConfig, ReadyPredicate, RequireWait, Requirement, RequirementExpr,
-    RequirementListExpr,
-    ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr, TimeoutConfig,
-    TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
+    Alias, AllowMultiple, CacheConfig, CacheKeyInput, CliAutocomplete, CliConfig, CommandExpr, ExecutionMode,
+    FunctionDef, FunctionDefAction, If, OptionConfig, Predicate, ReadyExpr, RequireWait, Requirement, RequirementExpr,
+    RequirementListExpr, ServiceHidden, StringExpr, StringListExpr, TaskCall, TaskConfigExpr, TaskKind, TestConfigExpr,
+    TimeoutConfig, TimeoutPredicate, VarMeta, WorkspaceConfig, parse_duration,
 };
 
 fn parse_predicate<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<Predicate<'a>, Failed> {
     let table = value.require_table(ctx)?;
-    let mut profile: Option<&'a str> = None;
+    let mut predicate = None;
     for (key, val) in table {
-        match key.name {
-            "profile" => profile = Some(val.require_string(ctx)?),
-            _ => {
-                ctx.report_unexpected_key(0, val, key.span);
+        let next = match key.name {
+            "profile" => Predicate::Profile(val.require_string(ctx)?),
+            "option" => {
+                let options = val.require_table(ctx)?;
+                let mut entries = options.into_iter();
+                let Some((name, value)) = entries.next() else {
+                    return Err(ctx.report_custom_error("`if.option` must compare exactly one option", val));
+                };
+                if entries.next().is_some() {
+                    return Err(ctx.report_custom_error("`if.option` must compare exactly one option", val));
+                }
+                Predicate::Option { name: name.name, value: value.require_string(ctx)? }
             }
+            _ => return Err(ctx.report_unexpected_key(0, val, key.span)),
+        };
+        if predicate.replace(next).is_some() {
+            return Err(ctx.report_custom_error("`if` must specify exactly one of `profile` or `option`", value));
         }
     }
-    match profile {
-        Some(p) => Ok(Predicate::Profile(p)),
-        None => Err(ctx.report_missing_field("profile", value)),
-    }
+    predicate.ok_or_else(|| ctx.report_custom_error("`if` requires `profile` or `option`", value))
 }
 
 fn parse_string_expr<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<StringExpr<'a>, Failed> {
@@ -172,52 +182,41 @@ fn parse_timeout_predicate<'a>(
     }
 }
 
-fn parse_ready_predicate<'a>(
-    when_table: &Table<'a>,
-    when_value: &Item<'a>,
-    ctx: &mut Context<'a>,
-) -> Result<ReadyPredicate<'a>, Failed> {
-    let mut output_contains: Option<&'a str> = None;
-    for (key, val) in when_table {
-        match key.name {
-            "output_contains" => output_contains = Some(val.require_string(ctx)?),
-            _ => {
-                ctx.report_unexpected_key(0, val, key.span);
+fn parse_ready_config<'a>(alloc: &'a Bump, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<ReadyExpr<'a>, Failed> {
+    let ready_table = value.require_table(ctx)?;
+    if let Some(condition) = ready_table.get("if") {
+        let cond = parse_predicate(condition, ctx)?;
+        let then = ready_table.get("then").ok_or_else(|| ctx.report_missing_field("then", value))?;
+        let then = parse_ready_config(alloc, then, ctx)?;
+        let mut or_else = None;
+        for (key, val) in ready_table {
+            match key.name {
+                "if" | "then" => {}
+                "else" | "or_else" => or_else = Some(parse_ready_config(alloc, val, ctx)?),
+                _ => return Err(ctx.report_unexpected_key(0, val, key.span)),
             }
         }
+        return Ok(ReadyExpr::If(alloc.alloc(If { cond, then, or_else })));
     }
-    match output_contains {
-        Some(s) => Ok(ReadyPredicate::OutputContains(s)),
-        None => {
-            Err(ctx.report_custom_error("`ready.when` must specify a predicate (e.g., `output_contains`)", when_value))
-        }
-    }
-}
-
-fn parse_ready_config<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<ReadyConfig<'a>, Failed> {
-    let ready_table = value.require_table(ctx)?;
-    let mut when: Option<ReadyPredicate<'a>> = None;
-    let mut timeout: Option<f64> = None;
-
+    let mut pattern = None;
+    let mut timeout = None;
     for (key, val) in ready_table {
         match key.name {
             "when" => {
-                let when_table = val.require_table(ctx)?;
-                when = Some(parse_ready_predicate(when_table, val, ctx)?);
+                for (key, val) in val.require_table(ctx)? {
+                    match key.name {
+                        "output_contains" => pattern = Some(parse_string_expr(alloc, val, ctx)?),
+                        _ => return Err(ctx.report_unexpected_key(0, val, key.span)),
+                    }
+                }
             }
-            "timeout" => match val.value() {
-                Value::Float(&f) => timeout = Some(f),
-                Value::Integer(&i) => timeout = Some(i.as_f64()),
-                _ => return Err(ctx.report_expected_but_found(&"a number", val)),
-            },
-            _ => {
-                ctx.report_unexpected_key(0, val, key.span);
-            }
+            "timeout" => timeout = Some(parse_duration_config(val, ctx)?.as_secs_f64()),
+            _ => return Err(ctx.report_unexpected_key(0, val, key.span)),
         }
     }
-
-    let when = when.ok_or_else(|| ctx.report_missing_field("when", value))?;
-    Ok(ReadyConfig { when, timeout })
+    let pattern =
+        pattern.ok_or_else(|| ctx.report_custom_error("`ready.when` must specify `output_contains`", value))?;
+    Ok(ReadyExpr::OutputContains { pattern, timeout })
 }
 
 fn parse_timeout_config<'a>(value: &Item<'a>, ctx: &mut Context<'a>) -> Result<TimeoutConfig<'a>, Failed> {
@@ -340,7 +339,7 @@ fn parse_task<'a>(
     let mut envvar_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut require: &[RequirementExpr<'a>] = &[];
     let mut cache: Option<CacheConfig<'a>> = None;
-    let mut ready: Option<ReadyConfig<'a>> = None;
+    let mut ready: Option<ReadyExpr<'a>> = None;
     let mut timeout: Option<TimeoutConfig<'a>> = None;
     let mut info = "";
     let mut cmd: Option<StringListExpr> = None;
@@ -372,13 +371,8 @@ fn parse_task<'a>(
                 }
             }
             "require" => {
-                let arr = value.require_array(ctx)?;
-                let mut calls = bumpalo::collections::Vec::new_in(alloc);
-                for item in arr {
-                    calls.push(parse_requirement_expr(alloc, item, ctx)?);
-                }
-                check_no_duplicate_resources_in_exprs(&calls, value, ctx)?;
-                require = calls.into_bump_slice();
+                require = parse_requirement_branch(alloc, value, ctx)?.items;
+                check_no_duplicate_resources_in_exprs(require, value, ctx)?;
             }
             "cache" => {
                 let cache_table = value.require_table(ctx)?;
@@ -399,7 +393,7 @@ fn parse_task<'a>(
                 if kind != TaskKind::Service {
                     return Err(ctx.report_custom_error("`ready` is only valid for services", value));
                 }
-                ready = Some(parse_ready_config(value, ctx)?);
+                ready = Some(parse_ready_config(alloc, value, ctx)?);
             }
             "timeout" => timeout = Some(parse_timeout_config(value, ctx)?),
             "managed" => match value.value() {
@@ -461,10 +455,7 @@ fn parse_task<'a>(
     }
 
     if sticky && managed != ExecutionMode::Terminal {
-        return Err(ctx.report_custom_error(
-            "`sticky = true` requires `managed = \"terminal\"`",
-            task_table.as_item(),
-        ));
+        return Err(ctx.report_custom_error("`sticky = true` requires `managed = \"terminal\"`", task_table.as_item()));
     }
 
     if managed == ExecutionMode::Terminal {
@@ -474,7 +465,9 @@ fn parse_task<'a>(
                 task_table.as_item(),
             ));
         }
-        if timeout.as_ref().is_some_and(|timeout| timeout.when.is_some() || timeout.conditional.is_some() || timeout.idle.is_some() || timeout.max.is_some()) {
+        if timeout.as_ref().is_some_and(|timeout| {
+            timeout.when.is_some() || timeout.conditional.is_some() || timeout.idle.is_some() || timeout.max.is_some()
+        }) {
             return Err(ctx.report_custom_error(
                 "`timeout` is not supported with `managed = \"terminal\"` in this release",
                 task_table.as_item(),
@@ -493,7 +486,7 @@ fn parse_task<'a>(
         }
     };
 
-    Ok(TaskConfigExpr {
+    let mut task = TaskConfigExpr {
         kind,
         info,
         pwd,
@@ -503,6 +496,7 @@ fn parse_task<'a>(
         require,
         cache,
         ready,
+        referenced_options: &[],
         timeout,
         tags: &[],
         managed,
@@ -511,7 +505,9 @@ fn parse_task<'a>(
         allow_multiple,
         cli,
         vars: vars_vec.into_bump_slice(),
-    })
+    };
+    task.referenced_options = collect_option_names(alloc, &task);
+    Ok(task)
 }
 
 fn parse_cache_key_input<'a>(
@@ -624,13 +620,8 @@ fn parse_test<'a>(
                 }
             }
             "require" => {
-                let arr = value.require_array(ctx)?;
-                let mut calls = bumpalo::collections::Vec::new_in(alloc);
-                for item in arr {
-                    calls.push(parse_requirement_expr(alloc, item, ctx)?);
-                }
-                check_no_duplicate_resources_in_exprs(&calls, value, ctx)?;
-                require = calls.into_bump_slice();
+                require = parse_requirement_branch(alloc, value, ctx)?.items;
+                check_no_duplicate_resources_in_exprs(require, value, ctx)?;
             }
             "tag" => match value.value() {
                 Value::String(&s) => tags_vec.push(s),
@@ -672,7 +663,7 @@ fn parse_test<'a>(
         }
     };
 
-    Ok(TestConfigExpr {
+    let mut test = TestConfigExpr {
         info,
         pwd,
         command,
@@ -683,7 +674,10 @@ fn parse_test<'a>(
         timeout,
         cli,
         vars: vars_vec.into_bump_slice(),
-    })
+        referenced_options: &[],
+    };
+    test.referenced_options = collect_option_names(alloc, &test);
+    Ok(test)
 }
 
 fn parse_requirement_expr<'a>(
@@ -881,7 +875,12 @@ fn parse_task_call<'a>(
     match value.value() {
         Value::String(&s) => {
             let (name, profile) = split_task_call_name(s);
-            Ok(TaskCall { name: Alias(name), profile, vars: jsony_value::ValueMap::new(), wait: RequireWait::Satisfied })
+            Ok(TaskCall {
+                name: Alias(name),
+                profile,
+                vars: jsony_value::ValueMap::new(),
+                wait: RequireWait::Satisfied,
+            })
         }
         Value::Array(_) => Err(ctx.report_custom_error(
             "task call arrays are no longer supported; use { name = \"...\", vars = { ... } }",
@@ -1055,7 +1054,8 @@ pub fn parse_workspace<'a>(
     doc: &mut Document<'a>,
 ) -> Result<WorkspaceConfig<'a>, Failed> {
     let (ctx, root) = doc.split();
-    parse_root(base_path, alloc, root, ctx)
+    let result = parse_root(base_path, alloc, root, ctx);
+    if doc.has_errors() { Err(Failed) } else { result }
 }
 
 fn validate_task_sub_name<'a>(name: &str, value: &Item<'a>, ctx: &mut Context<'a>) -> Result<(), Failed> {
@@ -1068,12 +1068,91 @@ fn validate_task_sub_name<'a>(name: &str, value: &Item<'a>, ctx: &mut Context<'a
     Ok(())
 }
 
+fn collect_option_names<'a>(alloc: &'a Bump, expr: &impl VisitOptions<'a>) -> &'a [&'a str] {
+    let mut names = Vec::new();
+    expr.visit_option_predicates(&mut |name, _| names.push(name));
+    names.sort_unstable();
+    names.dedup();
+    alloc.alloc_slice_copy(&names)
+}
+
+fn validate_option_predicates<'a>(
+    expr: &impl VisitOptions<'a>,
+    options: &[(&str, OptionConfig<'_>)],
+    item: &Item<'a>,
+    ctx: &mut Context<'a>,
+) -> Result<(), Failed> {
+    let mut failed = false;
+    expr.visit_option_predicates(&mut |name, value| {
+        let error = match options.iter().find(|(n, _)| *n == name) {
+            None => Some(format!("undeclared option '{name}' in `if.option`")),
+            Some((_, option)) if !option.choices.contains(&value) => {
+                Some(format!("invalid value '{value}' for option '{name}'; choices: {}", option.choices.join(", ")))
+            }
+            _ => None,
+        };
+        if let Some(error) = error {
+            ctx.report_custom_error(error, item);
+            failed = true;
+        }
+    });
+    if failed { Err(Failed) } else { Ok(()) }
+}
+
+fn parse_options<'a>(
+    alloc: &'a Bump,
+    value: Option<&Item<'a>>,
+    ctx: &mut Context<'a>,
+) -> Result<&'a [(&'a str, OptionConfig<'a>)], Failed> {
+    let Some(value) = value else { return Ok(&[]) };
+    let mut options = bumpalo::collections::Vec::new_in(alloc);
+    for (name, value) in value.require_table(ctx)? {
+        if name.name.is_empty() || !name.name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+        {
+            return Err(ctx.report_custom_error("option names must match [a-z0-9_]+", value));
+        }
+        let mut choices = None;
+        let mut default = None;
+        let mut info = "";
+        for (key, item) in value.require_table(ctx)? {
+            match key.name {
+                "choices" => {
+                    let mut items = bumpalo::collections::Vec::new_in(alloc);
+                    for item in item.require_array(ctx)? {
+                        let choice = item.require_string(ctx)?;
+                        if items.contains(&choice) {
+                            return Err(ctx.report_custom_error("option choices must be unique", item));
+                        }
+                        items.push(choice);
+                    }
+                    if items.is_empty() {
+                        return Err(ctx.report_custom_error("option choices must not be empty", item));
+                    }
+                    choices = Some(&*items.into_bump_slice());
+                }
+                "default" => default = Some(item.require_string(ctx)?),
+                "info" => info = item.require_string(ctx)?,
+                _ => return Err(ctx.report_unexpected_key(0, item, key.span)),
+            }
+        }
+        let choices = choices.ok_or_else(|| ctx.report_missing_field("choices", value))?;
+        if let Some(default) = default
+            && !choices.contains(&default)
+        {
+            return Err(ctx.report_custom_error("option default must be one of its choices", value));
+        }
+        options.push((name.name, OptionConfig { choices, default, info }));
+    }
+    Ok(options.into_bump_slice())
+}
+
 fn parse_root<'a>(
     base_path: &'a std::path::Path,
     alloc: &'a Bump,
     root: &Table<'a>,
     ctx: &mut Context<'a>,
 ) -> Result<WorkspaceConfig<'a>, Failed> {
+    let options = parse_options(alloc, root.get("option"), ctx)?;
     let mut tasks_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut tests_vec = bumpalo::collections::Vec::new_in(alloc);
     let mut groups_vec = bumpalo::collections::Vec::new_in(alloc);
@@ -1096,6 +1175,7 @@ fn parse_root<'a>(
                     }
                     let task_table = task_value.require_table(ctx)?;
                     let task = parse_task(alloc, task_table, TaskKind::Action, ctx)?;
+                    validate_option_predicates(&task, options, task_value, ctx)?;
                     tasks_vec.push((name.name, task));
                 }
             }
@@ -1113,6 +1193,7 @@ fn parse_root<'a>(
                     }
                     let task_table = task_value.require_table(ctx)?;
                     let task = parse_task(alloc, task_table, TaskKind::Service, ctx)?;
+                    validate_option_predicates(&task, options, task_value, ctx)?;
                     tasks_vec.push((name.name, task));
                 }
             }
@@ -1133,9 +1214,11 @@ fn parse_root<'a>(
                     validate_task_sub_name(name.name, test_value, ctx)?;
                     let single_test_table = test_value.require_table(ctx)?;
                     let test = parse_test(alloc, single_test_table, ctx)?;
+                    validate_option_predicates(&test, options, test_value, ctx)?;
                     tests_vec.push((name.name, &*alloc.alloc(test)));
                 }
             }
+            "option" => {}
             "function" => function_table = Some(value.require_table(ctx)?),
             _ => {
                 ctx.report_unexpected_key(0, value, key.span);
@@ -1151,6 +1234,8 @@ fn parse_root<'a>(
         tests: tests_vec.into_bump_slice(),
         groups: groups_vec.into_bump_slice(),
         functions,
+        options,
+        option_values: &[],
     })
 }
 
@@ -1229,6 +1314,30 @@ mod test {
         let result = parse_workspace(Path::new("/"), bump, &mut doc);
         doc.compute_error_paths();
         (doc, result)
+    }
+
+    #[test]
+    fn option_declarations_and_predicates_are_validated() {
+        for text in [
+            "[option.infra]\ndefault = 'docker'",
+            "[option.infra]\nchoices = []",
+            "[option.infra]\nchoices = ['docker', 'docker']",
+            "[option.infra]\nchoices = ['docker']\ndefault = 'native'",
+            "[option.BadName]\nchoices = ['docker']",
+            "[option.'bad-name']\nchoices = ['docker']",
+            "[option.infra]\nchoices = 'docker'",
+            "[action.a]\ncmd = { if.option.missing = 'docker', then = 'true' }",
+            "[option.infra]\nchoices = ['docker']\n[action.a]\ncmd = { if.option.infra = 'typo', then = 'true' }",
+            "[option.infra]\nchoices = ['docker']\n[action.a]\ncmd = { if = { profile = 'debug', option.infra = 'docker' }, then = 'true' }",
+            "[option.infra]\nchoices = ['docker']\n[action.a]\ncmd = { if.option = { infra = 'docker', other = 'x' }, then = 'true' }",
+            "[option.infra]\nchoices = ['docker']\n[test.a]\ncmd = { if.profile = 'debug', then = { if.option.infra = 'typo', then = 'true' } }",
+        ] {
+            let arena = toml_spanner::Arena::new();
+            let bump = Bump::new();
+            let (doc, result) = parse_text(text, &arena, &bump);
+            assert!(result.is_err(), "invalid config accepted: {text}");
+            assert!(!collect_messages(&doc).is_empty(), "missing diagnostic: {text}");
+        }
     }
 
     #[test]
@@ -1636,13 +1745,13 @@ require = [
         let (_, task) = &config.tasks[0];
 
         let mut default_require = Vec::new();
-        RequirementListExpr { items: task.require }.eval_for_profile_append("default", &mut default_require);
+        RequirementListExpr { items: task.require }.eval_for_profile_append("default", &[], &mut default_require);
         assert_eq!(default_require.len(), 1);
         let Requirement::Task(call) = &default_require[0] else { panic!("expected task call") };
         assert_eq!(&*call.name, "setup");
 
         let mut live_require = Vec::new();
-        RequirementListExpr { items: task.require }.eval_for_profile_append("traffic-live", &mut live_require);
+        RequirementListExpr { items: task.require }.eval_for_profile_append("traffic-live", &[], &mut live_require);
         assert_eq!(live_require.len(), 2);
         let Requirement::Task(call) = &live_require[1] else { panic!("expected task call") };
         assert_eq!(&*call.name, "ingest-live");
@@ -1666,13 +1775,13 @@ require = [
         let (_, task) = &config.tasks[0];
 
         let mut default_require = Vec::new();
-        RequirementListExpr { items: task.require }.eval_for_profile_append("default", &mut default_require);
+        RequirementListExpr { items: task.require }.eval_for_profile_append("default", &[], &mut default_require);
         assert_eq!(default_require.len(), 1);
         let Requirement::Task(call) = &default_require[0] else { panic!("expected task call") };
         assert_eq!(&*call.name, "setup");
 
         let mut live_require = Vec::new();
-        RequirementListExpr { items: task.require }.eval_for_profile_append("live", &mut live_require);
+        RequirementListExpr { items: task.require }.eval_for_profile_append("live", &[], &mut live_require);
         assert_eq!(live_require.len(), 2);
         let Requirement::Task(call) = &live_require[0] else { panic!("expected task call") };
         assert_eq!(&*call.name, "svc");

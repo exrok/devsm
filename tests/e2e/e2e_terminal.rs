@@ -1,5 +1,8 @@
 use crate::harness::{RpcEvent, RpcSubscriber, TestAppServer, TestHarness};
-use crate::rpc::{ClientProtocol, DecodeResult, Encoder, ExitCause, JobStatusKind, RpcMessageKind, TerminalExitedEvent, TerminalRunEvent, TerminalStartEvent};
+use crate::rpc::{
+    ClientProtocol, DecodeResult, Encoder, ExitCause, JobStatusKind, RpcMessageKind, TerminalExitedEvent,
+    TerminalRunEvent, TerminalStartEvent,
+};
 use jsony::ToBinary;
 use std::io::{Read, Write};
 use std::os::unix::{ffi::OsStrExt, net::UnixStream};
@@ -80,7 +83,11 @@ fn subscribe(harness: &TestHarness) -> RpcSubscriber {
 
 fn wait_for_exit(subscriber: &mut RpcSubscriber, job_index: u32) -> Vec<RpcEvent> {
     let events = subscriber.collect_until(
-        |events| events.iter().any(|event| matches!(event, RpcEvent::JobExited { job_index: index, .. } if *index == job_index)),
+        |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, RpcEvent::JobExited { job_index: index, .. } if *index == job_index))
+        },
         Duration::from_secs(5),
     );
     assert!(
@@ -203,44 +210,37 @@ cmd = ["true"]
     let first = wrapper.next_start();
     wrapper.send(
         RpcMessageKind::TerminalStarted,
-        &TerminalRunEvent {
-            run_token: first.run_token,
-            process_group: unsafe { libc::getpid() },
-        },
+        &TerminalRunEvent { run_token: first.run_token, process_group: unsafe { libc::getpid() } },
     );
-    wrapper.send(
-        RpcMessageKind::TerminalExited,
-        &TerminalExitedEvent { run_token: first.run_token, exit_code: 0 },
-    );
+    wrapper.send(RpcMessageKind::TerminalExited, &TerminalExitedEvent { run_token: first.run_token, exit_code: 0 });
     wait_for_exit(&mut subscriber, 0);
 
     let started = harness.run_client(&["start", "editor"]);
     assert!(started.success(), "relaunch failed: {}", started.stderr);
     let second = wrapper.next_start();
     assert_ne!(first.run_token, second.run_token);
-    wrapper.send(
-        RpcMessageKind::TerminalExited,
-        &TerminalExitedEvent { run_token: first.run_token, exit_code: 99 },
-    );
+    wrapper.send(RpcMessageKind::TerminalExited, &TerminalExitedEvent { run_token: first.run_token, exit_code: 99 });
     let status = harness.run_client(&["status", "editor"]);
     assert!(!status.stdout.contains("code 99"), "stale exit mutated replacement job: {}", status.stdout);
 
     wrapper.send(
         RpcMessageKind::TerminalStarted,
-        &TerminalRunEvent {
-            run_token: second.run_token,
-            process_group: unsafe { libc::getpid() },
-        },
+        &TerminalRunEvent { run_token: second.run_token, process_group: unsafe { libc::getpid() } },
     );
     let events = subscriber.collect_until(
-        |events| events.iter().any(|event| matches!(event, RpcEvent::JobStatus { job_index: 1, status: JobStatusKind::Running })),
+        |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, RpcEvent::JobStatus { job_index: 1, status: JobStatusKind::Running }))
+        },
         Duration::from_secs(5),
     );
-    assert!(events.iter().any(|event| matches!(event, RpcEvent::JobStatus { job_index: 1, status: JobStatusKind::Running })));
-    wrapper.send(
-        RpcMessageKind::TerminalExited,
-        &TerminalExitedEvent { run_token: second.run_token, exit_code: 0 },
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, RpcEvent::JobStatus { job_index: 1, status: JobStatusKind::Running }))
     );
+    wrapper.send(RpcMessageKind::TerminalExited, &TerminalExitedEvent { run_token: second.run_token, exit_code: 0 });
     wait_for_exit(&mut subscriber, 1);
     let mut encoder = Encoder::new();
     encoder.encode_empty(RpcMessageKind::TerminalDetach, 0);
@@ -957,15 +957,10 @@ require = ["setup"]
     let replacement = second.next_start();
     second.send(
         RpcMessageKind::TerminalStarted,
-        &TerminalRunEvent {
-            run_token: replacement.run_token,
-            process_group: unsafe { libc::getpid() },
-        },
+        &TerminalRunEvent { run_token: replacement.run_token, process_group: unsafe { libc::getpid() } },
     );
-    second.send(
-        RpcMessageKind::TerminalExited,
-        &TerminalExitedEvent { run_token: replacement.run_token, exit_code: 0 },
-    );
+    second
+        .send(RpcMessageKind::TerminalExited, &TerminalExitedEvent { run_token: replacement.run_token, exit_code: 0 });
 
     let mut detach = Encoder::new();
     detach.encode_empty(RpcMessageKind::TerminalDetach, 0);
@@ -1225,7 +1220,11 @@ cmd = ["true"]
     assert_ne!(result.exit_code, 0, "incompatible wrapper remained attached after active exit");
     assert!(result.output.contains("no longer terminal-managed"), "PTY output:\n{}", result.output);
     let status = harness.run_client(&["status", "editor"]);
-    assert!(!status.stdout.contains("idle wrapper attached"), "derived idle cache retained detached wrapper: {}", status.stdout);
+    assert!(
+        !status.stdout.contains("idle wrapper attached"),
+        "derived idle cache retained detached wrapper: {}",
+        status.stdout
+    );
 }
 
 #[test]

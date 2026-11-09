@@ -444,12 +444,7 @@ enum TerminationKind {
 /// One workspace's decision for a single scheduling pass, computed while holding
 /// the workspace read lock and acted on after it is released.
 enum SchedulingStep {
-    Spawn {
-        job_id: LogGroup,
-        job_index: JobIndex,
-        task: TaskConfigRc,
-        target: workspace::ExecutionTarget,
-    },
+    Spawn { job_id: LogGroup, job_index: JobIndex, task: TaskConfigRc, target: workspace::ExecutionTarget },
     Cancel { job_index: JobIndex },
     Idle,
 }
@@ -1100,7 +1095,9 @@ pub(crate) enum ProcessRequest {
         restart: bool,
         response: std::sync::mpsc::SyncSender<Result<(), String>>,
     },
-    ReconcileTerminalHarnesses { workspace_id: WorkspaceIndex },
+    ReconcileTerminalHarnesses {
+        workspace_id: WorkspaceIndex,
+    },
     ClientExited {
         index: usize,
     },
@@ -1867,11 +1864,11 @@ impl EventLoop {
             if bytes.len() - offset < crate::rpc::HEAD_SIZE {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "truncated RPC frame"));
             }
-            let header: &[u8; crate::rpc::HEAD_SIZE] = bytes[offset..offset + crate::rpc::HEAD_SIZE]
-                .try_into()
-                .expect("header length checked");
-            let head = crate::rpc::Head::from_bytes(header)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid RPC frame: {error:?}")))?;
+            let header: &[u8; crate::rpc::HEAD_SIZE] =
+                bytes[offset..offset + crate::rpc::HEAD_SIZE].try_into().expect("header length checked");
+            let head = crate::rpc::Head::from_bytes(header).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid RPC frame: {error:?}"))
+            })?;
             let payload = head.ws_len as usize + head.len as usize;
             if payload > crate::rpc::DEFAULT_MAX_PAYLOAD {
                 return Err(std::io::Error::new(
@@ -2097,7 +2094,9 @@ impl EventLoop {
             let mut encoder = crate::rpc::Encoder::new();
             encoder.encode_push(
                 RpcMessageKind::TerminalError,
-                &crate::rpc::TerminalErrorEvent { message: "terminal wrapper reported an invalid process group".into() },
+                &crate::rpc::TerminalErrorEvent {
+                    message: "terminal wrapper reported an invalid process group".into(),
+                },
             );
             let _ = self.queue_client_output(client_index as ClientIndex, encoder.output());
             return;
@@ -2140,10 +2139,7 @@ impl EventLoop {
         let mut encoder = crate::rpc::Encoder::new();
         encoder.encode_empty(RpcMessageKind::TerminalAttached, 0);
         if !waiting.is_empty() {
-            encoder.encode_push(
-                RpcMessageKind::TerminalWaiting,
-                &crate::rpc::TerminalWaitingEvent { tasks: waiting },
-            );
+            encoder.encode_push(RpcMessageKind::TerminalWaiting, &crate::rpc::TerminalWaitingEvent { tasks: waiting });
         }
         if let Err(error) = self.queue_client_output(client_index as ClientIndex, encoder.output()) {
             kvlog::warn!("Failed to queue terminal attachment", harness_id, %error);
@@ -2162,7 +2158,8 @@ impl EventLoop {
     ) -> anyhow::Result<()> {
         let binding = TerminalRunBinding { job: job_index, run_token };
         let client_index = {
-            let harness = self.state.terminal_harnesses.get_mut(&harness_id).context("terminal wrapper disconnected")?;
+            let harness =
+                self.state.terminal_harnesses.get_mut(&harness_id).context("terminal wrapper disconnected")?;
             if harness.workspace != workspace_id {
                 bail!("terminal wrapper belongs to another workspace");
             }
@@ -2228,7 +2225,11 @@ impl EventLoop {
         }
         if event.process_group <= 0 {
             let client_index = harness.client_index;
-            kvlog::warn!("Terminal harness reported invalid process group", harness_id, process_group = event.process_group);
+            kvlog::warn!(
+                "Terminal harness reported invalid process group",
+                harness_id,
+                process_group = event.process_group
+            );
             self.terminate_client(client_index, SocketTerminationReason::ProtocolError);
             return;
         }
@@ -2253,11 +2254,7 @@ impl EventLoop {
         self.scheduled();
     }
 
-    fn terminal_spawn_failed(
-        &mut self,
-        harness_id: workspace::HarnessId,
-        event: crate::rpc::TerminalSpawnFailedEvent,
-    ) {
+    fn terminal_spawn_failed(&mut self, harness_id: workspace::HarnessId, event: crate::rpc::TerminalSpawnFailedEvent) {
         let Some(harness) = self.state.terminal_harnesses.get_mut(&harness_id) else { return };
         let Some(binding) = harness.state.binding else { return };
         if binding.run_token != event.run_token {
@@ -2316,10 +2313,7 @@ impl EventLoop {
             .state
             .write()
             .unwrap()
-            .update_job_status(
-                job_index,
-                JobStatus::Exited { finished_at: crate::clock::now(), cause, status },
-            )
+            .update_job_status(job_index, JobStatus::Exited { finished_at: crate::clock::now(), cause, status })
             .unwrap_or(0);
         self.broadcast_job_exited(ws_index, public_id, event.exit_code, Self::rpc_exit_cause(cause));
         self.reconcile_idle_terminal_harnesses(ws_index);
@@ -2358,10 +2352,7 @@ impl EventLoop {
                 return false;
             };
 
-            let replacement_matches = harness
-                .state
-                .replacement
-                .is_some_and(|binding| binding.run_token == run_token);
+            let replacement_matches = harness.state.replacement.is_some_and(|binding| binding.run_token == run_token);
             let reserved_binding_matches = harness.state.phase == TerminalHarnessAvailability::Reserved
                 && harness.state.binding.is_some_and(|binding| binding.run_token == run_token);
             if replacement_matches {
@@ -2380,13 +2371,7 @@ impl EventLoop {
             } else if harness.state.binding.is_none() {
                 harness.state.phase = TerminalHarnessAvailability::Reserved;
             }
-            (
-                harness.workspace,
-                harness.client_index,
-                harness.sticky,
-                harness.wrapper_process_group,
-                became_idle,
-            )
+            (harness.workspace, harness.client_index, harness.sticky, harness.wrapper_process_group, became_idle)
         };
 
         if became_idle {
@@ -2478,8 +2463,7 @@ impl EventLoop {
                 },
             );
             encoder.encode_empty(RpcMessageKind::TerminalDetached, 0);
-            if let Err(error) =
-                self.queue_client_output_and_wake(client_index, encoder.output(), wrapper_process_group)
+            if let Err(error) = self.queue_client_output_and_wake(client_index, encoder.output(), wrapper_process_group)
             {
                 kvlog::warn!("Failed to queue incompatible terminal detach", harness_id, %error);
                 self.terminate_client(client_index, SocketTerminationReason::WriteError);
@@ -2613,19 +2597,14 @@ impl EventLoop {
         let run_token = self.state.next_run_token;
         self.state.next_run_token = self.state.next_run_token.wrapping_add(1).max(1);
         if replacing
-            && self
-                .state
-                .terminal_harnesses
-                .get(&harness_id)
-                .is_some_and(|harness| harness.state.replacement.is_some())
+            && self.state.terminal_harnesses.get(&harness_id).is_some_and(|harness| harness.state.replacement.is_some())
         {
             return Some(CommandBody::Error(
                 format!("Cannot restart terminal task '{}': a replacement is already pending", req.task_name).into(),
             ));
         }
-        let result = workspace
-            .handle
-            .submit_terminal(req.task_name, &profile, params, harness_id, run_token, replacing);
+        let result =
+            workspace.handle.submit_terminal(req.task_name, &profile, params, harness_id, run_token, replacing);
         let result = match result {
             Ok(result) => result,
             Err(error) => return Some(CommandBody::Error(error.into())),
@@ -2995,37 +2974,37 @@ impl EventLoop {
                 for binding in bindings.into_iter().flatten() {
                     let Some(workspace) = self.state.workspaces.get(harness.workspace as usize) else { continue };
                     let transition = {
-                    let mut state = workspace.handle.state.write().unwrap();
-                    match state.jobs.get(binding.job).map(|job| &job.process_status) {
-                        Some(JobStatus::Scheduled { .. }) => {
-                            state.update_job_status(binding.job, JobStatus::Cancelled);
-                            None
+                        let mut state = workspace.handle.state.write().unwrap();
+                        match state.jobs.get(binding.job).map(|job| &job.process_status) {
+                            Some(JobStatus::Scheduled { .. }) => {
+                                state.update_job_status(binding.job, JobStatus::Cancelled);
+                                None
+                            }
+                            Some(JobStatus::Starting) => state
+                                .update_job_status(
+                                    binding.job,
+                                    JobStatus::Exited {
+                                        finished_at: crate::clock::now(),
+                                        cause: ExitCause::SpawnFailed,
+                                        status: 127,
+                                    },
+                                )
+                                .map(|id| (id, 127)),
+                            Some(JobStatus::Running {
+                                owner: ProcessOwner::Terminal { harness_id: owner_id, run_token },
+                                ..
+                            }) if *owner_id == harness_id && *run_token == binding.run_token => state
+                                .update_job_status(
+                                    binding.job,
+                                    JobStatus::Exited {
+                                        finished_at: crate::clock::now(),
+                                        cause: ExitCause::SpawnFailed,
+                                        status: 1,
+                                    },
+                                )
+                                .map(|id| (id, 1)),
+                            _ => None,
                         }
-                        Some(JobStatus::Starting) => state
-                            .update_job_status(
-                                binding.job,
-                                JobStatus::Exited {
-                                    finished_at: crate::clock::now(),
-                                    cause: ExitCause::SpawnFailed,
-                                    status: 127,
-                                },
-                            )
-                            .map(|id| (id, 127)),
-                        Some(JobStatus::Running {
-                            owner: ProcessOwner::Terminal { harness_id: owner_id, run_token },
-                            ..
-                        }) if *owner_id == harness_id && *run_token == binding.run_token => state
-                            .update_job_status(
-                                binding.job,
-                                JobStatus::Exited {
-                                    finished_at: crate::clock::now(),
-                                    cause: ExitCause::SpawnFailed,
-                                    status: 1,
-                                },
-                            )
-                            .map(|id| (id, 1)),
-                        _ => None,
-                    }
                     };
                     if let Some((public_id, status)) = transition {
                         self.broadcast_job_exited(

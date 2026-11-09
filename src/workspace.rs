@@ -114,8 +114,11 @@ fn build_require_analysis(
             let fallback = profile == OTHER_REQUIRE_PROFILE;
             let eval_profile = if fallback { OTHER_REQUIRE_PROFILE } else { profile.as_str() };
             let mut requirements = Vec::new();
-            crate::config::RequirementListExpr { items: bt.config.require }
-                .eval_for_profile_append(eval_profile, &mut requirements);
+            crate::config::RequirementListExpr { items: bt.config.require }.eval_for_profile_append(
+                eval_profile,
+                bt.config.option_values(),
+                &mut requirements,
+            );
             let input_idx = meta.len();
             if fallback {
                 fallback_map.insert(base_task, input_idx);
@@ -178,10 +181,14 @@ pub const DEFAULT_JOB_HISTORY: u32 = 10_000;
 enum CacheKeyInfoItem {
     Modified { paths: Vec<PathBuf>, ignore: &'static [&'static str] },
     ProfileChanged { task_name: String, counter: u32 },
+    Option { name: String, value: String },
 }
 
 struct CacheKeyInfo {
     base_index: BaseTaskIndex,
+    // Keep expression-backed paths and the selected options alive while hashing
+    // outside the workspace lock, even if another client reloads the config.
+    generation: Arc<ConfigGeneration>,
     cache_key_inputs: Vec<CacheKeyInfoItem>,
     persistent: bool,
     max_age: Option<Duration>,
@@ -216,6 +223,7 @@ fn compute_cache_key_standalone(inputs: &[CacheKeyInfoItem], profile: &str, para
                 hasher.update(b"=");
                 hasher.update_u32(*counter);
             }
+            CacheKeyInfoItem::Option { name, value } => hash_option_value(&mut hasher, name, value),
         }
     }
 
@@ -232,6 +240,13 @@ fn compute_cache_key_standalone(inputs: &[CacheKeyInfoItem], profile: &str, para
         }
     }
     hasher.finalize_hex()
+}
+
+fn hash_option_value(hasher: &mut CacheKeyHasher, name: &str, value: &str) {
+    hasher.update(b"option:");
+    hash_len_prefixed(hasher, name.as_bytes());
+    hasher.update(b"=");
+    hash_len_prefixed(hasher, value.as_bytes());
 }
 
 /// Byte sink for structural hashing. Implemented by both `CacheKeyHasher`
@@ -700,6 +715,8 @@ fn finished_within_max_age(status: &JobStatus, max_age: Option<Duration>) -> boo
 
 pub struct LatestConfig {
     modified_time: SystemTime,
+    local_modified_time: Option<SystemTime>,
+    error: Option<String>,
     path: PathBuf,
     pub current: Arc<ConfigGeneration>,
 }
@@ -715,28 +732,38 @@ impl LatestConfig {
         let content = std::fs::read_to_string(&path).map_err(|e| crate::config::ConfigError {
             message: format!("error: failed to read {}: {}\n", path.display(), e),
         })?;
+        let local_modified_time =
+            Self::local_modified_time(&path).map_err(|message| crate::config::ConfigError { message })?;
         let current = crate::config::load_workspace_generation_capturing(&path, content)?;
-        Ok(Self { modified_time, path, current })
+        Ok(Self { modified_time, local_modified_time, error: None, path, current })
     }
-    fn refresh(&mut self) -> anyhow::Result<bool> {
-        let metadata = self.path.metadata()?;
-        let modified = metadata.modified()?;
-        if self.modified_time == modified {
-            return Ok(false);
+    fn local_modified_time(path: &Path) -> Result<Option<SystemTime>, String> {
+        let path = crate::config::options::local_path(path);
+        match path.metadata() {
+            Ok(metadata) => {
+                metadata.modified().map(Some).map_err(|e| format!("Failed to get mtime for {}: {e}", path.display()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("Failed to read {}: {error}", path.display())),
         }
-        let content = std::fs::read_to_string(&self.path)?;
-        let new_config = crate::config::load_workspace_generation_capturing(&self.path, content)
-            .map_err(|e| anyhow::anyhow!("{}", e.message))?;
-        self.current = new_config;
-        self.modified_time = modified;
-        Ok(true)
+    }
+
+    fn refresh(&mut self) -> Result<bool, String> {
+        self.refresh_capturing()
     }
 
     pub fn refresh_capturing(&mut self) -> Result<bool, String> {
+        let result = self.refresh_inner();
+        self.error = result.as_ref().err().cloned();
+        result
+    }
+
+    fn refresh_inner(&mut self) -> Result<bool, String> {
         let metadata = self.path.metadata().map_err(|e| format!("Failed to read {}: {}", self.path.display(), e))?;
         let modified = metadata.modified().map_err(|e| format!("Failed to get mtime: {}", e))?;
 
-        if self.modified_time == modified {
+        let local_modified = Self::local_modified_time(&self.path)?;
+        if self.modified_time == modified && self.local_modified_time == local_modified {
             return Ok(false);
         }
 
@@ -747,6 +774,7 @@ impl LatestConfig {
 
         self.current = new_config;
         self.modified_time = modified;
+        self.local_modified_time = local_modified;
         Ok(true)
     }
 
@@ -1000,11 +1028,7 @@ impl ServiceDependents {
         self.dependents.get(&service).is_none_or(|deps| deps.is_empty())
     }
 
-    fn all_dependents_pending_termination(
-        &self,
-        service: JobIndex,
-        pending: &hashbrown::HashSet<JobIndex>,
-    ) -> bool {
+    fn all_dependents_pending_termination(&self, service: JobIndex, pending: &hashbrown::HashSet<JobIndex>) -> bool {
         self.dependents
             .get(&service)
             .is_some_and(|dependents| !dependents.is_empty() && dependents.iter().all(|job| pending.contains(job)))
@@ -1320,13 +1344,7 @@ fn terminal_suggested_invocation(task_name: &str, profile: &str, variables: &Val
 
 impl ScheduleError {
     pub fn suggested_invocation(&self) -> Option<String> {
-        let Self::TerminalTaskNotRunning {
-            required_task,
-            effective_profile,
-            requirement_variables,
-            ..
-        } = self
-        else {
+        let Self::TerminalTaskNotRunning { required_task, effective_profile, requirement_variables, .. } = self else {
             return None;
         };
         Some(terminal_suggested_invocation(required_task, effective_profile, requirement_variables))
@@ -1584,10 +1602,12 @@ impl WorkspaceState {
     fn compute_cache_key_with_require(
         &mut self,
         cache_key_inputs: &[CacheKeyInput],
+        option_values: crate::config::OptionValues<'_>,
         profile: &str,
         params: &ValueMap,
     ) -> String {
-        if cache_key_inputs.is_empty() && profile.is_empty() && params.entries().is_empty() {
+        if cache_key_inputs.is_empty() && option_values.is_empty() && profile.is_empty() && params.entries().is_empty()
+        {
             return String::new();
         }
 
@@ -1611,6 +1631,10 @@ impl WorkspaceState {
                     self.cache_key_hasher.update_u32(counter);
                 }
             }
+        }
+
+        for (name, value) in option_values {
+            hash_option_value(&mut self.cache_key_hasher, name, value);
         }
 
         if !profile.is_empty() {
@@ -1818,7 +1842,7 @@ impl WorkspaceState {
             return Ok(spec);
         }
         let config = self.base_tasks[base_task.idx()].config.clone();
-        let env = Environment { profile, param: params.clone(), vars: config.vars };
+        let env = Environment { profile, param: params.clone(), vars: config.vars, options: &[] };
         let task = config.eval(&env)?;
         Ok(self.insert_spawn_spec(generation_id, base_task, profile, params, task))
     }
@@ -2050,7 +2074,7 @@ impl WorkspaceState {
             let profile = graph.nodes[owner].profile.clone();
             let params = graph.nodes[owner].params.clone();
             let config = &self.base_tasks[base.idx()].config;
-            let env = Environment { profile: &profile, param: params, vars: config.vars };
+            let env = Environment { profile: &profile, param: params, vars: config.vars, options: &[] };
             if let Ok(task) = config.eval(&env) {
                 for child in self.classify_children(task.config().require) {
                     let is_service = child.is_service;
@@ -2103,6 +2127,9 @@ impl WorkspaceState {
     /// Runs before any job is created so a problematic spawn fails up-front
     /// instead of leaving jobs stuck in `Scheduled` forever.
     pub fn detect_require_problems(&self, root: BaseTaskIndex, profile: &str) -> Result<(), String> {
+        if let Some(error) = &self.config.error {
+            return Err(error.clone());
+        }
         self.require_analysis.problem_for_profile(root, profile)
     }
 
@@ -2292,7 +2319,7 @@ impl WorkspaceState {
 
     fn compute_task_cache_key(&mut self, task: &TaskConfigRc, profile: &str, params: &ValueMap) -> String {
         match task.config().cache.as_ref() {
-            Some(cache) => self.compute_cache_key_with_require(cache.key, profile, params),
+            Some(cache) => self.compute_cache_key_with_require(cache.key, task.config().option_values, profile, params),
             None => String::new(),
         }
     }
@@ -2371,7 +2398,8 @@ impl WorkspaceState {
         self.detect_require_problems(base_task, eval_profile)?;
         let task = {
             let spawner = &self.base_tasks[base_task.idx()];
-            let env = Environment { profile: eval_profile, param: params.clone(), vars: spawner.config.vars };
+            let env =
+                Environment { profile: eval_profile, param: params.clone(), vars: spawner.config.vars, options: &[] };
             spawner.config.eval(&env).map_err(|e| format!("Failed to evaluate queued service config: {:?}", e))?
         };
         self.validate_service_requirement_variants(base_task, &task)?;
@@ -2648,9 +2676,7 @@ impl WorkspaceState {
             }
             let base_task = job.log_group.base_task_index();
             if self.base_tasks[base_task.idx()].config.kind == TaskKind::Service
-                && self
-                    .service_dependents
-                    .all_dependents_pending_termination(terminate.job, &terminate_running_set)
+                && self.service_dependents.all_dependents_pending_termination(terminate.job, &terminate_running_set)
             {
                 // Let the scheduler stop the service after this plan's active
                 // dependents have actually exited. This prevents a restarted
@@ -3868,9 +3894,8 @@ impl WorkspaceState {
         // Reloading the current task must not rewrite diagnostics for a job
         // that was already scheduled or running.
         let terminal = matches!(dep_job.execution_target, ExecutionTarget::Terminal { .. });
-        let suggested_invocation = terminal.then(|| {
-            terminal_suggested_invocation(&task_name, dep_job.spawn_profile(), dep_job.spawn_params())
-        });
+        let suggested_invocation = terminal
+            .then(|| terminal_suggested_invocation(&task_name, dep_job.spawn_profile(), dep_job.spawn_params()));
         let (reason, exit_code, cause) = Self::dependency_status_reason(predicate, &dep_job.process_status);
 
         DependencyFailure {
@@ -4183,7 +4208,7 @@ impl WorkspaceState {
                 continue;
             }
 
-            let dep_config = &self.base_tasks[base_task.idx()].config;
+            let dep_config = self.base_tasks[base_task.idx()].config.clone();
             let terminal_mode = dep_config.managed == crate::config::ExecutionMode::Terminal;
             let required_name = self.base_tasks[base_task.idx()].name.to_string();
             let effective_profile = self.effective_profile_for_task(base_task, &profile);
@@ -4203,8 +4228,12 @@ impl WorkspaceState {
                         // expected key must resolve identically or a default-profile
                         // required action would never hit cache and re-run every time.
                         let effective_profile = self.effective_profile_for_task(base_task, &profile);
-                        let expected_cache_key =
-                            self.compute_cache_key_with_require(cache_config.key, &effective_profile, &params);
+                        let expected_cache_key = self.compute_cache_key_with_require(
+                            cache_config.key,
+                            &dep_config.cache_option_values(),
+                            &effective_profile,
+                            &params,
+                        );
                         let spawner = &self.base_tasks[base_task.idx()];
 
                         for &ji in spawner.jobs.all().iter().rev() {
@@ -4254,17 +4283,18 @@ impl WorkspaceState {
                         continue;
                     }
 
-
                     // Terminal actions that are already in flight are ordinary
                     // scheduler dependencies even when they have no cache
                     // configuration. A requirement may wait for them, but must
                     // never create a terminal launch.
                     if terminal_mode {
-                        if let Some(&ji) = self.base_tasks[base_task.idx()].jobs.non_terminal().iter().rev().find(|&&ji| {
-                            !plan.is_conflict_pending(ji)
-                                && self.jobs[ji].spawn_profile() == effective_profile
-                                && self.jobs[ji].spawn_params() == &params
-                        }) {
+                        if let Some(&ji) =
+                            self.base_tasks[base_task.idx()].jobs.non_terminal().iter().rev().find(|&&ji| {
+                                !plan.is_conflict_pending(ji)
+                                    && self.jobs[ji].spawn_profile() == effective_profile
+                                    && self.jobs[ji].spawn_params() == &params
+                            })
+                        {
                             batch.mark_resolved(key, ResolvedRequirement::Pending(JobRef::Live(ji)));
                             continue;
                         }
@@ -4299,21 +4329,22 @@ impl WorkspaceState {
                             .map(|target| PlannedReq::Task { target, predicate: JobPredicate::Terminated }),
                     );
 
-                    let new_job = self.spawn_task_with_extra_requirements_impl(
-                        plan,
-                        workspace_id,
-                        channel,
-                        base_task,
-                        params,
-                        &profile,
-                        ScheduleReason::Dependency,
-                        false,
-                        false,
-                        extra_requirements,
-                        protected_conflict_jobs,
-                        true,
-                    )
-                    .map_err(ScheduleError::Message)?;
+                    let new_job = self
+                        .spawn_task_with_extra_requirements_impl(
+                            plan,
+                            workspace_id,
+                            channel,
+                            base_task,
+                            params,
+                            &profile,
+                            ScheduleReason::Dependency,
+                            false,
+                            false,
+                            extra_requirements,
+                            protected_conflict_jobs,
+                            true,
+                        )
+                        .map_err(ScheduleError::Message)?;
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Service => {
@@ -4340,16 +4371,17 @@ impl WorkspaceState {
                                     running_profiles = ?running_profiles,
                                     requested_profile,
                                 );
-                                let queued_job = self.schedule_queued_service(
-                                    plan,
-                                    workspace_id,
-                                    channel,
-                                    base_task,
-                                    params,
-                                    &profile,
-                                    running_jobs,
-                                )
-                                .map_err(ScheduleError::Message)?;
+                                let queued_job = self
+                                    .schedule_queued_service(
+                                        plan,
+                                        workspace_id,
+                                        channel,
+                                        base_task,
+                                        params,
+                                        &profile,
+                                        running_jobs,
+                                    )
+                                    .map_err(ScheduleError::Message)?;
                                 batch.mark_resolved(key, ResolvedRequirement::Pending(queued_job));
                                 continue;
                             }
@@ -4366,18 +4398,19 @@ impl WorkspaceState {
                         });
                     }
 
-                    let new_job = self.spawn_task_tracked(
-                        plan,
-                        workspace_id,
-                        channel,
-                        base_task,
-                        params,
-                        &profile,
-                        ScheduleReason::Dependency,
-                        false,
-                        false,
-                    )
-                    .map_err(ScheduleError::Message)?;
+                    let new_job = self
+                        .spawn_task_tracked(
+                            plan,
+                            workspace_id,
+                            channel,
+                            base_task,
+                            params,
+                            &profile,
+                            ScheduleReason::Dependency,
+                            false,
+                            false,
+                        )
+                        .map_err(ScheduleError::Message)?;
                     batch.mark_resolved(key, ResolvedRequirement::Spawned(new_job));
                 }
                 TaskKind::Test => {
@@ -4429,6 +4462,7 @@ impl WorkspaceState {
             {
                 let cache_key = self.compute_cache_key_with_require(
                     cache_config.key,
+                    task_config.config().option_values,
                     &matched.spawn_profile,
                     &matched.spawn_params,
                 );
@@ -4726,7 +4760,7 @@ impl Workspace {
                     Vec::new(),
                     Vec::new(),
                     terminal_target.is_none(),
-                    )?
+                )?
             };
             if let Some(target) = terminal_target {
                 match job_ref {
@@ -4986,7 +5020,12 @@ impl Workspace {
                 .and_then(|ji| state.jobs.get(ji))
                 .map(|job| (job.spawn_profile().to_string(), job.spawn_params().clone()))
                 .unwrap_or_else(|| (String::new(), ValueMap::new()));
-            let env = Environment { profile: &spawn_profile, param: spawn_params.clone(), vars: base_task.config.vars };
+            let env = Environment {
+                profile: &spawn_profile,
+                param: spawn_params.clone(),
+                vars: base_task.config.vars,
+                options: &[],
+            };
             let Ok(task_config) = base_task.config.eval(&env) else {
                 kvlog::error!("Failed to evaluate test config", name = base_task.name.as_ref());
                 continue;
@@ -5235,7 +5274,7 @@ impl Workspace {
                 };
 
                 let base_path = state.config.current.base_path().to_path_buf();
-                let cache_key_inputs: Vec<_> = cache_config
+                let mut cache_key_inputs: Vec<_> = cache_config
                     .key
                     .iter()
                     .map(|input| match input {
@@ -5257,9 +5296,14 @@ impl Workspace {
                     })
                     .collect();
 
+                cache_key_inputs.extend(bt.config.cache_option_values().into_iter().map(|(name, value)| {
+                    CacheKeyInfoItem::Option { name: name.to_string(), value: value.to_string() }
+                }));
+
                 (
                     CacheKeyInfo {
                         base_index,
+                        generation: state.config.current.clone(),
                         cache_key_inputs,
                         persistent: cache_config.persistent,
                         max_age: cache_config.max_age,
@@ -5274,13 +5318,16 @@ impl Workspace {
 
             // Phase 3: Check for cache hit and spawn if needed (re-acquire lock)
             let state = &mut *self.state.write().unwrap();
-            if let Some(msg) = state.check_cache_hit_with_key(
-                name,
-                cache_info.base_index,
-                &expected_cache_key,
-                cache_info.max_age,
-                cache_info.persistent,
-            ) {
+            state.detect_require_problems(cache_info.base_index, profile)?;
+            if state.config.current.id() == cache_info.generation.id()
+                && let Some(msg) = state.check_cache_hit_with_key(
+                    name,
+                    cache_info.base_index,
+                    &expected_cache_key,
+                    cache_info.max_age,
+                    cache_info.persistent,
+                )
+            {
                 return Ok(Some(msg));
             }
 
@@ -5388,7 +5435,7 @@ impl Workspace {
             if !matches_test_filters(base_task.name.as_ref(), tags, filters) {
                 continue;
             }
-            let env = Environment { profile: "", param: ValueMap::new(), vars: base_task.config.vars };
+            let env = Environment { profile: "", param: ValueMap::new(), vars: base_task.config.vars, options: &[] };
             let Ok(task_config) = base_task.config.eval(&env) else {
                 kvlog::error!("Failed to evaluate test config", name = base_task.name.as_ref());
                 continue;
@@ -5500,7 +5547,10 @@ mod scheduling_tests {
     fn test_job_status_is_pending_completion() {
         assert!(JobStatus::Scheduled { after: vec![] }.is_pending_completion());
         assert!(JobStatus::Starting.is_pending_completion());
-        assert!(JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None }.is_pending_completion());
+        assert!(
+            JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None }
+                .is_pending_completion()
+        );
         assert!(
             !JobStatus::Exited { finished_at: Instant::now(), cause: ExitCause::Unknown, status: 0 }
                 .is_pending_completion()
@@ -5512,7 +5562,10 @@ mod scheduling_tests {
     fn test_job_status_is_successful_completion() {
         assert!(!JobStatus::Scheduled { after: vec![] }.is_successful_completion());
         assert!(!JobStatus::Starting.is_successful_completion());
-        assert!(!JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None }.is_successful_completion());
+        assert!(
+            !JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None }
+                .is_successful_completion()
+        );
         assert!(!JobStatus::Cancelled.is_successful_completion());
 
         assert!(
@@ -5555,7 +5608,7 @@ mod scheduling_tests {
             let base_task = state.lookup_name("simple_cmd").unwrap();
             let config = state.base_tasks[base_task.idx()].config.clone();
             let task = config
-                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars, options: &[] })
                 .expect("eval task");
             let spec = state.cache_spawn_spec(base_task, "", ValueMap::new(), task);
             (state, base_task, spec)
@@ -5633,11 +5686,17 @@ mod scheduling_tests {
         #[test]
         fn ready_predicate_is_met_when_service_is_ready_or_terminal() {
             assert!(matches!(
-                status_for(JobPredicate::Ready, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None }),
+                status_for(
+                    JobPredicate::Ready,
+                    JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None }
+                ),
                 RequirementStatus::Met
             ));
             assert!(matches!(
-                status_for(JobPredicate::Ready, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: Some(true) }),
+                status_for(
+                    JobPredicate::Ready,
+                    JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: Some(true) }
+                ),
                 RequirementStatus::Met
             ));
             assert!(matches!(
@@ -5658,7 +5717,10 @@ mod scheduling_tests {
             ));
             assert!(matches!(status_for(JobPredicate::Ready, JobStatus::Starting), RequirementStatus::Pending));
             assert!(matches!(
-                status_for(JobPredicate::Ready, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: Some(false) }),
+                status_for(
+                    JobPredicate::Ready,
+                    JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: Some(false) }
+                ),
                 RequirementStatus::Pending
             ));
         }
@@ -5860,7 +5922,9 @@ mod scheduling_tests {
             let failing_task = state.lookup_name("with_var").unwrap();
 
             let config = state.base_tasks[base_task.idx()].config.clone();
-            let task = config.eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars }).unwrap();
+            let task = config
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars, options: &[] })
+                .unwrap();
             let cached = state.cache_spawn_spec(base_task, "", ValueMap::new(), task);
 
             state.base_tasks[base_task.idx()].config = state.base_tasks[failing_task.idx()].config.clone();
@@ -6075,7 +6139,7 @@ require = ["svc:alpha", "child"]
             let parent = state.lookup_name("parent").expect("parent task");
             let config = state.base_tasks[parent.idx()].config.clone();
             let task = config
-                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars, options: &[] })
                 .expect("eval parent");
 
             let err = state
@@ -6129,7 +6193,7 @@ cmd = ["true"]
             let root = state.lookup_name("root").expect("root task");
             let root_config = state.base_tasks[root.idx()].config.clone();
             let task = root_config
-                .eval(&Environment { profile: "", param: ValueMap::new(), vars: root_config.vars })
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: root_config.vars, options: &[] })
                 .expect("eval root");
 
             let started = Instant::now();
@@ -6146,7 +6210,7 @@ cmd = ["true"]
             let root = state.lookup_name(root_name).expect("root task");
             let config = state.base_tasks[root.idx()].config.clone();
             let task = config
-                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars, options: &[] })
                 .expect("eval root");
             state.validate_service_requirement_variants(root, &task)
         }
@@ -6350,14 +6414,18 @@ require = ["sink{next}"]
             params: ValueMap<'static>,
         ) -> JobIndex {
             let config = state.base_tasks[base_task.idx()].config.clone();
-            let task =
-                config.eval(&Environment { profile, param: params.clone(), vars: config.vars }).expect("eval service");
+            let task = config
+                .eval(&Environment { profile, param: params.clone(), vars: config.vars, options: &[] })
+                .expect("eval service");
             let spec = state.cache_spawn_spec(base_task, profile, params, task);
             let pc = state.base_tasks[base_task.idx()].spawn_counter as usize;
             state.base_tasks[base_task.idx()].spawn_counter =
                 state.base_tasks[base_task.idx()].spawn_counter.wrapping_add(1);
             let ji = state.jobs.insert(Job {
-                process_status: JobStatus::Running { owner: ProcessOwner::Daemon { process_index: pc }, ready_state: None },
+                process_status: JobStatus::Running {
+                    owner: ProcessOwner::Daemon { process_index: pc },
+                    ready_state: None,
+                },
                 log_group: LogGroup::new(base_task, pc),
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
@@ -6382,8 +6450,9 @@ require = ["sink{next}"]
             params: ValueMap<'static>,
         ) -> JobIndex {
             let config = state.base_tasks[base_task.idx()].config.clone();
-            let task =
-                config.eval(&Environment { profile, param: params.clone(), vars: config.vars }).expect("eval service");
+            let task = config
+                .eval(&Environment { profile, param: params.clone(), vars: config.vars, options: &[] })
+                .expect("eval service");
             let spec = state.cache_spawn_spec(base_task, profile, params, task);
             let pc = state.base_tasks[base_task.idx()].spawn_counter as usize;
             state.base_tasks[base_task.idx()].spawn_counter =
@@ -6490,7 +6559,7 @@ require = ["sink{next}"]
             let config = state.base_tasks[base_task.idx()].config.clone();
             let params = ValueMap::new();
             let task = config
-                .eval(&Environment { profile: "watch", param: params.clone(), vars: config.vars })
+                .eval(&Environment { profile: "watch", param: params.clone(), vars: config.vars, options: &[] })
                 .expect("eval service");
             let mut plan = SchedulePlan::default();
             let planned = plan.push_job(PlannedJob {
@@ -6613,7 +6682,7 @@ require = ["sink{next}"]
             let base_task = state.lookup_name("simple_cmd").unwrap();
             let config = state.base_tasks[base_task.idx()].config.clone();
             let task = config
-                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars, options: &[] })
                 .expect("eval task");
             let spec = state.cache_spawn_spec(base_task, "", ValueMap::new(), task);
             (state, base_task, spec)
@@ -6647,7 +6716,10 @@ require = ["sink{next}"]
             // Match the real spawn_task flow: Starting → Running → Exited.
             // The (Starting, Exited) direct transition is not modelled by
             // the global kind-list and would leak stale entries there.
-            state.update_job_status(ji, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None });
+            state.update_job_status(
+                ji,
+                JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None },
+            );
             state.update_job_status(
                 ji,
                 JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status },
@@ -6755,11 +6827,14 @@ require = ["sink{next}"]
             let service_task = state.lookup_name("simple_service").unwrap();
             let service_config = state.base_tasks[service_task.idx()].config.clone();
             let task = service_config
-                .eval(&Environment { profile: "", param: ValueMap::new(), vars: service_config.vars })
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: service_config.vars, options: &[] })
                 .expect("eval service");
             let service_spec = state.cache_spawn_spec(service_task, "", ValueMap::new(), task);
             let service_job = state.jobs.insert(Job {
-                process_status: JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: Some(false) },
+                process_status: JobStatus::Running {
+                    owner: ProcessOwner::Daemon { process_index: 0 },
+                    ready_state: Some(false),
+                },
                 log_group: LogGroup::new(service_task, 0),
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
@@ -6934,7 +7009,7 @@ require = ["sink{next}"]
             let base_task = state.lookup_name("test.test_with_cache").expect("cached test task");
             let config = state.base_tasks[base_task.idx()].config.clone();
             let task = config
-                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars, options: &[] })
                 .expect("eval cached test");
             let spec = state.cache_spawn_spec(base_task, "", ValueMap::new(), task.clone());
             let cache_key = String::new();
@@ -6992,7 +7067,7 @@ require = ["sink{next}"]
             let base_task = state.lookup_name("test.test_with_cache").expect("cached test task");
             let config = state.base_tasks[base_task.idx()].config.clone();
             let task = config
-                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars, options: &[] })
                 .expect("eval cached test");
             let spec = state.cache_spawn_spec(base_task, "", ValueMap::new(), task.clone());
             let cache_key = String::new();
@@ -7111,7 +7186,10 @@ cmd = ["true"]
             let c_public_id = state.jobs.public_id_of(c).expect("c must be live before transition");
 
             state.max_job_history = 1;
-            state.update_job_status(c, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None });
+            state.update_job_status(
+                c,
+                JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None },
+            );
             let returned = state.update_job_status(
                 c,
                 JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },
@@ -7179,7 +7257,7 @@ cmd = ["true"]
             let base_task = state.lookup_name("simple_cmd").unwrap();
             let config = state.base_tasks[base_task.idx()].config.clone();
             let task = config
-                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars })
+                .eval(&Environment { profile: "", param: ValueMap::new(), vars: config.vars, options: &[] })
                 .expect("eval task");
             let spec = state.cache_spawn_spec(base_task, "", ValueMap::new(), task);
             (state, base_task, spec)
@@ -7218,14 +7296,18 @@ cmd = ["true"]
 
         fn insert_running_service(state: &mut WorkspaceState, base_task: BaseTaskIndex, profile: &str) -> JobIndex {
             let config = state.base_tasks[base_task.idx()].config.clone();
-            let task =
-                config.eval(&Environment { profile, param: ValueMap::new(), vars: config.vars }).expect("eval service");
+            let task = config
+                .eval(&Environment { profile, param: ValueMap::new(), vars: config.vars, options: &[] })
+                .expect("eval service");
             let spec = state.cache_spawn_spec(base_task, profile, ValueMap::new(), task);
             let bt = &mut state.base_tasks[base_task.idx()];
             let pc = bt.spawn_counter as usize;
             bt.spawn_counter = bt.spawn_counter.wrapping_add(1);
             let ji = state.jobs.insert(Job {
-                process_status: JobStatus::Running { owner: ProcessOwner::Daemon { process_index: pc }, ready_state: None },
+                process_status: JobStatus::Running {
+                    owner: ProcessOwner::Daemon { process_index: pc },
+                    ready_state: None,
+                },
                 log_group: LogGroup::new(base_task, pc),
                 started_at: crate::clock::now(),
                 cache_key: String::new(),
@@ -7250,8 +7332,9 @@ cmd = ["true"]
             after: Vec<ScheduleRequirement>,
         ) -> JobIndex {
             let config = state.base_tasks[base_task.idx()].config.clone();
-            let task =
-                config.eval(&Environment { profile, param: ValueMap::new(), vars: config.vars }).expect("eval service");
+            let task = config
+                .eval(&Environment { profile, param: ValueMap::new(), vars: config.vars, options: &[] })
+                .expect("eval service");
             let spec = state.cache_spawn_spec(base_task, profile, ValueMap::new(), task);
             let bt = &mut state.base_tasks[base_task.idx()];
             let pc = bt.spawn_counter as usize;
@@ -7311,7 +7394,10 @@ cmd = ["true"]
             let ji = insert_scheduled_with_resources(&mut state, base_task, spec, vec![(id, 0)]);
 
             state.update_job_status(ji, JobStatus::Starting);
-            state.update_job_status(ji, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None });
+            state.update_job_status(
+                ji,
+                JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None },
+            );
             state.update_job_status(
                 ji,
                 JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },
@@ -7363,7 +7449,10 @@ cmd = ["true"]
                 other => panic!("expected None while resource is held, got {other:?}"),
             }
 
-            state.update_job_status(first, JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None });
+            state.update_job_status(
+                first,
+                JobStatus::Running { owner: ProcessOwner::Daemon { process_index: 0 }, ready_state: None },
+            );
             state.update_job_status(
                 first,
                 JobStatus::Exited { finished_at: crate::clock::now(), cause: ExitCause::Unknown, status: 0 },

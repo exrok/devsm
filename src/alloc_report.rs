@@ -48,7 +48,7 @@ fn predicted_cache_key_bytes(task: &TaskConfig<'_>, profile: &str, params: &Valu
     let Some(cache) = task.cache.as_ref() else {
         return 0;
     };
-    if cache.key.is_empty() && profile.is_empty() && params.entries().is_empty() {
+    if cache.key.is_empty() && task.option_values.is_empty() && profile.is_empty() && params.entries().is_empty() {
         return 0;
     }
     64
@@ -62,9 +62,10 @@ fn measure_restart_scenario(
     name: String,
     expr: &'static TaskConfigExpr<'static>,
     profile: &str,
+    options: crate::config::OptionValues<'_>,
 ) -> Option<ScenarioMeasurement> {
     let params = base_restart_params(expr)?;
-    let task = expr.eval(&Environment { profile, param: params.clone(), vars: expr.vars }).unwrap();
+    let task = expr.eval(&Environment { profile, param: params.clone(), vars: expr.vars, options }).unwrap();
     let bump_bytes = task.allocated_bytes_including_metadata();
     let shared_eval_bytes = size_of::<(TaskConfig<'static>, Bump)>() + 2 * size_of::<usize>() + bump_bytes;
     let repeated_per_job_bytes =
@@ -85,13 +86,14 @@ fn collect_restart_measurements(relative: &str) -> Vec<ScenarioMeasurement> {
     let mut measurements = Vec::new();
     for (name, expr) in config.tasks {
         let profile = expr.profiles.first().copied().unwrap_or("");
-        if let Some(measurement) = measure_restart_scenario((*name).to_string(), expr, profile) {
+        if let Some(measurement) = measure_restart_scenario((*name).to_string(), expr, profile, config.option_values) {
             measurements.push(measurement);
         }
     }
     for (base_name, test) in config.tests {
         let name = format!("test.{base_name}");
-        if let Some(measurement) = measure_restart_scenario(name, test.to_task_config_expr(), "") {
+        if let Some(measurement) = measure_restart_scenario(name, test.to_task_config_expr(), "", config.option_values)
+        {
             measurements.push(measurement);
         }
     }

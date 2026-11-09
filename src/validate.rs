@@ -152,9 +152,17 @@ fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptio
         emit(toml_error_to_diagnostic(err, content));
     }
 
-    let Some(workspace_config) = workspace_config else {
+    let Some(mut workspace_config) = workspace_config else {
         return Ok(false);
     };
+    let local_warnings = match crate::config::options::load_local_options(path, &mut workspace_config, &bump) {
+        Ok(warnings) => warnings,
+        Err(error) => {
+            eprintln!("{error}");
+            return Ok(false);
+        }
+    };
+    crate::config::options::emit_warnings(&local_warnings);
 
     validate_cross_references(&workspace_config, doc.table(), &mut emit);
     validate_require_graph(&workspace_config, doc.table(), &mut emit);
@@ -166,7 +174,7 @@ fn validate_workspace_config(path: &Path, content: &str, options: &ValidateOptio
     if has_errors {
         Ok(false)
     } else {
-        eprintln!("{}", validity_summary(path, warnings));
+        eprintln!("{}", validity_summary(path, warnings + local_warnings.len()));
         Ok(true)
     }
 }
@@ -300,29 +308,32 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                 let resolved = resolve_qualified_reference(required_name, &name_kinds, &test_names);
 
                 let Some(short) = resolved else {
-                    if let Some(span) = find_require_span(root, task_name, required_name) {
-                        emit(
-                            Diagnostic::error()
-                                .with_message(format!("required task '{}' does not exist", required_name))
-                                .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                                .with_notes(vec![format!("in task '{}'", task_name)]),
-                        );
-                    }
+                    let labels = find_require_span(root, task_name, required_name)
+                        .map(|span| vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                        .unwrap_or_default();
+                    emit(
+                        Diagnostic::error()
+                            .with_message(format!("required task '{}' does not exist", required_name))
+                            .with_labels(labels)
+                            .with_notes(vec![format!("in task '{}'", task_name)]),
+                    );
                     return;
                 };
                 if let Some(profile) = call.profile
                     && !task_profiles.contains(&(short, profile))
-                    && let Some(span) = find_require_span(root, task_name, required_name)
                 {
                     let available: Vec<_> =
                         task_profiles.iter().filter(|(n, _)| *n == short).map(|(_, p)| *p).collect();
+                    let labels = find_require_span(root, task_name, required_name)
+                        .map(|span| vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                        .unwrap_or_default();
                     emit(
                         Diagnostic::error()
                             .with_message(format!(
                                 "required task '{}' does not have profile '{}'",
                                 required_name, profile
                             ))
-                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                            .with_labels(labels)
                             .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
                     );
                 }
@@ -356,29 +367,32 @@ fn validate_cross_references(config: &WorkspaceConfig, root: &Table, emit: &mut 
                 let resolved = resolve_qualified_reference(required_name, &name_kinds, &test_names);
 
                 let Some(short) = resolved else {
-                    if let Some(span) = find_test_require_span(root, test_name, required_name) {
-                        emit(
-                            Diagnostic::error()
-                                .with_message(format!("required task '{}' does not exist", required_name))
-                                .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
-                                .with_notes(vec![format!("in test '{}'", test_name)]),
-                        );
-                    }
+                    let labels = find_test_require_span(root, test_name, required_name)
+                        .map(|span| vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                        .unwrap_or_default();
+                    emit(
+                        Diagnostic::error()
+                            .with_message(format!("required task '{}' does not exist", required_name))
+                            .with_labels(labels)
+                            .with_notes(vec![format!("in test '{}'", test_name)]),
+                    );
                     return;
                 };
                 if let Some(profile) = call.profile
                     && !task_profiles.contains(&(short, profile))
-                    && let Some(span) = find_test_require_span(root, test_name, required_name)
                 {
                     let available: Vec<_> =
                         task_profiles.iter().filter(|(n, _)| *n == short).map(|(_, p)| *p).collect();
+                    let labels = find_test_require_span(root, test_name, required_name)
+                        .map(|span| vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                        .unwrap_or_default();
                     emit(
                         Diagnostic::error()
                             .with_message(format!(
                                 "required task '{}' does not have profile '{}'",
                                 required_name, profile
                             ))
-                            .with_labels(vec![DiagnosticLabel::primary(span).with_message("referenced here")])
+                            .with_labels(labels)
                             .with_notes(vec![format!("available profiles: {}", available.join(", "))]),
                     );
                 }
@@ -427,6 +441,7 @@ fn push_validate_variant<'a>(
     base_name: &str,
     kind: TaskKind,
     require_exprs: &'a [crate::config::RequirementExpr<'a>],
+    options: crate::config::OptionValues<'_>,
     profile: String,
     variant_base: &mut Vec<usize>,
     variant_kind: &mut Vec<TaskKind>,
@@ -440,8 +455,11 @@ fn push_validate_variant<'a>(
     let fallback = profile == VALIDATE_OTHER_PROFILE;
     let eval_profile = if fallback { VALIDATE_OTHER_PROFILE } else { profile.as_str() };
     let mut requirements = Vec::new();
-    crate::config::RequirementListExpr { items: require_exprs }
-        .eval_for_profile_append(eval_profile, &mut requirements);
+    crate::config::RequirementListExpr { items: require_exprs }.eval_for_profile_append(
+        eval_profile,
+        options,
+        &mut requirements,
+    );
     let input_idx = variant_base.len();
     if fallback {
         fallback_map.insert(base, input_idx);
@@ -504,6 +522,7 @@ fn validate_require_graph(config: &WorkspaceConfig, root: &Table, emit: &mut dyn
                 name,
                 expr.kind,
                 expr.require,
+                config.option_values,
                 profile,
                 &mut variant_base,
                 &mut variant_kind,
@@ -532,6 +551,7 @@ fn validate_require_graph(config: &WorkspaceConfig, root: &Table, emit: &mut dyn
                 name,
                 TaskKind::Test,
                 test_expr.require,
+                config.option_values,
                 profile,
                 &mut variant_base,
                 &mut variant_kind,
@@ -741,29 +761,15 @@ fn table_task_call_name_matches(table: &Table, target_name: &str) -> bool {
 
 fn find_require_span(root: &Table, task_name: &str, required_name: &str) -> Option<Range<usize>> {
     let task = table_by_task_name(root, task_name)?;
-    if let Some(require_array) = task.get("require").and_then(|v| v.as_array()) {
-        for item in require_array {
-            if let Some(span) = match_task_call_span(item, required_name) {
-                return Some(span);
-            }
-        }
-    }
-    None
+    match_task_call_span(task.get("require")?, required_name)
 }
 
 fn find_test_require_span(root: &Table, test_name: &str, required_name: &str) -> Option<Range<usize>> {
     let test_table = root.get("test")?.as_table()?;
     let test_value = test_table.get(test_name)?;
 
-    let search_require = |table: &Table| -> Option<Range<usize>> {
-        let require_array = table.get("require")?.as_array()?;
-        for item in require_array {
-            if let Some(span) = match_task_call_span(item, required_name) {
-                return Some(span);
-            }
-        }
-        None
-    };
+    let search_require =
+        |table: &Table| -> Option<Range<usize>> { match_task_call_span(table.get("require")?, required_name) };
 
     match test_value.value() {
         Value::Table(table) => search_require(table),
@@ -787,13 +793,7 @@ fn match_task_call_span(item: &Item, target_name: &str) -> Option<Range<usize>> 
             let item_name = s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s);
             if item_name == target_name { Some(item.span().range()) } else { None }
         }
-        Value::Array(arr) if !arr.is_empty() => {
-            if let Value::String(s) = arr.as_slice()[0].value() {
-                let item_name = s.rsplit_once(':').map(|(n, _)| n).unwrap_or(s);
-                if item_name == target_name {
-                    return Some(item.span().range());
-                }
-            }
+        Value::Array(arr) => {
             for child in arr {
                 if let Some(span) = match_task_call_span(child, target_name) {
                     return Some(span);
@@ -860,5 +860,41 @@ fn find_test_pwd_span(root: &Table, test_name: &str) -> Option<Range<usize>> {
             None
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_require_errors_without_source_spans() {
+        for kind in ["action", "service", "test"] {
+            let content = format!(
+                r#"
+[action.dep]
+cmd = "true"
+profiles = ["debug"]
+[{kind}.consumer]
+cmd = "true"
+require = ["missing", "dep:missing"]
+"#
+            );
+            let arena = toml_spanner::Arena::new();
+            let bump = Bump::new();
+            let mut doc = toml_spanner::parse_recoverable(&content, &arena);
+            let workspace = toml_handler::parse_workspace(Path::new("."), &bump, &mut doc).unwrap();
+            // Reference validation must still fail when diagnostic source lookup cannot find the task.
+            let empty_source = toml_spanner::parse("", &arena).unwrap();
+            let mut diagnostics = Vec::new();
+            validate_cross_references(&workspace, empty_source.table(), &mut |diag| diagnostics.push(diag));
+
+            assert_eq!(
+                diagnostics.iter().map(|diag| diag.message.as_str()).collect::<Vec<_>>(),
+                ["required task 'missing' does not exist", "required task 'dep' does not have profile 'missing'"],
+                "{kind}",
+            );
+            assert!(diagnostics.iter().all(|diag| diag.level == DiagnosticLevel::Error && diag.labels.is_empty()));
+        }
     }
 }

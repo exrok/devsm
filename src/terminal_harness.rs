@@ -147,8 +147,8 @@ fn drain_messages(
             DecodeResult::Message { kind, payload, .. } => match kind {
                 RpcMessageKind::TerminalAttached => incoming.push(Incoming::Attached),
                 RpcMessageKind::TerminalWaiting => {
-                    let event: crate::rpc::TerminalWaitingEvent = jsony::from_binary(payload)
-                        .map_err(|_| anyhow::anyhow!("invalid TerminalWaiting payload"))?;
+                    let event: crate::rpc::TerminalWaitingEvent =
+                        jsony::from_binary(payload).map_err(|_| anyhow::anyhow!("invalid TerminalWaiting payload"))?;
                     incoming.push(Incoming::Waiting(event.tasks));
                 }
                 RpcMessageKind::TerminalStart => incoming.push(Incoming::Start(
@@ -349,10 +349,7 @@ fn run_child(
     send(
         socket,
         RpcMessageKind::TerminalStarted,
-        &crate::rpc::TerminalRunEvent {
-            run_token: start.run_token,
-            process_group: pid,
-        },
+        &crate::rpc::TerminalRunEvent { run_token: start.run_token, process_group: pid },
     )?;
 
     let mut replacement_pending = initial_stop.unwrap_or(false);
@@ -385,13 +382,7 @@ fn run_child(
 
                 let messages = drain_messages(socket, protocol, buffer)
                     .map_err(|error| error.context("daemon disappeared while terminal child was stopped"))?;
-                apply_stop_messages(
-                    messages,
-                    start.run_token,
-                    pid,
-                    &mut replacement_pending,
-                    &mut stop_sent_at,
-                );
+                apply_stop_messages(messages, start.run_token, pid, &mut replacement_pending, &mut stop_sent_at);
 
                 if stop_sent_at.is_some() {
                     // SIGTERM remains pending for a job-control-stopped group;
@@ -434,13 +425,7 @@ fn run_child(
 
         match drain_messages(socket, protocol, buffer) {
             Ok(messages) => {
-                apply_stop_messages(
-                    messages,
-                    start.run_token,
-                    pid,
-                    &mut replacement_pending,
-                    &mut stop_sent_at,
-                );
+                apply_stop_messages(messages, start.run_token, pid, &mut replacement_pending, &mut stop_sent_at);
             }
             Err(error) => {
                 kill_and_reap(pid);

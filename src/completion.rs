@@ -89,7 +89,12 @@ pub fn complete_schema_task(
         return None;
     };
     let profile = if profile.is_empty() { expr.profiles.first().copied().unwrap_or("") } else { profile };
-    let env = config::Environment { profile, param: jsony_value::ValueMap::new(), vars: expr.vars };
+    let env = config::Environment {
+        profile,
+        param: jsony_value::ValueMap::new(),
+        vars: expr.vars,
+        options: workspace.option_values,
+    };
     let evaluated = expr.eval(&env).ok()?;
     let task_config = evaluated.config();
     let cwd = workspace.base_path.join(task_config.pwd);

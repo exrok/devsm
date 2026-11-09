@@ -124,10 +124,29 @@ pub enum Command<'a> {
     Global,
     Server,
     RestartSelected,
-    Start { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool, wait: Option<WaitOptions> },
-    Restart { job: &'a str, value_map: ValueMap<'a>, as_test: bool, cached: bool, wait: Option<WaitOptions> },
-    Wait { names: Vec<&'a str>, options: WaitOptions },
-    Exec { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String] },
+    Start {
+        job: &'a str,
+        value_map: ValueMap<'a>,
+        as_test: bool,
+        cached: bool,
+        wait: Option<WaitOptions>,
+    },
+    Restart {
+        job: &'a str,
+        value_map: ValueMap<'a>,
+        as_test: bool,
+        cached: bool,
+        wait: Option<WaitOptions>,
+    },
+    Wait {
+        names: Vec<&'a str>,
+        options: WaitOptions,
+    },
+    Exec {
+        job: &'a str,
+        value_map: ValueMap<'a>,
+        trailing_args: &'a [String],
+    },
     Run {
         job: &'a str,
         value_map: ValueMap<'a>,
@@ -136,17 +155,43 @@ pub enum Command<'a> {
         derive_cache_key: bool,
         sticky: bool,
     },
-    Auto { job: &'a str, value_map: ValueMap<'a>, trailing_args: &'a [String] },
-    Stop { job: &'a str },
-    Status { name: Option<&'a str> },
-    Test { filters: Vec<TestFilter<'a>>, force: bool },
-    RerunTests { only_failed: bool },
-    Validate { path: Option<&'a str>, skip_path_checks: bool },
-    Get { resource: GetResource },
-    FunctionCall { name: &'a str },
-    Logs { options: LogsOptions<'a> },
-    Complete { context: CompleteContext<'a> },
-    Completions { shell: CompletionShell },
+    Auto {
+        job: &'a str,
+        value_map: ValueMap<'a>,
+        trailing_args: &'a [String],
+    },
+    Stop {
+        job: &'a str,
+    },
+    Status {
+        name: Option<&'a str>,
+    },
+    Test {
+        filters: Vec<TestFilter<'a>>,
+        force: bool,
+    },
+    RerunTests {
+        only_failed: bool,
+    },
+    Validate {
+        path: Option<&'a str>,
+        skip_path_checks: bool,
+    },
+    Get {
+        resource: GetResource,
+    },
+    FunctionCall {
+        name: &'a str,
+    },
+    Logs {
+        options: LogsOptions<'a>,
+    },
+    Complete {
+        context: CompleteContext<'a>,
+    },
+    Completions {
+        shell: CompletionShell,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -389,7 +434,8 @@ fn parse_daemon_task<'a>(parser: &mut ArgParser<'a>, restart: bool) -> anyhow::R
 }
 
 fn parse_wait_timeout(value: &str) -> anyhow::Result<std::time::Duration> {
-    let secs = crate::config::parse_duration(value).map_err(|err| anyhow::anyhow!("Invalid timeout {value:?}: {err}"))?;
+    let secs =
+        crate::config::parse_duration(value).map_err(|err| anyhow::anyhow!("Invalid timeout {value:?}: {err}"))?;
     Ok(std::time::Duration::from_secs_f64(secs))
 }
 

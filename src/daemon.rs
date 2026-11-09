@@ -496,7 +496,11 @@ mod socket_tests {
     impl Fixture {
         fn new() -> Self {
             static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::env::temp_dir().join(format!("dsm_lock_{}_{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed)));
+            let dir = std::env::temp_dir().join(format!(
+                "dsm_lock_{}_{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir(&dir).unwrap();
             Self(dir)
         }

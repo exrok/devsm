@@ -4,7 +4,8 @@ use crate::config::{RequireWait, Requirement};
 use crate::rpc::DecodeResult;
 use crate::rpc::DecodingState;
 use crate::workspace::{
-    BaseTaskIndex, FunctionGlobalAction, Job, JobIndex, JobPredicate, ScheduleRequirement, SpawnSpec, WorkspaceState as WsState,
+    BaseTaskIndex, FunctionGlobalAction, Job, JobIndex, JobPredicate, ScheduleRequirement, SpawnSpec,
+    WorkspaceState as WsState,
 };
 use jsony_value::ValueMap;
 

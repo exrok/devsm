@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-04/schema#",
+  "title": "devsm local options",
+  "description": "Per-checkout option values. Names and choices are declared in devsm.toml.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "option": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}
